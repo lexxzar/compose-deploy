@@ -1,0 +1,39 @@
+# Binaries for programs and plugins
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+bin/
+.bin/*
+!.bin/.gitkeep
+dist/
+
+# Test binary, built with `go test -c`
+*.test
+
+# Output of the go coverage tool
+*.out
+coverage.out
+coverage.html
+
+# Go workspace file
+go.work
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.gomodcache/
+.gocache/
+
+# OS
+.DS_Store
+Thumbs.db
+.gitconfig
+
+# Build artifacts
+/cdeploy*
+*.log
