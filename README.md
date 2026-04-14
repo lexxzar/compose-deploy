@@ -1,8 +1,10 @@
 # cdeploy
 
-A TUI/CLI tool for managing Docker Compose container deployments and restarts — locally or on remote servers via SSH.
+cdeploy is a TUI/CLI app for teams and solo developers who deploy Docker Compose apps to a few servers over SSH.
 
-Replaces manual `docker compose stop && docker compose rm -f && docker compose pull && docker compose up --no-start && docker compose start` workflows with a single command or interactive interface.
+Instead of SSH-ing into each machine and running `docker compose stop && docker compose rm -f && docker compose pull && docker compose up --no-start && docker compose start` by hand, cdeploy wraps that rollout into a single command or terminal UI.
+
+No daemon. No agents to install on your servers. No cluster orchestrator. Single binary. Plain SSH.
 
 ## Install
 
