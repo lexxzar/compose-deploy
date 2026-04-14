@@ -72,18 +72,18 @@
 - Modify: `internal/runner/runner_test.go`
 - Modify: `internal/compose/compose_test.go`
 
-- [ ] Add `ServiceStatus` struct with `Running bool` and `Health string` fields in `internal/runner/runner.go`
-- [ ] Change `ContainerStatus()` return type in `Composer` interface from `map[string]bool` to `map[string]ServiceStatus`
-- [ ] Add `Health string \`json:"Health"\`` field to `psEntry` struct in `internal/compose/compose.go`
-- [ ] Change `parseContainerStatus()` return type to `map[string]runner.ServiceStatus`
-- [ ] Update parsing logic: set `Running` from State, set `Health` from the new field; for scaled services, OR the Running flag and use worst-case health priority (`unhealthy` > `starting` > `healthy`)
-- [ ] Update `Compose.ContainerStatus()` return type to match
-- [ ] Update `RemoteCompose.ContainerStatus()` return type in `internal/compose/remote.go` (signature only — delegates to shared `parseContainerStatus`)
-- [ ] Update `mockComposer.ContainerStatus()` return type in `internal/runner/runner_test.go` to return `map[string]runner.ServiceStatus` with non-empty Health values
-- [ ] Update `TestParseContainerStatus`: change `want` type to `map[string]runner.ServiceStatus`, update all existing cases
-- [ ] Add test cases: container with `"Health":"healthy"`, container with `"Health":"unhealthy"`, container with `"Health":"starting"`, container with no Health field
-- [ ] Add test case: scaled service with mixed health values (verify worst-case priority wins)
-- [ ] Run tests: `go test ./internal/compose/ ./internal/runner/ -v` — must pass before next task
+- [x] Add `ServiceStatus` struct with `Running bool` and `Health string` fields in `internal/runner/runner.go`
+- [x] Change `ContainerStatus()` return type in `Composer` interface from `map[string]bool` to `map[string]ServiceStatus`
+- [x] Add `Health string \`json:"Health"\`` field to `psEntry` struct in `internal/compose/compose.go`
+- [x] Change `parseContainerStatus()` return type to `map[string]runner.ServiceStatus`
+- [x] Update parsing logic: set `Running` from State, set `Health` from the new field; for scaled services, OR the Running flag and use worst-case health priority (`unhealthy` > `starting` > `healthy`)
+- [x] Update `Compose.ContainerStatus()` return type to match
+- [x] Update `RemoteCompose.ContainerStatus()` return type in `internal/compose/remote.go` (signature only — delegates to shared `parseContainerStatus`)
+- [x] Update `mockComposer.ContainerStatus()` return type in `internal/runner/runner_test.go` to return `map[string]runner.ServiceStatus` with non-empty Health values
+- [x] Update `TestParseContainerStatus`: change `want` type to `map[string]runner.ServiceStatus`, update all existing cases
+- [x] Add test cases: container with `"Health":"healthy"`, container with `"Health":"unhealthy"`, container with `"Health":"starting"`, container with no Health field
+- [x] Add test case: scaled service with mixed health values (verify worst-case priority wins)
+- [x] Run tests: `go test ./internal/compose/ ./internal/runner/ -v` — must pass before next task
 
 ### Task 2: Update CLI list command
 
@@ -91,12 +91,12 @@
 - Modify: `cmd/list.go`
 - Modify: `cmd/list_test.go` (if exists, otherwise `cmd/deploy_test.go`)
 
-- [ ] Update `serviceStatus` struct to include `Health string \`json:"health,omitempty"\``
-- [ ] Update `mergeStatus()` to accept `map[string]runner.ServiceStatus` and populate Health field
-- [ ] Update `formatDots()` to show health icon when Health is non-empty (same icons as TUI)
-- [ ] Update tests for `mergeStatus` and `formatDots` with health variations
-- [ ] Add test: `formatJSON` includes `health` field in JSON output when Health is non-empty
-- [ ] Run tests: `go test ./cmd/ -v` — must pass before next task
+- [x] Update `serviceStatus` struct to include `Health string \`json:"health,omitempty"\``
+- [x] Update `mergeStatus()` to accept `map[string]runner.ServiceStatus` and populate Health field
+- [x] Update `formatDots()` to show health icon when Health is non-empty (same icons as TUI)
+- [x] Update tests for `mergeStatus` and `formatDots` with health variations
+- [x] Add test: `formatJSON` includes `health` field in JSON output when Health is non-empty
+- [x] Run tests: `go test ./cmd/ -v` — must pass before next task
 
 ### Task 3: Update TUI model and messages
 
@@ -104,16 +104,16 @@
 - Modify: `internal/tui/app.go`
 - Modify: `internal/tui/app_test.go`
 
-- [ ] Replace `svcRunning map[string]bool` with `svcStatus map[string]runner.ServiceStatus` in `Model`
-- [ ] Update `servicesMsg` field from `running map[string]bool` to `status map[string]runner.ServiceStatus`
-- [ ] Update `statusMsg` field from `running map[string]bool` to `status map[string]runner.ServiceStatus`
-- [ ] Update all `servicesMsg` and `statusMsg` handlers in `Update()` to use new field names
-- [ ] Update `refreshStatus()` and `loadServices()` to construct messages with the new type
-- [ ] Update all reads of `m.svcRunning[svc]` to `m.svcStatus[svc].Running` throughout the file
-- [ ] Update backward-navigation cleanup: change `m.svcRunning = nil` to `m.svcStatus = nil` in esc handler, `entryLocal` handler, and `connectResultMsg` error path
-- [ ] Update `mockComposer` in `app_test.go`: change `running map[string]bool` to `status map[string]runner.ServiceStatus`, update `ContainerStatus()` to return it
-- [ ] Update all test cases that construct `servicesMsg` or `statusMsg` or check `svcRunning`
-- [ ] Run tests: `go test ./internal/tui/ -v` — must pass before next task
+- [x] Replace `svcRunning map[string]bool` with `svcStatus map[string]runner.ServiceStatus` in `Model`
+- [x] Update `servicesMsg` field from `running map[string]bool` to `status map[string]runner.ServiceStatus`
+- [x] Update `statusMsg` field from `running map[string]bool` to `status map[string]runner.ServiceStatus`
+- [x] Update all `servicesMsg` and `statusMsg` handlers in `Update()` to use new field names
+- [x] Update `refreshStatus()` and `loadServices()` to construct messages with the new type
+- [x] Update all reads of `m.svcRunning[svc]` to `m.svcStatus[svc].Running` throughout the file
+- [x] Update backward-navigation cleanup: change `m.svcRunning = nil` to `m.svcStatus = nil` in esc handler, `entryLocal` handler, and `connectResultMsg` error path
+- [x] Update `mockComposer` in `app_test.go`: change `running map[string]bool` to `status map[string]runner.ServiceStatus`, update `ContainerStatus()` to return it
+- [x] Update all test cases that construct `servicesMsg` or `statusMsg` or check `svcRunning`
+- [x] Run tests: `go test ./internal/tui/ -v` — must pass before next task
 
 ### Task 4: Add health icon rendering and styles
 
@@ -122,22 +122,22 @@
 - Modify: `internal/tui/app.go`
 - Modify: `internal/tui/app_test.go`
 
-- [ ] Add three new styles in `styles.go`: `healthHealthy` (color 2/green), `healthUnhealthy` (color 1/red), `healthStarting` (color 3/yellow)
-- [ ] In `viewContainerSelect()`, add a fixed-width health column between checkbox and dot using single-width Unicode characters for all states to avoid terminal width issues
-- [ ] Ensure rows align regardless of health icon presence (fixed-width slot with trailing space)
-- [ ] Add test: verify View() output contains health icon for service with health status
-- [ ] Add test: verify View() output alignment for mixed health/no-health services
-- [ ] Run tests: `go test ./internal/tui/ -v` — must pass before next task
+- [x] Add three new styles in `styles.go`: `healthHealthy` (color 2/green), `healthUnhealthy` (color 1/red), `healthStarting` (color 3/yellow)
+- [x] In `viewContainerSelect()`, add a fixed-width health column between checkbox and dot using single-width Unicode characters for all states to avoid terminal width issues
+- [x] Ensure rows align regardless of health icon presence (fixed-width slot with trailing space)
+- [x] Add test: verify View() output contains health icon for service with health status
+- [x] Add test: verify View() output alignment for mixed health/no-health services
+- [x] Run tests: `go test ./internal/tui/ -v` — must pass before next task
 
 ### Task 5: Verify acceptance criteria
 
-- [ ] Run full test suite: `go test ./... -count=1`
-- [ ] Verify edge cases are covered in tests: no healthcheck, all healthy, all unhealthy, mixed, scaled services with worst-case priority
+- [x] Run full test suite: `go test ./... -count=1`
+- [x] Verify edge cases are covered in tests: no healthcheck, all healthy, all unhealthy, mixed, scaled services with worst-case priority
 
 ### Task 6: [Final] Update documentation
 
-- [ ] Update CLAUDE.md if new patterns discovered (e.g., ServiceStatus struct, health column)
-- [ ] Move this plan to `docs/plans/completed/`
+- [x] Update CLAUDE.md if new patterns discovered (e.g., ServiceStatus struct, health column)
+- [x] Move this plan to `docs/plans/completed/`
 
 ## Post-Completion
 

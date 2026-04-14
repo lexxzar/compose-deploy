@@ -7,6 +7,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/lexxzar/compose-deploy/internal/runner"
 )
 
 func TestParseProjects(t *testing.T) {
@@ -312,23 +314,29 @@ func TestParseContainerStatus(t *testing.T) {
 	tests := []struct {
 		name    string
 		input   string
-		want    map[string]bool
+		want    map[string]runner.ServiceStatus
 		wantErr bool
 	}{
 		{
 			name:  "mixed states",
 			input: "{\"Service\":\"nginx\",\"State\":\"running\"}\n{\"Service\":\"postgres\",\"State\":\"exited\"}\n",
-			want:  map[string]bool{"nginx": true, "postgres": false},
+			want: map[string]runner.ServiceStatus{
+				"nginx":    {Running: true},
+				"postgres": {Running: false},
+			},
 		},
 		{
 			name:  "all running",
 			input: "{\"Service\":\"web\",\"State\":\"running\"}\n{\"Service\":\"db\",\"State\":\"running\"}\n",
-			want:  map[string]bool{"web": true, "db": true},
+			want: map[string]runner.ServiceStatus{
+				"web": {Running: true},
+				"db":  {Running: true},
+			},
 		},
 		{
 			name:  "all stopped",
 			input: "{\"Service\":\"web\",\"State\":\"exited\"}\n",
-			want:  map[string]bool{"web": false},
+			want:  map[string]runner.ServiceStatus{"web": {Running: false}},
 		},
 		{
 			name:  "empty output",
@@ -348,37 +356,85 @@ func TestParseContainerStatus(t *testing.T) {
 		{
 			name:  "created state",
 			input: "{\"Service\":\"app\",\"State\":\"created\"}\n",
-			want:  map[string]bool{"app": false},
+			want:  map[string]runner.ServiceStatus{"app": {Running: false}},
 		},
 		{
 			name:  "scaled service NDJSON any running means running",
 			input: "{\"Service\":\"web\",\"State\":\"running\"}\n{\"Service\":\"web\",\"State\":\"exited\"}\n{\"Service\":\"web\",\"State\":\"running\"}\n",
-			want:  map[string]bool{"web": true},
+			want:  map[string]runner.ServiceStatus{"web": {Running: true}},
 		},
 		{
 			name:  "scaled service NDJSON all exited",
 			input: "{\"Service\":\"web\",\"State\":\"exited\"}\n{\"Service\":\"web\",\"State\":\"exited\"}\n",
-			want:  map[string]bool{"web": false},
+			want:  map[string]runner.ServiceStatus{"web": {Running: false}},
 		},
 		{
 			name:  "scaled service JSON array any running means running",
 			input: `[{"Service":"web","State":"running"},{"Service":"web","State":"exited"},{"Service":"db","State":"running"}]`,
-			want:  map[string]bool{"web": true, "db": true},
+			want: map[string]runner.ServiceStatus{
+				"web": {Running: true},
+				"db":  {Running: true},
+			},
 		},
 		{
 			name:  "JSON array format",
 			input: `[{"Service":"nginx","State":"running"},{"Service":"postgres","State":"exited"}]`,
-			want:  map[string]bool{"nginx": true, "postgres": false},
+			want: map[string]runner.ServiceStatus{
+				"nginx":    {Running: true},
+				"postgres": {Running: false},
+			},
 		},
 		{
 			name:  "JSON array single entry",
 			input: `[{"Service":"web","State":"running"}]`,
-			want:  map[string]bool{"web": true},
+			want:  map[string]runner.ServiceStatus{"web": {Running: true}},
 		},
 		{
 			name:  "JSON array empty",
 			input: `[]`,
 			want:  nil,
+		},
+		{
+			name:  "healthy container",
+			input: `{"Service":"web","State":"running","Health":"healthy"}` + "\n",
+			want:  map[string]runner.ServiceStatus{"web": {Running: true, Health: "healthy"}},
+		},
+		{
+			name:  "unhealthy container",
+			input: `{"Service":"web","State":"running","Health":"unhealthy"}` + "\n",
+			want:  map[string]runner.ServiceStatus{"web": {Running: true, Health: "unhealthy"}},
+		},
+		{
+			name:  "starting health",
+			input: `{"Service":"web","State":"running","Health":"starting"}` + "\n",
+			want:  map[string]runner.ServiceStatus{"web": {Running: true, Health: "starting"}},
+		},
+		{
+			name:  "no health field",
+			input: `{"Service":"web","State":"running"}` + "\n",
+			want:  map[string]runner.ServiceStatus{"web": {Running: true, Health: ""}},
+		},
+		{
+			name: "scaled service mixed health worst-case wins",
+			input: `[{"Service":"web","State":"running","Health":"healthy"},` +
+				`{"Service":"web","State":"running","Health":"unhealthy"},` +
+				`{"Service":"web","State":"running","Health":"starting"}]`,
+			want: map[string]runner.ServiceStatus{"web": {Running: true, Health: "unhealthy"}},
+		},
+		{
+			name: "scaled service healthy and starting",
+			input: `[{"Service":"web","State":"running","Health":"healthy"},` +
+				`{"Service":"web","State":"running","Health":"starting"}]`,
+			want: map[string]runner.ServiceStatus{"web": {Running: true, Health: "starting"}},
+		},
+		{
+			name: "mixed health and no health",
+			input: `[{"Service":"web","State":"running","Health":"healthy"},` +
+				`{"Service":"db","State":"running"}]`,
+			want: map[string]runner.ServiceStatus{
+				"web": {Running: true, Health: "healthy"},
+				"db":  {Running: true, Health: ""},
+			},
 		},
 	}
 
@@ -397,9 +453,13 @@ func TestParseContainerStatus(t *testing.T) {
 			if len(got) != len(tt.want) {
 				t.Fatalf("got %d entries, want %d: %v", len(got), len(tt.want), got)
 			}
-			for svc, wantRunning := range tt.want {
-				if got[svc] != wantRunning {
-					t.Errorf("status[%q] = %v, want %v", svc, got[svc], wantRunning)
+			for svc, want := range tt.want {
+				gotStatus := got[svc]
+				if gotStatus.Running != want.Running {
+					t.Errorf("status[%q].Running = %v, want %v", svc, gotStatus.Running, want.Running)
+				}
+				if gotStatus.Health != want.Health {
+					t.Errorf("status[%q].Health = %q, want %q", svc, gotStatus.Health, want.Health)
 				}
 			}
 		})

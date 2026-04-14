@@ -9,6 +9,8 @@ import (
 	"os/exec"
 	"strings"
 	"time"
+
+	"github.com/lexxzar/compose-deploy/internal/runner"
 )
 
 // RemoteCompose implements runner.Composer by wrapping docker compose commands
@@ -155,8 +157,8 @@ func (r *RemoteCompose) ListServices(ctx context.Context) ([]string, error) {
 	return services, nil
 }
 
-// ContainerStatus returns a map of service name to running state on the remote host.
-func (r *RemoteCompose) ContainerStatus(ctx context.Context) (map[string]bool, error) {
+// ContainerStatus returns a map of service name to ServiceStatus on the remote host.
+func (r *RemoteCompose) ContainerStatus(ctx context.Context) (map[string]runner.ServiceStatus, error) {
 	cmd := r.remoteCommand(ctx, "ps", "-a", "--format", "json")
 	out, err := cmd.Output()
 	if err != nil {

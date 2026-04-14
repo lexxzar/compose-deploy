@@ -5,12 +5,16 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/lexxzar/compose-deploy/internal/runner"
 	"github.com/spf13/cobra"
 )
 
 func TestMergeStatus_AllRunning(t *testing.T) {
 	services := []string{"nginx", "postgres"}
-	status := map[string]bool{"nginx": true, "postgres": true}
+	status := map[string]runner.ServiceStatus{
+		"nginx":    {Running: true},
+		"postgres": {Running: true},
+	}
 
 	got := mergeStatus(services, status)
 
@@ -26,7 +30,11 @@ func TestMergeStatus_AllRunning(t *testing.T) {
 
 func TestMergeStatus_SomeStopped(t *testing.T) {
 	services := []string{"nginx", "redis", "postgres"}
-	status := map[string]bool{"nginx": true, "postgres": true, "redis": false}
+	status := map[string]runner.ServiceStatus{
+		"nginx":    {Running: true},
+		"postgres": {Running: true},
+		"redis":    {Running: false},
+	}
 
 	got := mergeStatus(services, status)
 
@@ -44,7 +52,9 @@ func TestMergeStatus_SomeStopped(t *testing.T) {
 
 func TestMergeStatus_AbsentFromStatus(t *testing.T) {
 	services := []string{"nginx", "redis"}
-	status := map[string]bool{"nginx": true}
+	status := map[string]runner.ServiceStatus{
+		"nginx": {Running: true},
+	}
 
 	got := mergeStatus(services, status)
 
@@ -67,12 +77,31 @@ func TestMergeStatus_Empty(t *testing.T) {
 
 func TestMergeStatus_SortedAlphabetically(t *testing.T) {
 	services := []string{"Zebra", "alpha", "middle"}
-	status := map[string]bool{}
+	status := map[string]runner.ServiceStatus{}
 
 	got := mergeStatus(services, status)
 
 	if got[0].Name != "alpha" || got[1].Name != "middle" || got[2].Name != "Zebra" {
 		t.Errorf("order = [%s, %s, %s], want [alpha, middle, Zebra]", got[0].Name, got[1].Name, got[2].Name)
+	}
+}
+
+func TestMergeStatus_WithHealth(t *testing.T) {
+	services := []string{"web", "db"}
+	status := map[string]runner.ServiceStatus{
+		"web": {Running: true, Health: "healthy"},
+		"db":  {Running: true},
+	}
+
+	got := mergeStatus(services, status)
+
+	for _, s := range got {
+		if s.Name == "web" && s.Health != "healthy" {
+			t.Errorf("web health = %q, want %q", s.Health, "healthy")
+		}
+		if s.Name == "db" && s.Health != "" {
+			t.Errorf("db health = %q, want empty", s.Health)
+		}
 	}
 }
 
@@ -90,16 +119,12 @@ func TestFormatDots_Alignment(t *testing.T) {
 		t.Fatalf("lines = %d, want 3", len(lines))
 	}
 
-	// All "running"/"stopped" labels should start at the same column
-	// Find the position of "running" or "stopped" in each line
 	for _, line := range lines {
 		if !strings.Contains(line, "running") && !strings.Contains(line, "stopped") {
 			t.Errorf("line missing status label: %q", line)
 		}
 	}
 
-	// Check that padding aligns — "postgres" is longest (8 chars), so
-	// "nginx" and "redis" should be padded to 8
 	if !strings.Contains(lines[2], "redis   ") {
 		t.Errorf("redis not padded: %q", lines[2])
 	}
@@ -125,6 +150,35 @@ func TestFormatDots_Empty(t *testing.T) {
 	out := formatDots(nil)
 	if out != "" {
 		t.Errorf("got %q, want empty", out)
+	}
+}
+
+func TestFormatDots_HealthIcons(t *testing.T) {
+	items := []serviceStatus{
+		{Name: "web", Running: true, Health: "healthy"},
+		{Name: "api", Running: true, Health: "unhealthy"},
+		{Name: "worker", Running: true, Health: "starting"},
+		{Name: "db", Running: true},
+	}
+
+	out := formatDots(items)
+	lines := strings.Split(out, "\n")
+
+	if len(lines) != 4 {
+		t.Fatalf("lines = %d, want 4", len(lines))
+	}
+
+	// Healthy line should contain "H"
+	if !strings.Contains(lines[0], "H") {
+		t.Errorf("healthy line missing H icon: %q", lines[0])
+	}
+	// Unhealthy line should contain "U"
+	if !strings.Contains(lines[1], "U") {
+		t.Errorf("unhealthy line missing U icon: %q", lines[1])
+	}
+	// Starting line should contain "~"
+	if !strings.Contains(lines[2], "~") {
+		t.Errorf("starting line missing ~ icon: %q", lines[2])
 	}
 }
 
@@ -162,6 +216,38 @@ func TestFormatJSON_Empty(t *testing.T) {
 	}
 	if out != "[]" {
 		t.Errorf("got %q, want []", out)
+	}
+}
+
+func TestFormatJSON_IncludesHealth(t *testing.T) {
+	items := []serviceStatus{
+		{Name: "web", Running: true, Health: "healthy"},
+		{Name: "db", Running: true},
+	}
+
+	out, err := formatJSON(items)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var got []serviceStatus
+	if err := json.Unmarshal([]byte(out), &got); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+
+	if got[0].Health != "healthy" {
+		t.Errorf("got[0].Health = %q, want %q", got[0].Health, "healthy")
+	}
+	// db has no healthcheck, should omit health field
+	if got[1].Health != "" {
+		t.Errorf("got[1].Health = %q, want empty (omitempty)", got[1].Health)
+	}
+	// Verify omitempty: raw JSON should not contain "health" for db
+	if strings.Contains(out, `"db"`) {
+		// Find the db entry in raw JSON
+		if strings.Count(out, `"health"`) != 1 {
+			t.Errorf("expected health field exactly once (for web only), got JSON: %s", out)
+		}
 	}
 }
 

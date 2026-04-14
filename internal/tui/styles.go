@@ -45,6 +45,15 @@ var (
 	statusStoppedDot = lipgloss.NewStyle().
 				Foreground(lipgloss.Color("1"))
 
+	healthHealthy = lipgloss.NewStyle().
+			Foreground(lipgloss.Color("2"))
+
+	healthUnhealthy = lipgloss.NewStyle().
+			Foreground(lipgloss.Color("1"))
+
+	healthStarting = lipgloss.NewStyle().
+			Foreground(lipgloss.Color("3"))
+
 	groupHeaderStyle = lipgloss.NewStyle().
 				Foreground(lipgloss.Color("8")).
 				PaddingLeft(2)

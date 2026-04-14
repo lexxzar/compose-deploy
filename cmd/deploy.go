@@ -16,8 +16,9 @@ import (
 )
 
 var (
-	styleOK     = lipgloss.NewStyle().Foreground(lipgloss.Color("2")).Bold(true)
-	styleFailed = lipgloss.NewStyle().Foreground(lipgloss.Color("1")).Bold(true)
+	styleOK      = lipgloss.NewStyle().Foreground(lipgloss.Color("2")).Bold(true)
+	styleFailed  = lipgloss.NewStyle().Foreground(lipgloss.Color("1")).Bold(true)
+	styleWarning = lipgloss.NewStyle().Foreground(lipgloss.Color("3")).Bold(true)
 )
 
 func newDeployCmd() *cobra.Command {

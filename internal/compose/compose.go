@@ -9,6 +9,8 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+
+	"github.com/lexxzar/compose-deploy/internal/runner"
 )
 
 // Project represents a running Docker Compose project discovered via `docker compose ls`.
@@ -161,10 +163,11 @@ func (c *Compose) command(ctx context.Context, args ...string) *exec.Cmd {
 type psEntry struct {
 	Service string `json:"Service"`
 	State   string `json:"State"`
+	Health  string `json:"Health"`
 }
 
-// ContainerStatus returns a map of service name to running state.
-func (c *Compose) ContainerStatus(ctx context.Context) (map[string]bool, error) {
+// ContainerStatus returns a map of service name to ServiceStatus.
+func (c *Compose) ContainerStatus(ctx context.Context) (map[string]runner.ServiceStatus, error) {
 	cmd := c.command(ctx, "ps", "-a", "--format", "json")
 	out, err := cmd.Output()
 	if err != nil {
@@ -173,9 +176,24 @@ func (c *Compose) ContainerStatus(ctx context.Context) (map[string]bool, error) 
 	return parseContainerStatus(out)
 }
 
+// healthPriority returns a numeric priority for health values.
+// Higher = worse. Used to pick worst-case health for scaled services.
+func healthPriority(h string) int {
+	switch h {
+	case "unhealthy":
+		return 3
+	case "starting":
+		return 2
+	case "healthy":
+		return 1
+	default:
+		return 0 // no healthcheck
+	}
+}
+
 // parseContainerStatus parses the JSON output of `docker compose ps --format json`.
 // Docker Compose v2.21+ outputs a JSON array; older versions output NDJSON (one object per line).
-func parseContainerStatus(data []byte) (map[string]bool, error) {
+func parseContainerStatus(data []byte) (map[string]runner.ServiceStatus, error) {
 	s := strings.TrimSpace(string(data))
 	if s == "" || s == "[]" {
 		return nil, nil
@@ -203,10 +221,15 @@ func parseContainerStatus(data []byte) (map[string]bool, error) {
 		}
 	}
 
-	status := make(map[string]bool)
+	status := make(map[string]runner.ServiceStatus)
 	for _, entry := range entries {
 		if entry.Service != "" {
-			status[entry.Service] = status[entry.Service] || entry.State == "running"
+			prev := status[entry.Service]
+			prev.Running = prev.Running || entry.State == "running"
+			if healthPriority(entry.Health) > healthPriority(prev.Health) {
+				prev.Health = entry.Health
+			}
+			status[entry.Service] = prev
 		}
 	}
 

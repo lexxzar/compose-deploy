@@ -17,22 +17,39 @@ import (
 type serviceStatus struct {
 	Name    string `json:"service"`
 	Running bool   `json:"running"`
+	Health  string `json:"health,omitempty"`
 }
 
 // mergeStatus combines the canonical service list with container status.
 // Services missing from the status map are treated as stopped.
-func mergeStatus(services []string, status map[string]bool) []serviceStatus {
+func mergeStatus(services []string, status map[string]runner.ServiceStatus) []serviceStatus {
 	result := make([]serviceStatus, len(services))
 	for i, svc := range services {
+		st := status[svc]
 		result[i] = serviceStatus{
 			Name:    svc,
-			Running: status[svc],
+			Running: st.Running,
+			Health:  st.Health,
 		}
 	}
 	sort.Slice(result, func(i, j int) bool {
 		return strings.ToLower(result[i].Name) < strings.ToLower(result[j].Name)
 	})
 	return result
+}
+
+// healthIcon returns a colored health icon for CLI output.
+func healthIcon(health string) string {
+	switch health {
+	case "healthy":
+		return styleOK.Render("H")
+	case "unhealthy":
+		return styleFailed.Render("U")
+	case "starting":
+		return styleWarning.Render("~")
+	default:
+		return " "
+	}
 }
 
 // formatDots renders service statuses as colored dot lines with aligned names.
@@ -55,13 +72,16 @@ func formatDots(items []serviceStatus) string {
 		}
 		if item.Running {
 			b.WriteString(styleOK.Render("●"))
-			b.WriteByte(' ')
-			b.WriteString(fmt.Sprintf("%-*s", maxLen, item.Name))
-			b.WriteString("  running")
 		} else {
 			b.WriteString(styleFailed.Render("○"))
-			b.WriteByte(' ')
-			b.WriteString(fmt.Sprintf("%-*s", maxLen, item.Name))
+		}
+		b.WriteByte(' ')
+		b.WriteString(healthIcon(item.Health))
+		b.WriteByte(' ')
+		b.WriteString(fmt.Sprintf("%-*s", maxLen, item.Name))
+		if item.Running {
+			b.WriteString("  running")
+		} else {
 			b.WriteString("  stopped")
 		}
 	}

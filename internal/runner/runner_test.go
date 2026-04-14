@@ -58,8 +58,11 @@ func (m *mockComposer) ListServices(ctx context.Context) ([]string, error) {
 	return []string{"nginx", "postgres"}, nil
 }
 
-func (m *mockComposer) ContainerStatus(ctx context.Context) (map[string]bool, error) {
-	return map[string]bool{"nginx": true, "postgres": true}, nil
+func (m *mockComposer) ContainerStatus(ctx context.Context) (map[string]ServiceStatus, error) {
+	return map[string]ServiceStatus{
+		"nginx":    {Running: true, Health: "healthy"},
+		"postgres": {Running: true},
+	}, nil
 }
 
 func (m *mockComposer) Logs(ctx context.Context, service string, follow bool, tail int, w io.Writer) error {

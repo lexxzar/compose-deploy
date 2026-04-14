@@ -21,7 +21,7 @@ func mockFactory(mc *mockComposer) ComposerFactory {
 
 type mockComposer struct {
 	services  []string
-	running   map[string]bool
+	status    map[string]runner.ServiceStatus
 	err       error
 	statusErr error
 }
@@ -44,8 +44,8 @@ func (m *mockComposer) Start(ctx context.Context, containers []string, w io.Writ
 func (m *mockComposer) ListServices(ctx context.Context) ([]string, error) {
 	return m.services, m.err
 }
-func (m *mockComposer) ContainerStatus(ctx context.Context) (map[string]bool, error) {
-	return m.running, m.statusErr
+func (m *mockComposer) ContainerStatus(ctx context.Context) (map[string]runner.ServiceStatus, error) {
+	return m.status, m.statusErr
 }
 
 func (m *mockComposer) Logs(ctx context.Context, service string, follow bool, tail int, w io.Writer) error {
@@ -207,8 +207,8 @@ func TestSelectContainers_EscGoesBackWhenPickerShown(t *testing.T) {
 	if len(m.services) != 0 {
 		t.Error("services should be cleared on back")
 	}
-	if m.svcRunning != nil {
-		t.Error("svcRunning should be nil after going back")
+	if m.svcStatus != nil {
+		t.Error("svcStatus should be nil after going back")
 	}
 	if cmd != nil {
 		t.Error("should not reload projects when already loaded")
@@ -262,7 +262,7 @@ func TestSelectContainers_EscDoesNothingWhenPickerSkipped(t *testing.T) {
 	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
 	m.screen = screenSelectContainers
 	m.services = mc.services
-	m.svcRunning = map[string]bool{"nginx": true}
+	m.svcStatus = map[string]runner.ServiceStatus{"nginx": {Running: true}}
 
 	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyEsc})
 	m = updated.(Model)
@@ -270,8 +270,8 @@ func TestSelectContainers_EscDoesNothingWhenPickerSkipped(t *testing.T) {
 	if m.screen != screenSelectContainers {
 		t.Errorf("screen = %d, want %d (should stay on container select)", m.screen, screenSelectContainers)
 	}
-	if m.svcRunning == nil {
-		t.Error("svcRunning should be preserved when picker is skipped")
+	if m.svcStatus == nil {
+		t.Error("svcStatus should be preserved when picker is skipped")
 	}
 }
 
@@ -580,15 +580,84 @@ func TestBreadcrumb_WithoutProjectName(t *testing.T) {
 	}
 }
 
-func TestViewSelectContainers_StatusDots(t *testing.T) {
+func TestViewSelectContainers_HealthIcons(t *testing.T) {
 	mc := &mockComposer{
-		services: []string{"nginx", "postgres"},
-		running:  map[string]bool{"nginx": true, "postgres": false},
+		services: []string{"api", "db", "web", "worker"},
+		status: map[string]runner.ServiceStatus{
+			"web":    {Running: true, Health: "healthy"},
+			"api":    {Running: true, Health: "unhealthy"},
+			"worker": {Running: true, Health: "starting"},
+			"db":     {Running: true},
+		},
+	}
+	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
+	m.screen = screenSelectContainers
+	m.services = []string{"api", "db", "web", "worker"}
+	m.svcStatus = mc.status
+
+	v := m.View()
+
+	// Should contain health icon "!" for unhealthy (api)
+	if !strings.Contains(v, "!") {
+		t.Error("view should contain '!' for unhealthy service")
+	}
+	// Should contain "H" for healthy (web)
+	if !strings.Contains(v, "H") {
+		t.Error("view should contain 'H' for healthy service")
+	}
+	// Should contain "~" for starting (worker)
+	if !strings.Contains(v, "~") {
+		t.Error("view should contain '~' for starting service")
+	}
+}
+
+func TestViewSelectContainers_HealthAlignment(t *testing.T) {
+	mc := &mockComposer{
+		services: []string{"web", "db"},
+		status: map[string]runner.ServiceStatus{
+			"web": {Running: true, Health: "healthy"},
+			"db":  {Running: true},
+		},
 	}
 	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
 	m.screen = screenSelectContainers
 	m.services = mc.services
-	m.svcRunning = mc.running
+	m.svcStatus = mc.status
+
+	v := m.View()
+	lines := strings.Split(v, "\n")
+
+	// Find lines containing service names, check they both have the dot character
+	svcLines := []string{}
+	for _, line := range lines {
+		if strings.Contains(line, "web") || strings.Contains(line, "db") {
+			svcLines = append(svcLines, line)
+		}
+	}
+	if len(svcLines) != 2 {
+		t.Fatalf("expected 2 service lines, got %d", len(svcLines))
+	}
+
+	// Both lines should contain the status dot
+	for _, line := range svcLines {
+		if !strings.Contains(line, "●") {
+			t.Errorf("service line missing status dot: %q", line)
+		}
+	}
+}
+
+func TestViewSelectContainers_StatusDots(t *testing.T) {
+	mc := &mockComposer{
+		services: []string{"nginx", "postgres"},
+		status: map[string]runner.ServiceStatus{
+			"nginx":    {Running: true},
+			"postgres": {Running: false},
+		},
+	}
+	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
+	m.screen = screenSelectContainers
+	m.services = mc.services
+	m.svcStatus = mc.status
 
 	v := m.View()
 	if !strings.Contains(v, "●") {
@@ -606,20 +675,23 @@ func TestServicesMsg_StoresRunningStatus(t *testing.T) {
 	mc := &mockComposer{}
 	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
 
-	running := map[string]bool{"nginx": true, "postgres": false}
+	status := map[string]runner.ServiceStatus{
+		"nginx":    {Running: true},
+		"postgres": {Running: false},
+	}
 	updated, _ := m.Update(servicesMsg{
 		services: []string{"nginx", "postgres"},
-		running:  running,
+		status:   status,
 	})
 	m = updated.(Model)
 
-	if m.svcRunning == nil {
-		t.Fatal("svcRunning should be set")
+	if m.svcStatus == nil {
+		t.Fatal("svcStatus should be set")
 	}
-	if !m.svcRunning["nginx"] {
+	if !m.svcStatus["nginx"].Running {
 		t.Error("nginx should be running")
 	}
-	if m.svcRunning["postgres"] {
+	if m.svcStatus["postgres"].Running {
 		t.Error("postgres should not be running")
 	}
 }
@@ -809,14 +881,14 @@ func TestStatusMsg_SuccessClearsSvcErr(t *testing.T) {
 	m.services = mc.services
 	m.svcErr = fmt.Errorf("previous error")
 
-	updated, _ := m.Update(statusMsg{running: map[string]bool{"nginx": true}})
+	updated, _ := m.Update(statusMsg{status: map[string]runner.ServiceStatus{"nginx": {Running: true}}})
 	m = updated.(Model)
 
 	if m.svcErr != nil {
 		t.Errorf("svcErr should be nil after successful statusMsg, got %v", m.svcErr)
 	}
-	if !m.svcRunning["nginx"] {
-		t.Error("svcRunning should be updated after successful statusMsg")
+	if !m.svcStatus["nginx"].Running {
+		t.Error("svcStatus should be updated after successful statusMsg")
 	}
 }
 

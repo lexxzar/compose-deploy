@@ -138,11 +138,11 @@ type Model struct {
 	composerFactory ComposerFactory
 
 	// Screen 1: service select
-	services   []string
-	svcRunning map[string]bool // service name → running state
-	selected   map[int]bool
-	svcCursor  int
-	svcErr     error
+	services  []string
+	svcStatus map[string]runner.ServiceStatus // service name → status
+	selected  map[int]bool
+	svcCursor int
+	svcErr    error
 
 	// Confirmation state (within container screen)
 	confirming bool
@@ -194,12 +194,12 @@ type projectsMsg struct {
 }
 type servicesMsg struct {
 	services []string
-	running  map[string]bool
+	status   map[string]runner.ServiceStatus
 	err      error
 }
 type statusMsg struct {
-	running map[string]bool
-	err     error
+	status map[string]runner.ServiceStatus
+	err    error
 }
 type pipelineDoneMsg struct{}
 type logChunkMsg struct {
@@ -332,7 +332,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		m.svcErr = nil
 		m.services = sortServices(msg.services)
-		m.svcRunning = msg.running
+		m.svcStatus = msg.status
 		m.selected = make(map[int]bool)
 		m.svcCursor = 0
 		return m, nil
@@ -343,7 +343,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 		m.svcErr = nil
-		m.svcRunning = msg.running
+		m.svcStatus = msg.status
 		return m, nil
 
 	case stepEventMsg:
@@ -530,7 +530,7 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 				m.composer = nil
 				m.projName = ""
 				m.services = nil
-				m.svcRunning = nil
+				m.svcStatus = nil
 				m.selected = make(map[int]bool)
 				m.svcCursor = 0
 				m.svcErr = nil
@@ -841,8 +841,8 @@ func (m Model) refreshStatus() tea.Cmd {
 	ctx := m.ctx
 	c := m.composer
 	return func() tea.Msg {
-		running, err := c.ContainerStatus(ctx)
-		return statusMsg{running: running, err: err}
+		status, err := c.ContainerStatus(ctx)
+		return statusMsg{status: status, err: err}
 	}
 }
 
@@ -854,11 +854,11 @@ func (m Model) loadServices() tea.Cmd {
 		if err != nil {
 			return servicesMsg{err: err}
 		}
-		running, err := c.ContainerStatus(ctx)
+		status, err := c.ContainerStatus(ctx)
 		if err != nil {
 			return servicesMsg{err: err}
 		}
-		return servicesMsg{services: services, running: running}
+		return servicesMsg{services: services, status: status}
 	}
 }
 
@@ -1048,6 +1048,20 @@ func (m Model) viewSelectProject() string {
 	return b.String()
 }
 
+// healthIndicator returns a fixed-width health icon for the TUI container list.
+func healthIndicator(health string) string {
+	switch health {
+	case "healthy":
+		return healthHealthy.Render("H")
+	case "unhealthy":
+		return healthUnhealthy.Render("!")
+	case "starting":
+		return healthStarting.Render("~")
+	default:
+		return " "
+	}
+}
+
 func (m Model) viewSelectContainers() string {
 	var b strings.Builder
 	b.WriteString(titleStyle.Render(fmt.Sprintf(
@@ -1084,12 +1098,15 @@ func (m Model) viewSelectContainers() string {
 			checkbox = checkboxOn.Render("[x]")
 		}
 
+		st := m.svcStatus[svc]
+		health := healthIndicator(st.Health)
+
 		dot := statusStoppedDot.Render("●")
-		if m.svcRunning[svc] {
+		if st.Running {
 			dot = statusRunningDot.Render("●")
 		}
 
-		b.WriteString(fmt.Sprintf("%s%s %s %s\n", cursor, checkbox, dot, svc))
+		b.WriteString(fmt.Sprintf("%s%s %s %s %s\n", cursor, checkbox, health, dot, svc))
 	}
 
 	if m.confirming {

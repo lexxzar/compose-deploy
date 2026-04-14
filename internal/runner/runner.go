@@ -5,6 +5,12 @@ import (
 	"io"
 )
 
+// ServiceStatus holds the running state and health check status of a service.
+type ServiceStatus struct {
+	Running bool
+	Health  string // "healthy", "unhealthy", "starting", or "" (no healthcheck)
+}
+
 // Composer is the interface consumed by the runner, implemented by compose.Compose.
 type Composer interface {
 	Stop(ctx context.Context, containers []string, w io.Writer) error
@@ -13,9 +19,10 @@ type Composer interface {
 	Create(ctx context.Context, containers []string, w io.Writer) error
 	Start(ctx context.Context, containers []string, w io.Writer) error
 	ListServices(ctx context.Context) ([]string, error)
-	// ContainerStatus returns a map of service name to running state.
-	// Services with a running container are true; stopped/exited/absent are false.
-	ContainerStatus(ctx context.Context) (map[string]bool, error)
+	// ContainerStatus returns a map of service name to ServiceStatus.
+	// For scaled services, Running uses OR (any running = running) and
+	// Health uses worst-case priority (unhealthy > starting > healthy).
+	ContainerStatus(ctx context.Context) (map[string]ServiceStatus, error)
 	// Logs streams docker compose logs for a single service to w.
 	// When follow is true, it streams until ctx is cancelled.
 	// tail controls how many historical lines to show (0 = all).
