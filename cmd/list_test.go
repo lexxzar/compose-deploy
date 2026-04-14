@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"os"
 	"strings"
 	"testing"
 
@@ -556,5 +557,58 @@ func TestListCmd_HasExample(t *testing.T) {
 	cmd := newListCmd()
 	if cmd.Example == "" {
 		t.Error("list command has no Example text")
+	}
+}
+
+func TestListCmd_ExplicitProjectDir_NoComposeFile(t *testing.T) {
+	dir := t.TempDir()
+	old := projectDir
+	projectDir = dir
+	t.Cleanup(func() { projectDir = old })
+
+	err := runList(context.Background(), false)
+	if err == nil {
+		t.Fatal("expected error when -C points to directory without compose file")
+	}
+	if !strings.Contains(err.Error(), "no compose file found") {
+		t.Errorf("error = %q, want it to contain 'no compose file found'", err.Error())
+	}
+}
+
+func TestListCmd_RemoteIgnoresServerProjectDir(t *testing.T) {
+	tmpHome := t.TempDir()
+	cfgDir := tmpHome + "/.cdeploy"
+	if err := os.MkdirAll(cfgDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	cfgData := "servers:\n  - name: test-srv\n    host: user@host.invalid\n    project_dir: /opt/apps\n"
+	if err := os.WriteFile(cfgDir+"/servers.yml", []byte(cfgData), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	oldHome := os.Getenv("HOME")
+	os.Setenv("HOME", tmpHome)
+	t.Cleanup(func() { os.Setenv("HOME", oldHome) })
+
+	oldServer := serverName
+	serverName = "test-srv"
+	t.Cleanup(func() { serverName = oldServer })
+
+	oldProj := projectDir
+	projectDir = ""
+	t.Cleanup(func() { projectDir = oldProj })
+
+	var capturedProjDir string
+	oldNewRemote := newRemote
+	newRemote = func(host, projDir string) *compose.RemoteCompose {
+		capturedProjDir = projDir
+		return oldNewRemote(host, projDir)
+	}
+	t.Cleanup(func() { newRemote = oldNewRemote })
+
+	_ = runList(context.Background(), false)
+
+	if capturedProjDir != "" {
+		t.Errorf("newRemote received projDir = %q, want empty (server.ProjectDir should be ignored)", capturedProjDir)
 	}
 }

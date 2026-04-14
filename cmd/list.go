@@ -14,6 +14,8 @@ import (
 	"github.com/spf13/cobra"
 )
 
+var newRemote = compose.NewRemote
+
 type serviceStatus struct {
 	Project string `json:"project,omitempty"`
 	Name    string `json:"service"`
@@ -296,18 +298,17 @@ func runList(ctx context.Context, jsonOutput bool) error {
 			return err
 		}
 
-		projDir := server.ProjectDir
-		if projectDir != "" {
-			projDir = projectDir
-		}
+		// For list, only honor explicit -C; ignore server.ProjectDir so
+		// multi-project discovery works by default.
+		projDir := projectDir
 
-		rc := compose.NewRemote(server.Host, projDir)
+		rc := newRemote(server.Host, projDir)
 		if err := rc.Connect(ctx); err != nil {
 			return fmt.Errorf("connecting to %s: %w", serverName, err)
 		}
 		defer rc.Close()
 
-		// Single-project mode: -C specified or project_dir in config
+		// Single-project mode: -C explicitly specified
 		if projDir != "" {
 			return listSingleProject(ctx, rc, jsonOutput)
 		}
@@ -323,7 +324,7 @@ func runList(ctx context.Context, jsonOutput bool) error {
 		}
 
 		factory := func(d string) runner.Composer {
-			return compose.NewRemote(server.Host, d)
+			return newRemote(server.Host, d)
 		}
 		grouped := collectMultiProject(ctx, projects, factory)
 		return printMultiProject(grouped, jsonOutput)
@@ -332,6 +333,11 @@ func runList(ctx context.Context, jsonOutput bool) error {
 	// Local mode: single-project if -C given or compose file in CWD
 	if compose.HasComposeFile(dir) {
 		return listSingleProject(ctx, compose.New(dir), jsonOutput)
+	}
+
+	// Explicit -C but no compose file → error, don't fall through to discovery
+	if projectDir != "" {
+		return fmt.Errorf("no compose file found in %s", dir)
 	}
 
 	// Local multi-project: discover all projects on the system
