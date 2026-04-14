@@ -217,6 +217,52 @@ func TestSoftWrapLine(t *testing.T) {
 	}
 }
 
+func TestSoftWrapLine_UTF8(t *testing.T) {
+	// 6 runes: "日本語テスト" — each is 3 bytes (18 bytes total)
+	line := "日本語テスト"
+	got := softWrapLine(line, 4)
+
+	// Should split at 4 runes, not 4 bytes
+	if len(got) != 2 {
+		t.Fatalf("expected 2 lines, got %d: %v", len(got), got)
+	}
+	if got[0] != "日本語テ" {
+		t.Errorf("first chunk = %q, want %q", got[0], "日本語テ")
+	}
+	if got[1] != "スト" {
+		t.Errorf("second chunk = %q, want %q", got[1], "スト")
+	}
+}
+
+func TestSoftWrapLine_MixedASCIIUTF8(t *testing.T) {
+	line := "ab日cd" // 5 runes, 7 bytes
+	got := softWrapLine(line, 3)
+
+	if len(got) != 2 {
+		t.Fatalf("expected 2 lines, got %d: %v", len(got), got)
+	}
+	if got[0] != "ab日" {
+		t.Errorf("first chunk = %q, want %q", got[0], "ab日")
+	}
+	if got[1] != "cd" {
+		t.Errorf("second chunk = %q, want %q", got[1], "cd")
+	}
+}
+
+func TestFormatLogLines(t *testing.T) {
+	lines := []string{
+		`app | {"level":"info"}`,
+		"app | plain text",
+	}
+	got := formatLogLines(lines, 200, false, true)
+	if !strings.Contains(got, `"level": "info"`) {
+		t.Errorf("should pretty-print JSON line, got:\n%s", got)
+	}
+	if !strings.Contains(got, "app | plain text") {
+		t.Errorf("should pass through plain text, got:\n%s", got)
+	}
+}
+
 func TestTryPrettyJSON(t *testing.T) {
 	// Valid JSON
 	lines, ok := tryPrettyJSON(`{"a":"b"}`)

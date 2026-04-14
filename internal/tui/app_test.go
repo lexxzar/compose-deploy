@@ -1963,3 +1963,82 @@ func TestLogsScreen_EscClearsWrapPretty(t *testing.T) {
 		t.Error("logsPretty should be cleared after esc")
 	}
 }
+
+// Regression: a wrapped partial line extended by the next chunk must not
+// duplicate the earlier wrapped segments (P1 corruption bug).
+func TestLogsScreen_IncrementalWrapNoDuplication(t *testing.T) {
+	m := setupLogsModel()
+	m.logsContent = ""
+	m.logsFormatted = ""
+	m.logsRawOff = 0
+	m.logsWrap = true
+	m.logsPretty = false
+	m.logsViewport = viewport.New(5, 20) // width=5 to force wrapping
+	m.logsViewport.SetHorizontalStep(0)
+	m.logsSession = 1
+
+	pr, pw := io.Pipe()
+	m.logsPipeR = pr
+
+	// Chunk 1: partial line, no newline — 10 chars wraps to 2 segments
+	m.logsContent = strings.Repeat("a", 10)
+	m.applyLogFormat()
+	content1 := m.logsFormatted
+	// logsFormatted should be empty (no complete lines yet)
+	if content1 != "" {
+		t.Errorf("no complete lines yet, logsFormatted should be empty, got %q", content1)
+	}
+
+	// Chunk 2: extend the same line and complete it
+	m.logsContent = strings.Repeat("a", 10) + "bbbb\n"
+	m.applyLogFormat()
+
+	// The raw line "aaaaaaaaaabbbb" (14 chars) should wrap to: "aaaaa", "aaaaa", "aaaa", "bbbb"
+	// No duplicated segments
+	viewContent := m.logsFormatted
+	lines := strings.Split(viewContent, "\n")
+	aCount := 0
+	for _, l := range lines {
+		aCount += strings.Count(l, "a")
+	}
+	if aCount != 10 {
+		t.Errorf("expected 10 'a' chars total, got %d in formatted output: %q", aCount, viewContent)
+	}
+
+	pw.Close()
+	pr.Close()
+}
+
+// Verify that incremental formatting only scans new data, not the full buffer.
+func TestLogsScreen_IncrementalOffsetAdvances(t *testing.T) {
+	m := setupLogsModel()
+	m.logsContent = ""
+	m.logsFormatted = ""
+	m.logsRawOff = 0
+	m.logsWrap = false
+	m.logsPretty = false
+	m.logsViewport = viewport.New(80, 20)
+
+	// Add two complete lines
+	m.logsContent = "line1\nline2\n"
+	m.applyLogFormat()
+
+	if m.logsRawOff != 12 { // len("line1\nline2\n")
+		t.Errorf("logsRawOff = %d, want 12", m.logsRawOff)
+	}
+
+	// Add a third line — offset should advance past it
+	m.logsContent += "line3\n"
+	m.applyLogFormat()
+
+	if m.logsRawOff != 18 { // 12 + len("line3\n")
+		t.Errorf("logsRawOff = %d, want 18", m.logsRawOff)
+	}
+
+	// logsFormatted should contain all three lines
+	if !strings.Contains(m.logsFormatted, "line1") ||
+		!strings.Contains(m.logsFormatted, "line2") ||
+		!strings.Contains(m.logsFormatted, "line3") {
+		t.Errorf("logsFormatted should contain all lines, got: %q", m.logsFormatted)
+	}
+}

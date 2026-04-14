@@ -159,16 +159,18 @@ type Model struct {
 	cancel      context.CancelFunc
 
 	// Screen: logs
-	logsService  string             // service being viewed
-	logsContent  string             // accumulated log output
-	logsViewport viewport.Model     // dedicated viewport for log screen
-	logsCancel   context.CancelFunc // cancels the log goroutine; derived from m.ctx
-	logsDone     bool               // true when streaming finished
-	logsErr      error              // error from Logs() call
-	logsPipeR    io.Reader          // pipe reader for log streaming
-	logsSession  uint64             // monotonic counter to discard stale messages from prior sessions
-	logsWrap     bool               // soft-wrap long lines at viewport width
-	logsPretty   bool               // pretty-print JSON log bodies
+	logsService   string             // service being viewed
+	logsContent   string             // accumulated log output
+	logsViewport  viewport.Model     // dedicated viewport for log screen
+	logsCancel    context.CancelFunc // cancels the log goroutine; derived from m.ctx
+	logsDone      bool               // true when streaming finished
+	logsErr       error              // error from Logs() call
+	logsPipeR     io.Reader          // pipe reader for log streaming
+	logsSession   uint64             // monotonic counter to discard stale messages from prior sessions
+	logsWrap      bool               // soft-wrap long lines at viewport width
+	logsPretty    bool               // pretty-print JSON log bodies
+	logsFormatted string             // formatted output for complete raw lines (up to logsRawOff)
+	logsRawOff    int                // byte offset into logsContent: everything before this is in logsFormatted
 
 	// Shared
 	ctx       context.Context
@@ -306,7 +308,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				h = 3
 			}
 			m.logsViewport.Height = h
-			m.applyLogFormat()
+			m.fullReformat()
 		}
 		return m, nil
 
@@ -593,6 +595,8 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.logsViewport = viewport.Model{}
 			m.logsWrap = false
 			m.logsPretty = false
+			m.logsFormatted = ""
+			m.logsRawOff = 0
 			m.screen = screenSelectContainers
 			return m, m.refreshStatus()
 		case "w":
@@ -602,11 +606,11 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			} else {
 				m.logsViewport.SetHorizontalStep(4)
 			}
-			m.applyLogFormat()
+			m.fullReformat()
 			return m, nil
 		case "p":
 			m.logsPretty = !m.logsPretty
-			m.applyLogFormat()
+			m.fullReformat()
 			return m, nil
 		case "G":
 			m.logsViewport.GotoBottom()
@@ -724,6 +728,8 @@ func (m *Model) enterLogs() (tea.Model, tea.Cmd) {
 	m.logsSession++
 	m.logsWrap = true
 	m.logsPretty = false
+	m.logsFormatted = ""
+	m.logsRawOff = 0
 
 	vpHeight := m.height - 6
 	if vpHeight < 3 {
@@ -753,10 +759,46 @@ func (m *Model) enterLogs() (tea.Model, tea.Cmd) {
 	return *m, m.readLogChunk()
 }
 
-// applyLogFormat re-renders logsContent through formatLogContent and updates the viewport.
+// applyLogFormat incrementally formats only new data since the last call.
+// It scans only m.logsContent[m.logsRawOff:] for new complete lines, formats
+// them, and appends to the cached logsFormatted. The trailing incomplete line
+// is formatted fresh each time. Call fullReformat() when toggles or width change.
 func (m *Model) applyLogFormat() {
-	formatted := formatLogContent(m.logsContent, m.logsViewport.Width, m.logsWrap, m.logsPretty)
-	m.logsViewport.SetContent(formatted)
+	remaining := m.logsContent[m.logsRawOff:]
+
+	// Find new complete lines (everything up to the last \n in remaining)
+	if lastNL := strings.LastIndex(remaining, "\n"); lastNL >= 0 {
+		completePart := remaining[:lastNL]
+		newLines := strings.Split(completePart, "\n")
+		formatted := formatLogLines(newLines, m.logsViewport.Width, m.logsWrap, m.logsPretty)
+		if m.logsFormatted == "" {
+			m.logsFormatted = formatted
+		} else {
+			m.logsFormatted += "\n" + formatted
+		}
+		m.logsRawOff += lastNL + 1
+		remaining = remaining[lastNL+1:]
+	}
+
+	// Format the trailing incomplete line (if any) and combine with cache
+	if len(remaining) > 0 {
+		tail := formatLogLines([]string{remaining}, m.logsViewport.Width, m.logsWrap, m.logsPretty)
+		if m.logsFormatted == "" {
+			m.logsViewport.SetContent(tail)
+		} else {
+			m.logsViewport.SetContent(m.logsFormatted + "\n" + tail)
+		}
+	} else {
+		m.logsViewport.SetContent(m.logsFormatted)
+	}
+}
+
+// fullReformat re-processes all content from scratch. Used when toggles change
+// or the viewport is resized, since width/mode changes affect every line.
+func (m *Model) fullReformat() {
+	m.logsRawOff = 0
+	m.logsFormatted = ""
+	m.applyLogFormat()
 }
 
 func (m Model) readLogChunk() tea.Cmd {
