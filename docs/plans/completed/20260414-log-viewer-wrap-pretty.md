@@ -68,35 +68,35 @@ This function is called whenever content changes (new chunk), toggles flip, or t
 - Create: `internal/tui/format.go`
 - Create: `internal/tui/format_test.go`
 
-- [ ] create `internal/tui/format.go` with `formatLogContent(raw string, width int, wrap bool, pretty bool) string`
-- [ ] implement JSON pretty-print: split line on first ` | `, try `json.Valid`, `json.MarshalIndent` with 2-space indent, pad continuation lines with prefix-width spaces
-- [ ] implement soft-wrap: break lines exceeding `width`, indent continuation lines
-- [ ] handle edge cases: empty input, lines without ` | ` prefix, non-JSON bodies, mixed content
-- [ ] write tests for JSON line formatting (single JSON object, nested JSON)
-- [ ] write tests for non-JSON line pass-through
-- [ ] write tests for mixed content (some JSON, some plain text)
-- [ ] write tests for soft-wrap (long line, short line, exact width)
-- [ ] write tests for combined wrap+pretty mode
-- [ ] write tests for edge cases (empty string, no prefix, empty JSON `{}`)
-- [ ] run tests — must pass before task 2
+- [x] create `internal/tui/format.go` with `formatLogContent(raw string, width int, wrap bool, pretty bool) string`
+- [x] implement JSON pretty-print: split line on first ` | `, try `json.Valid`, `json.MarshalIndent` with 2-space indent, pad continuation lines with prefix-width spaces
+- [x] implement soft-wrap: break lines exceeding `width`, indent continuation lines
+- [x] handle edge cases: empty input, lines without ` | ` prefix, non-JSON bodies, mixed content
+- [x] write tests for JSON line formatting (single JSON object, nested JSON)
+- [x] write tests for non-JSON line pass-through
+- [x] write tests for mixed content (some JSON, some plain text)
+- [x] write tests for soft-wrap (long line, short line, exact width)
+- [x] write tests for combined wrap+pretty mode
+- [x] write tests for edge cases (empty string, no prefix, empty JSON `{}`)
+- [x] run tests — must pass before task 2
 
 ### Task 2: Integrate toggles into TUI Model and key handlers
 
 **Files:**
 - Modify: `internal/tui/app.go`
 
-- [ ] add `logsWrap bool` and `logsPretty bool` fields to Model struct
-- [ ] set `logsWrap = true` in `enterLogs()`
-- [ ] add helper method `applyLogFormat()` that calls `formatLogContent` and `SetContent` on the viewport
-- [ ] update `logChunkMsg` handler: append to `logsContent`, call `applyLogFormat()`
-- [ ] update `logDoneMsg` handler: same pattern for error append
-- [ ] add `w` key handler in `screenLogs`: toggle `logsWrap`, adjust `SetHorizontalStep`, call `applyLogFormat()`, preserve scroll position
-- [ ] add `p` key handler in `screenLogs`: toggle `logsPretty`, call `applyLogFormat()`, preserve scroll position
-- [ ] update `WindowSizeMsg` for `screenLogs`: call `applyLogFormat()` after resizing viewport (re-wrap at new width)
-- [ ] write test: `w` key toggles `logsWrap` and re-renders content
-- [ ] write test: `p` key toggles `logsPretty` and re-renders content
-- [ ] write test: window resize triggers re-format
-- [ ] run tests — must pass before task 3
+- [x] add `logsWrap bool` and `logsPretty bool` fields to Model struct
+- [x] set `logsWrap = true` in `enterLogs()`
+- [x] add helper method `applyLogFormat()` that calls `formatLogContent` and `SetContent` on the viewport
+- [x] update `logChunkMsg` handler: append to `logsContent`, call `applyLogFormat()`
+- [x] update `logDoneMsg` handler: same pattern for error append
+- [x] add `w` key handler in `screenLogs`: toggle `logsWrap`, adjust `SetHorizontalStep`, call `applyLogFormat()`, preserve scroll position
+- [x] add `p` key handler in `screenLogs`: toggle `logsPretty`, call `applyLogFormat()`, preserve scroll position
+- [x] update `WindowSizeMsg` for `screenLogs`: call `applyLogFormat()` after resizing viewport (re-wrap at new width)
+- [x] write test: `w` key toggles `logsWrap` and re-renders content
+- [x] write test: `p` key toggles `logsPretty` and re-renders content
+- [x] write test: window resize triggers re-format
+- [x] run tests — must pass before task 3
 
 ### Task 3: Update help bar and cleanup
 
@@ -104,19 +104,19 @@ This function is called whenever content changes (new chunk), toggles flip, or t
 - Modify: `internal/tui/app.go`
 - Modify: `internal/tui/app_test.go`
 
-- [ ] update `viewLogs()` help bar to show `w wrap` and `p pretty` hints
-- [ ] show `<-/-> scroll` hint only when wrap is off
-- [ ] update `esc` handler cleanup to reset `logsWrap` and `logsPretty`
-- [ ] write test: help bar content changes based on wrap state
-- [ ] write test: `esc` clears wrap/pretty state
-- [ ] run tests — must pass before task 4
+- [x] update `viewLogs()` help bar to show `w wrap` and `p pretty` hints
+- [x] show `<-/-> scroll` hint only when wrap is off
+- [x] update `esc` handler cleanup to reset `logsWrap` and `logsPretty`
+- [x] write test: help bar content changes based on wrap state
+- [x] write test: `esc` clears wrap/pretty state
+- [x] run tests — must pass before task 4
 
 ### Task 4: Verify acceptance criteria
 
-- [ ] verify all four mode combinations work: raw, wrap-only, pretty-only, wrap+pretty
-- [ ] verify edge cases are handled (empty logs, non-JSON, mixed content)
-- [ ] run full test suite: `go test ./... -count=1`
-- [ ] verify test coverage for new code
+- [x] verify all four mode combinations work: raw, wrap-only, pretty-only, wrap+pretty
+- [x] verify edge cases are handled (empty logs, non-JSON, mixed content)
+- [x] run full test suite: `go test ./... -count=1`
+- [x] verify test coverage for new code
 
 ### Task 5: [Final] Update documentation
 

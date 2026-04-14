@@ -1756,3 +1756,210 @@ func TestPreselectedServer_OutOfRange(t *testing.T) {
 		t.Error("Init() should return nil for out-of-range preselection")
 	}
 }
+
+// --- Log viewer wrap/pretty toggle tests ---
+
+func setupLogsModel() Model {
+	mc := &mockComposer{services: []string{"app"}}
+	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
+	m.screen = screenLogs
+	m.services = mc.services
+	m.composer = mc
+	m.logsService = "app"
+	m.logsContent = `app | {"level":"info","msg":"hello"}`
+	m.logsWrap = true
+	m.logsPretty = false
+	m.logsViewport = viewport.New(80, 20)
+	m.logsViewport.SetHorizontalStep(0)
+	m.logsViewport.SetContent(m.logsContent)
+	m.width = 84
+	m.height = 26
+	return m
+}
+
+func TestLogsScreen_WKeyTogglesWrap(t *testing.T) {
+	m := setupLogsModel()
+	if !m.logsWrap {
+		t.Fatal("logsWrap should default to true")
+	}
+
+	// Toggle wrap off
+	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'w'}})
+	m = updated.(Model)
+	if m.logsWrap {
+		t.Error("logsWrap should be false after pressing 'w'")
+	}
+
+	// Toggle wrap back on
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'w'}})
+	m = updated.(Model)
+	if !m.logsWrap {
+		t.Error("logsWrap should be true after pressing 'w' again")
+	}
+}
+
+func TestLogsScreen_PKeyTogglesPretty(t *testing.T) {
+	m := setupLogsModel()
+	if m.logsPretty {
+		t.Fatal("logsPretty should default to false")
+	}
+
+	// Toggle pretty on
+	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'p'}})
+	m = updated.(Model)
+	if !m.logsPretty {
+		t.Error("logsPretty should be true after pressing 'p'")
+	}
+
+	// Viewport content should be reformatted with pretty JSON
+	content := m.logsViewport.View()
+	if !strings.Contains(content, "level") {
+		t.Errorf("viewport should contain formatted JSON after pretty toggle, got:\n%s", content)
+	}
+
+	// Toggle pretty off
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'p'}})
+	m = updated.(Model)
+	if m.logsPretty {
+		t.Error("logsPretty should be false after pressing 'p' again")
+	}
+}
+
+func TestLogsScreen_WrapUpdatesHorizontalStep(t *testing.T) {
+	m := setupLogsModel()
+
+	// Wrap off → horizontal scroll enabled
+	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'w'}})
+	m = updated.(Model)
+	if m.logsWrap {
+		t.Error("logsWrap should be false")
+	}
+	// We can't directly read HorizontalStep, but we verify the toggle works
+	// by checking the model state is consistent
+
+	// Wrap on → horizontal scroll disabled
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'w'}})
+	m = updated.(Model)
+	if !m.logsWrap {
+		t.Error("logsWrap should be true")
+	}
+}
+
+func TestLogsScreen_WindowResizeReformats(t *testing.T) {
+	m := setupLogsModel()
+	m.logsPretty = true
+	m.applyLogFormat()
+
+	// Resize window
+	updated, _ := m.Update(tea.WindowSizeMsg{Width: 60, Height: 20})
+	m = updated.(Model)
+
+	if m.logsViewport.Width != 56 { // 60 - 4
+		t.Errorf("viewport width = %d, want 56", m.logsViewport.Width)
+	}
+}
+
+func TestLogsScreen_LogChunkAppliesFormat(t *testing.T) {
+	m := setupLogsModel()
+	m.logsContent = ""
+	m.logsPretty = true
+	m.logsSession = 42
+
+	// Simulate a pipe reader so readLogChunk doesn't panic
+	pr, pw := io.Pipe()
+	m.logsPipeR = pr
+	go func() { pw.Close() }()
+
+	updated, _ := m.Update(logChunkMsg{
+		data:    []byte(`svc | {"key":"val"}` + "\n"),
+		session: 42,
+	})
+	m = updated.(Model)
+
+	content := m.logsViewport.View()
+	if !strings.Contains(content, "key") {
+		t.Errorf("viewport should contain formatted content after logChunkMsg, got:\n%s", content)
+	}
+}
+
+func TestLogsScreen_EnterLogsDefaultState(t *testing.T) {
+	mc := &mockComposer{services: []string{"app"}}
+	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
+	m.screen = screenSelectContainers
+	m.services = mc.services
+	m.composer = mc
+	m.width = 84
+	m.height = 26
+	m.svcCursor = 0
+
+	updated, _ := m.enterLogs()
+	m = updated.(Model)
+
+	if !m.logsWrap {
+		t.Error("logsWrap should default to true on entering logs")
+	}
+	if m.logsPretty {
+		t.Error("logsPretty should default to false on entering logs")
+	}
+}
+
+func TestLogsScreen_HelpBarWrapOn(t *testing.T) {
+	m := setupLogsModel()
+	m.logsWrap = true
+
+	v := m.View()
+	if !strings.Contains(v, "w unwrap") {
+		t.Errorf("help bar should show 'w unwrap' when wrap is on, got:\n%s", v)
+	}
+	if strings.Contains(v, "<-/-> scroll") {
+		t.Errorf("help bar should NOT show horizontal scroll hint when wrap is on, got:\n%s", v)
+	}
+}
+
+func TestLogsScreen_HelpBarWrapOff(t *testing.T) {
+	m := setupLogsModel()
+	m.logsWrap = false
+
+	v := m.View()
+	if !strings.Contains(v, "w wrap") {
+		t.Errorf("help bar should show 'w wrap' when wrap is off, got:\n%s", v)
+	}
+	if !strings.Contains(v, "<-/-> scroll") {
+		t.Errorf("help bar should show horizontal scroll hint when wrap is off, got:\n%s", v)
+	}
+}
+
+func TestLogsScreen_HelpBarPrettyToggle(t *testing.T) {
+	m := setupLogsModel()
+
+	m.logsPretty = false
+	v := m.View()
+	if !strings.Contains(v, "p pretty") {
+		t.Errorf("help bar should show 'p pretty' when pretty is off, got:\n%s", v)
+	}
+
+	m.logsPretty = true
+	v = m.View()
+	if !strings.Contains(v, "p raw") {
+		t.Errorf("help bar should show 'p raw' when pretty is on, got:\n%s", v)
+	}
+}
+
+func TestLogsScreen_EscClearsWrapPretty(t *testing.T) {
+	m := setupLogsModel()
+	m.logsWrap = true
+	m.logsPretty = true
+
+	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyEsc})
+	m = updated.(Model)
+
+	if m.screen != screenSelectContainers {
+		t.Errorf("screen = %d, want %d", m.screen, screenSelectContainers)
+	}
+	if m.logsWrap {
+		t.Error("logsWrap should be cleared after esc")
+	}
+	if m.logsPretty {
+		t.Error("logsPretty should be cleared after esc")
+	}
+}

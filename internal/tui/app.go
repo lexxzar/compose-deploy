@@ -167,6 +167,8 @@ type Model struct {
 	logsErr      error              // error from Logs() call
 	logsPipeR    io.Reader          // pipe reader for log streaming
 	logsSession  uint64             // monotonic counter to discard stale messages from prior sessions
+	logsWrap     bool               // soft-wrap long lines at viewport width
+	logsPretty   bool               // pretty-print JSON log bodies
 
 	// Shared
 	ctx       context.Context
@@ -304,6 +306,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				h = 3
 			}
 			m.logsViewport.Height = h
+			m.applyLogFormat()
 		}
 		return m, nil
 
@@ -376,7 +379,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 		m.logsContent += string(msg.data)
-		m.logsViewport.SetContent(m.logsContent)
+		m.applyLogFormat()
 		m.logsViewport.GotoBottom()
 		return m, m.readLogChunk()
 
@@ -388,7 +391,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if msg.err != nil {
 			m.logsErr = msg.err
 			m.logsContent += fmt.Sprintf("\n\nError: %v", msg.err)
-			m.logsViewport.SetContent(m.logsContent)
+			m.applyLogFormat()
 			m.logsViewport.GotoBottom()
 		}
 		return m, nil
@@ -588,8 +591,23 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.logsErr = nil
 			m.logsPipeR = nil
 			m.logsViewport = viewport.Model{}
+			m.logsWrap = false
+			m.logsPretty = false
 			m.screen = screenSelectContainers
 			return m, m.refreshStatus()
+		case "w":
+			m.logsWrap = !m.logsWrap
+			if m.logsWrap {
+				m.logsViewport.SetHorizontalStep(0)
+			} else {
+				m.logsViewport.SetHorizontalStep(4)
+			}
+			m.applyLogFormat()
+			return m, nil
+		case "p":
+			m.logsPretty = !m.logsPretty
+			m.applyLogFormat()
+			return m, nil
 		case "G":
 			m.logsViewport.GotoBottom()
 			return m, nil
@@ -704,6 +722,8 @@ func (m *Model) enterLogs() (tea.Model, tea.Cmd) {
 	m.logsDone = false
 	m.logsErr = nil
 	m.logsSession++
+	m.logsWrap = true
+	m.logsPretty = false
 
 	vpHeight := m.height - 6
 	if vpHeight < 3 {
@@ -714,6 +734,8 @@ func (m *Model) enterLogs() (tea.Model, tea.Cmd) {
 		w = 40
 	}
 	m.logsViewport = viewport.New(w, vpHeight)
+	// Wrap is on by default, so disable horizontal scrolling
+	m.logsViewport.SetHorizontalStep(0)
 
 	ctx, cancel := context.WithCancel(m.ctx)
 	m.logsCancel = cancel
@@ -729,6 +751,12 @@ func (m *Model) enterLogs() (tea.Model, tea.Cmd) {
 
 	m.screen = screenLogs
 	return *m, m.readLogChunk()
+}
+
+// applyLogFormat re-renders logsContent through formatLogContent and updates the viewport.
+func (m *Model) applyLogFormat() {
+	formatted := formatLogContent(m.logsContent, m.logsViewport.Width, m.logsWrap, m.logsPretty)
+	m.logsViewport.SetContent(formatted)
 }
 
 func (m Model) readLogChunk() tea.Cmd {
@@ -1054,7 +1082,23 @@ func (m Model) viewLogs() string {
 	b.WriteString(m.logsViewport.View())
 	b.WriteString("\n")
 
-	b.WriteString(helpStyle.Render("  esc back  •  up/down scroll  •  G bottom  •  q quit"))
+	help := "  esc back  •  up/down scroll"
+	if !m.logsWrap {
+		help += "  •  <-/-> scroll"
+	}
+	help += "  •  G bottom"
+	if m.logsWrap {
+		help += "  •  w unwrap"
+	} else {
+		help += "  •  w wrap"
+	}
+	if m.logsPretty {
+		help += "  •  p raw"
+	} else {
+		help += "  •  p pretty"
+	}
+	help += "  •  q quit"
+	b.WriteString(helpStyle.Render(help))
 	return b.String()
 }
 
