@@ -625,3 +625,36 @@ func TestRunOperation_ServerNoProjectDir(t *testing.T) {
 		t.Errorf("error = %q, want it to contain 'requires --project-dir'", err.Error())
 	}
 }
+
+func TestRunOperation_LocalDetectFailure(t *testing.T) {
+	oldNew := opNewLocal
+	oldProj := projectDir
+	oldServer := serverName
+	t.Cleanup(func() {
+		opNewLocal = oldNew
+		projectDir = oldProj
+		serverName = oldServer
+	})
+
+	opNewLocal = func(dir string) *compose.Compose {
+		c := compose.New(dir)
+		c.SetTestHooks(
+			nil,
+			func(cmd *exec.Cmd) ([]byte, error) {
+				// Fail all version probes to simulate Docker not installed
+				return nil, fmt.Errorf("not found")
+			},
+		)
+		return c
+	}
+	projectDir = ""
+	serverName = ""
+
+	err := runOperation(context.Background(), runner.Deploy, true, nil)
+	if err == nil {
+		t.Fatal("expected error when Detect fails")
+	}
+	if !strings.Contains(err.Error(), "neither") {
+		t.Errorf("error = %q, want it to contain 'neither'", err.Error())
+	}
+}

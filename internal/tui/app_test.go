@@ -99,6 +99,54 @@ func TestInit_LoadsProjectsWhenPickerShown(t *testing.T) {
 	}
 }
 
+func TestWithLocalProjectLoader(t *testing.T) {
+	mc := &mockComposer{}
+	called := false
+	loader := func(ctx context.Context) ([]compose.Project, error) {
+		called = true
+		return []compose.Project{{Name: "test", ConfigDir: "/test"}}, nil
+	}
+	m := NewModel(nil, io.Discard, mockFactory(mc), nil, nil, WithLocalProjectLoader(loader))
+
+	if m.localProjectLoader == nil {
+		t.Fatal("localProjectLoader should be set")
+	}
+	if m.projectLoader == nil {
+		t.Fatal("projectLoader should be set by WithLocalProjectLoader")
+	}
+
+	// Execute the loader via loadProjects
+	cmd := m.loadProjects()
+	msg := cmd()
+	pm := msg.(projectsMsg)
+	if pm.err != nil {
+		t.Fatalf("unexpected error: %v", pm.err)
+	}
+	if !called {
+		t.Error("local loader should have been called")
+	}
+	if len(pm.projects) != 1 || pm.projects[0].Name != "test" {
+		t.Errorf("projects = %v, want [{test /test}]", pm.projects)
+	}
+}
+
+func TestLoadProjects_NilLoader_ReturnsError(t *testing.T) {
+	mc := &mockComposer{}
+	m := NewModel(nil, io.Discard, mockFactory(mc), nil, nil)
+	// Ensure no loader is set
+	m.projectLoader = nil
+
+	cmd := m.loadProjects()
+	msg := cmd()
+	pm := msg.(projectsMsg)
+	if pm.err == nil {
+		t.Fatal("expected error when no loader configured")
+	}
+	if !strings.Contains(pm.err.Error(), "no project loader") {
+		t.Errorf("error = %q, want it to contain 'no project loader'", pm.err.Error())
+	}
+}
+
 func TestInit_LoadsServicesWhenPickerSkipped(t *testing.T) {
 	mc := &mockComposer{}
 	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
@@ -1033,7 +1081,9 @@ func TestServerScreen_Navigation(t *testing.T) {
 
 func TestServerScreen_LocalSelection(t *testing.T) {
 	mc := &mockComposer{}
-	m := NewModel(nil, io.Discard, mockFactory(mc), testServers, mockConnectCb(mc))
+	localLoader := func(ctx context.Context) ([]compose.Project, error) { return nil, nil }
+	m := NewModel(nil, io.Discard, mockFactory(mc), testServers, mockConnectCb(mc),
+		WithLocalProjectLoader(localLoader))
 
 	// Cursor at 0 = "Local", press enter
 	updated, cmd := m.Update(tea.KeyMsg{Type: tea.KeyEnter})
@@ -1048,8 +1098,8 @@ func TestServerScreen_LocalSelection(t *testing.T) {
 	if m.disconnectFunc != nil {
 		t.Error("disconnectFunc should be nil for local")
 	}
-	if m.projectLoader != nil {
-		t.Error("projectLoader should be nil for local")
+	if m.projectLoader == nil {
+		t.Error("projectLoader should be restored to localProjectLoader for local")
 	}
 	if !m.showPicker {
 		t.Error("showPicker should be true after local selection")
@@ -1155,11 +1205,13 @@ func TestServerScreen_ConnectSuccess(t *testing.T) {
 
 func TestServerScreen_ConnectError(t *testing.T) {
 	mc := &mockComposer{}
-	m := NewModel(nil, io.Discard, mockFactory(mc), testServers, mockConnectCb(mc))
+	localLoader := func(ctx context.Context) ([]compose.Project, error) { return nil, nil }
+	m := NewModel(nil, io.Discard, mockFactory(mc), testServers, mockConnectCb(mc),
+		WithLocalProjectLoader(localLoader))
 	m.serverName = "prod"
 	// Simulate stale remote state set before connect attempt
 	m.projectLoader = func(ctx context.Context) ([]compose.Project, error) {
-		return nil, nil
+		return nil, fmt.Errorf("remote loader")
 	}
 	m.disconnectFunc = func() error { return nil }
 
@@ -1173,8 +1225,8 @@ func TestServerScreen_ConnectError(t *testing.T) {
 	if m.serverErr.Error() != "connection refused" {
 		t.Errorf("serverErr = %q, want %q", m.serverErr.Error(), "connection refused")
 	}
-	if m.projectLoader != nil {
-		t.Error("projectLoader should be cleared after connect failure")
+	if m.projectLoader == nil {
+		t.Error("projectLoader should be restored to localProjectLoader after connect failure")
 	}
 	if m.disconnectFunc != nil {
 		t.Error("disconnectFunc should be cleared after connect failure")
@@ -1193,7 +1245,9 @@ func TestServerScreen_QuitReturnsQuit(t *testing.T) {
 
 func TestEscFromProjectScreen_WithServers_GoesToServerScreen(t *testing.T) {
 	mc := &mockComposer{}
-	m := NewModel(nil, io.Discard, mockFactory(mc), testServers, mockConnectCb(mc))
+	localLoader := func(ctx context.Context) ([]compose.Project, error) { return nil, nil }
+	m := NewModel(nil, io.Discard, mockFactory(mc), testServers, mockConnectCb(mc),
+		WithLocalProjectLoader(localLoader))
 	// Simulate state after connecting to remote server and being on project screen
 	m.screen = screenSelectProject
 	m.serverName = "prod"
@@ -1201,7 +1255,7 @@ func TestEscFromProjectScreen_WithServers_GoesToServerScreen(t *testing.T) {
 	disconnectCalled := false
 	m.disconnectFunc = func() error { disconnectCalled = true; return nil }
 	m.projectLoader = func(ctx context.Context) ([]compose.Project, error) {
-		return nil, nil
+		return nil, fmt.Errorf("remote loader")
 	}
 
 	updated, cmd := m.Update(tea.KeyMsg{Type: tea.KeyEsc})
@@ -1216,11 +1270,8 @@ func TestEscFromProjectScreen_WithServers_GoesToServerScreen(t *testing.T) {
 	if m.disconnectFunc != nil {
 		t.Error("disconnectFunc should be nil after going back")
 	}
-	if m.projectLoader != nil {
-		t.Error("projectLoader should be nil after going back")
-	}
-	if !m.showPicker {
-		// showPicker is reset to false since we're going back to server screen
+	if m.projectLoader == nil {
+		t.Error("projectLoader should be restored to localProjectLoader after going back")
 	}
 
 	// Disconnect is called async via tea.Cmd

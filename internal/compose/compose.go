@@ -56,13 +56,6 @@ func (c *Compose) ListProjects(ctx context.Context) ([]Project, error) {
 	return parseProjects(out)
 }
 
-// ListProjects returns all Docker Compose projects on the system using plugin mode.
-// This is a thin wrapper for backward compatibility. For standalone support,
-// use the Compose.ListProjects() method with Detect() instead.
-func ListProjects(ctx context.Context) ([]Project, error) {
-	return (&Compose{}).ListProjects(ctx)
-}
-
 // lsEntry matches the JSON schema of `docker compose ls --format json`.
 type lsEntry struct {
 	Name        string `json:"Name"`

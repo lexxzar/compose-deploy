@@ -282,6 +282,41 @@ func TestRunLogs_ServerSuccess(t *testing.T) {
 	}
 }
 
+func TestRunLogs_LocalDetectFailure(t *testing.T) {
+	oldHas := logsHasCompose
+	oldNew := logsNewLocal
+	oldProj := projectDir
+	oldServer := serverName
+	t.Cleanup(func() {
+		logsHasCompose = oldHas
+		logsNewLocal = oldNew
+		projectDir = oldProj
+		serverName = oldServer
+	})
+
+	logsHasCompose = func(dir string) bool { return true }
+	logsNewLocal = func(dir string) *compose.Compose {
+		c := compose.New(dir)
+		c.SetTestHooks(
+			nil,
+			func(cmd *exec.Cmd) ([]byte, error) {
+				return nil, fmt.Errorf("not found")
+			},
+		)
+		return c
+	}
+	projectDir = ""
+	serverName = ""
+
+	err := runLogs(context.Background(), "nginx", true, 50)
+	if err == nil {
+		t.Fatal("expected error when Detect fails")
+	}
+	if !strings.Contains(err.Error(), "neither") {
+		t.Errorf("error = %q, want it to contain 'neither'", err.Error())
+	}
+}
+
 func TestRunLogs_WithProjectDir(t *testing.T) {
 	oldHas := logsHasCompose
 	oldNew := logsNewLocal

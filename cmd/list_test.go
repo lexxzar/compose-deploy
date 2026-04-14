@@ -976,6 +976,76 @@ func TestRunList_LocalNoProjects(t *testing.T) {
 	}
 }
 
+func TestRunList_LocalDetectFailure(t *testing.T) {
+	oldHas := hasLocalCompose
+	oldNew := newLocalComposer
+	oldProj := projectDir
+	oldServer := serverName
+	t.Cleanup(func() {
+		hasLocalCompose = oldHas
+		newLocalComposer = oldNew
+		projectDir = oldProj
+		serverName = oldServer
+	})
+
+	hasLocalCompose = func(dir string) bool { return true }
+	newLocalComposer = func(dir string) *compose.Compose {
+		c := compose.New(dir)
+		c.SetTestHooks(
+			nil,
+			func(cmd *exec.Cmd) ([]byte, error) {
+				return nil, fmt.Errorf("not found")
+			},
+		)
+		return c
+	}
+	projectDir = ""
+	serverName = ""
+
+	err := runList(context.Background(), false)
+	if err == nil {
+		t.Fatal("expected error when Detect fails")
+	}
+	if !strings.Contains(err.Error(), "neither") {
+		t.Errorf("error = %q, want it to contain 'neither'", err.Error())
+	}
+}
+
+func TestRunList_LocalMultiProjectDetectFailure(t *testing.T) {
+	oldHas := hasLocalCompose
+	oldNew := newLocalComposer
+	oldProj := projectDir
+	oldServer := serverName
+	t.Cleanup(func() {
+		hasLocalCompose = oldHas
+		newLocalComposer = oldNew
+		projectDir = oldProj
+		serverName = oldServer
+	})
+
+	hasLocalCompose = func(dir string) bool { return false }
+	newLocalComposer = func(dir string) *compose.Compose {
+		c := compose.New(dir)
+		c.SetTestHooks(
+			nil,
+			func(cmd *exec.Cmd) ([]byte, error) {
+				return nil, fmt.Errorf("not found")
+			},
+		)
+		return c
+	}
+	projectDir = ""
+	serverName = ""
+
+	err := runList(context.Background(), false)
+	if err == nil {
+		t.Fatal("expected error when Detect fails")
+	}
+	if !strings.Contains(err.Error(), "neither") {
+		t.Errorf("error = %q, want it to contain 'neither'", err.Error())
+	}
+}
+
 func TestRunList_ServerSingleProject(t *testing.T) {
 	tmpHome := t.TempDir()
 	cfgDir := tmpHome + "/.cdeploy"
