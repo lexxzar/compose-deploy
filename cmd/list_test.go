@@ -168,13 +168,13 @@ func TestFormatDots_HealthIcons(t *testing.T) {
 		t.Fatalf("lines = %d, want 4", len(lines))
 	}
 
-	// Healthy line should contain "H"
-	if !strings.Contains(lines[0], "H") {
-		t.Errorf("healthy line missing H icon: %q", lines[0])
+	// Healthy line should contain "♥"
+	if !strings.Contains(lines[0], "♥") {
+		t.Errorf("healthy line missing ♥ icon: %q", lines[0])
 	}
-	// Unhealthy line should contain "U"
-	if !strings.Contains(lines[1], "U") {
-		t.Errorf("unhealthy line missing U icon: %q", lines[1])
+	// Unhealthy line should contain "✗"
+	if !strings.Contains(lines[1], "✗") {
+		t.Errorf("unhealthy line missing ✗ icon: %q", lines[1])
 	}
 	// Starting line should contain "~"
 	if !strings.Contains(lines[2], "~") {

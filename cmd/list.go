@@ -42,9 +42,9 @@ func mergeStatus(services []string, status map[string]runner.ServiceStatus) []se
 func healthIcon(health string) string {
 	switch health {
 	case "healthy":
-		return styleOK.Render("H")
+		return styleOK.Render("♥")
 	case "unhealthy":
-		return styleFailed.Render("U")
+		return styleFailed.Render("✗")
 	case "starting":
 		return styleWarning.Render("~")
 	default:

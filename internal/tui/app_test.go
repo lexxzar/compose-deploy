@@ -597,13 +597,13 @@ func TestViewSelectContainers_HealthIcons(t *testing.T) {
 
 	v := m.View()
 
-	// Should contain health icon "!" for unhealthy (api)
-	if !strings.Contains(v, "!") {
-		t.Error("view should contain '!' for unhealthy service")
+	// Should contain health icon "✗" for unhealthy (api)
+	if !strings.Contains(v, "✗") {
+		t.Error("view should contain '✗' for unhealthy service")
 	}
-	// Should contain "H" for healthy (web)
-	if !strings.Contains(v, "H") {
-		t.Error("view should contain 'H' for healthy service")
+	// Should contain "♥" for healthy (web)
+	if !strings.Contains(v, "♥") {
+		t.Error("view should contain '♥' for healthy service")
 	}
 	// Should contain "~" for starting (worker)
 	if !strings.Contains(v, "~") {

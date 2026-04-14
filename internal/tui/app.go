@@ -1052,9 +1052,9 @@ func (m Model) viewSelectProject() string {
 func healthIndicator(health string) string {
 	switch health {
 	case "healthy":
-		return healthHealthy.Render("H")
+		return healthHealthy.Render("♥")
 	case "unhealthy":
-		return healthUnhealthy.Render("!")
+		return healthUnhealthy.Render("✗")
 	case "starting":
 		return healthStarting.Render("~")
 	default:
