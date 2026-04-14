@@ -3,6 +3,7 @@ package compose
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -47,7 +48,7 @@ var execListProjects = func(ctx context.Context) ([]byte, error) {
 func ListProjects(ctx context.Context) ([]Project, error) {
 	out, err := execListProjects(ctx)
 	if err != nil {
-		return nil, fmt.Errorf("listing projects: %w", err)
+		return nil, fmt.Errorf("listing projects: %w", withStderr(err))
 	}
 	return parseProjects(out)
 }
@@ -126,7 +127,7 @@ func (c *Compose) ListServices(ctx context.Context) ([]string, error) {
 		out, err = cmd.Output()
 	}
 	if err != nil {
-		return nil, fmt.Errorf("listing services: %w", err)
+		return nil, fmt.Errorf("listing services: %w", withStderr(err))
 	}
 	lines := strings.Split(strings.TrimSpace(string(out)), "\n")
 	var services []string
@@ -164,6 +165,16 @@ func (c *Compose) Start(ctx context.Context, containers []string, w io.Writer) e
 	return c.run(ctx, w, append([]string{"start"}, containers...)...)
 }
 
+// withStderr appends any captured stderr to an exec.ExitError so the
+// caller sees the actual diagnostic message, not just the exit code.
+func withStderr(err error) error {
+	var exitErr *exec.ExitError
+	if errors.As(err, &exitErr) && len(exitErr.Stderr) > 0 {
+		return fmt.Errorf("%w: %s", err, strings.TrimSpace(string(exitErr.Stderr)))
+	}
+	return err
+}
+
 func (c *Compose) command(ctx context.Context, args ...string) *exec.Cmd {
 	cmd := exec.CommandContext(ctx, "docker", append([]string{"compose"}, args...)...)
 	cmd.Env = append(os.Environ(), "CURRENT_UID="+c.UID)
@@ -191,7 +202,7 @@ func (c *Compose) ContainerStatus(ctx context.Context) (map[string]runner.Servic
 		out, err = cmd.Output()
 	}
 	if err != nil {
-		return nil, fmt.Errorf("listing container status: %w", err)
+		return nil, fmt.Errorf("listing container status: %w", withStderr(err))
 	}
 	return parseContainerStatus(out)
 }

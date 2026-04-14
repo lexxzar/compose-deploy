@@ -159,6 +159,10 @@ All docker compose output is logged to `~/.cdeploy/logs/`. Each log file is name
 
 cdeploy is not a replacement for Kubernetes, Docker Swarm, or full deployment platforms like Kamal. It's for teams and solo developers who deploy to a handful of servers with plain `docker compose` and just want a faster, less error-prone way to do it — without installing anything on the servers themselves.
 
+## License
+
+[MIT](LICENSE)
+
 ## Requirements
 
 - Go 1.26+

@@ -169,7 +169,7 @@ func (r *RemoteCompose) ListServices(ctx context.Context) ([]string, error) {
 		out, err = cmd.Output()
 	}
 	if err != nil {
-		return nil, fmt.Errorf("listing remote services: %w", err)
+		return nil, fmt.Errorf("listing remote services: %w", withStderr(err))
 	}
 	lines := strings.Split(strings.TrimSpace(string(out)), "\n")
 	var services []string
@@ -193,7 +193,7 @@ func (r *RemoteCompose) ContainerStatus(ctx context.Context) (map[string]runner.
 		out, err = cmd.Output()
 	}
 	if err != nil {
-		return nil, fmt.Errorf("listing remote container status: %w", err)
+		return nil, fmt.Errorf("listing remote container status: %w", withStderr(err))
 	}
 	return parseContainerStatus(out)
 }
@@ -209,7 +209,7 @@ func (r *RemoteCompose) ListProjects(ctx context.Context) ([]Project, error) {
 		out, err = cmd.Output()
 	}
 	if err != nil {
-		return nil, fmt.Errorf("listing remote projects: %w", err)
+		return nil, fmt.Errorf("listing remote projects: %w", withStderr(err))
 	}
 	return parseProjects(out)
 }
