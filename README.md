@@ -145,6 +145,20 @@ In TUI mode, the SSH connect command runs with full terminal access so interacti
 
 All docker compose output is logged to `~/.cdeploy/logs/cdeploy_on_{hostname}_{timestamp}.log`. Override with `--log-dir`.
 
+## Coverage
+
+Coverage is published to Coveralls from GitHub Actions on every push, pull request, and manual run.
+
+The workflow in `.github/workflows/coveralls.yml` runs:
+
+```bash
+go test ./... -covermode=atomic -coverprofile=coverage.out
+```
+
+and uploads the resulting `coverage.out` file with the official Coveralls GitHub Action.
+
+You do not need to pre-create the repository in Coveralls; the first successful workflow run will publish the initial report there.
+
 ## Requirements
 
 - Go 1.26+
