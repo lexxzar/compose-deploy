@@ -1,5 +1,3 @@
-
-
 # cdeploy [![Go Report Card](https://goreportcard.com/badge/github.com/lexxzar/compose-deploy)](https://goreportcard.com/report/github.com/lexxzar/compose-deploy) [![Coverage Status](https://coveralls.io/repos/github/lexxzar/compose-deploy/badge.svg?branch=main)](https://coveralls.io/github/lexxzar/compose-deploy?branch=main)
 
 cdeploy is a TUI/CLI app for teams and solo developers who deploy Docker Compose apps to a few servers over SSH.
@@ -143,23 +141,23 @@ In TUI mode, the SSH connect command runs with full terminal access so interacti
 | **Restart** | stop → remove → create → start |
 | **Stop** | stop |
 
+## Health Checks
+
+If your services define Docker health checks, cdeploy displays their status alongside the running/stopped indicator:
+
+- **♥** healthy
+- **✗** unhealthy
+- **~** starting (health check hasn't passed yet)
+
+For scaled services, the worst-case health is shown (unhealthy > starting > healthy). Services without a health check show only the running/stopped dot.
+
 ## Logging
 
-All docker compose output is logged to `~/.cdeploy/logs/cdeploy_on_{hostname}_{timestamp}.log`. Override with `--log-dir`.
+All docker compose output is logged to `~/.cdeploy/logs/`. Each log file is named `cdeploy_on_{hostname}_{timestamp}.log`, so you get a per-host, timestamped record of every operation. Override the directory with `--log-dir`.
 
-## Coverage
+## Why cdeploy?
 
-Coverage is published to Coveralls from GitHub Actions on every push, pull request, and manual run.
-
-The workflow in `.github/workflows/coveralls.yml` runs:
-
-```bash
-go test ./... -covermode=atomic -coverprofile=coverage.out
-```
-
-and uploads the resulting `coverage.out` file with the official Coveralls GitHub Action.
-
-You do not need to pre-create the repository in Coveralls; the first successful workflow run will publish the initial report there.
+cdeploy is not a replacement for Kubernetes, Docker Swarm, or full deployment platforms like Kamal. It's for teams and solo developers who deploy to a handful of servers with plain `docker compose` and just want a faster, less error-prone way to do it — without installing anything on the servers themselves.
 
 ## Requirements
 
