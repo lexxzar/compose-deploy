@@ -107,13 +107,13 @@ JSON (flat array with project field, omitted in single-project mode via `omitemp
 - Modify: `cmd/list.go`
 - Modify: `cmd/list_test.go`
 
-- [ ] Add `Project string` field with `json:"project,omitempty"` to `serviceStatus` struct
-- [ ] Add `projectServices` struct with `Name string` and `Services []serviceStatus`
-- [ ] Implement `formatDotsGrouped([]projectServices) string` — project name header, indented service lines (reuse dot/health rendering from `formatDots`), blank line between projects
-- [ ] Write tests for `formatDotsGrouped` (single project, multiple projects, empty)
-- [ ] Write test verifying `formatJSON` still omits `project` when field is empty (omitempty backward compat)
-- [ ] Verify existing formatter tests still pass: `go test ./cmd/ -run TestFormat -v`
-- [ ] Run tests — must pass before Task 2
+- [x] Add `Project string` field with `json:"project,omitempty"` to `serviceStatus` struct
+- [x] Add `projectServices` struct with `Name string` and `Services []serviceStatus`
+- [x] Implement `formatDotsGrouped([]projectServices) string` — project name header, indented service lines (reuse dot/health rendering from `formatDots`), blank line between projects
+- [x] Write tests for `formatDotsGrouped` (single project, multiple projects, empty)
+- [x] Write test verifying `formatJSON` still omits `project` when field is empty (omitempty backward compat)
+- [x] Verify existing formatter tests still pass: `go test ./cmd/ -run TestFormat -v`
+- [x] Run tests — must pass before Task 2
 
 ### Task 2: Implement multi-project listing in `runList`
 
@@ -121,33 +121,33 @@ JSON (flat array with project field, omitted in single-project mode via `omitemp
 - Modify: `cmd/list.go`
 - Modify: `cmd/list_test.go`
 
-- [ ] Extract a helper `listSingleProject(ctx, composer, jsonOutput) error` from the existing single-project tail of `runList` (services → status → merge → format → print)
-- [ ] Verify existing tests still pass after extraction (no behavior change): `go test ./cmd/ -v`
-- [ ] In `runList`, when `serverName != ""` and no project dir: connect with empty `ProjectDir`, call `ListProjects` (fatal on failure), iterate each project creating scoped `RemoteCompose` (do NOT call `Connect()`/`Close()` on these — they piggyback on the ControlMaster socket), collect `projectServices`
-- [ ] Handle per-project `ListServices`/`ContainerStatus` errors: print warning to stderr, skip project, continue
-- [ ] For dots output call `formatDotsGrouped`; for JSON flatten `[]projectServices` to `[]serviceStatus` (setting `Project` field) and reuse existing `formatJSON()`
-- [ ] Remove the error `--server %q requires --project-dir or project_dir in config` — replace with multi-project flow
-- [ ] Extract multi-project orchestration into a testable function that accepts a factory callback (`func(dir string) runner.Composer`) for mock injection
-- [ ] Write tests for orchestration function using mock composers (multiple projects, empty project list, per-project error skipping)
-- [ ] Run tests — must pass before Task 3
+- [x] Extract a helper `listSingleProject(ctx, composer, jsonOutput) error` from the existing single-project tail of `runList` (services → status → merge → format → print)
+- [x] Verify existing tests still pass after extraction (no behavior change): `go test ./cmd/ -v`
+- [x] In `runList`, when `serverName != ""` and no project dir: connect with empty `ProjectDir`, call `ListProjects` (fatal on failure), iterate each project creating scoped `RemoteCompose` (do NOT call `Connect()`/`Close()` on these — they piggyback on the ControlMaster socket), collect `projectServices`
+- [x] Handle per-project `ListServices`/`ContainerStatus` errors: print warning to stderr, skip project, continue
+- [x] For dots output call `formatDotsGrouped`; for JSON flatten `[]projectServices` to `[]serviceStatus` (setting `Project` field) and reuse existing `formatJSON()`
+- [x] Remove the error `--server %q requires --project-dir or project_dir in config` — replace with multi-project flow
+- [x] Extract multi-project orchestration into a testable function that accepts a factory callback (`func(dir string) runner.Composer`) for mock injection
+- [x] Write tests for orchestration function using mock composers (multiple projects, empty project list, per-project error skipping)
+- [x] Run tests — must pass before Task 3
 
 ### Task 3: Update command help text
 
 **Files:**
 - Modify: `cmd/list.go`
 
-- [ ] Update `Long` description to mention multi-project discovery when `-C` is omitted
-- [ ] Update `Example` block with `cdeploy list -s prod` (no -C) showing it lists all projects
-- [ ] Run tests — must pass before Task 4
+- [x] Update `Long` description to mention multi-project discovery when `-C` is omitted
+- [x] Update `Example` block with `cdeploy list -s prod` (no -C) showing it lists all projects
+- [x] Run tests — must pass before Task 4
 
 ### Task 4: Verify acceptance criteria
 
-- [ ] Verify: `cdeploy list -s server` without `-C` discovers and lists all projects (grouped output)
-- [ ] Verify: `cdeploy list -s server -C /path` still shows single-project flat output (backward compat)
-- [ ] Verify: `cdeploy list` locally without `-s` still works as before
-- [ ] Verify: `--json` works in both single and multi-project modes
-- [ ] Verify: single-project JSON has no `project` field (omitempty)
-- [ ] Run full test suite: `go test ./... -count=1`
+- [x] Verify: `cdeploy list -s server` without `-C` discovers and lists all projects (grouped output) — verified via `collectMultiProject` + `formatDotsGrouped` tests
+- [x] Verify: `cdeploy list -s server -C /path` still shows single-project flat output (backward compat) — code path unchanged, existing tests pass
+- [x] Verify: `cdeploy list` locally without `-s` still works as before — existing tests pass
+- [x] Verify: `--json` works in both single and multi-project modes — `TestFormatJSON_IncludesProject` + `flattenProjectServices` tests
+- [x] Verify: single-project JSON has no `project` field (omitempty) — `TestFormatJSON_OmitsEmptyProject`
+- [x] Run full test suite: `go test ./... -count=1` — all packages pass
 
 ### Task 5: [Final] Update documentation
 

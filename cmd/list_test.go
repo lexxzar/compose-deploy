@@ -1,10 +1,14 @@
 package cmd
 
 import (
+	"context"
 	"encoding/json"
+	"fmt"
+	"io"
 	"strings"
 	"testing"
 
+	"github.com/lexxzar/compose-deploy/internal/compose"
 	"github.com/lexxzar/compose-deploy/internal/runner"
 	"github.com/spf13/cobra"
 )
@@ -248,6 +252,267 @@ func TestFormatJSON_IncludesHealth(t *testing.T) {
 		if strings.Count(out, `"health"`) != 1 {
 			t.Errorf("expected health field exactly once (for web only), got JSON: %s", out)
 		}
+	}
+}
+
+func TestFormatDotsGrouped_MultipleProjects(t *testing.T) {
+	projects := []projectServices{
+		{
+			Name: "myapp",
+			Services: []serviceStatus{
+				{Name: "nginx", Running: true, Health: "healthy"},
+				{Name: "postgres", Running: true},
+			},
+		},
+		{
+			Name: "monitoring",
+			Services: []serviceStatus{
+				{Name: "grafana", Running: true},
+				{Name: "loki", Running: false},
+			},
+		},
+	}
+
+	out := formatDotsGrouped(projects)
+
+	if !strings.Contains(out, "myapp") {
+		t.Error("missing project header 'myapp'")
+	}
+	if !strings.Contains(out, "monitoring") {
+		t.Error("missing project header 'monitoring'")
+	}
+	// Services should be indented
+	for _, line := range strings.Split(out, "\n") {
+		if line == "myapp" || line == "monitoring" || line == "" {
+			continue
+		}
+		if !strings.HasPrefix(line, "  ") {
+			t.Errorf("service line not indented: %q", line)
+		}
+	}
+	// Should have blank line between projects
+	if !strings.Contains(out, "\n\n") {
+		t.Error("missing blank line between projects")
+	}
+}
+
+func TestFormatDotsGrouped_SingleProject(t *testing.T) {
+	projects := []projectServices{
+		{
+			Name: "myapp",
+			Services: []serviceStatus{
+				{Name: "web", Running: true},
+			},
+		},
+	}
+
+	out := formatDotsGrouped(projects)
+
+	if !strings.Contains(out, "myapp") {
+		t.Error("missing project header")
+	}
+	if strings.Contains(out, "\n\n") {
+		t.Error("single project should not have blank line separator")
+	}
+}
+
+func TestFormatDotsGrouped_Empty(t *testing.T) {
+	out := formatDotsGrouped(nil)
+	if out != "" {
+		t.Errorf("got %q, want empty", out)
+	}
+}
+
+func TestFormatDotsGrouped_HealthIcons(t *testing.T) {
+	projects := []projectServices{
+		{
+			Name: "app",
+			Services: []serviceStatus{
+				{Name: "web", Running: true, Health: "healthy"},
+				{Name: "api", Running: true, Health: "unhealthy"},
+			},
+		},
+	}
+
+	out := formatDotsGrouped(projects)
+
+	if !strings.Contains(out, "♥") {
+		t.Error("missing healthy icon ♥")
+	}
+	if !strings.Contains(out, "✗") {
+		t.Error("missing unhealthy icon ✗")
+	}
+}
+
+func TestFormatJSON_OmitsEmptyProject(t *testing.T) {
+	items := []serviceStatus{
+		{Name: "nginx", Running: true},
+	}
+
+	out, err := formatJSON(items)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if strings.Contains(out, "project") {
+		t.Errorf("empty project should be omitted from JSON, got: %s", out)
+	}
+}
+
+func TestFormatJSON_IncludesProject(t *testing.T) {
+	items := []serviceStatus{
+		{Project: "myapp", Name: "nginx", Running: true},
+	}
+
+	out, err := formatJSON(items)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var got []serviceStatus
+	if err := json.Unmarshal([]byte(out), &got); err != nil {
+		t.Fatal(err)
+	}
+	if got[0].Project != "myapp" {
+		t.Errorf("project = %q, want %q", got[0].Project, "myapp")
+	}
+}
+
+// mockComposer implements runner.Composer for testing.
+type mockComposer struct {
+	services []string
+	status   map[string]runner.ServiceStatus
+	err      error
+}
+
+func (m *mockComposer) ListServices(_ context.Context) ([]string, error) {
+	if m.err != nil {
+		return nil, m.err
+	}
+	return m.services, nil
+}
+
+func (m *mockComposer) ContainerStatus(_ context.Context) (map[string]runner.ServiceStatus, error) {
+	if m.err != nil {
+		return nil, m.err
+	}
+	return m.status, nil
+}
+
+func (m *mockComposer) Stop(_ context.Context, _ []string, _ io.Writer) error   { return nil }
+func (m *mockComposer) Remove(_ context.Context, _ []string, _ io.Writer) error { return nil }
+func (m *mockComposer) Pull(_ context.Context, _ []string, _ io.Writer) error   { return nil }
+func (m *mockComposer) Create(_ context.Context, _ []string, _ io.Writer) error { return nil }
+func (m *mockComposer) Start(_ context.Context, _ []string, _ io.Writer) error  { return nil }
+func (m *mockComposer) Logs(_ context.Context, _ string, _ bool, _ int, _ io.Writer) error {
+	return nil
+}
+
+func TestCollectMultiProject_Success(t *testing.T) {
+	mocks := map[string]*mockComposer{
+		"/app1": {
+			services: []string{"web", "db"},
+			status:   map[string]runner.ServiceStatus{"web": {Running: true}, "db": {Running: true}},
+		},
+		"/app2": {
+			services: []string{"api"},
+			status:   map[string]runner.ServiceStatus{"api": {Running: false}},
+		},
+	}
+
+	projects := []compose.Project{
+		{Name: "app1", ConfigDir: "/app1"},
+		{Name: "app2", ConfigDir: "/app2"},
+	}
+
+	factory := func(dir string) runner.Composer { return mocks[dir] }
+	result := collectMultiProject(context.Background(), projects, factory)
+
+	if len(result) != 2 {
+		t.Fatalf("got %d projects, want 2", len(result))
+	}
+	if result[0].Name != "app1" {
+		t.Errorf("result[0].Name = %q, want %q", result[0].Name, "app1")
+	}
+	if len(result[0].Services) != 2 {
+		t.Errorf("app1 services = %d, want 2", len(result[0].Services))
+	}
+	if len(result[1].Services) != 1 {
+		t.Errorf("app2 services = %d, want 1", len(result[1].Services))
+	}
+}
+
+func TestCollectMultiProject_SkipsFailedProject(t *testing.T) {
+	mocks := map[string]*mockComposer{
+		"/good": {
+			services: []string{"web"},
+			status:   map[string]runner.ServiceStatus{"web": {Running: true}},
+		},
+		"/bad": {
+			err: fmt.Errorf("compose file not found"),
+		},
+	}
+
+	projects := []compose.Project{
+		{Name: "good", ConfigDir: "/good"},
+		{Name: "bad", ConfigDir: "/bad"},
+	}
+
+	factory := func(dir string) runner.Composer { return mocks[dir] }
+	result := collectMultiProject(context.Background(), projects, factory)
+
+	if len(result) != 1 {
+		t.Fatalf("got %d projects, want 1 (bad should be skipped)", len(result))
+	}
+	if result[0].Name != "good" {
+		t.Errorf("result[0].Name = %q, want %q", result[0].Name, "good")
+	}
+}
+
+func TestCollectMultiProject_EmptyProjects(t *testing.T) {
+	result := collectMultiProject(context.Background(), nil, nil)
+	if len(result) != 0 {
+		t.Fatalf("got %d projects, want 0", len(result))
+	}
+}
+
+func TestFlattenProjectServices(t *testing.T) {
+	projects := []projectServices{
+		{
+			Name: "app1",
+			Services: []serviceStatus{
+				{Name: "web", Running: true},
+				{Name: "db", Running: true},
+			},
+		},
+		{
+			Name: "app2",
+			Services: []serviceStatus{
+				{Name: "api", Running: false},
+			},
+		},
+	}
+
+	flat := flattenProjectServices(projects)
+
+	if len(flat) != 3 {
+		t.Fatalf("got %d items, want 3", len(flat))
+	}
+
+	for _, item := range flat[:2] {
+		if item.Project != "app1" {
+			t.Errorf("item %q project = %q, want %q", item.Name, item.Project, "app1")
+		}
+	}
+	if flat[2].Project != "app2" {
+		t.Errorf("item %q project = %q, want %q", flat[2].Name, flat[2].Project, "app2")
+	}
+}
+
+func TestFlattenProjectServices_Empty(t *testing.T) {
+	flat := flattenProjectServices(nil)
+	if len(flat) != 0 {
+		t.Fatalf("got %d items, want 0", len(flat))
 	}
 }
 
