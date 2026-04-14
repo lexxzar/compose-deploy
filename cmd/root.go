@@ -48,14 +48,8 @@ Remote server configuration (~/.cdeploy/servers.yml):
 				}
 			}
 
-			factory := func(d string) runner.Composer { return compose.New(d) }
-
-			var c runner.Composer
-			if compose.HasComposeFile(dir) {
-				c = compose.New(dir)
-			}
-
-			// Load server config
+			// Load server config first — this determines whether we must
+			// have a working local Docker installation.
 			cfg, err := config.Load(config.DefaultPath())
 			if err != nil {
 				return err
@@ -63,6 +57,47 @@ Remote server configuration (~/.cdeploy/servers.yml):
 			if len(cfg.Servers) > 0 {
 				if err := cfg.Validate(); err != nil {
 					return err
+				}
+			}
+
+			// localDetector is lazily initialized on first Detect() call.
+			// It avoids failing TUI startup when Docker is not installed locally
+			// (the user may only target remote servers).
+			localDetector := compose.New(dir)
+			var localDetected bool
+
+			detectLocal := func(ctx context.Context) error {
+				if localDetected {
+					return nil
+				}
+				if err := localDetector.Detect(ctx); err != nil {
+					return err
+				}
+				localDetected = true
+				return nil
+			}
+
+			factory := func(d string) runner.Composer {
+				lc := compose.New(d)
+				if localDetected {
+					lc.SetStandalone(localDetector.Standalone)
+				}
+				return lc
+			}
+
+			// When the cwd has a compose file, try to detect the local
+			// Docker variant so the TUI can skip the project picker.
+			// If servers are configured, detection failure is non-fatal —
+			// the user may only target remote servers.
+			var c runner.Composer
+			if compose.HasComposeFile(dir) {
+				if err := detectLocal(cmd.Context()); err != nil {
+					if len(cfg.Servers) == 0 {
+						return err
+					}
+					// Servers available — local Docker not required.
+				} else {
+					c = localDetector
 				}
 			}
 
@@ -77,13 +112,26 @@ Remote server configuration (~/.cdeploy/servers.yml):
 					rc := compose.NewRemote(server.Host, projDir)
 					connectCmd := rc.ConnectCmd(cmd.Context())
 					remoteFactory := func(d string) runner.Composer {
-						return compose.NewRemote(server.Host, d)
+						newRC := compose.NewRemote(server.Host, d)
+						newRC.SetStandalone(rc.Standalone)
+						return newRC
 					}
 					loader := func(ctx context.Context) ([]compose.Project, error) {
+						if err := rc.Detect(ctx); err != nil {
+							return nil, err
+						}
 						return rc.ListProjects(ctx)
 					}
 					return connectCmd, remoteFactory, loader, rc.Close
 				}
+			}
+
+			// Local project loader — lazily detects standalone mode
+			localLoader := func(ctx context.Context) ([]compose.Project, error) {
+				if err := detectLocal(ctx); err != nil {
+					return nil, err
+				}
+				return localDetector.ListProjects(ctx)
 			}
 
 			logger, err := logging.NewLogger(logDir)
@@ -92,7 +140,7 @@ Remote server configuration (~/.cdeploy/servers.yml):
 			}
 			defer logger.Close()
 
-			var tuiOpts []tui.Option
+			tuiOpts := []tui.Option{tui.WithLocalProjectLoader(localLoader)}
 			if serverName != "" && len(cfg.Servers) == 0 {
 				return fmt.Errorf("--server %q specified but no servers configured in %s", serverName, config.DefaultPath())
 			}

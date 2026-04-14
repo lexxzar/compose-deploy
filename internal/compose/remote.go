@@ -19,6 +19,9 @@ type RemoteCompose struct {
 	Host       string
 	ProjectDir string
 	SocketPath string
+	Standalone bool // use standalone docker-compose binary on the remote host
+
+	detected bool // true after Detect() or SetStandalone() has been called
 
 	// testing hooks; nil = use real exec
 	runCmd    func(*exec.Cmd) error
@@ -41,6 +44,62 @@ func NewRemote(host, projectDir string) *RemoteCompose {
 func (r *RemoteCompose) SetTestHooks(run func(*exec.Cmd) error, output func(*exec.Cmd) ([]byte, error)) {
 	r.runCmd = run
 	r.outputCmd = output
+}
+
+// Detect probes for the docker compose variant available on the remote host.
+// It builds its own SSH probe command directly (not via remoteCommand()) to
+// avoid unnecessary CURRENT_UID and cd prefix. Tries "docker compose version"
+// first, then "docker-compose version". No-ops if already detected.
+func (r *RemoteCompose) Detect(ctx context.Context) error {
+	if r.detected {
+		return nil
+	}
+
+	// Try plugin mode: docker compose version
+	pluginCmd := exec.CommandContext(ctx, "ssh",
+		"-S", r.SocketPath,
+		"-o", "ControlMaster=no",
+		r.Host,
+		"docker compose version",
+	)
+	var pluginErr error
+	if r.outputCmd != nil {
+		_, pluginErr = r.outputCmd(pluginCmd)
+	} else {
+		_, pluginErr = pluginCmd.Output()
+	}
+	if pluginErr == nil {
+		r.Standalone = false
+		r.detected = true
+		return nil
+	}
+
+	// Try standalone mode: docker-compose version
+	standaloneCmd := exec.CommandContext(ctx, "ssh",
+		"-S", r.SocketPath,
+		"-o", "ControlMaster=no",
+		r.Host,
+		"docker-compose version",
+	)
+	var standaloneErr error
+	if r.outputCmd != nil {
+		_, standaloneErr = r.outputCmd(standaloneCmd)
+	} else {
+		_, standaloneErr = standaloneCmd.Output()
+	}
+	if standaloneErr == nil {
+		r.Standalone = true
+		r.detected = true
+		return nil
+	}
+
+	return fmt.Errorf("neither 'docker compose' nor 'docker-compose' found on host")
+}
+
+// SetStandalone sets the Standalone flag and marks detection as complete.
+func (r *RemoteCompose) SetStandalone(standalone bool) {
+	r.Standalone = standalone
+	r.detected = true
 }
 
 // shellEscape wraps an argument in single quotes for safe SSH transport.
@@ -95,8 +154,13 @@ func (r *RemoteCompose) remoteCommand(ctx context.Context, args ...string) *exec
 		escaped = append(escaped, shellEscape(a))
 	}
 
-	remoteCmd := fmt.Sprintf("CURRENT_UID=$(id -u):$(id -g) docker compose %s",
-		strings.Join(escaped, " "))
+	composeBin := "docker compose"
+	if r.Standalone {
+		composeBin = "docker-compose"
+	}
+
+	remoteCmd := fmt.Sprintf("CURRENT_UID=$(id -u):$(id -g) %s %s",
+		composeBin, strings.Join(escaped, " "))
 
 	if r.ProjectDir != "" {
 		remoteCmd = fmt.Sprintf("cd %s && %s", shellEscape(r.ProjectDir), remoteCmd)

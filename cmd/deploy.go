@@ -20,7 +20,7 @@ var (
 	styleFailed  = lipgloss.NewStyle().Foreground(lipgloss.Color("1")).Bold(true)
 	styleWarning = lipgloss.NewStyle().Foreground(lipgloss.Color("3")).Bold(true)
 
-	opNewLocal  = func(dir string) runner.Composer { return compose.New(dir) }
+	opNewLocal  = compose.New
 	opNewRemote = compose.NewRemote
 	opNewLogger = logging.NewLogger
 )
@@ -152,9 +152,16 @@ func runOperation(ctx context.Context, op runner.Operation, all bool, containers
 			return fmt.Errorf("connecting to %s: %w", serverName, err)
 		}
 		defer rc.Close()
+		if err := rc.Detect(ctx); err != nil {
+			return err
+		}
 		c = rc
 	} else {
-		c = opNewLocal(dir)
+		lc := opNewLocal(dir)
+		if err := lc.Detect(ctx); err != nil {
+			return err
+		}
+		c = lc
 	}
 
 	logger, err := opNewLogger(logDir)

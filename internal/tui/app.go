@@ -126,8 +126,9 @@ type Model struct {
 	hasPreselection   bool // true when --server was specified
 
 	// Local state (preserved across server selection changes)
-	localComposer runner.Composer
-	localFactory  ComposerFactory
+	localComposer       runner.Composer
+	localFactory        ComposerFactory
+	localProjectLoader  ProjectLoader
 
 	// Screen: project select
 	projects        []compose.Project
@@ -232,6 +233,16 @@ func WithPreselectedServer(idx int) Option {
 	return func(m *Model) {
 		m.preselectedServer = idx
 		m.hasPreselection = true
+	}
+}
+
+// WithLocalProjectLoader sets the project loader used for local project discovery.
+// This replaces the default compose.ListProjects fallback with a loader that
+// respects standalone docker-compose detection.
+func WithLocalProjectLoader(loader ProjectLoader) Option {
+	return func(m *Model) {
+		m.localProjectLoader = loader
+		m.projectLoader = loader
 	}
 }
 
@@ -364,7 +375,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if msg.err != nil {
 			m.serverErr = msg.err
 			m.composerFactory = m.localFactory
-			m.projectLoader = nil
+			m.projectLoader = m.localProjectLoader
 			m.disconnectFunc = nil
 			return m, nil
 		}
@@ -434,7 +445,7 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			case entryLocal:
 				m.serverName = ""
 				m.composerFactory = m.localFactory
-				m.projectLoader = nil
+				m.projectLoader = m.localProjectLoader
 				m.disconnectFunc = nil
 				if m.localComposer != nil {
 					m.composer = m.localComposer
@@ -471,8 +482,8 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 				m.screen = screenSelectServer
 				m.serverName = ""
 				m.disconnectFunc = nil
-				m.projectLoader = nil
-				m.composerFactory = nil
+				m.projectLoader = m.localProjectLoader
+				m.composerFactory = m.localFactory
 				m.composer = nil
 				m.projName = ""
 				m.projects = nil
@@ -826,13 +837,10 @@ func (m Model) loadProjects() tea.Cmd {
 	loader := m.projectLoader
 	ctx := m.ctx
 	return func() tea.Msg {
-		var projects []compose.Project
-		var err error
-		if loader != nil {
-			projects, err = loader(ctx)
-		} else {
-			projects, err = compose.ListProjects(ctx)
+		if loader == nil {
+			return projectsMsg{err: fmt.Errorf("no project loader configured")}
 		}
+		projects, err := loader(ctx)
 		return projectsMsg{projects: projects, err: err}
 	}
 }

@@ -57,13 +57,13 @@
 - Modify: `internal/compose/compose.go`
 - Modify: `internal/compose/compose_test.go`
 
-- [ ] Add `Standalone bool` and `detected bool` fields to `Compose` struct
-- [ ] Add `Detect(ctx context.Context) error` method: try `docker compose version` via `outputCmd` hook (or `exec.CommandContext` if nil), if fails try `docker-compose version`, set `Standalone` accordingly, skip if `detected` is true, return error `"neither 'docker compose' nor 'docker-compose' found"` if both fail
-- [ ] Add `SetStandalone(standalone bool)` method that sets `Standalone` and `detected = true`
-- [ ] Modify `command()` to branch: `exec.Command("docker-compose", args...)` when `Standalone`, else `exec.Command("docker", "compose", args...)` as before
-- [ ] Write tests for `Detect()`: plugin found, standalone found, neither found (using `outputCmd` hook)
-- [ ] Write tests for `command()`: verify `Cmd.Args` with `Standalone = false` and `Standalone = true`
-- [ ] Run tests: `go test ./internal/compose/ -v` — must pass before task 2
+- [x] Add `Standalone bool` and `detected bool` fields to `Compose` struct
+- [x] Add `Detect(ctx context.Context) error` method: try `docker compose version` via `outputCmd` hook (or `exec.CommandContext` if nil), if fails try `docker-compose version`, set `Standalone` accordingly, skip if `detected` is true, return error `"neither 'docker compose' nor 'docker-compose' found"` if both fail
+- [x] Add `SetStandalone(standalone bool)` method that sets `Standalone` and `detected = true`
+- [x] Modify `command()` to branch: `exec.Command("docker-compose", args...)` when `Standalone`, else `exec.Command("docker", "compose", args...)` as before
+- [x] Write tests for `Detect()`: plugin found, standalone found, neither found (using `outputCmd` hook)
+- [x] Write tests for `command()`: verify `Cmd.Args` with `Standalone = false` and `Standalone = true`
+- [x] Run tests: `go test ./internal/compose/ -v` — must pass before task 2
 
 ### Task 2: Add Standalone field and Detect method to RemoteCompose
 
@@ -71,13 +71,13 @@
 - Modify: `internal/compose/remote.go`
 - Modify: `internal/compose/remote_test.go`
 
-- [ ] Add `Standalone bool` and `detected bool` fields to `RemoteCompose` struct
-- [ ] Add `Detect(ctx context.Context) error` method: builds its own SSH command directly (not via `remoteCommand()`) to probe `docker compose version` then `docker-compose version` on the remote host, set `Standalone`, skip if `detected`, return clear error if both fail
-- [ ] Add `SetStandalone(standalone bool)` method that sets both fields
-- [ ] Modify `remoteCommand()` to use `"docker-compose %s"` when `Standalone`, else `"docker compose %s"` as before
-- [ ] Write tests for `Detect()` using `outputCmd` hook: plugin found, standalone found, neither found
-- [ ] Write tests for `remoteCommand()`: verify SSH command string with both standalone modes
-- [ ] Run tests: `go test ./internal/compose/ -v` — must pass before task 3
+- [x] Add `Standalone bool` and `detected bool` fields to `RemoteCompose` struct
+- [x] Add `Detect(ctx context.Context) error` method: builds its own SSH command directly (not via `remoteCommand()`) to probe `docker compose version` then `docker-compose version` on the remote host, set `Standalone`, skip if `detected`, return clear error if both fail
+- [x] Add `SetStandalone(standalone bool)` method that sets both fields
+- [x] Modify `remoteCommand()` to use `"docker-compose %s"` when `Standalone`, else `"docker compose %s"` as before
+- [x] Write tests for `Detect()` using `outputCmd` hook: plugin found, standalone found, neither found
+- [x] Write tests for `remoteCommand()`: verify SSH command string with both standalone modes
+- [x] Run tests: `go test ./internal/compose/ -v` — must pass before task 3
 
 ### Task 3: Move package-level ListProjects to method on Compose
 
@@ -86,11 +86,11 @@
 - Modify: `internal/compose/compose_test.go`
 - Modify: `cmd/list.go`
 
-- [ ] Add `ListProjects(ctx context.Context) ([]Project, error)` method on `Compose` that reads `c.Standalone` internally to build the correct command (`docker compose ls` vs `docker-compose ls`)
-- [ ] Keep the package-level `ListProjects` function as a thin wrapper (calls `Compose{}.ListProjects(ctx)`) for backward compat, or remove it and update callers directly
-- [ ] Update `cmd/list.go`: change `listLocalProjects` var to use a `Compose` instance with detection, so `ListProjects` reads `Standalone` from the instance
-- [ ] Write tests for `Compose.ListProjects()` with both standalone modes (verify command construction)
-- [ ] Run tests: `go test ./...` — must pass before task 4
+- [x] Add `ListProjects(ctx context.Context) ([]Project, error)` method on `Compose` that reads `c.Standalone` internally to build the correct command (`docker compose ls` vs `docker-compose ls`)
+- [x] Keep the package-level `ListProjects` function as a thin wrapper (calls `Compose{}.ListProjects(ctx)`) for backward compat, or remove it and update callers directly
+- [x] Update `cmd/list.go`: change `listLocalProjects` var to use a `Compose` instance with detection, so `ListProjects` reads `Standalone` from the instance
+- [x] Write tests for `Compose.ListProjects()` with both standalone modes (verify command construction)
+- [x] Run tests: `go test ./...` — must pass before task 4
 
 ### Task 4: Wire detection into CLI subcommands (deploy, list, logs)
 
@@ -102,39 +102,39 @@
 - Modify: `cmd/list_test.go`
 - Modify: `cmd/logs_test.go`
 
-- [ ] `cmd/deploy.go`: add `rc.Detect(ctx)` after `rc.Connect(ctx)` for remote path; add `c.Detect(ctx)` for local path (where `c` is created via `opNewLocal`)
-- [ ] `cmd/list.go` remote path: add `rc.Detect(ctx)` after `rc.Connect(ctx)`; update multi-project remote factory to `rc2 := newRemote(server.Host, d); rc2.SetStandalone(rc.Standalone); return rc2`
-- [ ] `cmd/list.go` local path: create `Compose` instance, call `Detect(ctx)`, use it for both single-project and multi-project (via `ListProjects` method); update factory to inherit standalone: `lc := newLocalComposer(d); lc.SetStandalone(c.Standalone); return lc`
-- [ ] `cmd/logs.go`: add `rc.Detect(ctx)` after `rc.Connect(ctx)` for remote path; add detection for local path
-- [ ] Update `cmd/deploy_test.go`: call `SetStandalone(false)` on test `RemoteCompose` instances (defensive, documents intent — not strictly required since default is false)
-- [ ] Update `cmd/list_test.go`: same pattern
-- [ ] Update `cmd/logs_test.go`: same pattern
-- [ ] Run tests: `go test ./cmd/ -v` — must pass before task 5
+- [x] `cmd/deploy.go`: add `rc.Detect(ctx)` after `rc.Connect(ctx)` for remote path; add `c.Detect(ctx)` for local path (where `c` is created via `opNewLocal`)
+- [x] `cmd/list.go` remote path: add `rc.Detect(ctx)` after `rc.Connect(ctx)`; update multi-project remote factory to `rc2 := newRemote(server.Host, d); rc2.SetStandalone(rc.Standalone); return rc2`
+- [x] `cmd/list.go` local path: create `Compose` instance, call `Detect(ctx)`, use it for both single-project and multi-project (via `ListProjects` method); update factory to inherit standalone: `lc := newLocalComposer(d); lc.SetStandalone(c.Standalone); return lc`
+- [x] `cmd/logs.go`: add `rc.Detect(ctx)` after `rc.Connect(ctx)` for remote path; add detection for local path
+- [x] Update `cmd/deploy_test.go`: updated test hooks to handle Detect probe
+- [x] Update `cmd/list_test.go`: same pattern
+- [x] Update `cmd/logs_test.go`: same pattern
+- [x] Run tests: `go test ./cmd/ -v` — must pass before task 5
 
 ### Task 5: Wire detection into TUI (root.go connectCb and local flow)
 
 **Files:**
 - Modify: `cmd/root.go`
 
-- [ ] Local flow: add nil guard (`if c != nil`), call `c.Detect(cmd.Context())` before `tui.Run()`; update `factory` closure to `lc := compose.New(d); lc.SetStandalone(c.Standalone); return lc`
-- [ ] Remote flow (`connectCb`): update `loader` closure to call `rc.Detect(ctx)` before `rc.ListProjects(ctx)` — this runs after SSH is established via `tea.ExecProcess` since the loader is only called on `connectResultMsg` success; update `remoteFactory` to `newRC := compose.NewRemote(server.Host, d); newRC.SetStandalone(rc.Standalone); return newRC`
-- [ ] Run tests: `go test ./cmd/ -v` and `go test ./internal/tui/ -v` — must pass before task 6
+- [x] Local flow: add nil guard (`if c != nil`), call `c.Detect(cmd.Context())` before `tui.Run()`; update `factory` closure to `lc := compose.New(d); lc.SetStandalone(c.Standalone); return lc`
+- [x] Remote flow (`connectCb`): update `loader` closure to call `rc.Detect(ctx)` before `rc.ListProjects(ctx)` — this runs after SSH is established via `tea.ExecProcess` since the loader is only called on `connectResultMsg` success; update `remoteFactory` to `newRC := compose.NewRemote(server.Host, d); newRC.SetStandalone(rc.Standalone); return newRC`
+- [x] Run tests: `go test ./cmd/ -v` and `go test ./internal/tui/ -v` — must pass before task 6
 
 ### Task 6: Verify acceptance criteria
 
 No new test code; this task verifies end-to-end behavior with the full existing test suite.
 
-- [ ] Verify: `docker compose` plugin mode works (default behavior unchanged)
-- [ ] Verify: `docker-compose` standalone mode works when plugin is unavailable
-- [ ] Verify: clear error message when neither variant is found
-- [ ] Verify: detection is cached (only one probe per session)
-- [ ] Run full test suite: `go test ./... -count=1`
-- [ ] Build binary: `go build -o cdeploy .`
+- [x] Verify: `docker compose` plugin mode works (default behavior unchanged)
+- [x] Verify: `docker-compose` standalone mode works when plugin is unavailable
+- [x] Verify: clear error message when neither variant is found
+- [x] Verify: detection is cached (only one probe per session)
+- [x] Run full test suite: `go test ./... -count=1`
+- [x] Build binary: `go build -o cdeploy .`
 
 ### Task 7: [Final] Update documentation
 
-- [ ] Update CLAUDE.md Docker Compose section to mention standalone `docker-compose` support and auto-detection
-- [ ] Move this plan to `docs/plans/completed/`
+- [x] Update CLAUDE.md Docker Compose section to mention standalone `docker-compose` support and auto-detection
+- [x] Move this plan to `docs/plans/completed/`
 
 ## Post-Completion
 

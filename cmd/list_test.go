@@ -758,14 +758,25 @@ func TestRunList_LocalSingleProject(t *testing.T) {
 	})
 
 	hasLocalCompose = func(dir string) bool { return true }
-	newLocalComposer = func(dir string) runner.Composer {
-		return &mockComposer{
-			services: []string{"web", "db"},
-			status: map[string]runner.ServiceStatus{
-				"web": {Running: true},
-				"db":  {Running: true},
+	newLocalComposer = func(dir string) *compose.Compose {
+		c := compose.New(dir)
+		c.SetTestHooks(
+			nil,
+			func(cmd *exec.Cmd) ([]byte, error) {
+				args := strings.Join(cmd.Args, " ")
+				if strings.Contains(args, "version") {
+					return []byte("Docker Compose version v2.24.0\n"), nil
+				}
+				if strings.Contains(args, "config") && strings.Contains(args, "--services") {
+					return []byte("web\ndb\n"), nil
+				}
+				if strings.Contains(args, "ps") {
+					return []byte(`[{"Service":"web","State":"running"},{"Service":"db","State":"running"}]`), nil
+				}
+				return nil, nil
 			},
-		}
+		)
+		return c
 	}
 	projectDir = ""
 
@@ -784,33 +795,49 @@ func TestRunList_LocalSingleProject(t *testing.T) {
 func TestRunList_LocalMultiProject(t *testing.T) {
 	oldHas := hasLocalCompose
 	oldNew := newLocalComposer
-	oldList := listLocalProjects
 	oldProj := projectDir
 	t.Cleanup(func() {
 		hasLocalCompose = oldHas
 		newLocalComposer = oldNew
-		listLocalProjects = oldList
 		projectDir = oldProj
 	})
 
 	hasLocalCompose = func(dir string) bool { return false }
-	listLocalProjects = func(ctx context.Context) ([]compose.Project, error) {
-		return []compose.Project{
-			{Name: "app1", ConfigDir: "/app1"},
-			{Name: "app2", ConfigDir: "/app2"},
-		}, nil
+
+	// Mock responses differ based on dir in the outputCmd
+	newLocalComposer = func(dir string) *compose.Compose {
+		c := compose.New(dir)
+		c.SetTestHooks(
+			nil,
+			func(cmd *exec.Cmd) ([]byte, error) {
+				args := strings.Join(cmd.Args, " ")
+				if strings.Contains(args, "version") {
+					return []byte("Docker Compose version v2.24.0\n"), nil
+				}
+				if strings.Contains(args, "ls") && strings.Contains(args, "--format") {
+					return []byte(`[{"Name":"app1","Status":"running(1)","ConfigFiles":"/app1/compose.yml"},{"Name":"app2","Status":"running(1)","ConfigFiles":"/app2/compose.yml"}]`), nil
+				}
+				if strings.Contains(args, "config") && strings.Contains(args, "--services") {
+					switch dir {
+					case "/app1":
+						return []byte("web\n"), nil
+					case "/app2":
+						return []byte("api\n"), nil
+					}
+				}
+				if strings.Contains(args, "ps") {
+					switch dir {
+					case "/app1":
+						return []byte(`[{"Service":"web","State":"running"}]`), nil
+					case "/app2":
+						return []byte(`[{"Service":"api","State":"exited"}]`), nil
+					}
+				}
+				return nil, nil
+			},
+		)
+		return c
 	}
-	mocks := map[string]*mockComposer{
-		"/app1": {
-			services: []string{"web"},
-			status:   map[string]runner.ServiceStatus{"web": {Running: true}},
-		},
-		"/app2": {
-			services: []string{"api"},
-			status:   map[string]runner.ServiceStatus{"api": {Running: false}},
-		},
-	}
-	newLocalComposer = func(dir string) runner.Composer { return mocks[dir] }
 	projectDir = ""
 
 	out := captureStdout(t, func() {
@@ -828,26 +855,36 @@ func TestRunList_LocalMultiProject(t *testing.T) {
 func TestRunList_LocalMultiProject_JSON(t *testing.T) {
 	oldHas := hasLocalCompose
 	oldNew := newLocalComposer
-	oldList := listLocalProjects
 	oldProj := projectDir
 	t.Cleanup(func() {
 		hasLocalCompose = oldHas
 		newLocalComposer = oldNew
-		listLocalProjects = oldList
 		projectDir = oldProj
 	})
 
 	hasLocalCompose = func(dir string) bool { return false }
-	listLocalProjects = func(ctx context.Context) ([]compose.Project, error) {
-		return []compose.Project{
-			{Name: "app1", ConfigDir: "/app1"},
-		}, nil
-	}
-	newLocalComposer = func(dir string) runner.Composer {
-		return &mockComposer{
-			services: []string{"web"},
-			status:   map[string]runner.ServiceStatus{"web": {Running: true}},
-		}
+	newLocalComposer = func(dir string) *compose.Compose {
+		c := compose.New(dir)
+		c.SetTestHooks(
+			nil,
+			func(cmd *exec.Cmd) ([]byte, error) {
+				args := strings.Join(cmd.Args, " ")
+				if strings.Contains(args, "version") {
+					return []byte("Docker Compose version v2.24.0\n"), nil
+				}
+				if strings.Contains(args, "ls") && strings.Contains(args, "--format") {
+					return []byte(`[{"Name":"app1","Status":"running(1)","ConfigFiles":"/app1/compose.yml"}]`), nil
+				}
+				if strings.Contains(args, "config") && strings.Contains(args, "--services") {
+					return []byte("web\n"), nil
+				}
+				if strings.Contains(args, "ps") {
+					return []byte(`[{"Service":"web","State":"running"}]`), nil
+				}
+				return nil, nil
+			},
+		)
+		return c
 	}
 	projectDir = ""
 
@@ -869,17 +906,28 @@ func TestRunList_LocalMultiProject_JSON(t *testing.T) {
 
 func TestRunList_LocalListProjectsError(t *testing.T) {
 	oldHas := hasLocalCompose
-	oldList := listLocalProjects
+	oldNew := newLocalComposer
 	oldProj := projectDir
 	t.Cleanup(func() {
 		hasLocalCompose = oldHas
-		listLocalProjects = oldList
+		newLocalComposer = oldNew
 		projectDir = oldProj
 	})
 
 	hasLocalCompose = func(dir string) bool { return false }
-	listLocalProjects = func(ctx context.Context) ([]compose.Project, error) {
-		return nil, fmt.Errorf("docker not running")
+	newLocalComposer = func(dir string) *compose.Compose {
+		c := compose.New(dir)
+		c.SetTestHooks(
+			nil,
+			func(cmd *exec.Cmd) ([]byte, error) {
+				args := strings.Join(cmd.Args, " ")
+				if strings.Contains(args, "version") {
+					return []byte("Docker Compose version v2.24.0\n"), nil
+				}
+				return nil, fmt.Errorf("docker not running")
+			},
+		)
+		return c
 	}
 	projectDir = ""
 
@@ -894,17 +942,28 @@ func TestRunList_LocalListProjectsError(t *testing.T) {
 
 func TestRunList_LocalNoProjects(t *testing.T) {
 	oldHas := hasLocalCompose
-	oldList := listLocalProjects
+	oldNew := newLocalComposer
 	oldProj := projectDir
 	t.Cleanup(func() {
 		hasLocalCompose = oldHas
-		listLocalProjects = oldList
+		newLocalComposer = oldNew
 		projectDir = oldProj
 	})
 
 	hasLocalCompose = func(dir string) bool { return false }
-	listLocalProjects = func(ctx context.Context) ([]compose.Project, error) {
-		return nil, nil
+	newLocalComposer = func(dir string) *compose.Compose {
+		c := compose.New(dir)
+		c.SetTestHooks(
+			nil,
+			func(cmd *exec.Cmd) ([]byte, error) {
+				args := strings.Join(cmd.Args, " ")
+				if strings.Contains(args, "version") {
+					return []byte("Docker Compose version v2.24.0\n"), nil
+				}
+				return []byte(`[]`), nil
+			},
+		)
+		return c
 	}
 	projectDir = ""
 
@@ -944,13 +1003,17 @@ func TestRunList_ServerSingleProject(t *testing.T) {
 	serverName = "test-srv"
 	projectDir = "/explicit/project"
 
-	// Create a RemoteCompose with hooks so Connect/Close succeed and ListServices/ContainerStatus work
+	// Create a RemoteCompose with hooks so Connect/Close/Detect succeed and ListServices/ContainerStatus work
 	newRemote = func(host, projDir string) *compose.RemoteCompose {
 		rc := oldNewRemote(host, projDir)
 		rc.SetTestHooks(
 			func(cmd *exec.Cmd) error { return nil }, // runCmd
 			func(cmd *exec.Cmd) ([]byte, error) { // outputCmd
-				// Remote commands are shell-escaped, so match on quoted args
+				// Handle Detect probe and remote commands
+				remoteCmd := cmd.Args[len(cmd.Args)-1]
+				if strings.Contains(remoteCmd, "version") {
+					return []byte("Docker Compose version v2.24.0\n"), nil
+				}
 				args := strings.Join(cmd.Args, " ")
 				if strings.Contains(args, "'config'") && strings.Contains(args, "'--services'") {
 					return []byte("web\ndb\n"), nil
@@ -1008,6 +1071,10 @@ func TestRunList_ServerMultiProject(t *testing.T) {
 		rc.SetTestHooks(
 			func(cmd *exec.Cmd) error { return nil },
 			func(cmd *exec.Cmd) ([]byte, error) {
+				remoteCmd := cmd.Args[len(cmd.Args)-1]
+				if strings.Contains(remoteCmd, "version") {
+					return []byte("Docker Compose version v2.24.0\n"), nil
+				}
 				args := strings.Join(cmd.Args, " ")
 				if strings.Contains(args, "'ls'") && strings.Contains(args, "'-a'") {
 					return []byte(`[{"Name":"app1","Status":"running(1)","ConfigFiles":"/srv/app1/compose.yml"}]`), nil

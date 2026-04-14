@@ -2,6 +2,7 @@ package cmd
 
 import (
 	"context"
+	"fmt"
 	"io"
 	"os"
 	"os/exec"
@@ -9,7 +10,6 @@ import (
 	"testing"
 
 	"github.com/lexxzar/compose-deploy/internal/compose"
-	"github.com/lexxzar/compose-deploy/internal/runner"
 )
 
 func TestRunLogs_NoComposeFile(t *testing.T) {
@@ -51,6 +51,39 @@ func (m *mockLogsComposer) Logs(_ context.Context, service string, follow bool, 
 	return m.logErr
 }
 
+// newTestLogsCompose creates a *compose.Compose with test hooks that delegate to a mockLogsComposer.
+func newTestLogsCompose(dir string, mock *mockLogsComposer) *compose.Compose {
+	c := compose.New(dir)
+	c.SetTestHooks(
+		func(cmd *exec.Cmd) error {
+			args := strings.Join(cmd.Args, " ")
+			if strings.Contains(args, "logs") {
+				// Extract follow, tail, and service from args
+				mock.logFollow = strings.Contains(args, "--follow")
+				// Parse tail value
+				for i, a := range cmd.Args {
+					if a == "--tail" && i+1 < len(cmd.Args) {
+						fmt.Sscanf(cmd.Args[i+1], "%d", &mock.logTail)
+					}
+				}
+				// Service is the last arg (after compose args)
+				mock.logService = cmd.Args[len(cmd.Args)-1]
+				return mock.logErr
+			}
+			return nil
+		},
+		func(cmd *exec.Cmd) ([]byte, error) {
+			// Handle Detect probe
+			args := strings.Join(cmd.Args, " ")
+			if strings.Contains(args, "version") {
+				return []byte("Docker Compose version v2.24.0\n"), nil
+			}
+			return nil, nil
+		},
+	)
+	return c
+}
+
 func TestRunLogs_LocalSuccess(t *testing.T) {
 	oldHas := logsHasCompose
 	oldNew := logsNewLocal
@@ -65,7 +98,7 @@ func TestRunLogs_LocalSuccess(t *testing.T) {
 
 	mock := &mockLogsComposer{}
 	logsHasCompose = func(dir string) bool { return true }
-	logsNewLocal = func(dir string) runner.Composer { return mock }
+	logsNewLocal = func(dir string) *compose.Compose { return newTestLogsCompose(dir, mock) }
 	projectDir = ""
 	serverName = ""
 
@@ -98,7 +131,7 @@ func TestRunLogs_LocalNoFollow(t *testing.T) {
 
 	mock := &mockLogsComposer{}
 	logsHasCompose = func(dir string) bool { return true }
-	logsNewLocal = func(dir string) runner.Composer { return mock }
+	logsNewLocal = func(dir string) *compose.Compose { return newTestLogsCompose(dir, mock) }
 	projectDir = ""
 	serverName = ""
 
@@ -125,7 +158,7 @@ func TestRunLogs_LogsError(t *testing.T) {
 
 	mock := &mockLogsComposer{logErr: context.Canceled}
 	logsHasCompose = func(dir string) bool { return true }
-	logsNewLocal = func(dir string) runner.Composer { return mock }
+	logsNewLocal = func(dir string) *compose.Compose { return newTestLogsCompose(dir, mock) }
 	projectDir = ""
 	serverName = ""
 
@@ -229,7 +262,13 @@ func TestRunLogs_ServerSuccess(t *testing.T) {
 				}
 				return nil
 			},
-			nil,
+			func(cmd *exec.Cmd) ([]byte, error) {
+				remoteCmd := cmd.Args[len(cmd.Args)-1]
+				if strings.Contains(remoteCmd, "version") {
+					return []byte("Docker Compose version v2.24.0\n"), nil
+				}
+				return nil, nil
+			},
 		)
 		return rc
 	}
@@ -258,9 +297,9 @@ func TestRunLogs_WithProjectDir(t *testing.T) {
 	var capturedDir string
 	mock := &mockLogsComposer{}
 	logsHasCompose = func(dir string) bool { return true }
-	logsNewLocal = func(dir string) runner.Composer {
+	logsNewLocal = func(dir string) *compose.Compose {
 		capturedDir = dir
-		return mock
+		return newTestLogsCompose(dir, mock)
 	}
 	projectDir = "/custom/path"
 	serverName = ""

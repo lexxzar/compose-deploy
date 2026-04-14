@@ -15,10 +15,9 @@ import (
 )
 
 var (
-	newRemote         = compose.NewRemote
-	newLocalComposer  = func(dir string) runner.Composer { return compose.New(dir) }
-	hasLocalCompose   = compose.HasComposeFile
-	listLocalProjects = compose.ListProjects
+	newRemote        = compose.NewRemote
+	newLocalComposer = func(dir string) *compose.Compose { return compose.New(dir) }
+	hasLocalCompose  = compose.HasComposeFile
 )
 
 type serviceStatus struct {
@@ -312,6 +311,9 @@ func runList(ctx context.Context, jsonOutput bool) error {
 			return fmt.Errorf("connecting to %s: %w", serverName, err)
 		}
 		defer rc.Close()
+		if err := rc.Detect(ctx); err != nil {
+			return err
+		}
 
 		// Single-project mode: -C explicitly specified
 		if projDir != "" {
@@ -329,15 +331,22 @@ func runList(ctx context.Context, jsonOutput bool) error {
 		}
 
 		factory := func(d string) runner.Composer {
-			return newRemote(server.Host, d)
+			rc2 := newRemote(server.Host, d)
+			rc2.SetStandalone(rc.Standalone)
+			return rc2
 		}
 		grouped := collectMultiProject(ctx, projects, factory)
 		return printMultiProject(grouped, jsonOutput)
 	}
 
 	// Local mode: single-project if -C given or compose file in CWD
+	c := newLocalComposer(dir)
+
 	if hasLocalCompose(dir) {
-		return listSingleProject(ctx, newLocalComposer(dir), jsonOutput)
+		if err := c.Detect(ctx); err != nil {
+			return err
+		}
+		return listSingleProject(ctx, c, jsonOutput)
 	}
 
 	// Explicit -C but no compose file → error, don't fall through to discovery
@@ -346,7 +355,10 @@ func runList(ctx context.Context, jsonOutput bool) error {
 	}
 
 	// Local multi-project: discover all projects on the system
-	projects, err := listLocalProjects(ctx)
+	if err := c.Detect(ctx); err != nil {
+		return err
+	}
+	projects, err := c.ListProjects(ctx)
 	if err != nil {
 		return fmt.Errorf("listing projects: %w", err)
 	}
@@ -354,7 +366,11 @@ func runList(ctx context.Context, jsonOutput bool) error {
 		return fmt.Errorf("no compose projects found (use -C to specify a project directory)")
 	}
 
-	factory := func(d string) runner.Composer { return newLocalComposer(d) }
+	factory := func(d string) runner.Composer {
+		lc := newLocalComposer(d)
+		lc.SetStandalone(c.Standalone)
+		return lc
+	}
 	grouped := collectMultiProject(ctx, projects, factory)
 	return printMultiProject(grouped, jsonOutput)
 }

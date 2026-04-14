@@ -339,6 +339,178 @@ func TestRemoteCommand_SpecialCharactersEscaped(t *testing.T) {
 	}
 }
 
+func TestRemoteDetect_PluginFound(t *testing.T) {
+	r := &RemoteCompose{
+		Host:       "user@example.com",
+		SocketPath: "/tmp/cdeploy-ctrl-abc-99",
+		outputCmd: func(cmd *exec.Cmd) ([]byte, error) {
+			// Check if the SSH remote command is "docker compose version"
+			remoteCmd := cmd.Args[len(cmd.Args)-1]
+			if remoteCmd == "docker compose version" {
+				return []byte("Docker Compose version v2.24.0\n"), nil
+			}
+			return nil, fmt.Errorf("unknown command")
+		},
+	}
+
+	err := r.Detect(context.Background())
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if r.Standalone {
+		t.Error("Standalone = true, want false (plugin found)")
+	}
+}
+
+func TestRemoteDetect_StandaloneFound(t *testing.T) {
+	r := &RemoteCompose{
+		Host:       "user@example.com",
+		SocketPath: "/tmp/cdeploy-ctrl-abc-99",
+		outputCmd: func(cmd *exec.Cmd) ([]byte, error) {
+			remoteCmd := cmd.Args[len(cmd.Args)-1]
+			if remoteCmd == "docker-compose version" {
+				return []byte("docker-compose version 1.29.2\n"), nil
+			}
+			return nil, fmt.Errorf("command failed")
+		},
+	}
+
+	err := r.Detect(context.Background())
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !r.Standalone {
+		t.Error("Standalone = false, want true (standalone found)")
+	}
+}
+
+func TestRemoteDetect_NeitherFound(t *testing.T) {
+	r := &RemoteCompose{
+		Host:       "user@example.com",
+		SocketPath: "/tmp/cdeploy-ctrl-abc-99",
+		outputCmd: func(cmd *exec.Cmd) ([]byte, error) {
+			return nil, fmt.Errorf("not found")
+		},
+	}
+
+	err := r.Detect(context.Background())
+	if err == nil {
+		t.Fatal("expected error, got nil")
+	}
+	if !strings.Contains(err.Error(), "neither") {
+		t.Errorf("error = %q, want it to contain 'neither'", err.Error())
+	}
+}
+
+func TestRemoteDetect_CachesResult(t *testing.T) {
+	calls := 0
+	r := &RemoteCompose{
+		Host:       "user@example.com",
+		SocketPath: "/tmp/cdeploy-ctrl-abc-99",
+		outputCmd: func(cmd *exec.Cmd) ([]byte, error) {
+			calls++
+			return []byte("ok\n"), nil
+		},
+	}
+
+	if err := r.Detect(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.Detect(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if calls != 1 {
+		t.Errorf("outputCmd called %d times, want 1 (cached)", calls)
+	}
+}
+
+func TestRemoteDetect_SSHArgs(t *testing.T) {
+	// Verify that Detect builds its own SSH command (no CURRENT_UID, no cd)
+	var capturedArgs []string
+	r := &RemoteCompose{
+		Host:       "user@example.com",
+		ProjectDir: "/app",
+		SocketPath: "/tmp/cdeploy-ctrl-abc-99",
+		outputCmd: func(cmd *exec.Cmd) ([]byte, error) {
+			capturedArgs = cmd.Args
+			return []byte("ok\n"), nil
+		},
+	}
+
+	if err := r.Detect(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+
+	remoteCmd := capturedArgs[len(capturedArgs)-1]
+	if strings.Contains(remoteCmd, "CURRENT_UID") {
+		t.Errorf("Detect probe should not include CURRENT_UID, got: %q", remoteCmd)
+	}
+	if strings.Contains(remoteCmd, "cd ") {
+		t.Errorf("Detect probe should not include cd, got: %q", remoteCmd)
+	}
+}
+
+func TestRemoteSetStandalone(t *testing.T) {
+	r := &RemoteCompose{
+		Host:       "user@example.com",
+		SocketPath: "/tmp/cdeploy-ctrl-abc-99",
+	}
+
+	r.SetStandalone(true)
+	if !r.Standalone {
+		t.Error("Standalone = false after SetStandalone(true)")
+	}
+
+	// Detect should no-op after SetStandalone
+	calls := 0
+	r.outputCmd = func(cmd *exec.Cmd) ([]byte, error) {
+		calls++
+		return nil, fmt.Errorf("should not be called")
+	}
+	if err := r.Detect(context.Background()); err != nil {
+		t.Fatalf("Detect after SetStandalone should no-op, got: %v", err)
+	}
+	if calls != 0 {
+		t.Error("Detect called outputCmd after SetStandalone")
+	}
+}
+
+func TestRemoteCommand_Standalone(t *testing.T) {
+	r := &RemoteCompose{
+		Host:       "user@example.com",
+		ProjectDir: "/app",
+		SocketPath: "/tmp/cdeploy-ctrl-abc-99",
+		Standalone: true,
+	}
+
+	cmd := r.remoteCommand(context.Background(), "stop", "nginx")
+	remoteCmd := cmd.Args[len(cmd.Args)-1]
+
+	if !strings.Contains(remoteCmd, "docker-compose") {
+		t.Errorf("standalone remote command should contain docker-compose, got: %q", remoteCmd)
+	}
+	// Should NOT contain "docker compose" (with space as subcommand)
+	if strings.Contains(remoteCmd, "docker compose") {
+		t.Errorf("standalone remote command should not contain 'docker compose', got: %q", remoteCmd)
+	}
+}
+
+func TestRemoteCommand_Plugin(t *testing.T) {
+	r := &RemoteCompose{
+		Host:       "user@example.com",
+		ProjectDir: "/app",
+		SocketPath: "/tmp/cdeploy-ctrl-abc-99",
+		Standalone: false,
+	}
+
+	cmd := r.remoteCommand(context.Background(), "stop", "nginx")
+	remoteCmd := cmd.Args[len(cmd.Args)-1]
+
+	if !strings.Contains(remoteCmd, "docker compose") {
+		t.Errorf("plugin remote command should contain 'docker compose', got: %q", remoteCmd)
+	}
+}
+
 // --- Tests using injection hooks ---
 
 func TestRemoteConnect_ViaHook(t *testing.T) {

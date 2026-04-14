@@ -39,18 +39,28 @@ func HasComposeFile(dir string) bool {
 	return false
 }
 
-// execListProjects is the function that executes `docker compose ls`. Overridable in tests.
-var execListProjects = func(ctx context.Context) ([]byte, error) {
-	return exec.CommandContext(ctx, "docker", "compose", "ls", "-a", "--format", "json").Output()
-}
-
 // ListProjects returns all Docker Compose projects on the system, including stopped ones.
-func ListProjects(ctx context.Context) ([]Project, error) {
-	out, err := execListProjects(ctx)
+// It respects the Standalone field to use the correct binary.
+func (c *Compose) ListProjects(ctx context.Context) ([]Project, error) {
+	cmd := c.command(ctx, "ls", "-a", "--format", "json")
+	var out []byte
+	var err error
+	if c.outputCmd != nil {
+		out, err = c.outputCmd(cmd)
+	} else {
+		out, err = cmd.Output()
+	}
 	if err != nil {
 		return nil, fmt.Errorf("listing projects: %w", withStderr(err))
 	}
 	return parseProjects(out)
+}
+
+// ListProjects returns all Docker Compose projects on the system using plugin mode.
+// This is a thin wrapper for backward compatibility. For standalone support,
+// use the Compose.ListProjects() method with Detect() instead.
+func ListProjects(ctx context.Context) ([]Project, error) {
+	return (&Compose{}).ListProjects(ctx)
 }
 
 // lsEntry matches the JSON schema of `docker compose ls --format json`.
@@ -102,6 +112,9 @@ func sortProjects(projects []Project) {
 type Compose struct {
 	ProjectDir string // directory containing docker-compose.yml
 	UID        string // "uid:gid" for CURRENT_UID env var
+	Standalone bool   // use standalone docker-compose binary instead of docker compose plugin
+
+	detected bool // true after Detect() or SetStandalone() has been called
 
 	// testing hooks; nil = use real exec
 	runCmd    func(*exec.Cmd) error
@@ -114,6 +127,58 @@ func New(projectDir string) *Compose {
 		ProjectDir: projectDir,
 		UID:        fmt.Sprintf("%d:%d", os.Getuid(), os.Getgid()),
 	}
+}
+
+// SetTestHooks sets the testing hooks for command execution.
+func (c *Compose) SetTestHooks(run func(*exec.Cmd) error, output func(*exec.Cmd) ([]byte, error)) {
+	c.runCmd = run
+	c.outputCmd = output
+}
+
+// Detect probes for the docker compose variant available on the system.
+// It tries "docker compose version" first (plugin mode), then falls back to
+// "docker-compose version" (standalone binary). Sets Standalone accordingly.
+// No-ops if already detected. Returns an error if neither variant is found.
+func (c *Compose) Detect(ctx context.Context) error {
+	if c.detected {
+		return nil
+	}
+
+	// Try plugin mode: docker compose version
+	pluginCmd := exec.CommandContext(ctx, "docker", "compose", "version")
+	var pluginErr error
+	if c.outputCmd != nil {
+		_, pluginErr = c.outputCmd(pluginCmd)
+	} else {
+		_, pluginErr = pluginCmd.Output()
+	}
+	if pluginErr == nil {
+		c.Standalone = false
+		c.detected = true
+		return nil
+	}
+
+	// Try standalone mode: docker-compose version
+	standaloneCmd := exec.CommandContext(ctx, "docker-compose", "version")
+	var standaloneErr error
+	if c.outputCmd != nil {
+		_, standaloneErr = c.outputCmd(standaloneCmd)
+	} else {
+		_, standaloneErr = standaloneCmd.Output()
+	}
+	if standaloneErr == nil {
+		c.Standalone = true
+		c.detected = true
+		return nil
+	}
+
+	return fmt.Errorf("neither 'docker compose' nor 'docker-compose' found")
+}
+
+// SetStandalone sets the Standalone flag and marks detection as complete.
+func (c *Compose) SetStandalone(standalone bool) {
+	c.Standalone = standalone
+	c.detected = true
 }
 
 // ListServices returns the list of services defined in the compose file.
@@ -176,7 +241,12 @@ func withStderr(err error) error {
 }
 
 func (c *Compose) command(ctx context.Context, args ...string) *exec.Cmd {
-	cmd := exec.CommandContext(ctx, "docker", append([]string{"compose"}, args...)...)
+	var cmd *exec.Cmd
+	if c.Standalone {
+		cmd = exec.CommandContext(ctx, "docker-compose", args...)
+	} else {
+		cmd = exec.CommandContext(ctx, "docker", append([]string{"compose"}, args...)...)
+	}
 	cmd.Env = append(os.Environ(), "CURRENT_UID="+c.UID)
 	if c.ProjectDir != "" {
 		cmd.Dir = c.ProjectDir

@@ -596,6 +596,152 @@ func TestCreate_UsesNoStartFlag(t *testing.T) {
 	}
 }
 
+func TestDetect_PluginFound(t *testing.T) {
+	c := &Compose{
+		ProjectDir: "/proj",
+		UID:        "1000:1000",
+		outputCmd: func(cmd *exec.Cmd) ([]byte, error) {
+			// "docker compose version" succeeds
+			if len(cmd.Args) >= 3 && cmd.Args[1] == "compose" && cmd.Args[2] == "version" {
+				return []byte("Docker Compose version v2.24.0\n"), nil
+			}
+			return nil, fmt.Errorf("unknown command")
+		},
+	}
+
+	err := c.Detect(context.Background())
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if c.Standalone {
+		t.Error("Standalone = true, want false (plugin found)")
+	}
+}
+
+func TestDetect_StandaloneFound(t *testing.T) {
+	c := &Compose{
+		ProjectDir: "/proj",
+		UID:        "1000:1000",
+		outputCmd: func(cmd *exec.Cmd) ([]byte, error) {
+			// "docker compose version" fails, "docker-compose version" succeeds
+			if strings.HasSuffix(cmd.Path, "docker-compose") || cmd.Args[0] == "docker-compose" {
+				return []byte("docker-compose version 1.29.2\n"), nil
+			}
+			return nil, fmt.Errorf("unknown docker command")
+		},
+	}
+
+	err := c.Detect(context.Background())
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !c.Standalone {
+		t.Error("Standalone = false, want true (standalone found)")
+	}
+}
+
+func TestDetect_NeitherFound(t *testing.T) {
+	c := &Compose{
+		ProjectDir: "/proj",
+		UID:        "1000:1000",
+		outputCmd: func(cmd *exec.Cmd) ([]byte, error) {
+			return nil, fmt.Errorf("not found")
+		},
+	}
+
+	err := c.Detect(context.Background())
+	if err == nil {
+		t.Fatal("expected error, got nil")
+	}
+	if !strings.Contains(err.Error(), "neither") {
+		t.Errorf("error = %q, want it to contain 'neither'", err.Error())
+	}
+}
+
+func TestDetect_CachesResult(t *testing.T) {
+	calls := 0
+	c := &Compose{
+		ProjectDir: "/proj",
+		UID:        "1000:1000",
+		outputCmd: func(cmd *exec.Cmd) ([]byte, error) {
+			calls++
+			return []byte("ok\n"), nil
+		},
+	}
+
+	if err := c.Detect(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.Detect(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if calls != 1 {
+		t.Errorf("outputCmd called %d times, want 1 (cached)", calls)
+	}
+}
+
+func TestSetStandalone(t *testing.T) {
+	c := &Compose{ProjectDir: "/proj", UID: "1000:1000"}
+
+	c.SetStandalone(true)
+	if !c.Standalone {
+		t.Error("Standalone = false after SetStandalone(true)")
+	}
+
+	// Detect should no-op after SetStandalone
+	calls := 0
+	c.outputCmd = func(cmd *exec.Cmd) ([]byte, error) {
+		calls++
+		return nil, fmt.Errorf("should not be called")
+	}
+	if err := c.Detect(context.Background()); err != nil {
+		t.Fatalf("Detect after SetStandalone should no-op, got: %v", err)
+	}
+	if calls != 0 {
+		t.Error("Detect called outputCmd after SetStandalone")
+	}
+}
+
+func TestCommand_Standalone(t *testing.T) {
+	c := &Compose{ProjectDir: "/proj", UID: "1000:1000", Standalone: true}
+
+	cmd := c.command(context.Background(), "stop", "nginx")
+
+	// Standalone mode uses docker-compose binary directly
+	if !strings.HasSuffix(cmd.Path, "docker-compose") && !strings.Contains(cmd.Args[0], "docker-compose") {
+		t.Errorf("standalone command should use docker-compose, got path=%q args[0]=%q", cmd.Path, cmd.Args[0])
+	}
+
+	// Args should NOT include "compose" as a subcommand
+	gotArgs := cmd.Args[1:]
+	wantArgs := []string{"stop", "nginx"}
+	if len(gotArgs) != len(wantArgs) {
+		t.Fatalf("args = %v, want %v", gotArgs, wantArgs)
+	}
+	for i, want := range wantArgs {
+		if gotArgs[i] != want {
+			t.Errorf("arg[%d] = %q, want %q", i, gotArgs[i], want)
+		}
+	}
+}
+
+func TestCommand_Plugin(t *testing.T) {
+	c := &Compose{ProjectDir: "/proj", UID: "1000:1000", Standalone: false}
+
+	cmd := c.command(context.Background(), "stop", "nginx")
+
+	gotArgs := cmd.Args[1:]
+	wantArgs := []string{"compose", "stop", "nginx"}
+	if len(gotArgs) != len(wantArgs) {
+		t.Fatalf("args = %v, want %v", gotArgs, wantArgs)
+	}
+	for i, want := range wantArgs {
+		if gotArgs[i] != want {
+			t.Errorf("arg[%d] = %q, want %q", i, gotArgs[i], want)
+		}
+	}
+}
+
 // --- Tests using injection hooks ---
 
 func TestListServices_ViaHook(t *testing.T) {
@@ -947,14 +1093,14 @@ func TestRun_WriterWiring(t *testing.T) {
 }
 
 func TestListProjects_ViaHook(t *testing.T) {
-	old := execListProjects
-	defer func() { execListProjects = old }()
-
-	execListProjects = func(ctx context.Context) ([]byte, error) {
-		return []byte(`[{"Name":"app1","Status":"running(2)","ConfigFiles":"/srv/app1/compose.yml"},{"Name":"app2","Status":"exited(1)","ConfigFiles":"/srv/app2/compose.yml"}]`), nil
+	c := &Compose{
+		UID: "1000:1000",
+		outputCmd: func(cmd *exec.Cmd) ([]byte, error) {
+			return []byte(`[{"Name":"app1","Status":"running(2)","ConfigFiles":"/srv/app1/compose.yml"},{"Name":"app2","Status":"exited(1)","ConfigFiles":"/srv/app2/compose.yml"}]`), nil
+		},
 	}
 
-	projects, err := ListProjects(context.Background())
+	projects, err := c.ListProjects(context.Background())
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -970,18 +1116,66 @@ func TestListProjects_ViaHook(t *testing.T) {
 }
 
 func TestListProjects_Error(t *testing.T) {
-	old := execListProjects
-	defer func() { execListProjects = old }()
-
-	execListProjects = func(ctx context.Context) ([]byte, error) {
-		return nil, fmt.Errorf("docker not running")
+	c := &Compose{
+		UID: "1000:1000",
+		outputCmd: func(cmd *exec.Cmd) ([]byte, error) {
+			return nil, fmt.Errorf("docker not running")
+		},
 	}
 
-	_, err := ListProjects(context.Background())
+	_, err := c.ListProjects(context.Background())
 	if err == nil {
 		t.Fatal("expected error, got nil")
 	}
 	if !strings.Contains(err.Error(), "listing projects") {
 		t.Errorf("error = %q, want it to contain 'listing projects'", err.Error())
+	}
+}
+
+func TestListProjects_Standalone(t *testing.T) {
+	var capturedArgs []string
+	c := &Compose{
+		UID:        "1000:1000",
+		Standalone: true,
+		outputCmd: func(cmd *exec.Cmd) ([]byte, error) {
+			capturedArgs = cmd.Args
+			return []byte(`[{"Name":"app","Status":"running(1)","ConfigFiles":"/srv/app/compose.yml"}]`), nil
+		},
+	}
+
+	_, err := c.ListProjects(context.Background())
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	// Standalone should use "docker-compose ls -a --format json"
+	if capturedArgs[0] != "docker-compose" && !strings.HasSuffix(capturedArgs[0], "docker-compose") {
+		t.Errorf("standalone ListProjects should use docker-compose, got args[0]=%q", capturedArgs[0])
+	}
+	// Should NOT have "compose" as first arg
+	if len(capturedArgs) > 1 && capturedArgs[1] == "compose" {
+		t.Errorf("standalone should not have 'compose' subcommand, got: %v", capturedArgs)
+	}
+}
+
+func TestListProjects_Plugin(t *testing.T) {
+	var capturedArgs []string
+	c := &Compose{
+		UID:        "1000:1000",
+		Standalone: false,
+		outputCmd: func(cmd *exec.Cmd) ([]byte, error) {
+			capturedArgs = cmd.Args
+			return []byte(`[]`), nil
+		},
+	}
+
+	_, err := c.ListProjects(context.Background())
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	// Plugin should use "docker compose ls -a --format json"
+	if len(capturedArgs) < 2 || capturedArgs[1] != "compose" {
+		t.Errorf("plugin ListProjects should have 'compose' subcommand, got: %v", capturedArgs)
 	}
 }

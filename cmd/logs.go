@@ -13,7 +13,7 @@ import (
 )
 
 var (
-	logsNewLocal   = func(dir string) runner.Composer { return compose.New(dir) }
+	logsNewLocal   = compose.New
 	logsHasCompose = compose.HasComposeFile
 	logsNewRemote  = compose.NewRemote
 )
@@ -89,12 +89,19 @@ func runLogs(ctx context.Context, service string, follow bool, tail int) error {
 			return fmt.Errorf("connecting to %s: %w", serverName, err)
 		}
 		defer rc.Close()
+		if err := rc.Detect(ctx); err != nil {
+			return err
+		}
 		c = rc
 	} else {
 		if !logsHasCompose(dir) {
 			return fmt.Errorf("no compose file found in %s (use -s to specify a remote server)", dir)
 		}
-		c = logsNewLocal(dir)
+		lc := logsNewLocal(dir)
+		if err := lc.Detect(ctx); err != nil {
+			return err
+		}
+		c = lc
 	}
 
 	// Set up signal handling for graceful Ctrl+C

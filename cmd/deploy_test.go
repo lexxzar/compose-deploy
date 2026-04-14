@@ -265,6 +265,42 @@ func (m *opMockComposer) Start(_ context.Context, _ []string, _ io.Writer) error
 	return nil
 }
 
+// newTestCompose creates a *compose.Compose with test hooks that delegate to the mock.
+// The outputCmd hook handles the Detect probe by succeeding for "docker compose version".
+func newTestCompose(dir string, mock *opMockComposer) *compose.Compose {
+	c := compose.New(dir)
+	c.SetTestHooks(
+		func(cmd *exec.Cmd) error {
+			args := strings.Join(cmd.Args, " ")
+			if strings.Contains(args, "stop") {
+				return mock.Stop(context.Background(), nil, cmd.Stdout)
+			}
+			if strings.Contains(args, "rm") {
+				return mock.Remove(context.Background(), nil, cmd.Stdout)
+			}
+			if strings.Contains(args, "pull") {
+				return mock.Pull(context.Background(), nil, cmd.Stdout)
+			}
+			if strings.Contains(args, "up") {
+				return mock.Create(context.Background(), nil, cmd.Stdout)
+			}
+			if strings.Contains(args, "start") {
+				return mock.Start(context.Background(), nil, cmd.Stdout)
+			}
+			return nil
+		},
+		func(cmd *exec.Cmd) ([]byte, error) {
+			// Handle Detect probe
+			args := strings.Join(cmd.Args, " ")
+			if strings.Contains(args, "version") {
+				return []byte("Docker Compose version v2.24.0\n"), nil
+			}
+			return nil, nil
+		},
+	)
+	return c
+}
+
 func TestRunOperation_LocalDeploy(t *testing.T) {
 	oldNew := opNewLocal
 	oldLogger := opNewLogger
@@ -280,7 +316,7 @@ func TestRunOperation_LocalDeploy(t *testing.T) {
 	})
 
 	mock := &opMockComposer{}
-	opNewLocal = func(dir string) runner.Composer { return mock }
+	opNewLocal = func(dir string) *compose.Compose { return newTestCompose(dir, mock) }
 	opNewLogger = func(dir string) (*logging.Logger, error) {
 		return logging.NewLogger(t.TempDir())
 	}
@@ -316,7 +352,7 @@ func TestRunOperation_LocalRestart(t *testing.T) {
 	})
 
 	mock := &opMockComposer{}
-	opNewLocal = func(dir string) runner.Composer { return mock }
+	opNewLocal = func(dir string) *compose.Compose { return newTestCompose(dir, mock) }
 	opNewLogger = func(dir string) (*logging.Logger, error) {
 		return logging.NewLogger(t.TempDir())
 	}
@@ -348,7 +384,7 @@ func TestRunOperation_LocalStop(t *testing.T) {
 	})
 
 	mock := &opMockComposer{}
-	opNewLocal = func(dir string) runner.Composer { return mock }
+	opNewLocal = func(dir string) *compose.Compose { return newTestCompose(dir, mock) }
 	opNewLogger = func(dir string) (*logging.Logger, error) {
 		return logging.NewLogger(t.TempDir())
 	}
@@ -380,7 +416,7 @@ func TestRunOperation_FailedStep(t *testing.T) {
 	})
 
 	mock := &opMockComposer{failStep: "pull"}
-	opNewLocal = func(dir string) runner.Composer { return mock }
+	opNewLocal = func(dir string) *compose.Compose { return newTestCompose(dir, mock) }
 	opNewLogger = func(dir string) (*logging.Logger, error) {
 		return logging.NewLogger(t.TempDir())
 	}
@@ -409,7 +445,7 @@ func TestRunOperation_WithContainers(t *testing.T) {
 	})
 
 	mock := &opMockComposer{}
-	opNewLocal = func(dir string) runner.Composer { return mock }
+	opNewLocal = func(dir string) *compose.Compose { return newTestCompose(dir, mock) }
 	opNewLogger = func(dir string) (*logging.Logger, error) {
 		return logging.NewLogger(t.TempDir())
 	}
@@ -439,9 +475,9 @@ func TestRunOperation_WithProjectDir(t *testing.T) {
 
 	var capturedDir string
 	mock := &opMockComposer{}
-	opNewLocal = func(dir string) runner.Composer {
+	opNewLocal = func(dir string) *compose.Compose {
 		capturedDir = dir
-		return mock
+		return newTestCompose(dir, mock)
 	}
 	opNewLogger = func(dir string) (*logging.Logger, error) {
 		return logging.NewLogger(t.TempDir())
@@ -506,7 +542,14 @@ func TestRunOperation_ServerDeploy(t *testing.T) {
 				}
 				return nil
 			},
-			nil,
+			func(cmd *exec.Cmd) ([]byte, error) {
+				// Handle Detect probe
+				remoteCmd := cmd.Args[len(cmd.Args)-1]
+				if strings.Contains(remoteCmd, "version") {
+					return []byte("Docker Compose version v2.24.0\n"), nil
+				}
+				return nil, nil
+			},
 		)
 		return rc
 	}
