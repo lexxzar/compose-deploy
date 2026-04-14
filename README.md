@@ -1,4 +1,6 @@
-# cdeploy
+
+
+# cdeploy [![Go Report Card](https://goreportcard.com/badge/github.com/lexxzar/compose-deploy)](https://goreportcard.com/report/github.com/lexxzar/compose-deploy) [![Coverage Status](https://coveralls.io/repos/github/lexxzar/compose-deploy/badge.svg?branch=main)](https://coveralls.io/github/lexxzar/compose-deploy?branch=main)
 
 cdeploy is a TUI/CLI app for teams and solo developers who deploy Docker Compose apps to a few servers over SSH.
 
