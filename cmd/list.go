@@ -14,7 +14,12 @@ import (
 	"github.com/spf13/cobra"
 )
 
-var newRemote = compose.NewRemote
+var (
+	newRemote         = compose.NewRemote
+	newLocalComposer  = func(dir string) runner.Composer { return compose.New(dir) }
+	hasLocalCompose   = compose.HasComposeFile
+	listLocalProjects = compose.ListProjects
+)
 
 type serviceStatus struct {
 	Project string `json:"project,omitempty"`
@@ -331,8 +336,8 @@ func runList(ctx context.Context, jsonOutput bool) error {
 	}
 
 	// Local mode: single-project if -C given or compose file in CWD
-	if compose.HasComposeFile(dir) {
-		return listSingleProject(ctx, compose.New(dir), jsonOutput)
+	if hasLocalCompose(dir) {
+		return listSingleProject(ctx, newLocalComposer(dir), jsonOutput)
 	}
 
 	// Explicit -C but no compose file → error, don't fall through to discovery
@@ -341,7 +346,7 @@ func runList(ctx context.Context, jsonOutput bool) error {
 	}
 
 	// Local multi-project: discover all projects on the system
-	projects, err := compose.ListProjects(ctx)
+	projects, err := listLocalProjects(ctx)
 	if err != nil {
 		return fmt.Errorf("listing projects: %w", err)
 	}
@@ -349,7 +354,7 @@ func runList(ctx context.Context, jsonOutput bool) error {
 		return fmt.Errorf("no compose projects found (use -C to specify a project directory)")
 	}
 
-	factory := func(d string) runner.Composer { return compose.New(d) }
+	factory := func(d string) runner.Composer { return newLocalComposer(d) }
 	grouped := collectMultiProject(ctx, projects, factory)
 	return printMultiProject(grouped, jsonOutput)
 }

@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"os"
 	"os/exec"
 	"strings"
 	"testing"
@@ -2112,5 +2113,337 @@ func TestLogsScreen_IncrementalOffsetAdvances(t *testing.T) {
 		!strings.Contains(m.logsFormatted, "line2") ||
 		!strings.Contains(m.logsFormatted, "line3") {
 		t.Errorf("logsFormatted should contain all lines, got: %q", m.logsFormatted)
+	}
+}
+
+func TestShortenPath_HomeDir(t *testing.T) {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		t.Skip("cannot get home dir")
+	}
+
+	tests := []struct {
+		name string
+		dir  string
+		want string
+	}{
+		{"under home", home + "/projects/app", "~/projects/app"},
+		{"home itself", home, "~"},
+		{"not under home", "/usr/local/bin", "/usr/local/bin"},
+		{"empty", "", ""},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := shortenPath(tt.dir)
+			if got != tt.want {
+				t.Errorf("shortenPath(%q) = %q, want %q", tt.dir, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestSortServices_CaseInsensitive(t *testing.T) {
+	input := []string{"Zebra", "alpha", "BETA", "gamma"}
+	got := sortServices(input)
+
+	want := []string{"alpha", "BETA", "gamma", "Zebra"}
+	if len(got) != len(want) {
+		t.Fatalf("got %v, want %v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Errorf("sorted[%d] = %q, want %q", i, got[i], want[i])
+		}
+	}
+
+	// Original should be unmodified
+	if input[0] != "Zebra" {
+		t.Error("sortServices modified original slice")
+	}
+}
+
+func TestSortServices_Empty(t *testing.T) {
+	got := sortServices(nil)
+	if len(got) != 0 {
+		t.Errorf("got %v, want empty", got)
+	}
+}
+
+func TestSortServices_TieBreaker(t *testing.T) {
+	input := []string{"Beta", "beta", "alpha"}
+	got := sortServices(input)
+
+	// "alpha" first, then "Beta" vs "beta" — uppercase B < lowercase b
+	if got[0] != "alpha" {
+		t.Errorf("got[0] = %q, want %q", got[0], "alpha")
+	}
+	if got[1] != "Beta" {
+		t.Errorf("got[1] = %q, want %q", got[1], "Beta")
+	}
+	if got[2] != "beta" {
+		t.Errorf("got[2] = %q, want %q", got[2], "beta")
+	}
+}
+
+func TestAllSelected_Empty(t *testing.T) {
+	m := Model{services: nil, selected: nil}
+	if m.allSelected() {
+		t.Error("allSelected() = true for empty services, want false")
+	}
+}
+
+func TestAllSelected_AllTrue(t *testing.T) {
+	m := Model{
+		services: []string{"web", "db"},
+		selected: map[int]bool{0: true, 1: true},
+	}
+	if !m.allSelected() {
+		t.Error("allSelected() = false, want true")
+	}
+}
+
+func TestAllSelected_SomeFalse(t *testing.T) {
+	m := Model{
+		services: []string{"web", "db", "redis"},
+		selected: map[int]bool{0: true, 1: false, 2: true},
+	}
+	if m.allSelected() {
+		t.Error("allSelected() = true, want false")
+	}
+}
+
+func TestViewProgress_Running(t *testing.T) {
+	m := Model{
+		screen:    screenProgress,
+		pendingOp: runner.Deploy,
+		steps: []stepState{
+			{name: "Stop", status: runner.StatusDone},
+			{name: "Pull", status: runner.StatusRunning},
+			{name: "Create", status: ""},
+		},
+		width: 80,
+	}
+
+	view := m.viewProgress()
+	if !strings.Contains(view, "Stop") || !strings.Contains(view, "Pull") {
+		t.Errorf("viewProgress should show step names, got: %q", view)
+	}
+}
+
+func TestViewProgress_AllDone(t *testing.T) {
+	m := Model{
+		screen:    screenProgress,
+		pendingOp: runner.Restart,
+		steps: []stepState{
+			{name: "Stop", status: runner.StatusDone},
+			{name: "Start", status: runner.StatusDone},
+		},
+		done:  true,
+		width: 80,
+	}
+
+	view := m.viewProgress()
+	if !strings.Contains(view, "esc") {
+		t.Errorf("done progress should show esc hint, got: %q", view)
+	}
+}
+
+func TestViewProgress_Failed(t *testing.T) {
+	m := Model{
+		screen:    screenProgress,
+		pendingOp: runner.Deploy,
+		steps: []stepState{
+			{name: "Stop", status: runner.StatusDone},
+			{name: "Pull", status: runner.StatusFailed},
+		},
+		done:       true,
+		failed:     true,
+		logContent: "pull failed",
+		width:      80,
+	}
+
+	view := m.viewProgress()
+	if !strings.Contains(view, "Pull") {
+		t.Errorf("failed progress should show failed step, got: %q", view)
+	}
+}
+
+func TestLoadServices_Success(t *testing.T) {
+	mc := &mockComposer{
+		services: []string{"web", "db"},
+		status:   map[string]runner.ServiceStatus{"web": {Running: true}, "db": {Running: false}},
+	}
+
+	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
+	m.composer = mc
+	m.ctx = context.Background()
+
+	cmd := m.loadServices()
+	msg := cmd()
+
+	svcMsg, ok := msg.(servicesMsg)
+	if !ok {
+		t.Fatalf("expected servicesMsg, got %T", msg)
+	}
+	if svcMsg.err != nil {
+		t.Fatalf("unexpected error: %v", svcMsg.err)
+	}
+	if len(svcMsg.services) != 2 {
+		t.Errorf("got %d services, want 2", len(svcMsg.services))
+	}
+}
+
+func TestLoadServices_ListError(t *testing.T) {
+	mc := &mockComposer{err: fmt.Errorf("docker down")}
+
+	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
+	m.composer = mc
+	m.ctx = context.Background()
+
+	cmd := m.loadServices()
+	msg := cmd()
+
+	svcMsg, ok := msg.(servicesMsg)
+	if !ok {
+		t.Fatalf("expected servicesMsg, got %T", msg)
+	}
+	if svcMsg.err == nil {
+		t.Fatal("expected error, got nil")
+	}
+}
+
+func TestLoadServices_StatusError(t *testing.T) {
+	mc := &mockComposer{
+		services:  []string{"web"},
+		statusErr: fmt.Errorf("status failed"),
+	}
+
+	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
+	m.composer = mc
+	m.ctx = context.Background()
+
+	cmd := m.loadServices()
+	msg := cmd()
+
+	svcMsg, ok := msg.(servicesMsg)
+	if !ok {
+		t.Fatalf("expected servicesMsg, got %T", msg)
+	}
+	if svcMsg.err == nil {
+		t.Fatal("expected error, got nil")
+	}
+}
+
+func TestRefreshStatus_Success(t *testing.T) {
+	mc := &mockComposer{
+		status: map[string]runner.ServiceStatus{"web": {Running: true}},
+	}
+
+	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
+	m.composer = mc
+	m.ctx = context.Background()
+
+	cmd := m.refreshStatus()
+	msg := cmd()
+
+	stMsg, ok := msg.(statusMsg)
+	if !ok {
+		t.Fatalf("expected statusMsg, got %T", msg)
+	}
+	if stMsg.err != nil {
+		t.Fatalf("unexpected error: %v", stMsg.err)
+	}
+	if !stMsg.status["web"].Running {
+		t.Error("web should be running")
+	}
+}
+
+func TestRefreshStatus_Error(t *testing.T) {
+	mc := &mockComposer{statusErr: fmt.Errorf("timeout")}
+
+	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
+	m.composer = mc
+	m.ctx = context.Background()
+
+	cmd := m.refreshStatus()
+	msg := cmd()
+
+	stMsg, ok := msg.(statusMsg)
+	if !ok {
+		t.Fatalf("expected statusMsg, got %T", msg)
+	}
+	if stMsg.err == nil {
+		t.Fatal("expected error, got nil")
+	}
+}
+
+func TestLoadProjects_Success(t *testing.T) {
+	projects := []compose.Project{
+		{Name: "app1", ConfigDir: "/app1"},
+		{Name: "app2", ConfigDir: "/app2"},
+	}
+
+	m := NewModel(nil, io.Discard, nil, nil, nil)
+	m.ctx = context.Background()
+	m.projectLoader = func(ctx context.Context) ([]compose.Project, error) {
+		return projects, nil
+	}
+
+	cmd := m.loadProjects()
+	msg := cmd()
+
+	projMsg, ok := msg.(projectsMsg)
+	if !ok {
+		t.Fatalf("expected projectsMsg, got %T", msg)
+	}
+	if projMsg.err != nil {
+		t.Fatalf("unexpected error: %v", projMsg.err)
+	}
+	if len(projMsg.projects) != 2 {
+		t.Errorf("got %d projects, want 2", len(projMsg.projects))
+	}
+}
+
+func TestLoadProjects_Error(t *testing.T) {
+	m := NewModel(nil, io.Discard, nil, nil, nil)
+	m.ctx = context.Background()
+	m.projectLoader = func(ctx context.Context) ([]compose.Project, error) {
+		return nil, fmt.Errorf("docker not running")
+	}
+
+	cmd := m.loadProjects()
+	msg := cmd()
+
+	projMsg, ok := msg.(projectsMsg)
+	if !ok {
+		t.Fatalf("expected projectsMsg, got %T", msg)
+	}
+	if projMsg.err == nil {
+		t.Fatal("expected error, got nil")
+	}
+}
+
+func TestViewSelectContainers_ConfirmState(t *testing.T) {
+	mc := &mockComposer{
+		services: []string{"web", "db"},
+		status:   map[string]runner.ServiceStatus{"web": {Running: true}, "db": {Running: true}},
+	}
+
+	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
+	m.services = []string{"web", "db"}
+	m.selected = map[int]bool{0: true, 1: true}
+	m.svcStatus = mc.status
+	m.screen = screenSelectContainers
+	m.confirming = true
+	m.pendingOp = runner.Deploy
+	m.svcCursor = 0
+	m.width = 80
+	m.height = 24
+
+	view := m.viewSelectContainers()
+	// When confirming, should show the confirmation prompt
+	if !strings.Contains(view, "Deploy") {
+		t.Errorf("confirming view should mention the operation, got: %q", view)
 	}
 }

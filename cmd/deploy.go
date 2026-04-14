@@ -19,6 +19,10 @@ var (
 	styleOK      = lipgloss.NewStyle().Foreground(lipgloss.Color("2")).Bold(true)
 	styleFailed  = lipgloss.NewStyle().Foreground(lipgloss.Color("1")).Bold(true)
 	styleWarning = lipgloss.NewStyle().Foreground(lipgloss.Color("3")).Bold(true)
+
+	opNewLocal  = func(dir string) runner.Composer { return compose.New(dir) }
+	opNewRemote = compose.NewRemote
+	opNewLogger = logging.NewLogger
 )
 
 func newDeployCmd() *cobra.Command {
@@ -143,17 +147,17 @@ func runOperation(ctx context.Context, op runner.Operation, all bool, containers
 			return fmt.Errorf("--server %q requires --project-dir or project_dir in config", serverName)
 		}
 
-		rc := compose.NewRemote(server.Host, projDir)
+		rc := opNewRemote(server.Host, projDir)
 		if err := rc.Connect(ctx); err != nil {
 			return fmt.Errorf("connecting to %s: %w", serverName, err)
 		}
 		defer rc.Close()
 		c = rc
 	} else {
-		c = compose.New(dir)
+		c = opNewLocal(dir)
 	}
 
-	logger, err := logging.NewLogger(logDir)
+	logger, err := opNewLogger(logDir)
 	if err != nil {
 		return fmt.Errorf("creating logger: %w", err)
 	}

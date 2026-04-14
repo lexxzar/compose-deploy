@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"os/exec"
 	"strings"
 	"testing"
 
@@ -572,6 +573,466 @@ func TestListCmd_ExplicitProjectDir_NoComposeFile(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "no compose file found") {
 		t.Errorf("error = %q, want it to contain 'no compose file found'", err.Error())
+	}
+}
+
+// captureStdout runs fn while capturing os.Stdout, returns the captured output.
+func captureStdout(t *testing.T, fn func()) string {
+	t.Helper()
+	old := os.Stdout
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	os.Stdout = w
+	t.Cleanup(func() { os.Stdout = old })
+
+	fn()
+	w.Close()
+
+	var buf strings.Builder
+	if _, err := io.Copy(&buf, r); err != nil {
+		t.Fatal(err)
+	}
+	os.Stdout = old
+	return buf.String()
+}
+
+func TestListSingleProject_Dots(t *testing.T) {
+	mock := &mockComposer{
+		services: []string{"nginx", "postgres"},
+		status: map[string]runner.ServiceStatus{
+			"nginx":    {Running: true},
+			"postgres": {Running: false},
+		},
+	}
+
+	out := captureStdout(t, func() {
+		err := listSingleProject(context.Background(), mock, false)
+		if err != nil {
+			t.Errorf("unexpected error: %v", err)
+		}
+	})
+
+	if !strings.Contains(out, "nginx") || !strings.Contains(out, "postgres") {
+		t.Errorf("output should contain service names, got: %q", out)
+	}
+	if !strings.Contains(out, "running") || !strings.Contains(out, "stopped") {
+		t.Errorf("output should contain status labels, got: %q", out)
+	}
+}
+
+func TestListSingleProject_JSON(t *testing.T) {
+	mock := &mockComposer{
+		services: []string{"web"},
+		status:   map[string]runner.ServiceStatus{"web": {Running: true, Health: "healthy"}},
+	}
+
+	out := captureStdout(t, func() {
+		err := listSingleProject(context.Background(), mock, true)
+		if err != nil {
+			t.Errorf("unexpected error: %v", err)
+		}
+	})
+
+	var got []serviceStatus
+	if err := json.Unmarshal([]byte(strings.TrimSpace(out)), &got); err != nil {
+		t.Fatalf("invalid JSON output: %v\nraw: %q", err, out)
+	}
+	if len(got) != 1 || got[0].Name != "web" || !got[0].Running {
+		t.Errorf("unexpected JSON result: %+v", got)
+	}
+}
+
+func TestListSingleProject_ListServicesError(t *testing.T) {
+	mock := &mockComposer{err: fmt.Errorf("docker down")}
+
+	err := listSingleProject(context.Background(), mock, false)
+	if err == nil {
+		t.Fatal("expected error, got nil")
+	}
+	if !strings.Contains(err.Error(), "listing services") {
+		t.Errorf("error = %q, want it to contain 'listing services'", err.Error())
+	}
+}
+
+func TestListSingleProject_ContainerStatusError(t *testing.T) {
+	// mockComposerStatusErr returns services successfully but errors on ContainerStatus
+	statusErr := &mockComposerStatusErr{
+		services:  []string{"web"},
+		statusErr: fmt.Errorf("connection lost"),
+	}
+
+	err := listSingleProject(context.Background(), statusErr, false)
+	if err == nil {
+		t.Fatal("expected error, got nil")
+	}
+	if !strings.Contains(err.Error(), "getting container status") {
+		t.Errorf("error = %q, want it to contain 'getting container status'", err.Error())
+	}
+}
+
+// mockComposerStatusErr returns services successfully but errors on ContainerStatus.
+type mockComposerStatusErr struct {
+	services  []string
+	statusErr error
+}
+
+func (m *mockComposerStatusErr) ListServices(_ context.Context) ([]string, error) {
+	return m.services, nil
+}
+func (m *mockComposerStatusErr) ContainerStatus(_ context.Context) (map[string]runner.ServiceStatus, error) {
+	return nil, m.statusErr
+}
+func (m *mockComposerStatusErr) Stop(_ context.Context, _ []string, _ io.Writer) error   { return nil }
+func (m *mockComposerStatusErr) Remove(_ context.Context, _ []string, _ io.Writer) error { return nil }
+func (m *mockComposerStatusErr) Pull(_ context.Context, _ []string, _ io.Writer) error   { return nil }
+func (m *mockComposerStatusErr) Create(_ context.Context, _ []string, _ io.Writer) error { return nil }
+func (m *mockComposerStatusErr) Start(_ context.Context, _ []string, _ io.Writer) error  { return nil }
+func (m *mockComposerStatusErr) Logs(_ context.Context, _ string, _ bool, _ int, _ io.Writer) error {
+	return nil
+}
+
+func TestPrintMultiProject_Dots(t *testing.T) {
+	grouped := []projectServices{
+		{
+			Name: "app1",
+			Services: []serviceStatus{
+				{Name: "web", Running: true},
+			},
+		},
+		{
+			Name: "app2",
+			Services: []serviceStatus{
+				{Name: "api", Running: false},
+			},
+		},
+	}
+
+	out := captureStdout(t, func() {
+		err := printMultiProject(grouped, false)
+		if err != nil {
+			t.Errorf("unexpected error: %v", err)
+		}
+	})
+
+	if !strings.Contains(out, "app1") || !strings.Contains(out, "app2") {
+		t.Errorf("output should contain project names, got: %q", out)
+	}
+}
+
+func TestPrintMultiProject_JSON(t *testing.T) {
+	grouped := []projectServices{
+		{
+			Name: "app1",
+			Services: []serviceStatus{
+				{Name: "web", Running: true},
+			},
+		},
+	}
+
+	out := captureStdout(t, func() {
+		err := printMultiProject(grouped, true)
+		if err != nil {
+			t.Errorf("unexpected error: %v", err)
+		}
+	})
+
+	var got []serviceStatus
+	if err := json.Unmarshal([]byte(strings.TrimSpace(out)), &got); err != nil {
+		t.Fatalf("invalid JSON: %v\nraw: %q", err, out)
+	}
+	if len(got) != 1 || got[0].Project != "app1" {
+		t.Errorf("unexpected result: %+v", got)
+	}
+}
+
+func TestRunList_LocalSingleProject(t *testing.T) {
+	oldHas := hasLocalCompose
+	oldNew := newLocalComposer
+	oldProj := projectDir
+	t.Cleanup(func() {
+		hasLocalCompose = oldHas
+		newLocalComposer = oldNew
+		projectDir = oldProj
+	})
+
+	hasLocalCompose = func(dir string) bool { return true }
+	newLocalComposer = func(dir string) runner.Composer {
+		return &mockComposer{
+			services: []string{"web", "db"},
+			status: map[string]runner.ServiceStatus{
+				"web": {Running: true},
+				"db":  {Running: true},
+			},
+		}
+	}
+	projectDir = ""
+
+	out := captureStdout(t, func() {
+		err := runList(context.Background(), false)
+		if err != nil {
+			t.Errorf("unexpected error: %v", err)
+		}
+	})
+
+	if !strings.Contains(out, "web") || !strings.Contains(out, "db") {
+		t.Errorf("output should contain service names, got: %q", out)
+	}
+}
+
+func TestRunList_LocalMultiProject(t *testing.T) {
+	oldHas := hasLocalCompose
+	oldNew := newLocalComposer
+	oldList := listLocalProjects
+	oldProj := projectDir
+	t.Cleanup(func() {
+		hasLocalCompose = oldHas
+		newLocalComposer = oldNew
+		listLocalProjects = oldList
+		projectDir = oldProj
+	})
+
+	hasLocalCompose = func(dir string) bool { return false }
+	listLocalProjects = func(ctx context.Context) ([]compose.Project, error) {
+		return []compose.Project{
+			{Name: "app1", ConfigDir: "/app1"},
+			{Name: "app2", ConfigDir: "/app2"},
+		}, nil
+	}
+	mocks := map[string]*mockComposer{
+		"/app1": {
+			services: []string{"web"},
+			status:   map[string]runner.ServiceStatus{"web": {Running: true}},
+		},
+		"/app2": {
+			services: []string{"api"},
+			status:   map[string]runner.ServiceStatus{"api": {Running: false}},
+		},
+	}
+	newLocalComposer = func(dir string) runner.Composer { return mocks[dir] }
+	projectDir = ""
+
+	out := captureStdout(t, func() {
+		err := runList(context.Background(), false)
+		if err != nil {
+			t.Errorf("unexpected error: %v", err)
+		}
+	})
+
+	if !strings.Contains(out, "app1") || !strings.Contains(out, "app2") {
+		t.Errorf("output should contain project names, got: %q", out)
+	}
+}
+
+func TestRunList_LocalMultiProject_JSON(t *testing.T) {
+	oldHas := hasLocalCompose
+	oldNew := newLocalComposer
+	oldList := listLocalProjects
+	oldProj := projectDir
+	t.Cleanup(func() {
+		hasLocalCompose = oldHas
+		newLocalComposer = oldNew
+		listLocalProjects = oldList
+		projectDir = oldProj
+	})
+
+	hasLocalCompose = func(dir string) bool { return false }
+	listLocalProjects = func(ctx context.Context) ([]compose.Project, error) {
+		return []compose.Project{
+			{Name: "app1", ConfigDir: "/app1"},
+		}, nil
+	}
+	newLocalComposer = func(dir string) runner.Composer {
+		return &mockComposer{
+			services: []string{"web"},
+			status:   map[string]runner.ServiceStatus{"web": {Running: true}},
+		}
+	}
+	projectDir = ""
+
+	out := captureStdout(t, func() {
+		err := runList(context.Background(), true)
+		if err != nil {
+			t.Errorf("unexpected error: %v", err)
+		}
+	})
+
+	var got []serviceStatus
+	if err := json.Unmarshal([]byte(strings.TrimSpace(out)), &got); err != nil {
+		t.Fatalf("invalid JSON: %v\nraw: %q", err, out)
+	}
+	if len(got) != 1 || got[0].Project != "app1" {
+		t.Errorf("unexpected result: %+v", got)
+	}
+}
+
+func TestRunList_LocalListProjectsError(t *testing.T) {
+	oldHas := hasLocalCompose
+	oldList := listLocalProjects
+	oldProj := projectDir
+	t.Cleanup(func() {
+		hasLocalCompose = oldHas
+		listLocalProjects = oldList
+		projectDir = oldProj
+	})
+
+	hasLocalCompose = func(dir string) bool { return false }
+	listLocalProjects = func(ctx context.Context) ([]compose.Project, error) {
+		return nil, fmt.Errorf("docker not running")
+	}
+	projectDir = ""
+
+	err := runList(context.Background(), false)
+	if err == nil {
+		t.Fatal("expected error, got nil")
+	}
+	if !strings.Contains(err.Error(), "listing projects") {
+		t.Errorf("error = %q, want it to contain 'listing projects'", err.Error())
+	}
+}
+
+func TestRunList_LocalNoProjects(t *testing.T) {
+	oldHas := hasLocalCompose
+	oldList := listLocalProjects
+	oldProj := projectDir
+	t.Cleanup(func() {
+		hasLocalCompose = oldHas
+		listLocalProjects = oldList
+		projectDir = oldProj
+	})
+
+	hasLocalCompose = func(dir string) bool { return false }
+	listLocalProjects = func(ctx context.Context) ([]compose.Project, error) {
+		return nil, nil
+	}
+	projectDir = ""
+
+	err := runList(context.Background(), false)
+	if err == nil {
+		t.Fatal("expected error, got nil")
+	}
+	if !strings.Contains(err.Error(), "no compose projects found") {
+		t.Errorf("error = %q, want it to contain 'no compose projects found'", err.Error())
+	}
+}
+
+func TestRunList_ServerSingleProject(t *testing.T) {
+	tmpHome := t.TempDir()
+	cfgDir := tmpHome + "/.cdeploy"
+	if err := os.MkdirAll(cfgDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	cfgData := "servers:\n  - name: test-srv\n    host: user@host\n    project_dir: /opt/apps\n"
+	if err := os.WriteFile(cfgDir+"/servers.yml", []byte(cfgData), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	oldHome := os.Getenv("HOME")
+	os.Setenv("HOME", tmpHome)
+	t.Cleanup(func() { os.Setenv("HOME", oldHome) })
+
+	oldServer := serverName
+	oldProj := projectDir
+	oldNewRemote := newRemote
+	t.Cleanup(func() {
+		serverName = oldServer
+		projectDir = oldProj
+		newRemote = oldNewRemote
+	})
+
+	serverName = "test-srv"
+	projectDir = "/explicit/project"
+
+	// Create a RemoteCompose with hooks so Connect/Close succeed and ListServices/ContainerStatus work
+	newRemote = func(host, projDir string) *compose.RemoteCompose {
+		rc := oldNewRemote(host, projDir)
+		rc.SetTestHooks(
+			func(cmd *exec.Cmd) error { return nil }, // runCmd
+			func(cmd *exec.Cmd) ([]byte, error) { // outputCmd
+				// Remote commands are shell-escaped, so match on quoted args
+				args := strings.Join(cmd.Args, " ")
+				if strings.Contains(args, "'config'") && strings.Contains(args, "'--services'") {
+					return []byte("web\ndb\n"), nil
+				}
+				if strings.Contains(args, "'ps'") && strings.Contains(args, "'-a'") {
+					return []byte(`[{"Service":"web","State":"running"},{"Service":"db","State":"exited"}]`), nil
+				}
+				return nil, nil
+			},
+		)
+		return rc
+	}
+
+	out := captureStdout(t, func() {
+		err := runList(context.Background(), false)
+		if err != nil {
+			t.Errorf("unexpected error: %v", err)
+		}
+	})
+
+	if !strings.Contains(out, "web") || !strings.Contains(out, "db") {
+		t.Errorf("output should contain service names, got: %q", out)
+	}
+}
+
+func TestRunList_ServerMultiProject(t *testing.T) {
+	tmpHome := t.TempDir()
+	cfgDir := tmpHome + "/.cdeploy"
+	if err := os.MkdirAll(cfgDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	cfgData := "servers:\n  - name: test-srv\n    host: user@host\n    project_dir: /opt/apps\n"
+	if err := os.WriteFile(cfgDir+"/servers.yml", []byte(cfgData), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	oldHome := os.Getenv("HOME")
+	os.Setenv("HOME", tmpHome)
+	t.Cleanup(func() { os.Setenv("HOME", oldHome) })
+
+	oldServer := serverName
+	oldProj := projectDir
+	oldNewRemote := newRemote
+	t.Cleanup(func() {
+		serverName = oldServer
+		projectDir = oldProj
+		newRemote = oldNewRemote
+	})
+
+	serverName = "test-srv"
+	projectDir = "" // no explicit -C → multi-project discovery
+
+	newRemote = func(host, projDir string) *compose.RemoteCompose {
+		rc := oldNewRemote(host, projDir)
+		rc.SetTestHooks(
+			func(cmd *exec.Cmd) error { return nil },
+			func(cmd *exec.Cmd) ([]byte, error) {
+				args := strings.Join(cmd.Args, " ")
+				if strings.Contains(args, "'ls'") && strings.Contains(args, "'-a'") {
+					return []byte(`[{"Name":"app1","Status":"running(1)","ConfigFiles":"/srv/app1/compose.yml"}]`), nil
+				}
+				if strings.Contains(args, "'config'") && strings.Contains(args, "'--services'") {
+					return []byte("web\n"), nil
+				}
+				if strings.Contains(args, "'ps'") && strings.Contains(args, "'-a'") {
+					return []byte(`[{"Service":"web","State":"running"}]`), nil
+				}
+				return nil, nil
+			},
+		)
+		return rc
+	}
+
+	out := captureStdout(t, func() {
+		err := runList(context.Background(), false)
+		if err != nil {
+			t.Errorf("unexpected error: %v", err)
+		}
+	})
+
+	if !strings.Contains(out, "app1") {
+		t.Errorf("output should contain project name 'app1', got: %q", out)
 	}
 }
 

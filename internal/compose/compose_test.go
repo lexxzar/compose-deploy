@@ -3,7 +3,9 @@ package compose
 import (
 	"context"
 	"fmt"
+	"io"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -591,5 +593,395 @@ func TestCreate_UsesNoStartFlag(t *testing.T) {
 		if gotArgs[i] != want {
 			t.Errorf("arg[%d] = %q, want %q", i, gotArgs[i], want)
 		}
+	}
+}
+
+// --- Tests using injection hooks ---
+
+func TestListServices_ViaHook(t *testing.T) {
+	c := &Compose{
+		ProjectDir: "/proj",
+		UID:        "1000:1000",
+		outputCmd: func(cmd *exec.Cmd) ([]byte, error) {
+			return []byte("nginx\npostgres\nredis\n"), nil
+		},
+	}
+
+	services, err := c.ListServices(context.Background())
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	want := []string{"nginx", "postgres", "redis"}
+	if len(services) != len(want) {
+		t.Fatalf("got %d services, want %d", len(services), len(want))
+	}
+	for i, w := range want {
+		if services[i] != w {
+			t.Errorf("service[%d] = %q, want %q", i, services[i], w)
+		}
+	}
+}
+
+func TestListServices_Error(t *testing.T) {
+	c := &Compose{
+		ProjectDir: "/proj",
+		UID:        "1000:1000",
+		outputCmd: func(cmd *exec.Cmd) ([]byte, error) {
+			return nil, fmt.Errorf("docker not found")
+		},
+	}
+
+	_, err := c.ListServices(context.Background())
+	if err == nil {
+		t.Fatal("expected error, got nil")
+	}
+	if !strings.Contains(err.Error(), "listing services") {
+		t.Errorf("error = %q, want it to contain 'listing services'", err.Error())
+	}
+}
+
+func TestContainerStatus_ViaHook(t *testing.T) {
+	c := &Compose{
+		ProjectDir: "/proj",
+		UID:        "1000:1000",
+		outputCmd: func(cmd *exec.Cmd) ([]byte, error) {
+			return []byte(`[{"Service":"web","State":"running","Health":"healthy"},{"Service":"db","State":"exited"}]`), nil
+		},
+	}
+
+	status, err := c.ContainerStatus(context.Background())
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(status) != 2 {
+		t.Fatalf("got %d entries, want 2", len(status))
+	}
+	if !status["web"].Running {
+		t.Error("web should be running")
+	}
+	if status["web"].Health != "healthy" {
+		t.Errorf("web health = %q, want %q", status["web"].Health, "healthy")
+	}
+	if status["db"].Running {
+		t.Error("db should not be running")
+	}
+}
+
+func TestContainerStatus_Error(t *testing.T) {
+	c := &Compose{
+		ProjectDir: "/proj",
+		UID:        "1000:1000",
+		outputCmd: func(cmd *exec.Cmd) ([]byte, error) {
+			return nil, fmt.Errorf("connection refused")
+		},
+	}
+
+	_, err := c.ContainerStatus(context.Background())
+	if err == nil {
+		t.Fatal("expected error, got nil")
+	}
+	if !strings.Contains(err.Error(), "listing container status") {
+		t.Errorf("error = %q, want it to contain 'listing container status'", err.Error())
+	}
+}
+
+func TestStop_ViaHook(t *testing.T) {
+	var captured *exec.Cmd
+	c := &Compose{
+		ProjectDir: "/proj",
+		UID:        "1000:1000",
+		runCmd: func(cmd *exec.Cmd) error {
+			captured = cmd
+			return nil
+		},
+	}
+
+	err := c.Stop(context.Background(), []string{"nginx", "postgres"}, io.Discard)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if captured == nil {
+		t.Fatal("runCmd was not called")
+	}
+	args := captured.Args[1:] // skip "docker"
+	wantArgs := []string{"compose", "stop", "nginx", "postgres"}
+	if len(args) != len(wantArgs) {
+		t.Fatalf("args = %v, want %v", args, wantArgs)
+	}
+	for i, want := range wantArgs {
+		if args[i] != want {
+			t.Errorf("arg[%d] = %q, want %q", i, args[i], want)
+		}
+	}
+}
+
+func TestStop_AllContainers(t *testing.T) {
+	var captured *exec.Cmd
+	c := &Compose{
+		ProjectDir: "/proj",
+		UID:        "1000:1000",
+		runCmd: func(cmd *exec.Cmd) error {
+			captured = cmd
+			return nil
+		},
+	}
+
+	err := c.Stop(context.Background(), nil, io.Discard)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	args := captured.Args[1:]
+	wantArgs := []string{"compose", "stop"}
+	if len(args) != len(wantArgs) {
+		t.Fatalf("args = %v, want %v", args, wantArgs)
+	}
+}
+
+func TestRemove_ViaHook(t *testing.T) {
+	var captured *exec.Cmd
+	c := &Compose{
+		ProjectDir: "/proj",
+		UID:        "1000:1000",
+		runCmd: func(cmd *exec.Cmd) error {
+			captured = cmd
+			return nil
+		},
+	}
+
+	err := c.Remove(context.Background(), []string{"nginx"}, io.Discard)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	args := captured.Args[1:]
+	wantArgs := []string{"compose", "rm", "-f", "nginx"}
+	if len(args) != len(wantArgs) {
+		t.Fatalf("args = %v, want %v", args, wantArgs)
+	}
+	for i, want := range wantArgs {
+		if args[i] != want {
+			t.Errorf("arg[%d] = %q, want %q", i, args[i], want)
+		}
+	}
+}
+
+func TestPull_ViaHook(t *testing.T) {
+	var captured *exec.Cmd
+	c := &Compose{
+		ProjectDir: "/proj",
+		UID:        "1000:1000",
+		runCmd: func(cmd *exec.Cmd) error {
+			captured = cmd
+			return nil
+		},
+	}
+
+	err := c.Pull(context.Background(), []string{"nginx"}, io.Discard)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	args := captured.Args[1:]
+	wantArgs := []string{"compose", "pull", "nginx"}
+	if len(args) != len(wantArgs) {
+		t.Fatalf("args = %v, want %v", args, wantArgs)
+	}
+	for i, want := range wantArgs {
+		if args[i] != want {
+			t.Errorf("arg[%d] = %q, want %q", i, args[i], want)
+		}
+	}
+}
+
+func TestCreate_ViaHook(t *testing.T) {
+	var captured *exec.Cmd
+	c := &Compose{
+		ProjectDir: "/proj",
+		UID:        "1000:1000",
+		runCmd: func(cmd *exec.Cmd) error {
+			captured = cmd
+			return nil
+		},
+	}
+
+	err := c.Create(context.Background(), []string{"nginx"}, io.Discard)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	args := captured.Args[1:]
+	wantArgs := []string{"compose", "up", "--no-start", "nginx"}
+	if len(args) != len(wantArgs) {
+		t.Fatalf("args = %v, want %v", args, wantArgs)
+	}
+	for i, want := range wantArgs {
+		if args[i] != want {
+			t.Errorf("arg[%d] = %q, want %q", i, args[i], want)
+		}
+	}
+}
+
+func TestStart_ViaHook(t *testing.T) {
+	var captured *exec.Cmd
+	c := &Compose{
+		ProjectDir: "/proj",
+		UID:        "1000:1000",
+		runCmd: func(cmd *exec.Cmd) error {
+			captured = cmd
+			return nil
+		},
+	}
+
+	err := c.Start(context.Background(), []string{"nginx", "db"}, io.Discard)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	args := captured.Args[1:]
+	wantArgs := []string{"compose", "start", "nginx", "db"}
+	if len(args) != len(wantArgs) {
+		t.Fatalf("args = %v, want %v", args, wantArgs)
+	}
+	for i, want := range wantArgs {
+		if args[i] != want {
+			t.Errorf("arg[%d] = %q, want %q", i, args[i], want)
+		}
+	}
+}
+
+func TestLogs_ViaHook(t *testing.T) {
+	var captured *exec.Cmd
+	c := &Compose{
+		ProjectDir: "/proj",
+		UID:        "1000:1000",
+		runCmd: func(cmd *exec.Cmd) error {
+			captured = cmd
+			return nil
+		},
+	}
+
+	var buf strings.Builder
+	err := c.Logs(context.Background(), "nginx", true, 50, &buf)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	args := captured.Args[1:]
+	wantArgs := []string{"compose", "logs", "--follow", "--tail", "50", "nginx"}
+	if len(args) != len(wantArgs) {
+		t.Fatalf("args = %v, want %v", args, wantArgs)
+	}
+	for i, want := range wantArgs {
+		if args[i] != want {
+			t.Errorf("arg[%d] = %q, want %q", i, args[i], want)
+		}
+	}
+}
+
+func TestLogs_NoFollowNoTail(t *testing.T) {
+	var captured *exec.Cmd
+	c := &Compose{
+		ProjectDir: "/proj",
+		UID:        "1000:1000",
+		runCmd: func(cmd *exec.Cmd) error {
+			captured = cmd
+			return nil
+		},
+	}
+
+	err := c.Logs(context.Background(), "redis", false, 0, io.Discard)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	args := captured.Args[1:]
+	wantArgs := []string{"compose", "logs", "redis"}
+	if len(args) != len(wantArgs) {
+		t.Fatalf("args = %v, want %v", args, wantArgs)
+	}
+	for i, want := range wantArgs {
+		if args[i] != want {
+			t.Errorf("arg[%d] = %q, want %q", i, args[i], want)
+		}
+	}
+}
+
+func TestRun_ErrorPropagation(t *testing.T) {
+	c := &Compose{
+		ProjectDir: "/proj",
+		UID:        "1000:1000",
+		runCmd: func(cmd *exec.Cmd) error {
+			return fmt.Errorf("exit status 1")
+		},
+	}
+
+	err := c.Stop(context.Background(), []string{"nginx"}, io.Discard)
+	if err == nil {
+		t.Fatal("expected error, got nil")
+	}
+	if !strings.Contains(err.Error(), "exit status 1") {
+		t.Errorf("error = %q, want it to contain 'exit status 1'", err.Error())
+	}
+}
+
+func TestRun_WriterWiring(t *testing.T) {
+	c := &Compose{
+		ProjectDir: "/proj",
+		UID:        "1000:1000",
+		runCmd: func(cmd *exec.Cmd) error {
+			// Verify stdout and stderr are wired to the writer
+			if cmd.Stdout == nil {
+				return fmt.Errorf("stdout not wired")
+			}
+			if cmd.Stderr == nil {
+				return fmt.Errorf("stderr not wired")
+			}
+			// Write to stdout to verify it reaches our writer
+			fmt.Fprint(cmd.Stdout, "hello")
+			return nil
+		},
+	}
+
+	var buf strings.Builder
+	err := c.Stop(context.Background(), nil, &buf)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if buf.String() != "hello" {
+		t.Errorf("writer got %q, want %q", buf.String(), "hello")
+	}
+}
+
+func TestListProjects_ViaHook(t *testing.T) {
+	old := execListProjects
+	defer func() { execListProjects = old }()
+
+	execListProjects = func(ctx context.Context) ([]byte, error) {
+		return []byte(`[{"Name":"app1","Status":"running(2)","ConfigFiles":"/srv/app1/compose.yml"},{"Name":"app2","Status":"exited(1)","ConfigFiles":"/srv/app2/compose.yml"}]`), nil
+	}
+
+	projects, err := ListProjects(context.Background())
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(projects) != 2 {
+		t.Fatalf("got %d projects, want 2", len(projects))
+	}
+	if projects[0].Name != "app1" {
+		t.Errorf("project[0].Name = %q, want %q", projects[0].Name, "app1")
+	}
+	if projects[1].Name != "app2" {
+		t.Errorf("project[1].Name = %q, want %q", projects[1].Name, "app2")
+	}
+}
+
+func TestListProjects_Error(t *testing.T) {
+	old := execListProjects
+	defer func() { execListProjects = old }()
+
+	execListProjects = func(ctx context.Context) ([]byte, error) {
+		return nil, fmt.Errorf("docker not running")
+	}
+
+	_, err := ListProjects(context.Background())
+	if err == nil {
+		t.Fatal("expected error, got nil")
+	}
+	if !strings.Contains(err.Error(), "listing projects") {
+		t.Errorf("error = %q, want it to contain 'listing projects'", err.Error())
 	}
 }

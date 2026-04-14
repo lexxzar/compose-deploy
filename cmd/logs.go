@@ -12,6 +12,12 @@ import (
 	"github.com/spf13/cobra"
 )
 
+var (
+	logsNewLocal   = func(dir string) runner.Composer { return compose.New(dir) }
+	logsHasCompose = compose.HasComposeFile
+	logsNewRemote  = compose.NewRemote
+)
+
 func newLogsCmd() *cobra.Command {
 	var (
 		tail     int
@@ -78,17 +84,17 @@ func runLogs(ctx context.Context, service string, follow bool, tail int) error {
 			return fmt.Errorf("--server %q requires --project-dir or project_dir in config", serverName)
 		}
 
-		rc := compose.NewRemote(server.Host, projDir)
+		rc := logsNewRemote(server.Host, projDir)
 		if err := rc.Connect(ctx); err != nil {
 			return fmt.Errorf("connecting to %s: %w", serverName, err)
 		}
 		defer rc.Close()
 		c = rc
 	} else {
-		if !compose.HasComposeFile(dir) {
+		if !logsHasCompose(dir) {
 			return fmt.Errorf("no compose file found in %s (use -s to specify a remote server)", dir)
 		}
-		c = compose.New(dir)
+		c = logsNewLocal(dir)
 	}
 
 	// Set up signal handling for graceful Ctrl+C

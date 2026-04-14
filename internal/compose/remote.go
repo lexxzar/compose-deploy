@@ -19,6 +19,10 @@ type RemoteCompose struct {
 	Host       string
 	ProjectDir string
 	SocketPath string
+
+	// testing hooks; nil = use real exec
+	runCmd    func(*exec.Cmd) error
+	outputCmd func(*exec.Cmd) ([]byte, error)
 }
 
 // NewRemote creates a RemoteCompose instance. The socket path is deterministic
@@ -31,6 +35,12 @@ func NewRemote(host, projectDir string) *RemoteCompose {
 		ProjectDir: projectDir,
 		SocketPath: socket,
 	}
+}
+
+// SetTestHooks sets the testing hooks for command execution.
+func (r *RemoteCompose) SetTestHooks(run func(*exec.Cmd) error, output func(*exec.Cmd) ([]byte, error)) {
+	r.runCmd = run
+	r.outputCmd = output
 }
 
 // shellEscape wraps an argument in single quotes for safe SSH transport.
@@ -55,6 +65,9 @@ func (r *RemoteCompose) Connect(ctx context.Context) error {
 	cmd.Stdin = os.Stdin
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
+	if r.runCmd != nil {
+		return r.runCmd(cmd)
+	}
 	return cmd.Run()
 }
 
@@ -68,6 +81,9 @@ func (r *RemoteCompose) Close() error {
 		"-O", "exit",
 		r.Host,
 	)
+	if r.runCmd != nil {
+		return r.runCmd(cmd)
+	}
 	return cmd.Run()
 }
 
@@ -98,6 +114,9 @@ func (r *RemoteCompose) run(ctx context.Context, w io.Writer, args ...string) er
 	cmd := r.remoteCommand(ctx, args...)
 	cmd.Stdout = w
 	cmd.Stderr = w
+	if r.runCmd != nil {
+		return r.runCmd(cmd)
+	}
 	return cmd.Run()
 }
 
@@ -142,7 +161,13 @@ func (r *RemoteCompose) Logs(ctx context.Context, service string, follow bool, t
 // ListServices returns the list of services defined in the remote compose file.
 func (r *RemoteCompose) ListServices(ctx context.Context) ([]string, error) {
 	cmd := r.remoteCommand(ctx, "config", "--services")
-	out, err := cmd.Output()
+	var out []byte
+	var err error
+	if r.outputCmd != nil {
+		out, err = r.outputCmd(cmd)
+	} else {
+		out, err = cmd.Output()
+	}
 	if err != nil {
 		return nil, fmt.Errorf("listing remote services: %w", err)
 	}
@@ -160,7 +185,13 @@ func (r *RemoteCompose) ListServices(ctx context.Context) ([]string, error) {
 // ContainerStatus returns a map of service name to ServiceStatus on the remote host.
 func (r *RemoteCompose) ContainerStatus(ctx context.Context) (map[string]runner.ServiceStatus, error) {
 	cmd := r.remoteCommand(ctx, "ps", "-a", "--format", "json")
-	out, err := cmd.Output()
+	var out []byte
+	var err error
+	if r.outputCmd != nil {
+		out, err = r.outputCmd(cmd)
+	} else {
+		out, err = cmd.Output()
+	}
 	if err != nil {
 		return nil, fmt.Errorf("listing remote container status: %w", err)
 	}
@@ -170,7 +201,13 @@ func (r *RemoteCompose) ContainerStatus(ctx context.Context) (map[string]runner.
 // ListProjects returns all Docker Compose projects on the remote host.
 func (r *RemoteCompose) ListProjects(ctx context.Context) ([]Project, error) {
 	cmd := r.remoteCommand(ctx, "ls", "-a", "--format", "json")
-	out, err := cmd.Output()
+	var out []byte
+	var err error
+	if r.outputCmd != nil {
+		out, err = r.outputCmd(cmd)
+	} else {
+		out, err = cmd.Output()
+	}
 	if err != nil {
 		return nil, fmt.Errorf("listing remote projects: %w", err)
 	}

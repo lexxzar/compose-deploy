@@ -38,10 +38,14 @@ func HasComposeFile(dir string) bool {
 	return false
 }
 
+// execListProjects is the function that executes `docker compose ls`. Overridable in tests.
+var execListProjects = func(ctx context.Context) ([]byte, error) {
+	return exec.CommandContext(ctx, "docker", "compose", "ls", "-a", "--format", "json").Output()
+}
+
 // ListProjects returns all Docker Compose projects on the system, including stopped ones.
 func ListProjects(ctx context.Context) ([]Project, error) {
-	cmd := exec.CommandContext(ctx, "docker", "compose", "ls", "-a", "--format", "json")
-	out, err := cmd.Output()
+	out, err := execListProjects(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("listing projects: %w", err)
 	}
@@ -97,6 +101,10 @@ func sortProjects(projects []Project) {
 type Compose struct {
 	ProjectDir string // directory containing docker-compose.yml
 	UID        string // "uid:gid" for CURRENT_UID env var
+
+	// testing hooks; nil = use real exec
+	runCmd    func(*exec.Cmd) error
+	outputCmd func(*exec.Cmd) ([]byte, error)
 }
 
 // New creates a Compose instance with the current user's UID:GID.
@@ -110,7 +118,13 @@ func New(projectDir string) *Compose {
 // ListServices returns the list of services defined in the compose file.
 func (c *Compose) ListServices(ctx context.Context) ([]string, error) {
 	cmd := c.command(ctx, "config", "--services")
-	out, err := cmd.Output()
+	var out []byte
+	var err error
+	if c.outputCmd != nil {
+		out, err = c.outputCmd(cmd)
+	} else {
+		out, err = cmd.Output()
+	}
 	if err != nil {
 		return nil, fmt.Errorf("listing services: %w", err)
 	}
@@ -169,7 +183,13 @@ type psEntry struct {
 // ContainerStatus returns a map of service name to ServiceStatus.
 func (c *Compose) ContainerStatus(ctx context.Context) (map[string]runner.ServiceStatus, error) {
 	cmd := c.command(ctx, "ps", "-a", "--format", "json")
-	out, err := cmd.Output()
+	var out []byte
+	var err error
+	if c.outputCmd != nil {
+		out, err = c.outputCmd(cmd)
+	} else {
+		out, err = cmd.Output()
+	}
 	if err != nil {
 		return nil, fmt.Errorf("listing container status: %w", err)
 	}
@@ -253,5 +273,8 @@ func (c *Compose) run(ctx context.Context, w io.Writer, args ...string) error {
 	cmd := c.command(ctx, args...)
 	cmd.Stdout = w
 	cmd.Stderr = w
+	if c.runCmd != nil {
+		return c.runCmd(cmd)
+	}
 	return cmd.Run()
 }

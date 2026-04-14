@@ -3,7 +3,9 @@ package compose
 import (
 	"context"
 	"fmt"
+	"io"
 	"os"
+	"os/exec"
 	"strings"
 	"testing"
 )
@@ -334,5 +336,416 @@ func TestRemoteCommand_SpecialCharactersEscaped(t *testing.T) {
 
 	if !strings.Contains(remoteCmd, "'my-service'\\''s name'") {
 		t.Errorf("special characters should be escaped, got: %q", remoteCmd)
+	}
+}
+
+// --- Tests using injection hooks ---
+
+func TestRemoteConnect_ViaHook(t *testing.T) {
+	var captured *exec.Cmd
+	r := &RemoteCompose{
+		Host:       "user@example.com",
+		SocketPath: "/tmp/cdeploy-ctrl-abc-99",
+		runCmd: func(cmd *exec.Cmd) error {
+			captured = cmd
+			return nil
+		},
+	}
+
+	err := r.Connect(context.Background())
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if captured == nil {
+		t.Fatal("runCmd was not called")
+	}
+	// Verify it's the SSH ControlMaster command
+	wantArgs := []string{"ssh", "-fNM", "-S", "/tmp/cdeploy-ctrl-abc-99", "user@example.com"}
+	if len(captured.Args) != len(wantArgs) {
+		t.Fatalf("args = %v, want %v", captured.Args, wantArgs)
+	}
+	for i, want := range wantArgs {
+		if captured.Args[i] != want {
+			t.Errorf("arg[%d] = %q, want %q", i, captured.Args[i], want)
+		}
+	}
+}
+
+func TestRemoteConnect_Error(t *testing.T) {
+	r := &RemoteCompose{
+		Host:       "user@example.com",
+		SocketPath: "/tmp/cdeploy-ctrl-abc-99",
+		runCmd: func(cmd *exec.Cmd) error {
+			return fmt.Errorf("connection refused")
+		},
+	}
+
+	err := r.Connect(context.Background())
+	if err == nil {
+		t.Fatal("expected error, got nil")
+	}
+	if !strings.Contains(err.Error(), "connection refused") {
+		t.Errorf("error = %q, want it to contain 'connection refused'", err.Error())
+	}
+}
+
+func TestRemoteClose_ViaHook(t *testing.T) {
+	var captured *exec.Cmd
+	r := &RemoteCompose{
+		Host:       "user@example.com",
+		SocketPath: "/tmp/cdeploy-ctrl-abc-99",
+		runCmd: func(cmd *exec.Cmd) error {
+			captured = cmd
+			return nil
+		},
+	}
+
+	err := r.Close()
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if captured == nil {
+		t.Fatal("runCmd was not called")
+	}
+	wantArgs := []string{"ssh", "-S", "/tmp/cdeploy-ctrl-abc-99", "-O", "exit", "user@example.com"}
+	if len(captured.Args) != len(wantArgs) {
+		t.Fatalf("args = %v, want %v", captured.Args, wantArgs)
+	}
+	for i, want := range wantArgs {
+		if captured.Args[i] != want {
+			t.Errorf("arg[%d] = %q, want %q", i, captured.Args[i], want)
+		}
+	}
+}
+
+func TestRemoteStop_ViaHook(t *testing.T) {
+	var captured *exec.Cmd
+	r := &RemoteCompose{
+		Host:       "user@example.com",
+		ProjectDir: "/app",
+		SocketPath: "/tmp/cdeploy-ctrl-abc-99",
+		runCmd: func(cmd *exec.Cmd) error {
+			captured = cmd
+			return nil
+		},
+	}
+
+	err := r.Stop(context.Background(), []string{"nginx"}, io.Discard)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	remoteCmd := captured.Args[len(captured.Args)-1]
+	if !strings.Contains(remoteCmd, "'stop'") {
+		t.Errorf("remote command should contain 'stop', got: %q", remoteCmd)
+	}
+	if !strings.Contains(remoteCmd, "'nginx'") {
+		t.Errorf("remote command should contain 'nginx', got: %q", remoteCmd)
+	}
+}
+
+func TestRemoteRemove_ViaHook(t *testing.T) {
+	var captured *exec.Cmd
+	r := &RemoteCompose{
+		Host:       "user@example.com",
+		ProjectDir: "/app",
+		SocketPath: "/tmp/cdeploy-ctrl-abc-99",
+		runCmd: func(cmd *exec.Cmd) error {
+			captured = cmd
+			return nil
+		},
+	}
+
+	err := r.Remove(context.Background(), []string{"nginx"}, io.Discard)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	remoteCmd := captured.Args[len(captured.Args)-1]
+	if !strings.Contains(remoteCmd, "'rm'") || !strings.Contains(remoteCmd, "'-f'") {
+		t.Errorf("remote command should contain 'rm' '-f', got: %q", remoteCmd)
+	}
+}
+
+func TestRemotePull_ViaHook(t *testing.T) {
+	var captured *exec.Cmd
+	r := &RemoteCompose{
+		Host:       "user@example.com",
+		ProjectDir: "/app",
+		SocketPath: "/tmp/cdeploy-ctrl-abc-99",
+		runCmd: func(cmd *exec.Cmd) error {
+			captured = cmd
+			return nil
+		},
+	}
+
+	err := r.Pull(context.Background(), []string{"nginx"}, io.Discard)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	remoteCmd := captured.Args[len(captured.Args)-1]
+	if !strings.Contains(remoteCmd, "'pull'") || !strings.Contains(remoteCmd, "'nginx'") {
+		t.Errorf("remote command should contain 'pull' 'nginx', got: %q", remoteCmd)
+	}
+}
+
+func TestRemoteCreate_ViaHook(t *testing.T) {
+	var captured *exec.Cmd
+	r := &RemoteCompose{
+		Host:       "user@example.com",
+		ProjectDir: "/app",
+		SocketPath: "/tmp/cdeploy-ctrl-abc-99",
+		runCmd: func(cmd *exec.Cmd) error {
+			captured = cmd
+			return nil
+		},
+	}
+
+	err := r.Create(context.Background(), []string{"nginx"}, io.Discard)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	remoteCmd := captured.Args[len(captured.Args)-1]
+	if !strings.Contains(remoteCmd, "'up'") || !strings.Contains(remoteCmd, "'--no-start'") {
+		t.Errorf("remote command should contain 'up' '--no-start', got: %q", remoteCmd)
+	}
+}
+
+func TestRemoteStart_ViaHook(t *testing.T) {
+	var captured *exec.Cmd
+	r := &RemoteCompose{
+		Host:       "user@example.com",
+		ProjectDir: "/app",
+		SocketPath: "/tmp/cdeploy-ctrl-abc-99",
+		runCmd: func(cmd *exec.Cmd) error {
+			captured = cmd
+			return nil
+		},
+	}
+
+	err := r.Start(context.Background(), []string{"nginx", "db"}, io.Discard)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	remoteCmd := captured.Args[len(captured.Args)-1]
+	if !strings.Contains(remoteCmd, "'start'") || !strings.Contains(remoteCmd, "'nginx'") || !strings.Contains(remoteCmd, "'db'") {
+		t.Errorf("remote command should contain 'start' 'nginx' 'db', got: %q", remoteCmd)
+	}
+}
+
+func TestRemoteLogs_ViaHook(t *testing.T) {
+	var captured *exec.Cmd
+	r := &RemoteCompose{
+		Host:       "user@example.com",
+		ProjectDir: "/app",
+		SocketPath: "/tmp/cdeploy-ctrl-abc-99",
+		runCmd: func(cmd *exec.Cmd) error {
+			captured = cmd
+			return nil
+		},
+	}
+
+	err := r.Logs(context.Background(), "nginx", true, 50, io.Discard)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	remoteCmd := captured.Args[len(captured.Args)-1]
+	for _, want := range []string{"'logs'", "'--follow'", "'--tail'", "'50'", "'nginx'"} {
+		if !strings.Contains(remoteCmd, want) {
+			t.Errorf("remote command should contain %s, got: %q", want, remoteCmd)
+		}
+	}
+}
+
+func TestRemoteLogs_NoFollowNoTail(t *testing.T) {
+	var captured *exec.Cmd
+	r := &RemoteCompose{
+		Host:       "user@example.com",
+		ProjectDir: "/app",
+		SocketPath: "/tmp/cdeploy-ctrl-abc-99",
+		runCmd: func(cmd *exec.Cmd) error {
+			captured = cmd
+			return nil
+		},
+	}
+
+	err := r.Logs(context.Background(), "redis", false, 0, io.Discard)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	remoteCmd := captured.Args[len(captured.Args)-1]
+	if !strings.Contains(remoteCmd, "'logs'") || !strings.Contains(remoteCmd, "'redis'") {
+		t.Errorf("remote command should contain 'logs' 'redis', got: %q", remoteCmd)
+	}
+	if strings.Contains(remoteCmd, "'--follow'") {
+		t.Errorf("should not contain --follow, got: %q", remoteCmd)
+	}
+	if strings.Contains(remoteCmd, "'--tail'") {
+		t.Errorf("should not contain --tail, got: %q", remoteCmd)
+	}
+}
+
+func TestRemoteListServices_ViaHook(t *testing.T) {
+	r := &RemoteCompose{
+		Host:       "user@example.com",
+		ProjectDir: "/app",
+		SocketPath: "/tmp/cdeploy-ctrl-abc-99",
+		outputCmd: func(cmd *exec.Cmd) ([]byte, error) {
+			return []byte("web\ndb\nredis\n"), nil
+		},
+	}
+
+	services, err := r.ListServices(context.Background())
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	want := []string{"web", "db", "redis"}
+	if len(services) != len(want) {
+		t.Fatalf("got %d services, want %d", len(services), len(want))
+	}
+	for i, w := range want {
+		if services[i] != w {
+			t.Errorf("service[%d] = %q, want %q", i, services[i], w)
+		}
+	}
+}
+
+func TestRemoteListServices_Error(t *testing.T) {
+	r := &RemoteCompose{
+		Host:       "user@example.com",
+		ProjectDir: "/app",
+		SocketPath: "/tmp/cdeploy-ctrl-abc-99",
+		outputCmd: func(cmd *exec.Cmd) ([]byte, error) {
+			return nil, fmt.Errorf("ssh failed")
+		},
+	}
+
+	_, err := r.ListServices(context.Background())
+	if err == nil {
+		t.Fatal("expected error, got nil")
+	}
+	if !strings.Contains(err.Error(), "listing remote services") {
+		t.Errorf("error = %q, want it to contain 'listing remote services'", err.Error())
+	}
+}
+
+func TestRemoteContainerStatus_ViaHook(t *testing.T) {
+	r := &RemoteCompose{
+		Host:       "user@example.com",
+		ProjectDir: "/app",
+		SocketPath: "/tmp/cdeploy-ctrl-abc-99",
+		outputCmd: func(cmd *exec.Cmd) ([]byte, error) {
+			return []byte(`[{"Service":"web","State":"running"},{"Service":"db","State":"exited"}]`), nil
+		},
+	}
+
+	status, err := r.ContainerStatus(context.Background())
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(status) != 2 {
+		t.Fatalf("got %d entries, want 2", len(status))
+	}
+	if !status["web"].Running {
+		t.Error("web should be running")
+	}
+	if status["db"].Running {
+		t.Error("db should not be running")
+	}
+}
+
+func TestRemoteContainerStatus_Error(t *testing.T) {
+	r := &RemoteCompose{
+		Host:       "user@example.com",
+		ProjectDir: "/app",
+		SocketPath: "/tmp/cdeploy-ctrl-abc-99",
+		outputCmd: func(cmd *exec.Cmd) ([]byte, error) {
+			return nil, fmt.Errorf("ssh timeout")
+		},
+	}
+
+	_, err := r.ContainerStatus(context.Background())
+	if err == nil {
+		t.Fatal("expected error, got nil")
+	}
+	if !strings.Contains(err.Error(), "listing remote container status") {
+		t.Errorf("error = %q, want it to contain 'listing remote container status'", err.Error())
+	}
+}
+
+func TestRemoteListProjects_ViaHook(t *testing.T) {
+	r := &RemoteCompose{
+		Host:       "user@example.com",
+		SocketPath: "/tmp/cdeploy-ctrl-abc-99",
+		outputCmd: func(cmd *exec.Cmd) ([]byte, error) {
+			return []byte(`[{"Name":"app1","Status":"running(2)","ConfigFiles":"/srv/app1/compose.yml"}]`), nil
+		},
+	}
+
+	projects, err := r.ListProjects(context.Background())
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(projects) != 1 {
+		t.Fatalf("got %d projects, want 1", len(projects))
+	}
+	if projects[0].Name != "app1" {
+		t.Errorf("project[0].Name = %q, want %q", projects[0].Name, "app1")
+	}
+}
+
+func TestRemoteListProjects_Error(t *testing.T) {
+	r := &RemoteCompose{
+		Host:       "user@example.com",
+		SocketPath: "/tmp/cdeploy-ctrl-abc-99",
+		outputCmd: func(cmd *exec.Cmd) ([]byte, error) {
+			return nil, fmt.Errorf("ssh failed")
+		},
+	}
+
+	_, err := r.ListProjects(context.Background())
+	if err == nil {
+		t.Fatal("expected error, got nil")
+	}
+	if !strings.Contains(err.Error(), "listing remote projects") {
+		t.Errorf("error = %q, want it to contain 'listing remote projects'", err.Error())
+	}
+}
+
+func TestRemoteRun_ErrorPropagation(t *testing.T) {
+	r := &RemoteCompose{
+		Host:       "user@example.com",
+		ProjectDir: "/app",
+		SocketPath: "/tmp/cdeploy-ctrl-abc-99",
+		runCmd: func(cmd *exec.Cmd) error {
+			return fmt.Errorf("exit status 1")
+		},
+	}
+
+	err := r.Stop(context.Background(), []string{"nginx"}, io.Discard)
+	if err == nil {
+		t.Fatal("expected error, got nil")
+	}
+}
+
+func TestRemoteRun_WriterWiring(t *testing.T) {
+	r := &RemoteCompose{
+		Host:       "user@example.com",
+		ProjectDir: "/app",
+		SocketPath: "/tmp/cdeploy-ctrl-abc-99",
+		runCmd: func(cmd *exec.Cmd) error {
+			if cmd.Stdout == nil || cmd.Stderr == nil {
+				return fmt.Errorf("writers not wired")
+			}
+			fmt.Fprint(cmd.Stdout, "output")
+			return nil
+		},
+	}
+
+	var buf strings.Builder
+	err := r.Stop(context.Background(), nil, &buf)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if buf.String() != "output" {
+		t.Errorf("writer got %q, want %q", buf.String(), "output")
 	}
 }

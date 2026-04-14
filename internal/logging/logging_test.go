@@ -108,3 +108,31 @@ func TestLogger_Path(t *testing.T) {
 		t.Errorf("Path() = %q, want prefix %q", l.Path(), dir)
 	}
 }
+
+func TestNewLogger_EmptyDir_UsesDefault(t *testing.T) {
+	fakeHome := t.TempDir()
+	t.Setenv("HOME", fakeHome)
+	t.Setenv("USERPROFILE", fakeHome)
+
+	l, err := NewLogger("")
+	if err != nil {
+		t.Fatalf("NewLogger(\"\") error: %v", err)
+	}
+	defer l.Close()
+
+	wantDir := filepath.Join(fakeHome, ".cdeploy", "logs")
+	if !strings.HasPrefix(l.Path(), wantDir) {
+		t.Errorf("Path() = %q, want prefix %q", l.Path(), wantDir)
+	}
+}
+
+func TestNewLogger_InvalidDir(t *testing.T) {
+	// Try to create a logger in an unwritable path
+	_, err := NewLogger("/dev/null/impossible")
+	if err == nil {
+		t.Fatal("expected error for unwritable directory, got nil")
+	}
+	if !strings.Contains(err.Error(), "creating log directory") {
+		t.Errorf("error = %q, want it to contain 'creating log directory'", err.Error())
+	}
+}

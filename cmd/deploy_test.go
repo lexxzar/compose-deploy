@@ -2,8 +2,17 @@ package cmd
 
 import (
 	"bytes"
+	"context"
+	"fmt"
+	"io"
+	"os"
+	"os/exec"
 	"strings"
 	"testing"
+
+	"github.com/lexxzar/compose-deploy/internal/compose"
+	"github.com/lexxzar/compose-deploy/internal/logging"
+	"github.com/lexxzar/compose-deploy/internal/runner"
 )
 
 func TestDeployCmd_NoArgsNoFlag(t *testing.T) {
@@ -200,5 +209,376 @@ func TestDeployCmd_PersistentFlagsInherited(t *testing.T) {
 	projectDirFlag := deploy.InheritedFlags().Lookup("project-dir")
 	if projectDirFlag == nil {
 		t.Error("--project-dir persistent flag not inherited by deploy command")
+	}
+}
+
+// opMockComposer implements runner.Composer for runOperation tests.
+type opMockComposer struct {
+	stopCalls   int
+	removeCalls int
+	pullCalls   int
+	createCalls int
+	startCalls  int
+	failStep    string // which step should fail (e.g. "pull")
+}
+
+func (m *opMockComposer) ListServices(_ context.Context) ([]string, error) { return nil, nil }
+func (m *opMockComposer) ContainerStatus(_ context.Context) (map[string]runner.ServiceStatus, error) {
+	return nil, nil
+}
+func (m *opMockComposer) Logs(_ context.Context, _ string, _ bool, _ int, _ io.Writer) error {
+	return nil
+}
+func (m *opMockComposer) Stop(_ context.Context, _ []string, _ io.Writer) error {
+	m.stopCalls++
+	if m.failStep == "stop" {
+		return fmt.Errorf("stop failed")
+	}
+	return nil
+}
+func (m *opMockComposer) Remove(_ context.Context, _ []string, _ io.Writer) error {
+	m.removeCalls++
+	if m.failStep == "remove" {
+		return fmt.Errorf("remove failed")
+	}
+	return nil
+}
+func (m *opMockComposer) Pull(_ context.Context, _ []string, _ io.Writer) error {
+	m.pullCalls++
+	if m.failStep == "pull" {
+		return fmt.Errorf("pull failed")
+	}
+	return nil
+}
+func (m *opMockComposer) Create(_ context.Context, _ []string, _ io.Writer) error {
+	m.createCalls++
+	if m.failStep == "create" {
+		return fmt.Errorf("create failed")
+	}
+	return nil
+}
+func (m *opMockComposer) Start(_ context.Context, _ []string, _ io.Writer) error {
+	m.startCalls++
+	if m.failStep == "start" {
+		return fmt.Errorf("start failed")
+	}
+	return nil
+}
+
+func TestRunOperation_LocalDeploy(t *testing.T) {
+	oldNew := opNewLocal
+	oldLogger := opNewLogger
+	oldProj := projectDir
+	oldServer := serverName
+	oldLogDir := logDir
+	t.Cleanup(func() {
+		opNewLocal = oldNew
+		opNewLogger = oldLogger
+		projectDir = oldProj
+		serverName = oldServer
+		logDir = oldLogDir
+	})
+
+	mock := &opMockComposer{}
+	opNewLocal = func(dir string) runner.Composer { return mock }
+	opNewLogger = func(dir string) (*logging.Logger, error) {
+		return logging.NewLogger(t.TempDir())
+	}
+	projectDir = ""
+	serverName = ""
+	logDir = t.TempDir()
+
+	err := runOperation(context.Background(), runner.Deploy, true, nil)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if mock.stopCalls != 1 {
+		t.Errorf("stop calls = %d, want 1", mock.stopCalls)
+	}
+	if mock.pullCalls != 1 {
+		t.Errorf("pull calls = %d, want 1", mock.pullCalls)
+	}
+	if mock.startCalls != 1 {
+		t.Errorf("start calls = %d, want 1", mock.startCalls)
+	}
+}
+
+func TestRunOperation_LocalRestart(t *testing.T) {
+	oldNew := opNewLocal
+	oldLogger := opNewLogger
+	oldProj := projectDir
+	oldServer := serverName
+	t.Cleanup(func() {
+		opNewLocal = oldNew
+		opNewLogger = oldLogger
+		projectDir = oldProj
+		serverName = oldServer
+	})
+
+	mock := &opMockComposer{}
+	opNewLocal = func(dir string) runner.Composer { return mock }
+	opNewLogger = func(dir string) (*logging.Logger, error) {
+		return logging.NewLogger(t.TempDir())
+	}
+	projectDir = ""
+	serverName = ""
+
+	err := runOperation(context.Background(), runner.Restart, true, nil)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if mock.pullCalls != 0 {
+		t.Errorf("restart should not pull, but pull calls = %d", mock.pullCalls)
+	}
+	if mock.stopCalls != 1 || mock.startCalls != 1 {
+		t.Errorf("restart should stop+start, got stop=%d start=%d", mock.stopCalls, mock.startCalls)
+	}
+}
+
+func TestRunOperation_LocalStop(t *testing.T) {
+	oldNew := opNewLocal
+	oldLogger := opNewLogger
+	oldProj := projectDir
+	oldServer := serverName
+	t.Cleanup(func() {
+		opNewLocal = oldNew
+		opNewLogger = oldLogger
+		projectDir = oldProj
+		serverName = oldServer
+	})
+
+	mock := &opMockComposer{}
+	opNewLocal = func(dir string) runner.Composer { return mock }
+	opNewLogger = func(dir string) (*logging.Logger, error) {
+		return logging.NewLogger(t.TempDir())
+	}
+	projectDir = ""
+	serverName = ""
+
+	err := runOperation(context.Background(), runner.StopOnly, true, nil)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if mock.stopCalls != 1 {
+		t.Errorf("stop calls = %d, want 1", mock.stopCalls)
+	}
+	if mock.startCalls != 0 {
+		t.Errorf("stop-only should not start, but start calls = %d", mock.startCalls)
+	}
+}
+
+func TestRunOperation_FailedStep(t *testing.T) {
+	oldNew := opNewLocal
+	oldLogger := opNewLogger
+	oldProj := projectDir
+	oldServer := serverName
+	t.Cleanup(func() {
+		opNewLocal = oldNew
+		opNewLogger = oldLogger
+		projectDir = oldProj
+		serverName = oldServer
+	})
+
+	mock := &opMockComposer{failStep: "pull"}
+	opNewLocal = func(dir string) runner.Composer { return mock }
+	opNewLogger = func(dir string) (*logging.Logger, error) {
+		return logging.NewLogger(t.TempDir())
+	}
+	projectDir = ""
+	serverName = ""
+
+	err := runOperation(context.Background(), runner.Deploy, true, nil)
+	if err == nil {
+		t.Fatal("expected error, got nil")
+	}
+	if !strings.Contains(err.Error(), "failed") {
+		t.Errorf("error = %q, want it to contain 'failed'", err.Error())
+	}
+}
+
+func TestRunOperation_WithContainers(t *testing.T) {
+	oldNew := opNewLocal
+	oldLogger := opNewLogger
+	oldProj := projectDir
+	oldServer := serverName
+	t.Cleanup(func() {
+		opNewLocal = oldNew
+		opNewLogger = oldLogger
+		projectDir = oldProj
+		serverName = oldServer
+	})
+
+	mock := &opMockComposer{}
+	opNewLocal = func(dir string) runner.Composer { return mock }
+	opNewLogger = func(dir string) (*logging.Logger, error) {
+		return logging.NewLogger(t.TempDir())
+	}
+	projectDir = ""
+	serverName = ""
+
+	err := runOperation(context.Background(), runner.Restart, false, []string{"nginx", "postgres"})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if mock.stopCalls != 1 {
+		t.Errorf("stop calls = %d, want 1", mock.stopCalls)
+	}
+}
+
+func TestRunOperation_WithProjectDir(t *testing.T) {
+	oldNew := opNewLocal
+	oldLogger := opNewLogger
+	oldProj := projectDir
+	oldServer := serverName
+	t.Cleanup(func() {
+		opNewLocal = oldNew
+		opNewLogger = oldLogger
+		projectDir = oldProj
+		serverName = oldServer
+	})
+
+	var capturedDir string
+	mock := &opMockComposer{}
+	opNewLocal = func(dir string) runner.Composer {
+		capturedDir = dir
+		return mock
+	}
+	opNewLogger = func(dir string) (*logging.Logger, error) {
+		return logging.NewLogger(t.TempDir())
+	}
+	projectDir = "/custom/project"
+	serverName = ""
+
+	err := runOperation(context.Background(), runner.StopOnly, true, nil)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if capturedDir != "/custom/project" {
+		t.Errorf("dir = %q, want %q", capturedDir, "/custom/project")
+	}
+}
+
+func TestRunOperation_ServerDeploy(t *testing.T) {
+	tmpHome := t.TempDir()
+	cfgDir := tmpHome + "/.cdeploy"
+	if err := os.MkdirAll(cfgDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	cfgData := "servers:\n  - name: prod\n    host: user@prod\n    project_dir: /opt/app\n"
+	if err := os.WriteFile(cfgDir+"/servers.yml", []byte(cfgData), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	oldHome := os.Getenv("HOME")
+	os.Setenv("HOME", tmpHome)
+	t.Cleanup(func() { os.Setenv("HOME", oldHome) })
+
+	oldServer := serverName
+	oldProj := projectDir
+	oldNewRemote := opNewRemote
+	oldNewLogger := opNewLogger
+	t.Cleanup(func() {
+		serverName = oldServer
+		projectDir = oldProj
+		opNewRemote = oldNewRemote
+		opNewLogger = oldNewLogger
+	})
+
+	serverName = "prod"
+	projectDir = ""
+
+	// Track which compose operations were called via the remote command
+	var stopCalled, pullCalled, startCalled bool
+	opNewRemote = func(host, projDir string) *compose.RemoteCompose {
+		rc := compose.NewRemote(host, projDir)
+		rc.SetTestHooks(
+			func(cmd *exec.Cmd) error {
+				args := strings.Join(cmd.Args, " ")
+				// Detect compose operations from the remote command string
+				if strings.Contains(args, "'stop'") {
+					stopCalled = true
+				}
+				if strings.Contains(args, "'pull'") {
+					pullCalled = true
+				}
+				if strings.Contains(args, "'start'") {
+					startCalled = true
+				}
+				return nil
+			},
+			nil,
+		)
+		return rc
+	}
+	opNewLogger = func(dir string) (*logging.Logger, error) {
+		return logging.NewLogger(t.TempDir())
+	}
+
+	err := runOperation(context.Background(), runner.Deploy, true, nil)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !stopCalled {
+		t.Error("stop not called on remote")
+	}
+	if !pullCalled {
+		t.Error("pull not called on remote")
+	}
+	if !startCalled {
+		t.Error("start not called on remote")
+	}
+}
+
+func TestRunOperation_ServerNotFound(t *testing.T) {
+	oldServer := serverName
+	oldProj := projectDir
+	t.Cleanup(func() {
+		serverName = oldServer
+		projectDir = oldProj
+	})
+
+	serverName = "nonexistent"
+	projectDir = ""
+
+	err := runOperation(context.Background(), runner.Deploy, true, nil)
+	if err == nil {
+		t.Fatal("expected error, got nil")
+	}
+	if !strings.Contains(err.Error(), "not found") {
+		t.Errorf("error = %q, want it to contain 'not found'", err.Error())
+	}
+}
+
+func TestRunOperation_ServerNoProjectDir(t *testing.T) {
+	tmpHome := t.TempDir()
+	cfgDir := tmpHome + "/.cdeploy"
+	if err := os.MkdirAll(cfgDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	cfgData := "servers:\n  - name: srv\n    host: user@host\n"
+	if err := os.WriteFile(cfgDir+"/servers.yml", []byte(cfgData), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	oldHome := os.Getenv("HOME")
+	os.Setenv("HOME", tmpHome)
+	t.Cleanup(func() { os.Setenv("HOME", oldHome) })
+
+	oldServer := serverName
+	oldProj := projectDir
+	t.Cleanup(func() {
+		serverName = oldServer
+		projectDir = oldProj
+	})
+
+	serverName = "srv"
+	projectDir = ""
+
+	err := runOperation(context.Background(), runner.Deploy, true, nil)
+	if err == nil {
+		t.Fatal("expected error, got nil")
+	}
+	if !strings.Contains(err.Error(), "requires --project-dir") {
+		t.Errorf("error = %q, want it to contain 'requires --project-dir'", err.Error())
 	}
 }
