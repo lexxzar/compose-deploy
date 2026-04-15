@@ -1445,3 +1445,52 @@ func TestValidateConfig_Error(t *testing.T) {
 		t.Errorf("error = %q, want it to contain 'validation failed'", err.Error())
 	}
 }
+
+func TestValidateConfig_CombinedOutputSuccess(t *testing.T) {
+	dir := t.TempDir()
+	dockerPath := filepath.Join(dir, "docker")
+	script := "#!/bin/sh\n" +
+		"if [ \"$1\" = \"compose\" ] && [ \"$2\" = \"config\" ] && [ \"$3\" = \"--quiet\" ]; then\n" +
+		"  exit 0\n" +
+		"fi\n" +
+		"echo unexpected args: \"$@\" >&2\n" +
+		"exit 1\n"
+	if err := os.WriteFile(dockerPath, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	c := &Compose{
+		ProjectDir: dir,
+		UID:        "1000:1000",
+	}
+	if err := c.ValidateConfig(context.Background()); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestValidateConfig_CombinedOutputErrorIncludesStderr(t *testing.T) {
+	dir := t.TempDir()
+	dockerPath := filepath.Join(dir, "docker")
+	script := "#!/bin/sh\n" +
+		"echo yaml syntax error on line 3 >&2\n" +
+		"exit 1\n"
+	if err := os.WriteFile(dockerPath, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	c := &Compose{
+		ProjectDir: dir,
+		UID:        "1000:1000",
+	}
+	err := c.ValidateConfig(context.Background())
+	if err == nil {
+		t.Fatal("expected error, got nil")
+	}
+	if !strings.Contains(err.Error(), "yaml syntax error on line 3") {
+		t.Fatalf("error = %q, want stderr text included", err.Error())
+	}
+}

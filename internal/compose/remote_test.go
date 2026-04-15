@@ -6,6 +6,7 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"testing"
 )
@@ -1139,5 +1140,60 @@ func TestRemoteValidateConfig_Error(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "invalid config") {
 		t.Errorf("error = %q, want 'invalid config'", err.Error())
+	}
+}
+
+func TestRemoteValidateConfig_CombinedOutputSuccess(t *testing.T) {
+	dir := t.TempDir()
+	sshPath := filepath.Join(dir, "ssh")
+	script := "#!/bin/sh\n" +
+		"last=''\n" +
+		"for arg in \"$@\"; do\n" +
+		"  last=\"$arg\"\n" +
+		"done\n" +
+		"case \"$last\" in\n" +
+		"  *\"'config'\"*\"'--quiet'\"*) exit 0 ;;\n" +
+		"esac\n" +
+		"echo unexpected remote command: \"$last\" >&2\n" +
+		"exit 1\n"
+	if err := os.WriteFile(sshPath, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	r := &RemoteCompose{
+		Host:       "user@example.com",
+		ProjectDir: "/app",
+		SocketPath: "/tmp/cdeploy-ctrl-abc-99",
+	}
+	if err := r.ValidateConfig(context.Background()); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestRemoteValidateConfig_CombinedOutputErrorIncludesStderr(t *testing.T) {
+	dir := t.TempDir()
+	sshPath := filepath.Join(dir, "ssh")
+	script := "#!/bin/sh\n" +
+		"echo remote yaml syntax error >&2\n" +
+		"exit 1\n"
+	if err := os.WriteFile(sshPath, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	r := &RemoteCompose{
+		Host:       "user@example.com",
+		ProjectDir: "/app",
+		SocketPath: "/tmp/cdeploy-ctrl-abc-99",
+	}
+	err := r.ValidateConfig(context.Background())
+	if err == nil {
+		t.Fatal("expected error, got nil")
+	}
+	if !strings.Contains(err.Error(), "remote yaml syntax error") {
+		t.Fatalf("error = %q, want stderr text included", err.Error())
 	}
 }

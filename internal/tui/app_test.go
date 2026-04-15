@@ -2,6 +2,7 @@ package tui
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -2035,6 +2036,117 @@ func TestLogsScreen_LogChunkAppliesFormat(t *testing.T) {
 	}
 }
 
+func TestWaitForEvent_ReturnsStepEventMsg(t *testing.T) {
+	ch := make(chan runner.StepEvent, 1)
+	m := Model{eventCh: ch}
+	want := runner.StepEvent{Step: "pull", Status: runner.StatusRunning}
+	ch <- want
+
+	msg := m.waitForEvent()()
+	got, ok := msg.(stepEventMsg)
+	if !ok {
+		t.Fatalf("msg type = %T, want stepEventMsg", msg)
+	}
+	if runner.StepEvent(got) != want {
+		t.Fatalf("step event = %+v, want %+v", runner.StepEvent(got), want)
+	}
+}
+
+func TestWaitForEvent_ReturnsPipelineDoneWhenClosed(t *testing.T) {
+	ch := make(chan runner.StepEvent)
+	close(ch)
+	m := Model{eventCh: ch}
+
+	msg := m.waitForEvent()()
+	if _, ok := msg.(pipelineDoneMsg); !ok {
+		t.Fatalf("msg type = %T, want pipelineDoneMsg", msg)
+	}
+}
+
+type zeroReader struct{}
+
+func (zeroReader) Read([]byte) (int, error) { return 0, nil }
+
+type errReader struct{ err error }
+
+func (r errReader) Read([]byte) (int, error) { return 0, r.err }
+
+func TestReadLogChunk_ReturnsChunk(t *testing.T) {
+	m := Model{
+		logsPipeR:   strings.NewReader("hello"),
+		logsSession: 7,
+	}
+
+	msg := m.readLogChunk()()
+	got, ok := msg.(logChunkMsg)
+	if !ok {
+		t.Fatalf("msg type = %T, want logChunkMsg", msg)
+	}
+	if string(got.data) != "hello" {
+		t.Fatalf("chunk data = %q, want %q", string(got.data), "hello")
+	}
+	if got.session != 7 {
+		t.Fatalf("chunk session = %d, want 7", got.session)
+	}
+}
+
+func TestReadLogChunk_ReturnsDoneOnEOF(t *testing.T) {
+	m := Model{
+		logsPipeR:   strings.NewReader(""),
+		logsSession: 9,
+	}
+
+	msg := m.readLogChunk()()
+	got, ok := msg.(logDoneMsg)
+	if !ok {
+		t.Fatalf("msg type = %T, want logDoneMsg", msg)
+	}
+	if got.err != nil {
+		t.Fatalf("done err = %v, want nil", got.err)
+	}
+	if got.session != 9 {
+		t.Fatalf("done session = %d, want 9", got.session)
+	}
+}
+
+func TestReadLogChunk_ReturnsDoneOnReadError(t *testing.T) {
+	m := Model{
+		logsPipeR:   errReader{err: errors.New("boom")},
+		logsSession: 11,
+	}
+
+	msg := m.readLogChunk()()
+	got, ok := msg.(logDoneMsg)
+	if !ok {
+		t.Fatalf("msg type = %T, want logDoneMsg", msg)
+	}
+	if got.err == nil || got.err.Error() != "boom" {
+		t.Fatalf("done err = %v, want boom", got.err)
+	}
+	if got.session != 11 {
+		t.Fatalf("done session = %d, want 11", got.session)
+	}
+}
+
+func TestReadLogChunk_ReturnsDoneOnZeroReadWithoutError(t *testing.T) {
+	m := Model{
+		logsPipeR:   zeroReader{},
+		logsSession: 13,
+	}
+
+	msg := m.readLogChunk()()
+	got, ok := msg.(logDoneMsg)
+	if !ok {
+		t.Fatalf("msg type = %T, want logDoneMsg", msg)
+	}
+	if got.err != nil {
+		t.Fatalf("done err = %v, want nil", got.err)
+	}
+	if got.session != 13 {
+		t.Fatalf("done session = %d, want 13", got.session)
+	}
+}
+
 func TestLogsScreen_EnterLogsDefaultState(t *testing.T) {
 	mc := &mockComposer{services: []string{"app"}}
 	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
@@ -2805,6 +2917,59 @@ func TestConfigScreen_EditDoneError(t *testing.T) {
 	}
 	if cmd != nil {
 		t.Error("expected no cmd when edit returns error")
+	}
+}
+
+func TestFetchConfigHelpers_RequireConfigProvider(t *testing.T) {
+	mc := &mockComposer{}
+	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
+
+	if cmd := m.fetchConfigFile(); cmd != nil {
+		t.Fatal("fetchConfigFile should return nil when composer is not a ConfigProvider")
+	}
+	if cmd := m.fetchConfigResolved(); cmd != nil {
+		t.Fatal("fetchConfigResolved should return nil when composer is not a ConfigProvider")
+	}
+	if cmd := m.fetchConfigValidate(); cmd != nil {
+		t.Fatal("fetchConfigValidate should return nil when composer is not a ConfigProvider")
+	}
+}
+
+func TestFetchConfigHelpers_ReturnMessages(t *testing.T) {
+	mc := &mockConfigComposer{
+		mockComposer:   mockComposer{services: []string{"web"}},
+		configFile:     []byte("raw"),
+		configResolved: []byte("resolved"),
+		validateErr:    fmt.Errorf("bad yaml"),
+	}
+	m := NewModel(mc, io.Discard, mockConfigFactory(mc), nil, nil)
+	m.configSession = 23
+
+	fileMsg := m.fetchConfigFile()()
+	gotFile, ok := fileMsg.(configFileMsg)
+	if !ok {
+		t.Fatalf("file msg type = %T, want configFileMsg", fileMsg)
+	}
+	if string(gotFile.data) != "raw" || gotFile.err != nil || gotFile.session != 23 {
+		t.Fatalf("configFileMsg = %+v, want data raw, nil err, session 23", gotFile)
+	}
+
+	resolvedMsg := m.fetchConfigResolved()()
+	gotResolved, ok := resolvedMsg.(configResolvedMsg)
+	if !ok {
+		t.Fatalf("resolved msg type = %T, want configResolvedMsg", resolvedMsg)
+	}
+	if string(gotResolved.data) != "resolved" || gotResolved.err != nil || gotResolved.session != 23 {
+		t.Fatalf("configResolvedMsg = %+v, want data resolved, nil err, session 23", gotResolved)
+	}
+
+	validateMsg := m.fetchConfigValidate()()
+	gotValidate, ok := validateMsg.(configValidateMsg)
+	if !ok {
+		t.Fatalf("validate msg type = %T, want configValidateMsg", validateMsg)
+	}
+	if gotValidate.err == nil || gotValidate.err.Error() != "bad yaml" || gotValidate.session != 23 {
+		t.Fatalf("configValidateMsg = %+v, want err bad yaml, session 23", gotValidate)
 	}
 }
 
