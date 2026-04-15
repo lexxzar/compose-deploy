@@ -30,13 +30,14 @@ Run without arguments to launch the interactive interface:
 cdeploy
 ```
 
-The TUI walks through up to five screens:
+The TUI walks through up to six screens:
 
 1. **Server select** — choose a remote server or "Local" (only shown when servers are configured)
 2. **Project select** — pick a Docker Compose project (auto-skipped if the current directory has a compose file)
-3. **Service select** — pick services and choose an action (`r` restart, `d` deploy, `s` stop, `l` logs)
+3. **Service select** — pick services and choose an action (`r` restart, `d` deploy, `s` stop, `l` logs, `c` config)
 4. **Progress** — watch step-by-step execution with status indicators
 5. **Logs** — live-stream logs for the selected service
+6. **Config** — inspect or edit the compose file, toggle between raw and resolved config, and see validation status
 
 ### CLI Mode
 
@@ -128,7 +129,7 @@ SSH-specific options (keys, jump hosts, tunnels, ports) belong in `~/.ssh/config
 cdeploy uses SSH ControlMaster multiplexing:
 
 1. A persistent control socket is established once (password/key prompts happen here)
-2. All subsequent docker compose commands reuse the socket with zero auth overhead
+2. All subsequent docker compose commands and compose-file access reuse the socket with zero auth overhead
 3. The socket is torn down on disconnect or TUI quit
 
 In TUI mode, the SSH connect command runs with full terminal access so interactive prompts (passwords, host key verification) work naturally.
@@ -154,6 +155,14 @@ For scaled services, the worst-case health is shown (unhealthy > starting > heal
 ## Logging
 
 All docker compose output is logged to `~/.cdeploy/logs/`. Each log file is named `cdeploy_on_{hostname}_{timestamp}.log`, so you get a per-host, timestamped record of every operation. Override the directory with `--log-dir`.
+
+## Compose Config Screen
+
+From the service screen, press `c` to open the compose config viewer/editor. This works for both local projects and remote servers selected through the TUI.
+
+- `r` toggles between the raw compose file and resolved/interpolated `docker compose config` output
+- `e` opens the compose file in your editor. Local mode uses `$EDITOR`, then `$VISUAL`, then `vi`; values like `code --wait` are supported. Remote mode runs `${EDITOR:-vi}` over SSH on the target host.
+- After the editor exits, cdeploy reloads the raw file, switches back to raw view, and validates it with `docker compose config --quiet`. Validation errors are shown inline in the TUI.
 
 ## Why cdeploy?
 
