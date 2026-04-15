@@ -13,6 +13,24 @@ import (
 	"github.com/lexxzar/compose-deploy/internal/runner"
 )
 
+// Compile-time check: Compose implements tui.ConfigProvider.
+// Can't import tui (circular), so we verify the interface shape here.
+func TestCompose_ImplementsConfigProviderShape(t *testing.T) {
+	c := &Compose{ProjectDir: t.TempDir(), UID: "1000:1000"}
+	ctx := context.Background()
+
+	// ConfigFile
+	_, _ = c.ConfigFile(ctx)
+	// ConfigResolved (needs outputCmd hook to avoid running docker)
+	c.outputCmd = func(cmd *exec.Cmd) ([]byte, error) { return nil, nil }
+	_, _ = c.ConfigResolved(ctx)
+	// EditCommand
+	os.WriteFile(filepath.Join(c.ProjectDir, "compose.yml"), []byte("test"), 0o644)
+	_, _ = c.EditCommand(ctx)
+	// ValidateConfig
+	_ = c.ValidateConfig(ctx)
+}
+
 func TestParseProjects(t *testing.T) {
 	tests := []struct {
 		name    string
@@ -1177,5 +1195,239 @@ func TestListProjects_Plugin(t *testing.T) {
 	// Plugin should use "docker compose ls -a --format json"
 	if len(capturedArgs) < 2 || capturedArgs[1] != "compose" {
 		t.Errorf("plugin ListProjects should have 'compose' subcommand, got: %v", capturedArgs)
+	}
+}
+
+// --- ConfigProvider tests ---
+
+func TestFindComposeFile(t *testing.T) {
+	tests := []struct {
+		name     string
+		files    []string
+		wantName string
+		wantErr  bool
+	}{
+		{
+			name:     "compose.yml present",
+			files:    []string{"compose.yml"},
+			wantName: "compose.yml",
+		},
+		{
+			name:     "compose.yaml present",
+			files:    []string{"compose.yaml"},
+			wantName: "compose.yaml",
+		},
+		{
+			name:     "docker-compose.yml present",
+			files:    []string{"docker-compose.yml"},
+			wantName: "docker-compose.yml",
+		},
+		{
+			name:     "docker-compose.yaml present",
+			files:    []string{"docker-compose.yaml"},
+			wantName: "docker-compose.yaml",
+		},
+		{
+			name:     "first match wins",
+			files:    []string{"compose.yml", "docker-compose.yml"},
+			wantName: "compose.yml",
+		},
+		{
+			name:    "no compose file",
+			files:   []string{"Dockerfile"},
+			wantErr: true,
+		},
+		{
+			name:    "empty directory",
+			files:   nil,
+			wantErr: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			dir := t.TempDir()
+			for _, f := range tt.files {
+				if err := os.WriteFile(filepath.Join(dir, f), []byte("version: '3'"), 0o644); err != nil {
+					t.Fatal(err)
+				}
+			}
+			c := &Compose{ProjectDir: dir}
+			got, err := c.findComposeFile()
+			if tt.wantErr {
+				if err == nil {
+					t.Fatal("expected error, got nil")
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if filepath.Base(got) != tt.wantName {
+				t.Errorf("findComposeFile() = %q, want file named %q", got, tt.wantName)
+			}
+			if filepath.Dir(got) != dir {
+				t.Errorf("findComposeFile() dir = %q, want %q", filepath.Dir(got), dir)
+			}
+		})
+	}
+}
+
+func TestConfigFile_Success(t *testing.T) {
+	dir := t.TempDir()
+	content := "services:\n  web:\n    image: nginx\n"
+	if err := os.WriteFile(filepath.Join(dir, "compose.yml"), []byte(content), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	c := &Compose{ProjectDir: dir}
+	got, err := c.ConfigFile(context.Background())
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if string(got) != content {
+		t.Errorf("ConfigFile() = %q, want %q", string(got), content)
+	}
+}
+
+func TestConfigFile_NoFile(t *testing.T) {
+	dir := t.TempDir()
+	c := &Compose{ProjectDir: dir}
+	_, err := c.ConfigFile(context.Background())
+	if err == nil {
+		t.Fatal("expected error, got nil")
+	}
+	if !strings.Contains(err.Error(), "no compose file found") {
+		t.Errorf("error = %q, want it to contain 'no compose file found'", err.Error())
+	}
+}
+
+func TestConfigResolved_Args(t *testing.T) {
+	var capturedArgs []string
+	c := &Compose{
+		ProjectDir: "/proj",
+		UID:        "1000:1000",
+		outputCmd: func(cmd *exec.Cmd) ([]byte, error) {
+			capturedArgs = cmd.Args
+			return []byte("resolved config output"), nil
+		},
+	}
+
+	got, err := c.ConfigResolved(context.Background())
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if string(got) != "resolved config output" {
+		t.Errorf("ConfigResolved() = %q, want %q", string(got), "resolved config output")
+	}
+
+	// Verify command: docker compose config
+	wantArgs := []string{"compose", "config"}
+	gotArgs := capturedArgs[1:]
+	if len(gotArgs) != len(wantArgs) {
+		t.Fatalf("args = %v, want %v", gotArgs, wantArgs)
+	}
+	for i, want := range wantArgs {
+		if gotArgs[i] != want {
+			t.Errorf("arg[%d] = %q, want %q", i, gotArgs[i], want)
+		}
+	}
+}
+
+func TestEditCommand_EditorEnv(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "compose.yml"), []byte("test"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	tests := []struct {
+		name       string
+		editor     string
+		visual     string
+		wantEditor string
+	}{
+		{"EDITOR set", "nano", "", "nano"},
+		{"VISUAL fallback", "", "code", "code"},
+		{"vi default", "", "", "vi"},
+		{"EDITOR takes precedence", "nano", "code", "nano"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			// Save and restore env
+			origEditor := os.Getenv("EDITOR")
+			origVisual := os.Getenv("VISUAL")
+			defer func() {
+				os.Setenv("EDITOR", origEditor)
+				os.Setenv("VISUAL", origVisual)
+			}()
+
+			os.Setenv("EDITOR", tt.editor)
+			os.Setenv("VISUAL", tt.visual)
+
+			c := &Compose{ProjectDir: dir}
+			cmd, err := c.EditCommand(context.Background())
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if !strings.Contains(cmd.Args[0], tt.wantEditor) {
+				t.Errorf("editor = %q, want %q", cmd.Args[0], tt.wantEditor)
+			}
+			if cmd.Args[1] != filepath.Join(dir, "compose.yml") {
+				t.Errorf("file = %q, want %q", cmd.Args[1], filepath.Join(dir, "compose.yml"))
+			}
+		})
+	}
+}
+
+func TestEditCommand_NoFile(t *testing.T) {
+	dir := t.TempDir()
+	c := &Compose{ProjectDir: dir}
+	_, err := c.EditCommand(context.Background())
+	if err == nil {
+		t.Fatal("expected error, got nil")
+	}
+}
+
+func TestValidateConfig_Success(t *testing.T) {
+	c := &Compose{
+		ProjectDir: "/proj",
+		UID:        "1000:1000",
+		outputCmd: func(cmd *exec.Cmd) ([]byte, error) {
+			// Verify args include --quiet
+			args := cmd.Args[1:]
+			wantArgs := []string{"compose", "config", "--quiet"}
+			if len(args) != len(wantArgs) {
+				return nil, fmt.Errorf("unexpected args: %v", args)
+			}
+			for i, w := range wantArgs {
+				if args[i] != w {
+					return nil, fmt.Errorf("arg[%d] = %q, want %q", i, args[i], w)
+				}
+			}
+			return nil, nil
+		},
+	}
+
+	err := c.ValidateConfig(context.Background())
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestValidateConfig_Error(t *testing.T) {
+	c := &Compose{
+		ProjectDir: "/proj",
+		UID:        "1000:1000",
+		outputCmd: func(cmd *exec.Cmd) ([]byte, error) {
+			return nil, fmt.Errorf("validation failed")
+		},
+	}
+
+	err := c.ValidateConfig(context.Background())
+	if err == nil {
+		t.Fatal("expected error, got nil")
+	}
+	if !strings.Contains(err.Error(), "validation failed") {
+		t.Errorf("error = %q, want it to contain 'validation failed'", err.Error())
 	}
 }

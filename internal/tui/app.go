@@ -17,6 +17,16 @@ import (
 	"github.com/lexxzar/compose-deploy/internal/runner"
 )
 
+// ConfigProvider provides access to docker-compose configuration files.
+// Defined in the tui package (not runner) because it returns *exec.Cmd and
+// is TUI-only. Both Compose and RemoteCompose implement it.
+type ConfigProvider interface {
+	ConfigFile(ctx context.Context) ([]byte, error)
+	ConfigResolved(ctx context.Context) ([]byte, error)
+	EditCommand(ctx context.Context) (*exec.Cmd, error)
+	ValidateConfig(ctx context.Context) error
+}
+
 // ComposerFactory creates a runner.Composer for the given project directory.
 type ComposerFactory func(projectDir string) runner.Composer
 
@@ -107,6 +117,7 @@ const (
 	screenSelectContainers
 	screenProgress
 	screenLogs
+	screenConfig
 )
 
 // Model is the Bubble Tea model for the cdeploy TUI.
@@ -173,6 +184,16 @@ type Model struct {
 	logsFormatted string             // formatted output for complete raw lines (up to logsRawOff)
 	logsRawOff    int                // byte offset into logsContent: everything before this is in logsFormatted
 
+	// Screen: config
+	configContent  []byte             // raw compose file content
+	configResolved []byte             // resolved/interpolated config (cached)
+	configViewport viewport.Model     // viewport for config content
+	configShowRes  bool               // true = showing resolved, false = showing raw
+	configErr      error              // error from config operations
+	configValid    *bool              // nil = not checked, true = valid, false = invalid
+	configValidMsg string             // validation error message
+	configSession  uint64             // monotonic counter for stale message rejection
+
 	// Shared
 	ctx       context.Context
 	ctxCancel context.CancelFunc
@@ -214,6 +235,24 @@ type logDoneMsg struct {
 type connectResultMsg struct{ err error }
 type preselectedConnectMsg struct{}
 type disconnectDoneMsg struct{}
+type configFileMsg struct {
+	data    []byte
+	err     error
+	session uint64
+}
+type configResolvedMsg struct {
+	data    []byte
+	err     error
+	session uint64
+}
+type configEditDoneMsg struct {
+	err     error
+	session uint64
+}
+type configValidateMsg struct {
+	err     error
+	session uint64
+}
 
 // NewModel creates a new TUI model.
 //
@@ -312,6 +351,14 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 			m.logViewport.Height = h
 		}
+		if m.screen == screenConfig {
+			m.configViewport.Width = msg.Width - 4
+			h := msg.Height - 6
+			if h < 3 {
+				h = 3
+			}
+			m.configViewport.Height = h
+		}
 		if m.screen == screenLogs {
 			m.logsViewport.Width = msg.Width - 4
 			h := msg.Height - 6
@@ -406,6 +453,57 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.logsContent += fmt.Sprintf("\n\nError: %v", msg.err)
 			m.applyLogFormat()
 			m.logsViewport.GotoBottom()
+		}
+		return m, nil
+
+	case configFileMsg:
+		if m.screen != screenConfig || msg.session != m.configSession {
+			return m, nil
+		}
+		if msg.err != nil {
+			m.configErr = msg.err
+			return m, nil
+		}
+		m.configErr = nil
+		m.configContent = msg.data
+		m.configViewport.SetContent(string(msg.data))
+		return m, nil
+
+	case configResolvedMsg:
+		if m.screen != screenConfig || msg.session != m.configSession {
+			return m, nil
+		}
+		if msg.err != nil {
+			m.configErr = msg.err
+			return m, nil
+		}
+		m.configErr = nil
+		m.configResolved = msg.data
+		if m.configShowRes {
+			m.configViewport.SetContent(string(msg.data))
+		}
+		return m, nil
+
+	case configEditDoneMsg:
+		if m.screen != screenConfig || msg.session != m.configSession {
+			return m, nil
+		}
+		// Re-fetch raw content and validate concurrently
+		m.configResolved = nil // invalidate cache
+		return m, tea.Batch(m.fetchConfigFile(), m.fetchConfigValidate())
+
+	case configValidateMsg:
+		if m.screen != screenConfig || msg.session != m.configSession {
+			return m, nil
+		}
+		if msg.err != nil {
+			v := false
+			m.configValid = &v
+			m.configValidMsg = msg.err.Error()
+		} else {
+			v := true
+			m.configValid = &v
+			m.configValidMsg = ""
 		}
 		return m, nil
 
@@ -587,6 +685,10 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 				return m, nil
 			}
 			return m.enterLogs()
+		case "c":
+			if _, ok := m.composer.(ConfigProvider); ok {
+				return m.enterConfig()
+			}
 		}
 
 	case screenLogs:
@@ -629,6 +731,54 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		default:
 			var cmd tea.Cmd
 			m.logsViewport, cmd = m.logsViewport.Update(msg)
+			return m, cmd
+		}
+
+	case screenConfig:
+		switch key {
+		case "q", "ctrl+c":
+			return m, tea.Quit
+		case "esc":
+			m.configContent = nil
+			m.configResolved = nil
+			m.configViewport = viewport.Model{}
+			m.configShowRes = false
+			m.configErr = nil
+			m.configValid = nil
+			m.configValidMsg = ""
+			m.screen = screenSelectContainers
+			return m, nil
+		case "r":
+			m.configShowRes = !m.configShowRes
+			if m.configShowRes {
+				if m.configResolved != nil {
+					m.configViewport.SetContent(string(m.configResolved))
+				} else {
+					return m, m.fetchConfigResolved()
+				}
+			} else {
+				if m.configContent != nil {
+					m.configViewport.SetContent(string(m.configContent))
+				}
+			}
+			return m, nil
+		case "e":
+			cp, ok := m.composer.(ConfigProvider)
+			if !ok {
+				return m, nil
+			}
+			cmd, err := cp.EditCommand(m.ctx)
+			if err != nil {
+				m.configErr = err
+				return m, nil
+			}
+			session := m.configSession
+			return m, tea.ExecProcess(cmd, func(err error) tea.Msg {
+				return configEditDoneMsg{err: err, session: session}
+			})
+		default:
+			var cmd tea.Cmd
+			m.configViewport, cmd = m.configViewport.Update(msg)
 			return m, cmd
 		}
 
@@ -727,6 +877,68 @@ func (m Model) waitForEvent() tea.Cmd {
 			return pipelineDoneMsg{}
 		}
 		return stepEventMsg(event)
+	}
+}
+
+func (m *Model) enterConfig() (tea.Model, tea.Cmd) {
+	m.configSession++
+	m.configContent = nil
+	m.configResolved = nil
+	m.configShowRes = false
+	m.configErr = nil
+	m.configValid = nil
+	m.configValidMsg = ""
+
+	vpHeight := m.height - 6
+	if vpHeight < 3 {
+		vpHeight = 3
+	}
+	w := m.width - 4
+	if w < 10 {
+		w = 40
+	}
+	m.configViewport = viewport.New(w, vpHeight)
+
+	m.screen = screenConfig
+	return *m, m.fetchConfigFile()
+}
+
+func (m Model) fetchConfigFile() tea.Cmd {
+	cp, ok := m.composer.(ConfigProvider)
+	if !ok {
+		return nil
+	}
+	ctx := m.ctx
+	session := m.configSession
+	return func() tea.Msg {
+		data, err := cp.ConfigFile(ctx)
+		return configFileMsg{data: data, err: err, session: session}
+	}
+}
+
+func (m Model) fetchConfigResolved() tea.Cmd {
+	cp, ok := m.composer.(ConfigProvider)
+	if !ok {
+		return nil
+	}
+	ctx := m.ctx
+	session := m.configSession
+	return func() tea.Msg {
+		data, err := cp.ConfigResolved(ctx)
+		return configResolvedMsg{data: data, err: err, session: session}
+	}
+}
+
+func (m Model) fetchConfigValidate() tea.Cmd {
+	cp, ok := m.composer.(ConfigProvider)
+	if !ok {
+		return nil
+	}
+	ctx := m.ctx
+	session := m.configSession
+	return func() tea.Msg {
+		err := cp.ValidateConfig(ctx)
+		return configValidateMsg{err: err, session: session}
 	}
 }
 
@@ -925,6 +1137,8 @@ func (m Model) View() string {
 		return m.viewProgress()
 	case screenLogs:
 		return m.viewLogs()
+	case screenConfig:
+		return m.viewConfig()
 	}
 	return ""
 }
@@ -1130,7 +1344,7 @@ func (m Model) viewSelectContainers() string {
 			back = "esc back"
 		}
 		line1 := fmt.Sprintf("  space toggle  •  a all  •  %s", back)
-		line2 := "  r restart  •  d deploy  •  s stop  •  l logs"
+		line2 := "  r restart  •  d deploy  •  s stop  •  l logs  •  c config"
 		oneLine := line1 + "  •  " + line2[2:]
 		if m.width >= len(oneLine)+2 {
 			b.WriteString(helpStyle.Render("\n" + oneLine))
@@ -1165,6 +1379,43 @@ func (m Model) viewLogs() string {
 		help += "  •  p pretty"
 	}
 	help += "  •  q quit"
+	b.WriteString(helpStyle.Render(help))
+	return b.String()
+}
+
+func (m Model) viewConfig() string {
+	var b strings.Builder
+	b.WriteString(titleStyle.Render(fmt.Sprintf("%s > config", m.breadcrumb())))
+	b.WriteString("\n\n")
+
+	if m.configErr != nil {
+		b.WriteString(stepFailed.Render(fmt.Sprintf("  Error: %v\n", m.configErr)))
+	} else if m.configContent == nil && !m.configShowRes {
+		b.WriteString("  Loading...\n")
+	} else {
+		b.WriteString(m.configViewport.View())
+		b.WriteString("\n")
+	}
+
+	// Validation status line
+	if m.configValid != nil {
+		if *m.configValid {
+			b.WriteString(stepDone.Render("  Config valid"))
+			b.WriteString("\n")
+		} else {
+			b.WriteString(stepFailed.Render(fmt.Sprintf("  Config error: %s", m.configValidMsg)))
+			b.WriteString("\n")
+		}
+	}
+
+	// Help bar
+	help := "  esc back  •  "
+	if m.configShowRes {
+		help += "r raw"
+	} else {
+		help += "r resolved"
+	}
+	help += "  •  e edit  •  up/down scroll  •  q quit"
 	b.WriteString(helpStyle.Render(help))
 	return b.String()
 }

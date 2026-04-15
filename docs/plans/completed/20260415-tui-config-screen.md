@@ -96,18 +96,18 @@ Since we use type-assertion from `composer` (no separate `configProvider` field 
 - Modify: `internal/compose/compose.go`
 - Modify: `internal/compose/compose_test.go`
 
-- [ ] Define `ConfigProvider` interface in `internal/tui/app.go` with `ConfigFile`, `ConfigResolved`, `EditCommand`, `ValidateConfig`
-- [ ] Add `findComposeFile()` helper on `Compose` that probes `composeFiles` candidates and returns the path (related to existing `HasComposeFile()` but returns the path instead of bool)
-- [ ] Implement `ConfigFile` on `Compose` — call `findComposeFile()`, then `os.ReadFile`
-- [ ] Implement `ConfigResolved` on `Compose` — run `docker compose config` via `command()`, capture output with `outputCmd` hook
-- [ ] Implement `EditCommand` on `Compose` — resolve editor (`$EDITOR`/`$VISUAL`/`vi`), return `exec.Command(editor, filePath)`
-- [ ] Implement `ValidateConfig` on `Compose` — run `docker compose config --quiet`, capture stderr for error messages (not just exit code)
-- [ ] Write tests for `findComposeFile` (file exists, file missing, multiple candidates — first match wins)
-- [ ] Write tests for `ConfigFile` (success, no compose file error)
-- [ ] Write tests for `ConfigResolved` (verify command args)
-- [ ] Write tests for `EditCommand` (verify editor resolution: EDITOR set, VISUAL fallback, vi default; verify command args)
-- [ ] Write tests for `ValidateConfig` (success, validation error with stderr message)
-- [ ] Run tests: `go test ./internal/compose/ -v`
+- [x] Define `ConfigProvider` interface in `internal/tui/app.go` with `ConfigFile`, `ConfigResolved`, `EditCommand`, `ValidateConfig`
+- [x] Add `findComposeFile()` helper on `Compose` that probes `composeFiles` candidates and returns the path (related to existing `HasComposeFile()` but returns the path instead of bool)
+- [x] Implement `ConfigFile` on `Compose` — call `findComposeFile()`, then `os.ReadFile`
+- [x] Implement `ConfigResolved` on `Compose` — run `docker compose config` via `command()`, capture output with `outputCmd` hook
+- [x] Implement `EditCommand` on `Compose` — resolve editor (`$EDITOR`/`$VISUAL`/`vi`), return `exec.Command(editor, filePath)`
+- [x] Implement `ValidateConfig` on `Compose` — run `docker compose config --quiet`, capture stderr for error messages (not just exit code)
+- [x] Write tests for `findComposeFile` (file exists, file missing, multiple candidates — first match wins)
+- [x] Write tests for `ConfigFile` (success, no compose file error)
+- [x] Write tests for `ConfigResolved` (verify command args)
+- [x] Write tests for `EditCommand` (verify editor resolution: EDITOR set, VISUAL fallback, vi default; verify command args)
+- [x] Write tests for `ValidateConfig` (success, validation error with stderr message)
+- [x] Run tests: `go test ./internal/compose/ -v`
 
 ### Task 2: Add ConfigProvider implementation on RemoteCompose
 
@@ -115,17 +115,17 @@ Since we use type-assertion from `composer` (no separate `configProvider` field 
 - Modify: `internal/compose/remote.go`
 - Modify: `internal/compose/remote_test.go`
 
-- [ ] Add `findRemoteComposeFile()` on `RemoteCompose` — single SSH command that tests all candidates at once (`for f in ...; do test -f && echo && break; done`) to avoid multiple round-trips
-- [ ] Implement `ConfigFile` on `RemoteCompose` — call `findRemoteComposeFile()`, then `ssh cat <path>` via ControlMaster
-- [ ] Implement `ConfigResolved` on `RemoteCompose` — run `docker compose config` via `remoteCommand()`
-- [ ] Implement `EditCommand` on `RemoteCompose` — build `ssh -t -S socket -o ControlMaster=no host 'cd projDir && ${EDITOR:-vi} filename'`
-- [ ] Implement `ValidateConfig` on `RemoteCompose` — run `docker compose config --quiet` via `remoteCommand()`, capture stderr for error messages
-- [ ] Write tests for `findRemoteComposeFile` (verify SSH command construction)
-- [ ] Write tests for `ConfigFile` (verify SSH cat command args)
-- [ ] Write tests for `ConfigResolved` (verify remote command args)
-- [ ] Write tests for `EditCommand` (verify SSH -t command with shell escaping)
-- [ ] Write tests for `ValidateConfig` (verify remote command args)
-- [ ] Run tests: `go test ./internal/compose/ -v`
+- [x] Add `findRemoteComposeFile()` on `RemoteCompose` — single SSH command that tests all candidates at once (`for f in ...; do test -f && echo && break; done`) to avoid multiple round-trips
+- [x] Implement `ConfigFile` on `RemoteCompose` — call `findRemoteComposeFile()`, then `ssh cat <path>` via ControlMaster
+- [x] Implement `ConfigResolved` on `RemoteCompose` — run `docker compose config` via `remoteCommand()`
+- [x] Implement `EditCommand` on `RemoteCompose` — build `ssh -t -S socket -o ControlMaster=no host 'cd projDir && ${EDITOR:-vi} filename'`
+- [x] Implement `ValidateConfig` on `RemoteCompose` — run `docker compose config --quiet` via `remoteCommand()`, capture stderr for error messages
+- [x] Write tests for `findRemoteComposeFile` (verify SSH command construction)
+- [x] Write tests for `ConfigFile` (verify SSH cat command args)
+- [x] Write tests for `ConfigResolved` (verify remote command args)
+- [x] Write tests for `EditCommand` (verify SSH -t command with shell escaping)
+- [x] Write tests for `ValidateConfig` (verify remote command args)
+- [x] Run tests: `go test ./internal/compose/ -v`
 
 ### Task 3: Add screenConfig to TUI — model, enter/exit, key handling
 
@@ -133,26 +133,26 @@ Since we use type-assertion from `composer` (no separate `configProvider` field 
 - Modify: `internal/tui/app.go`
 - Modify: `internal/tui/app_test.go`
 
-- [ ] Add `screenConfig` constant to `screen` enum
-- [ ] Add config fields to `Model`: `configContent`, `configResolved`, `configViewport`, `configShowRes`, `configErr`, `configValid *bool`, `configValidMsg`, `configSession uint64`
-- [ ] Add `configFileMsg`, `configResolvedMsg`, `configEditDoneMsg`, `configValidateMsg` message types (all carry `session uint64` for stale message rejection)
-- [ ] Add `enterConfig()` method — type-assert `m.composer.(ConfigProvider)`, increment `configSession`, set `m.screen = screenConfig`, spawn tea.Cmd to fetch `ConfigFile()`
-- [ ] Handle `c` key on `screenSelectContainers` — if type-assertion succeeds, call `enterConfig()`; otherwise ignore (no config support for this composer)
-- [ ] Handle `configFileMsg` in `Update()` — check `m.screen == screenConfig && msg.session == m.configSession`, populate viewport with content, handle error
-- [ ] Handle `configResolvedMsg` in `Update()` — same session guard, cache resolved content, swap viewport if `configShowRes`
-- [ ] Add key handling for `screenConfig`: `esc` (back + cleanup), `q`/`ctrl+c` (quit), `r` (toggle), `e` (edit), viewport scroll delegation
-- [ ] Implement `r` toggle: if resolved not cached, spawn fetch cmd; if cached, swap viewport content
-- [ ] Implement `e` edit: call `EditCommand()` — if error, show in `configErr`; if success, return `tea.ExecProcess`; on return, re-fetch content + validate
-- [ ] Handle `configEditDoneMsg` — re-fetch `ConfigFile()` and spawn `ValidateConfig()` concurrently
-- [ ] Handle `configValidateMsg` — set `configValid`/`configValidMsg` from result (including stderr message on failure)
-- [ ] Implement `esc` cleanup: clear all `config*` fields, return to `screenSelectContainers`
-- [ ] Guard ALL async config message handlers with `m.screen == screenConfig && msg.session == m.configSession`
-- [ ] Write tests for `c` key entering config screen (type-assertion success path)
-- [ ] Write tests for `c` key when composer doesn't implement ConfigProvider (ignored)
-- [ ] Write tests for `esc` cleanup (all config fields cleared)
-- [ ] Write tests for `r` toggle state transitions
-- [ ] Write tests for stale message guard (message arrives after leaving screen — discarded)
-- [ ] Run tests: `go test ./internal/tui/ -v`
+- [x] Add `screenConfig` constant to `screen` enum
+- [x] Add config fields to `Model`: `configContent`, `configResolved`, `configViewport`, `configShowRes`, `configErr`, `configValid *bool`, `configValidMsg`, `configSession uint64`
+- [x] Add `configFileMsg`, `configResolvedMsg`, `configEditDoneMsg`, `configValidateMsg` message types (all carry `session uint64` for stale message rejection)
+- [x] Add `enterConfig()` method — type-assert `m.composer.(ConfigProvider)`, increment `configSession`, set `m.screen = screenConfig`, spawn tea.Cmd to fetch `ConfigFile()`
+- [x] Handle `c` key on `screenSelectContainers` — if type-assertion succeeds, call `enterConfig()`; otherwise ignore (no config support for this composer)
+- [x] Handle `configFileMsg` in `Update()` — check `m.screen == screenConfig && msg.session == m.configSession`, populate viewport with content, handle error
+- [x] Handle `configResolvedMsg` in `Update()` — same session guard, cache resolved content, swap viewport if `configShowRes`
+- [x] Add key handling for `screenConfig`: `esc` (back + cleanup), `q`/`ctrl+c` (quit), `r` (toggle), `e` (edit), viewport scroll delegation
+- [x] Implement `r` toggle: if resolved not cached, spawn fetch cmd; if cached, swap viewport content
+- [x] Implement `e` edit: call `EditCommand()` — if error, show in `configErr`; if success, return `tea.ExecProcess`; on return, re-fetch content + validate
+- [x] Handle `configEditDoneMsg` — re-fetch `ConfigFile()` and spawn `ValidateConfig()` concurrently
+- [x] Handle `configValidateMsg` — set `configValid`/`configValidMsg` from result (including stderr message on failure)
+- [x] Implement `esc` cleanup: clear all `config*` fields, return to `screenSelectContainers`
+- [x] Guard ALL async config message handlers with `m.screen == screenConfig && msg.session == m.configSession`
+- [x] Write tests for `c` key entering config screen (type-assertion success path)
+- [x] Write tests for `c` key when composer doesn't implement ConfigProvider (ignored)
+- [x] Write tests for `esc` cleanup (all config fields cleared)
+- [x] Write tests for `r` toggle state transitions
+- [x] Write tests for stale message guard (message arrives after leaving screen — discarded)
+- [x] Run tests: `go test ./internal/tui/ -v`
 
 ### Task 4: Add config screen rendering (View)
 
@@ -160,20 +160,20 @@ Since we use type-assertion from `composer` (no separate `configProvider` field 
 - Modify: `internal/tui/app.go`
 - Possibly modify: `internal/tui/styles.go`
 
-- [ ] Add `viewConfig()` method following `viewLogs()` pattern
-- [ ] Show breadcrumb title: `cdeploy > [server] > [project] > config`
-- [ ] Show viewport with config content
-- [ ] Show loading state when content is being fetched
-- [ ] Show error state when `configErr` is set
-- [ ] Show validation status line at bottom: green "Config valid" / red "Config error: ..." / nothing if not checked
-- [ ] Show help bar with keys: `esc back  .  r raw/resolved  .  e edit  .  up/down scroll  .  q quit`
-- [ ] Dynamically adjust help text based on `configShowRes` state (show "r raw" vs "r resolved")
-- [ ] Add `screenConfig` case to `View()` switch
-- [ ] Write tests: `viewConfig()` output contains breadcrumb
-- [ ] Write tests: `viewConfig()` shows "Loading..." when content is nil and no error
-- [ ] Write tests: `viewConfig()` shows error when `configErr` is set
-- [ ] Write tests: help bar reflects `configShowRes` state ("r raw" vs "r resolved")
-- [ ] Run tests: `go test ./internal/tui/ -v`
+- [x] Add `viewConfig()` method following `viewLogs()` pattern
+- [x] Show breadcrumb title: `cdeploy > [server] > [project] > config`
+- [x] Show viewport with config content
+- [x] Show loading state when content is being fetched
+- [x] Show error state when `configErr` is set
+- [x] Show validation status line at bottom: green "Config valid" / red "Config error: ..." / nothing if not checked
+- [x] Show help bar with keys: `esc back  .  r raw/resolved  .  e edit  .  up/down scroll  .  q quit`
+- [x] Dynamically adjust help text based on `configShowRes` state (show "r raw" vs "r resolved")
+- [x] Add `screenConfig` case to `View()` switch
+- [x] Write tests: `viewConfig()` output contains breadcrumb
+- [x] Write tests: `viewConfig()` shows "Loading..." when content is nil and no error
+- [x] Write tests: `viewConfig()` shows error when `configErr` is set
+- [x] Write tests: help bar reflects `configShowRes` state ("r raw" vs "r resolved")
+- [x] Run tests: `go test ./internal/tui/ -v`
 
 ### Task 5: Verify wiring works end-to-end
 
@@ -182,30 +182,30 @@ Since we use type-assertion (`composer.(ConfigProvider)`) rather than a separate
 **Files:**
 - Possibly modify: `cmd/root.go` (only if integration issues found)
 
-- [ ] Verify that `compose.Compose` satisfies `tui.ConfigProvider` (compile-time check via `var _ tui.ConfigProvider = (*compose.Compose)(nil)`)
-- [ ] Verify that `compose.RemoteCompose` satisfies `tui.ConfigProvider` (same compile-time check)
-- [ ] Verify the type-assertion in TUI works when composer is created via the existing `ComposerFactory` flow
-- [ ] Test that config screen works after project selection (composer changes → new type-assertion)
-- [ ] Run tests: `go test ./... -v`
+- [x] Verify that `compose.Compose` satisfies `tui.ConfigProvider` (compile-time check via `var _ tui.ConfigProvider = (*compose.Compose)(nil)`)
+- [x] Verify that `compose.RemoteCompose` satisfies `tui.ConfigProvider` (same compile-time check)
+- [x] Verify the type-assertion in TUI works when composer is created via the existing `ComposerFactory` flow
+- [x] Test that config screen works after project selection (composer changes → new type-assertion)
+- [x] Run tests: `go test ./... -v`
 
 ### Task 6: Verify acceptance criteria
 
-- [ ] Verify `c` key opens config screen from container screen
-- [ ] Verify raw compose file content is displayed correctly
-- [ ] Verify `r` toggles to resolved config and back
-- [ ] Verify `e` opens editor (local) and returns to config screen with refreshed content
-- [ ] Verify `e` opens editor (remote) via SSH -t and returns correctly
-- [ ] Verify post-edit validation message appears
-- [ ] Verify `esc` returns to container screen cleanly
-- [ ] Verify edge cases: no compose file found, validation failure, editor not found
-- [ ] Run full test suite: `go test ./... -count=1`
-- [ ] Verify test coverage: `go test ./internal/compose/ ./internal/tui/ -coverprofile=cover.out && go tool cover -func=cover.out`
+- [x] Verify `c` key opens config screen from container screen
+- [x] Verify raw compose file content is displayed correctly
+- [x] Verify `r` toggles to resolved config and back
+- [x] Verify `e` opens editor (local) and returns to config screen with refreshed content
+- [x] Verify `e` opens editor (remote) via SSH -t and returns correctly
+- [x] Verify post-edit validation message appears
+- [x] Verify `esc` returns to container screen cleanly
+- [x] Verify edge cases: no compose file found, validation failure, editor not found
+- [x] Run full test suite: `go test ./... -count=1`
+- [x] Verify test coverage: `go test ./internal/compose/ ./internal/tui/ -coverprofile=cover.out && go tool cover -func=cover.out`
 
 ### Task 7: [Final] Update documentation
 
-- [ ] Update `CLAUDE.md` with new `screenConfig` documentation (TUI state machine section, key bindings)
-- [ ] Update `CLAUDE.md` with `ConfigProvider` interface documentation
-- [ ] Move this plan to `docs/plans/completed/`
+- [x] Update `CLAUDE.md` with new `screenConfig` documentation (TUI state machine section, key bindings)
+- [x] Update `CLAUDE.md` with `ConfigProvider` interface documentation
+- [x] Move this plan to `docs/plans/completed/`
 
 ## Post-Completion
 *Items requiring manual intervention or external systems*

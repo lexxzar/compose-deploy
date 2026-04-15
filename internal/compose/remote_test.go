@@ -10,6 +10,23 @@ import (
 	"testing"
 )
 
+// Compile-time check: RemoteCompose implements tui.ConfigProvider shape.
+// Can't import tui (circular), so we verify the method signatures here.
+func TestRemoteCompose_ImplementsConfigProviderShape(t *testing.T) {
+	r := &RemoteCompose{
+		Host:       "user@host",
+		ProjectDir: "/app",
+		SocketPath: "/tmp/test-socket",
+		outputCmd:  func(cmd *exec.Cmd) ([]byte, error) { return nil, nil },
+	}
+	ctx := context.Background()
+
+	_, _ = r.ConfigFile(ctx)
+	_, _ = r.ConfigResolved(ctx)
+	_, _ = r.EditCommand(ctx)
+	_ = r.ValidateConfig(ctx)
+}
+
 func TestNewRemote_SocketPath(t *testing.T) {
 	r := NewRemote("user@host1", "/app")
 	if !strings.HasPrefix(r.SocketPath, "/tmp/cdeploy-ctrl-") {
@@ -919,5 +936,208 @@ func TestRemoteRun_WriterWiring(t *testing.T) {
 	}
 	if buf.String() != "output" {
 		t.Errorf("writer got %q, want %q", buf.String(), "output")
+	}
+}
+
+// --- RemoteCompose ConfigProvider tests ---
+
+func TestRemoteFindComposeFile_SSHCommand(t *testing.T) {
+	var capturedArgs []string
+	r := &RemoteCompose{
+		Host:       "user@example.com",
+		ProjectDir: "/app",
+		SocketPath: "/tmp/cdeploy-ctrl-abc-99",
+		outputCmd: func(cmd *exec.Cmd) ([]byte, error) {
+			capturedArgs = cmd.Args
+			return []byte("compose.yml\n"), nil
+		},
+	}
+
+	name, err := r.findRemoteComposeFile(context.Background())
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if name != "compose.yml" {
+		t.Errorf("findRemoteComposeFile() = %q, want %q", name, "compose.yml")
+	}
+
+	// Verify SSH args structure
+	if capturedArgs[0] != "ssh" {
+		t.Errorf("arg[0] = %q, want %q", capturedArgs[0], "ssh")
+	}
+	// Should use ControlMaster socket
+	remoteCmd := capturedArgs[len(capturedArgs)-1]
+	if !strings.Contains(remoteCmd, "for f in") {
+		t.Errorf("remote command should contain 'for f in', got: %q", remoteCmd)
+	}
+	if !strings.Contains(remoteCmd, "'/app'") {
+		t.Errorf("remote command should reference project dir, got: %q", remoteCmd)
+	}
+}
+
+func TestRemoteFindComposeFile_NoFile(t *testing.T) {
+	r := &RemoteCompose{
+		Host:       "user@example.com",
+		ProjectDir: "/app",
+		SocketPath: "/tmp/cdeploy-ctrl-abc-99",
+		outputCmd: func(cmd *exec.Cmd) ([]byte, error) {
+			return []byte(""), nil
+		},
+	}
+
+	_, err := r.findRemoteComposeFile(context.Background())
+	if err == nil {
+		t.Fatal("expected error, got nil")
+	}
+	if !strings.Contains(err.Error(), "no compose file found") {
+		t.Errorf("error = %q, want 'no compose file found'", err.Error())
+	}
+}
+
+func TestRemoteConfigFile_SSHCatCommand(t *testing.T) {
+	callCount := 0
+	r := &RemoteCompose{
+		Host:       "user@example.com",
+		ProjectDir: "/app",
+		SocketPath: "/tmp/cdeploy-ctrl-abc-99",
+		outputCmd: func(cmd *exec.Cmd) ([]byte, error) {
+			callCount++
+			remoteCmd := cmd.Args[len(cmd.Args)-1]
+			if strings.Contains(remoteCmd, "for f in") {
+				return []byte("compose.yml\n"), nil
+			}
+			if strings.Contains(remoteCmd, "cat") {
+				if !strings.Contains(remoteCmd, "'/app/compose.yml'") {
+					return nil, fmt.Errorf("unexpected cat path: %s", remoteCmd)
+				}
+				return []byte("services:\n  web:\n    image: nginx\n"), nil
+			}
+			return nil, fmt.Errorf("unexpected command: %s", remoteCmd)
+		},
+	}
+
+	got, err := r.ConfigFile(context.Background())
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if string(got) != "services:\n  web:\n    image: nginx\n" {
+		t.Errorf("ConfigFile() = %q, want compose content", string(got))
+	}
+	if callCount != 2 {
+		t.Errorf("expected 2 SSH calls (find + cat), got %d", callCount)
+	}
+}
+
+func TestRemoteConfigResolved_Args(t *testing.T) {
+	r := &RemoteCompose{
+		Host:       "user@example.com",
+		ProjectDir: "/app",
+		SocketPath: "/tmp/cdeploy-ctrl-abc-99",
+		outputCmd: func(cmd *exec.Cmd) ([]byte, error) {
+			remoteCmd := cmd.Args[len(cmd.Args)-1]
+			if !strings.Contains(remoteCmd, "'config'") {
+				return nil, fmt.Errorf("expected 'config' in command, got: %s", remoteCmd)
+			}
+			return []byte("resolved config"), nil
+		},
+	}
+
+	got, err := r.ConfigResolved(context.Background())
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if string(got) != "resolved config" {
+		t.Errorf("ConfigResolved() = %q, want %q", string(got), "resolved config")
+	}
+}
+
+func TestRemoteEditCommand_SSHArgs(t *testing.T) {
+	r := &RemoteCompose{
+		Host:       "user@example.com",
+		ProjectDir: "/app",
+		SocketPath: "/tmp/cdeploy-ctrl-abc-99",
+		outputCmd: func(cmd *exec.Cmd) ([]byte, error) {
+			remoteCmd := cmd.Args[len(cmd.Args)-1]
+			if strings.Contains(remoteCmd, "for f in") {
+				return []byte("compose.yml\n"), nil
+			}
+			return nil, fmt.Errorf("unexpected command")
+		},
+	}
+
+	cmd, err := r.EditCommand(context.Background())
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	// Must have -t for TTY
+	if !strings.Contains(strings.Join(cmd.Args, " "), "-t") {
+		t.Error("EditCommand should include -t for TTY")
+	}
+
+	remoteCmd := cmd.Args[len(cmd.Args)-1]
+	if !strings.Contains(remoteCmd, "${EDITOR:-vi}") {
+		t.Errorf("remote command should use ${EDITOR:-vi}, got: %q", remoteCmd)
+	}
+	if !strings.Contains(remoteCmd, "cd '/app'") {
+		t.Errorf("remote command should cd to project dir, got: %q", remoteCmd)
+	}
+	if !strings.Contains(remoteCmd, "'compose.yml'") {
+		t.Errorf("remote command should reference compose file, got: %q", remoteCmd)
+	}
+}
+
+func TestRemoteEditCommand_NoFile(t *testing.T) {
+	r := &RemoteCompose{
+		Host:       "user@example.com",
+		ProjectDir: "/app",
+		SocketPath: "/tmp/cdeploy-ctrl-abc-99",
+		outputCmd: func(cmd *exec.Cmd) ([]byte, error) {
+			return []byte(""), nil
+		},
+	}
+
+	_, err := r.EditCommand(context.Background())
+	if err == nil {
+		t.Fatal("expected error, got nil")
+	}
+}
+
+func TestRemoteValidateConfig_Args(t *testing.T) {
+	r := &RemoteCompose{
+		Host:       "user@example.com",
+		ProjectDir: "/app",
+		SocketPath: "/tmp/cdeploy-ctrl-abc-99",
+		outputCmd: func(cmd *exec.Cmd) ([]byte, error) {
+			remoteCmd := cmd.Args[len(cmd.Args)-1]
+			if !strings.Contains(remoteCmd, "'config'") || !strings.Contains(remoteCmd, "'--quiet'") {
+				return nil, fmt.Errorf("expected 'config' '--quiet', got: %s", remoteCmd)
+			}
+			return nil, nil
+		},
+	}
+
+	err := r.ValidateConfig(context.Background())
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestRemoteValidateConfig_Error(t *testing.T) {
+	r := &RemoteCompose{
+		Host:       "user@example.com",
+		ProjectDir: "/app",
+		SocketPath: "/tmp/cdeploy-ctrl-abc-99",
+		outputCmd: func(cmd *exec.Cmd) ([]byte, error) {
+			return nil, fmt.Errorf("invalid config")
+		},
+	}
+
+	err := r.ValidateConfig(context.Background())
+	if err == nil {
+		t.Fatal("expected error, got nil")
+	}
+	if !strings.Contains(err.Error(), "invalid config") {
+		t.Errorf("error = %q, want 'invalid config'", err.Error())
 	}
 }

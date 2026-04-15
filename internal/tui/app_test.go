@@ -53,6 +53,35 @@ func (m *mockComposer) Logs(ctx context.Context, service string, follow bool, ta
 	return nil
 }
 
+// mockConfigComposer implements both runner.Composer and ConfigProvider.
+type mockConfigComposer struct {
+	mockComposer
+	configFile     []byte
+	configResolved []byte
+	configErr      error
+	validateErr    error
+}
+
+func (m *mockConfigComposer) ConfigFile(ctx context.Context) ([]byte, error) {
+	return m.configFile, m.configErr
+}
+func (m *mockConfigComposer) ConfigResolved(ctx context.Context) ([]byte, error) {
+	return m.configResolved, m.configErr
+}
+func (m *mockConfigComposer) EditCommand(ctx context.Context) (*exec.Cmd, error) {
+	if m.configErr != nil {
+		return nil, m.configErr
+	}
+	return exec.Command("echo", "edit"), nil
+}
+func (m *mockConfigComposer) ValidateConfig(ctx context.Context) error {
+	return m.validateErr
+}
+
+func mockConfigFactory(mc *mockConfigComposer) ComposerFactory {
+	return func(string) runner.Composer { return mc }
+}
+
 func TestNewModel_InitialState(t *testing.T) {
 	mc := &mockComposer{}
 	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
@@ -2496,5 +2525,397 @@ func TestViewSelectContainers_ConfirmState(t *testing.T) {
 	// When confirming, should show the confirmation prompt
 	if !strings.Contains(view, "Deploy") {
 		t.Errorf("confirming view should mention the operation, got: %q", view)
+	}
+}
+
+// --- Config screen tests ---
+
+func TestConfigScreen_CKeyEntersConfig(t *testing.T) {
+	mc := &mockConfigComposer{
+		mockComposer: mockComposer{
+			services: []string{"web"},
+			status:   map[string]runner.ServiceStatus{"web": {Running: true}},
+		},
+		configFile: []byte("services:\n  web:\n    image: nginx\n"),
+	}
+	m := NewModel(mc, io.Discard, mockConfigFactory(mc), nil, nil)
+	m.services = mc.services
+	m.svcStatus = mc.status
+	m.screen = screenSelectContainers
+	m.width = 80
+	m.height = 24
+
+	result, cmd := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'c'}})
+	model := result.(Model)
+
+	if model.screen != screenConfig {
+		t.Errorf("screen = %d, want %d (screenConfig)", model.screen, screenConfig)
+	}
+	if cmd == nil {
+		t.Error("expected a cmd to fetch config file")
+	}
+	if model.configSession != 1 {
+		t.Errorf("configSession = %d, want 1", model.configSession)
+	}
+}
+
+func TestConfigScreen_CKeyIgnoredWithoutConfigProvider(t *testing.T) {
+	mc := &mockComposer{
+		services: []string{"web"},
+		status:   map[string]runner.ServiceStatus{"web": {Running: true}},
+	}
+	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
+	m.services = mc.services
+	m.svcStatus = mc.status
+	m.screen = screenSelectContainers
+
+	result, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'c'}})
+	model := result.(Model)
+
+	if model.screen != screenSelectContainers {
+		t.Errorf("screen = %d, want %d (should stay on containers)", model.screen, screenSelectContainers)
+	}
+}
+
+func TestConfigScreen_EscCleansUp(t *testing.T) {
+	mc := &mockConfigComposer{
+		mockComposer: mockComposer{
+			services: []string{"web"},
+			status:   map[string]runner.ServiceStatus{"web": {Running: true}},
+		},
+		configFile: []byte("test content"),
+	}
+	m := NewModel(mc, io.Discard, mockConfigFactory(mc), nil, nil)
+	m.services = mc.services
+	m.svcStatus = mc.status
+	m.screen = screenConfig
+	m.configContent = []byte("test")
+	m.configResolved = []byte("resolved")
+	m.configShowRes = true
+	v := true
+	m.configValid = &v
+	m.configValidMsg = "ok"
+	m.configSession = 5
+
+	result, _ := m.Update(tea.KeyMsg{Type: tea.KeyEsc})
+	model := result.(Model)
+
+	if model.screen != screenSelectContainers {
+		t.Errorf("screen = %d, want %d", model.screen, screenSelectContainers)
+	}
+	if model.configContent != nil {
+		t.Error("configContent should be nil after esc")
+	}
+	if model.configResolved != nil {
+		t.Error("configResolved should be nil after esc")
+	}
+	if model.configShowRes {
+		t.Error("configShowRes should be false after esc")
+	}
+	if model.configErr != nil {
+		t.Error("configErr should be nil after esc")
+	}
+	if model.configValid != nil {
+		t.Error("configValid should be nil after esc")
+	}
+	if model.configValidMsg != "" {
+		t.Error("configValidMsg should be empty after esc")
+	}
+}
+
+func TestConfigScreen_ToggleRawResolved(t *testing.T) {
+	mc := &mockConfigComposer{
+		mockComposer: mockComposer{
+			services: []string{"web"},
+			status:   map[string]runner.ServiceStatus{"web": {Running: true}},
+		},
+		configFile:     []byte("raw content"),
+		configResolved: []byte("resolved content"),
+	}
+	m := NewModel(mc, io.Discard, mockConfigFactory(mc), nil, nil)
+	m.screen = screenConfig
+	m.configContent = mc.configFile
+	m.configSession = 1
+	m.width = 80
+	m.height = 24
+	m.configViewport = viewport.New(76, 18)
+
+	// Toggle to resolved — no cache yet, should trigger fetch
+	result, cmd := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'r'}})
+	model := result.(Model)
+	if !model.configShowRes {
+		t.Error("configShowRes should be true after first r press")
+	}
+	if cmd == nil {
+		t.Error("expected a cmd to fetch resolved config")
+	}
+
+	// Simulate resolved data arriving
+	model.configResolved = mc.configResolved
+
+	// Toggle back to raw
+	result, _ = model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'r'}})
+	model = result.(Model)
+	if model.configShowRes {
+		t.Error("configShowRes should be false after second r press")
+	}
+
+	// Toggle to resolved again — cached this time
+	result, cmd = model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'r'}})
+	model = result.(Model)
+	if !model.configShowRes {
+		t.Error("configShowRes should be true after third r press")
+	}
+	if cmd != nil {
+		t.Error("should not fetch again when resolved is cached")
+	}
+}
+
+func TestConfigScreen_StaleMessageDiscarded(t *testing.T) {
+	mc := &mockConfigComposer{
+		mockComposer: mockComposer{
+			services: []string{"web"},
+			status:   map[string]runner.ServiceStatus{"web": {Running: true}},
+		},
+	}
+	m := NewModel(mc, io.Discard, mockConfigFactory(mc), nil, nil)
+	m.screen = screenConfig
+	m.configSession = 5
+
+	// Message from old session
+	result, _ := m.Update(configFileMsg{data: []byte("stale"), session: 3})
+	model := result.(Model)
+	if model.configContent != nil {
+		t.Error("stale configFileMsg should be discarded")
+	}
+
+	// Message from current session
+	result, _ = m.Update(configFileMsg{data: []byte("current"), session: 5})
+	model = result.(Model)
+	if string(model.configContent) != "current" {
+		t.Errorf("configContent = %q, want 'current'", string(model.configContent))
+	}
+}
+
+func TestConfigScreen_StaleMessageDiscardedWhenNotOnScreen(t *testing.T) {
+	mc := &mockConfigComposer{
+		mockComposer: mockComposer{
+			services: []string{"web"},
+			status:   map[string]runner.ServiceStatus{"web": {Running: true}},
+		},
+	}
+	m := NewModel(mc, io.Discard, mockConfigFactory(mc), nil, nil)
+	m.screen = screenSelectContainers
+	m.configSession = 5
+
+	// Message arrives while on containers screen
+	result, _ := m.Update(configFileMsg{data: []byte("stale"), session: 5})
+	model := result.(Model)
+	if model.configContent != nil {
+		t.Error("configFileMsg should be discarded when not on config screen")
+	}
+}
+
+func TestConfigScreen_ConfigFileMsgError(t *testing.T) {
+	mc := &mockConfigComposer{
+		mockComposer: mockComposer{
+			services: []string{"web"},
+		},
+	}
+	m := NewModel(mc, io.Discard, mockConfigFactory(mc), nil, nil)
+	m.screen = screenConfig
+	m.configSession = 1
+
+	result, _ := m.Update(configFileMsg{err: fmt.Errorf("no compose file"), session: 1})
+	model := result.(Model)
+	if model.configErr == nil {
+		t.Fatal("configErr should be set on error")
+	}
+	if !strings.Contains(model.configErr.Error(), "no compose file") {
+		t.Errorf("configErr = %q, want 'no compose file'", model.configErr.Error())
+	}
+}
+
+func TestConfigScreen_ValidateMsg(t *testing.T) {
+	mc := &mockConfigComposer{
+		mockComposer: mockComposer{services: []string{"web"}},
+	}
+	m := NewModel(mc, io.Discard, mockConfigFactory(mc), nil, nil)
+	m.screen = screenConfig
+	m.configSession = 1
+
+	// Success
+	result, _ := m.Update(configValidateMsg{err: nil, session: 1})
+	model := result.(Model)
+	if model.configValid == nil || !*model.configValid {
+		t.Error("configValid should be true on successful validation")
+	}
+
+	// Failure
+	result, _ = model.Update(configValidateMsg{err: fmt.Errorf("bad yaml"), session: 1})
+	model = result.(Model)
+	if model.configValid == nil || *model.configValid {
+		t.Error("configValid should be false on failed validation")
+	}
+	if model.configValidMsg != "bad yaml" {
+		t.Errorf("configValidMsg = %q, want 'bad yaml'", model.configValidMsg)
+	}
+}
+
+func TestConfigScreen_EditDoneTriggersFetchAndValidate(t *testing.T) {
+	mc := &mockConfigComposer{
+		mockComposer: mockComposer{services: []string{"web"}},
+		configFile:   []byte("new content"),
+	}
+	m := NewModel(mc, io.Discard, mockConfigFactory(mc), nil, nil)
+	m.screen = screenConfig
+	m.configSession = 1
+	m.configResolved = []byte("old resolved")
+
+	result, cmd := m.Update(configEditDoneMsg{session: 1})
+	model := result.(Model)
+
+	if model.configResolved != nil {
+		t.Error("configResolved should be cleared to invalidate cache after edit")
+	}
+	if cmd == nil {
+		t.Error("expected batch cmd for re-fetch and validate")
+	}
+}
+
+func TestViewConfig_Breadcrumb(t *testing.T) {
+	mc := &mockConfigComposer{
+		mockComposer: mockComposer{services: []string{"web"}},
+	}
+	m := NewModel(mc, io.Discard, mockConfigFactory(mc), nil, nil)
+	m.screen = screenConfig
+	m.configContent = []byte("test")
+	m.configViewport = viewport.New(76, 18)
+	m.configViewport.SetContent("test")
+	m.width = 80
+	m.height = 24
+	m.projName = "myapp"
+
+	view := m.viewConfig()
+	if !strings.Contains(view, "config") {
+		t.Errorf("view should contain 'config', got: %q", view)
+	}
+	if !strings.Contains(view, "myapp") {
+		t.Errorf("view should contain project name, got: %q", view)
+	}
+}
+
+func TestViewConfig_Loading(t *testing.T) {
+	mc := &mockConfigComposer{
+		mockComposer: mockComposer{services: []string{"web"}},
+	}
+	m := NewModel(mc, io.Discard, mockConfigFactory(mc), nil, nil)
+	m.screen = screenConfig
+	m.width = 80
+	m.height = 24
+
+	view := m.viewConfig()
+	if !strings.Contains(view, "Loading") {
+		t.Errorf("view should show 'Loading' when no content, got: %q", view)
+	}
+}
+
+func TestViewConfig_Error(t *testing.T) {
+	mc := &mockConfigComposer{
+		mockComposer: mockComposer{services: []string{"web"}},
+	}
+	m := NewModel(mc, io.Discard, mockConfigFactory(mc), nil, nil)
+	m.screen = screenConfig
+	m.configErr = fmt.Errorf("file not found")
+	m.width = 80
+	m.height = 24
+
+	view := m.viewConfig()
+	if !strings.Contains(view, "file not found") {
+		t.Errorf("view should show error, got: %q", view)
+	}
+}
+
+func TestViewConfig_HelpBarReflectsToggle(t *testing.T) {
+	mc := &mockConfigComposer{
+		mockComposer: mockComposer{services: []string{"web"}},
+	}
+	m := NewModel(mc, io.Discard, mockConfigFactory(mc), nil, nil)
+	m.screen = screenConfig
+	m.configContent = []byte("test")
+	m.configViewport = viewport.New(76, 18)
+	m.configViewport.SetContent("test")
+	m.width = 80
+	m.height = 24
+
+	// Raw mode: help should say "r resolved"
+	m.configShowRes = false
+	view := m.viewConfig()
+	if !strings.Contains(view, "r resolved") {
+		t.Errorf("help should say 'r resolved' when showing raw, got: %q", view)
+	}
+
+	// Resolved mode: help should say "r raw"
+	m.configShowRes = true
+	view = m.viewConfig()
+	if !strings.Contains(view, "r raw") {
+		t.Errorf("help should say 'r raw' when showing resolved, got: %q", view)
+	}
+}
+
+func TestViewConfig_ValidationStatus(t *testing.T) {
+	mc := &mockConfigComposer{
+		mockComposer: mockComposer{services: []string{"web"}},
+	}
+	m := NewModel(mc, io.Discard, mockConfigFactory(mc), nil, nil)
+	m.screen = screenConfig
+	m.configContent = []byte("test")
+	m.configViewport = viewport.New(76, 18)
+	m.configViewport.SetContent("test")
+	m.width = 80
+	m.height = 24
+
+	// No validation yet
+	view := m.viewConfig()
+	if strings.Contains(view, "Config valid") || strings.Contains(view, "Config error") {
+		t.Error("should not show validation status when configValid is nil")
+	}
+
+	// Valid
+	v := true
+	m.configValid = &v
+	view = m.viewConfig()
+	if !strings.Contains(view, "Config valid") {
+		t.Errorf("should show 'Config valid', got: %q", view)
+	}
+
+	// Invalid
+	v2 := false
+	m.configValid = &v2
+	m.configValidMsg = "bad yaml on line 5"
+	view = m.viewConfig()
+	if !strings.Contains(view, "Config error") {
+		t.Errorf("should show 'Config error', got: %q", view)
+	}
+	if !strings.Contains(view, "bad yaml on line 5") {
+		t.Errorf("should show validation message, got: %q", view)
+	}
+}
+
+func TestViewSelectContainers_ShowsConfigKey(t *testing.T) {
+	mc := &mockComposer{
+		services: []string{"web"},
+		status:   map[string]runner.ServiceStatus{"web": {Running: true}},
+	}
+	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
+	m.services = mc.services
+	m.svcStatus = mc.status
+	m.screen = screenSelectContainers
+	m.width = 120
+	m.height = 24
+
+	view := m.viewSelectContainers()
+	if !strings.Contains(view, "c config") {
+		t.Errorf("container screen help should mention 'c config', got: %q", view)
 	}
 }

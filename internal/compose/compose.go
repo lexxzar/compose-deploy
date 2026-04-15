@@ -21,6 +21,9 @@ type Project struct {
 	ConfigDir string // directory containing the compose file
 }
 
+// Compile-time interface satisfaction checks.
+var _ runner.Composer = (*Compose)(nil)
+
 // composeFile candidates for HasComposeFile detection.
 var composeFiles = []string{
 	"compose.yml",
@@ -99,6 +102,73 @@ func sortProjects(projects []Project) {
 			projects[j], projects[j-1] = projects[j-1], projects[j]
 		}
 	}
+}
+
+// findComposeFile returns the path to the first recognized compose file in ProjectDir.
+// It probes the same candidates as HasComposeFile but returns the full path.
+func (c *Compose) findComposeFile() (string, error) {
+	for _, name := range composeFiles {
+		p := filepath.Join(c.ProjectDir, name)
+		if _, err := os.Stat(p); err == nil {
+			return p, nil
+		}
+	}
+	return "", fmt.Errorf("no compose file found in %s", c.ProjectDir)
+}
+
+// ConfigFile returns the raw content of the compose file.
+func (c *Compose) ConfigFile(ctx context.Context) ([]byte, error) {
+	path, err := c.findComposeFile()
+	if err != nil {
+		return nil, err
+	}
+	return os.ReadFile(path)
+}
+
+// ConfigResolved returns the interpolated/resolved compose config
+// (output of `docker compose config`).
+func (c *Compose) ConfigResolved(ctx context.Context) ([]byte, error) {
+	cmd := c.command(ctx, "config")
+	if c.outputCmd != nil {
+		return c.outputCmd(cmd)
+	}
+	return cmd.Output()
+}
+
+// EditCommand returns an exec.Cmd that opens the compose file in the user's editor.
+// It checks $EDITOR, then $VISUAL, then falls back to "vi".
+func (c *Compose) EditCommand(ctx context.Context) (*exec.Cmd, error) {
+	path, err := c.findComposeFile()
+	if err != nil {
+		return nil, err
+	}
+	editor := os.Getenv("EDITOR")
+	if editor == "" {
+		editor = os.Getenv("VISUAL")
+	}
+	if editor == "" {
+		editor = "vi"
+	}
+	return exec.CommandContext(ctx, editor, path), nil
+}
+
+// ValidateConfig runs `docker compose config --quiet` and returns any error
+// with stderr captured so users see why validation failed.
+func (c *Compose) ValidateConfig(ctx context.Context) error {
+	cmd := c.command(ctx, "config", "--quiet")
+	if c.outputCmd != nil {
+		_, err := c.outputCmd(cmd)
+		return err
+	}
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		msg := strings.TrimSpace(string(out))
+		if msg != "" {
+			return fmt.Errorf("%w: %s", err, msg)
+		}
+		return err
+	}
+	return nil
 }
 
 // Compose wraps Docker Compose v2 CLI calls.

@@ -13,6 +13,17 @@ import (
 	"github.com/lexxzar/compose-deploy/internal/runner"
 )
 
+// Compile-time interface satisfaction checks.
+var _ runner.Composer = (*RemoteCompose)(nil)
+
+// remoteComposeFiles lists the compose file candidates to probe on the remote host.
+var remoteComposeFiles = []string{
+	"compose.yml",
+	"compose.yaml",
+	"docker-compose.yml",
+	"docker-compose.yaml",
+}
+
 // RemoteCompose implements runner.Composer by wrapping docker compose commands
 // in SSH calls over a ControlMaster connection.
 type RemoteCompose struct {
@@ -260,6 +271,129 @@ func (r *RemoteCompose) ContainerStatus(ctx context.Context) (map[string]runner.
 		return nil, fmt.Errorf("listing remote container status: %w", withStderr(err))
 	}
 	return parseContainerStatus(out)
+}
+
+// findRemoteComposeFile runs a single SSH command that probes all compose file
+// candidates and returns the first match. Avoids multiple SSH round-trips.
+func (r *RemoteCompose) findRemoteComposeFile(ctx context.Context) (string, error) {
+	// Build: for f in compose.yml compose.yaml ...; do test -f "$projDir/$f" && echo "$f" && break; done
+	var testExpr string
+	if r.ProjectDir != "" {
+		testExpr = fmt.Sprintf(
+			"for f in %s; do test -f %s/$f && echo $f && break; done",
+			strings.Join(remoteComposeFiles, " "),
+			shellEscape(r.ProjectDir),
+		)
+	} else {
+		testExpr = fmt.Sprintf(
+			"for f in %s; do test -f $f && echo $f && break; done",
+			strings.Join(remoteComposeFiles, " "),
+		)
+	}
+
+	cmd := exec.CommandContext(ctx, "ssh",
+		"-S", r.SocketPath,
+		"-o", "ControlMaster=no",
+		r.Host,
+		testExpr,
+	)
+	var out []byte
+	var err error
+	if r.outputCmd != nil {
+		out, err = r.outputCmd(cmd)
+	} else {
+		out, err = cmd.Output()
+	}
+	if err != nil {
+		return "", fmt.Errorf("finding remote compose file: %w", withStderr(err))
+	}
+	name := strings.TrimSpace(string(out))
+	if name == "" {
+		return "", fmt.Errorf("no compose file found on remote host")
+	}
+	return name, nil
+}
+
+// ConfigFile returns the raw content of the compose file on the remote host.
+func (r *RemoteCompose) ConfigFile(ctx context.Context) ([]byte, error) {
+	name, err := r.findRemoteComposeFile(ctx)
+	if err != nil {
+		return nil, err
+	}
+	filePath := name
+	if r.ProjectDir != "" {
+		filePath = r.ProjectDir + "/" + name
+	}
+
+	cmd := exec.CommandContext(ctx, "ssh",
+		"-S", r.SocketPath,
+		"-o", "ControlMaster=no",
+		r.Host,
+		"cat "+shellEscape(filePath),
+	)
+	var out []byte
+	if r.outputCmd != nil {
+		out, err = r.outputCmd(cmd)
+	} else {
+		out, err = cmd.Output()
+	}
+	if err != nil {
+		return nil, fmt.Errorf("reading remote compose file: %w", withStderr(err))
+	}
+	return out, nil
+}
+
+// ConfigResolved returns the interpolated/resolved compose config on the remote host
+// (output of `docker compose config`).
+func (r *RemoteCompose) ConfigResolved(ctx context.Context) ([]byte, error) {
+	cmd := r.remoteCommand(ctx, "config")
+	if r.outputCmd != nil {
+		return r.outputCmd(cmd)
+	}
+	return cmd.Output()
+}
+
+// EditCommand returns an exec.Cmd that opens the remote compose file in an editor
+// via SSH with a TTY. Uses $EDITOR on the remote host, falling back to vi.
+func (r *RemoteCompose) EditCommand(ctx context.Context) (*exec.Cmd, error) {
+	name, err := r.findRemoteComposeFile(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	var remoteCmd string
+	if r.ProjectDir != "" {
+		remoteCmd = fmt.Sprintf("cd %s && ${EDITOR:-vi} %s", shellEscape(r.ProjectDir), shellEscape(name))
+	} else {
+		remoteCmd = fmt.Sprintf("${EDITOR:-vi} %s", shellEscape(name))
+	}
+
+	return exec.CommandContext(ctx, "ssh",
+		"-t",
+		"-S", r.SocketPath,
+		"-o", "ControlMaster=no",
+		r.Host,
+		remoteCmd,
+	), nil
+}
+
+// ValidateConfig runs `docker compose config --quiet` on the remote host and returns
+// any error with stderr captured so users see why validation failed.
+func (r *RemoteCompose) ValidateConfig(ctx context.Context) error {
+	cmd := r.remoteCommand(ctx, "config", "--quiet")
+	if r.outputCmd != nil {
+		_, err := r.outputCmd(cmd)
+		return err
+	}
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		msg := strings.TrimSpace(string(out))
+		if msg != "" {
+			return fmt.Errorf("%w: %s", err, msg)
+		}
+		return err
+	}
+	return nil
 }
 
 // ListProjects returns all Docker Compose projects on the remote host.
