@@ -137,6 +137,7 @@ func (c *Compose) ConfigResolved(ctx context.Context) ([]byte, error) {
 
 // EditCommand returns an exec.Cmd that opens the compose file in the user's editor.
 // It checks $EDITOR, then $VISUAL, then falls back to "vi".
+// Multi-word values like "code --wait" are split into executable + args.
 func (c *Compose) EditCommand(ctx context.Context) (*exec.Cmd, error) {
 	path, err := c.findComposeFile()
 	if err != nil {
@@ -149,7 +150,9 @@ func (c *Compose) EditCommand(ctx context.Context) (*exec.Cmd, error) {
 	if editor == "" {
 		editor = "vi"
 	}
-	return exec.CommandContext(ctx, editor, path), nil
+	parts := strings.Fields(editor)
+	args := append(parts[1:], path)
+	return exec.CommandContext(ctx, parts[0], args...), nil
 }
 
 // ValidateConfig runs `docker compose config --quiet` and returns any error

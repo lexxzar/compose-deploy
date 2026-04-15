@@ -488,8 +488,14 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if m.screen != screenConfig || msg.session != m.configSession {
 			return m, nil
 		}
-		// Re-fetch raw content and validate concurrently
-		m.configResolved = nil // invalidate cache
+		if msg.err != nil {
+			m.configErr = msg.err
+			return m, nil
+		}
+		// Re-fetch raw content and validate concurrently; reset to raw view
+		// since the resolved cache is invalidated and raw is being re-fetched.
+		m.configResolved = nil
+		m.configShowRes = false
 		return m, tea.Batch(m.fetchConfigFile(), m.fetchConfigValidate())
 
 	case configValidateMsg:

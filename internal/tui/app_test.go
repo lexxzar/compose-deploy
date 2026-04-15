@@ -2771,6 +2771,7 @@ func TestConfigScreen_EditDoneTriggersFetchAndValidate(t *testing.T) {
 	m.screen = screenConfig
 	m.configSession = 1
 	m.configResolved = []byte("old resolved")
+	m.configShowRes = true
 
 	result, cmd := m.Update(configEditDoneMsg{session: 1})
 	model := result.(Model)
@@ -2778,8 +2779,32 @@ func TestConfigScreen_EditDoneTriggersFetchAndValidate(t *testing.T) {
 	if model.configResolved != nil {
 		t.Error("configResolved should be cleared to invalidate cache after edit")
 	}
+	if model.configShowRes {
+		t.Error("configShowRes should be reset to false after edit")
+	}
 	if cmd == nil {
 		t.Error("expected batch cmd for re-fetch and validate")
+	}
+}
+
+func TestConfigScreen_EditDoneError(t *testing.T) {
+	mc := &mockConfigComposer{
+		mockComposer: mockComposer{services: []string{"web"}},
+		configFile:   []byte("content"),
+	}
+	m := NewModel(mc, io.Discard, mockConfigFactory(mc), nil, nil)
+	m.screen = screenConfig
+	m.configSession = 1
+
+	editErr := fmt.Errorf("editor exited with status 1")
+	result, cmd := m.Update(configEditDoneMsg{err: editErr, session: 1})
+	model := result.(Model)
+
+	if model.configErr == nil || model.configErr.Error() != editErr.Error() {
+		t.Errorf("configErr = %v, want %v", model.configErr, editErr)
+	}
+	if cmd != nil {
+		t.Error("expected no cmd when edit returns error")
 	}
 }
 

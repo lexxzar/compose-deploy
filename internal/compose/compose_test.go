@@ -1344,11 +1344,14 @@ func TestEditCommand_EditorEnv(t *testing.T) {
 		editor     string
 		visual     string
 		wantEditor string
+		wantArgs   []string // expected args between editor and file path
 	}{
-		{"EDITOR set", "nano", "", "nano"},
-		{"VISUAL fallback", "", "code", "code"},
-		{"vi default", "", "", "vi"},
-		{"EDITOR takes precedence", "nano", "code", "nano"},
+		{"EDITOR set", "nano", "", "nano", nil},
+		{"VISUAL fallback", "", "code", "code", nil},
+		{"vi default", "", "", "vi", nil},
+		{"EDITOR takes precedence", "nano", "code", "nano", nil},
+		{"multi-word EDITOR", "code --wait", "", "code", []string{"--wait"}},
+		{"multi-word VISUAL", "", "nvim -f", "nvim", []string{"-f"}},
 	}
 
 	for _, tt := range tests {
@@ -1369,11 +1372,22 @@ func TestEditCommand_EditorEnv(t *testing.T) {
 			if err != nil {
 				t.Fatalf("unexpected error: %v", err)
 			}
-			if !strings.Contains(cmd.Args[0], tt.wantEditor) {
+			if cmd.Args[0] != tt.wantEditor {
 				t.Errorf("editor = %q, want %q", cmd.Args[0], tt.wantEditor)
 			}
-			if cmd.Args[1] != filepath.Join(dir, "compose.yml") {
-				t.Errorf("file = %q, want %q", cmd.Args[1], filepath.Join(dir, "compose.yml"))
+			// Check extra args between editor and file path
+			filePath := filepath.Join(dir, "compose.yml")
+			extraArgs := cmd.Args[1 : len(cmd.Args)-1]
+			if len(extraArgs) != len(tt.wantArgs) {
+				t.Fatalf("extra args = %v, want %v", extraArgs, tt.wantArgs)
+			}
+			for i, want := range tt.wantArgs {
+				if extraArgs[i] != want {
+					t.Errorf("arg[%d] = %q, want %q", i, extraArgs[i], want)
+				}
+			}
+			if cmd.Args[len(cmd.Args)-1] != filePath {
+				t.Errorf("file = %q, want %q", cmd.Args[len(cmd.Args)-1], filePath)
 			}
 		})
 	}
