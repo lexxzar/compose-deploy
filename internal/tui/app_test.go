@@ -840,8 +840,8 @@ func TestWarning_ShownWhenNoSelection(t *testing.T) {
 			updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{key}})
 			m = updated.(Model)
 
-			if m.warning != "No service is selected" {
-				t.Errorf("warning = %q, want %q", m.warning, "No service is selected")
+			if m.warning != warnNoSelection {
+				t.Errorf("warning = %q, want %q", m.warning, warnNoSelection)
 			}
 		})
 	}
@@ -852,7 +852,7 @@ func TestWarning_ClearedOnNextKeypress(t *testing.T) {
 	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
 	m.screen = screenSelectContainers
 	m.services = mc.services
-	m.warning = "No service is selected"
+	m.warning = warnNoSelection
 
 	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'j'}})
 	m = updated.(Model)

@@ -38,6 +38,8 @@ type ProjectLoader func(ctx context.Context) ([]compose.Project, error)
 // a ProjectLoader, and a disconnect function.
 type ConnectCallback func(server config.Server) (connectCmd *exec.Cmd, factory ComposerFactory, loader ProjectLoader, disconnect func() error)
 
+const warnNoSelection = "No service is selected"
+
 // serverEntryKind distinguishes selectable items from visual group headers.
 type serverEntryKind int
 
@@ -159,7 +161,7 @@ type Model struct {
 	// Confirmation state (within container screen)
 	confirming bool
 	pendingOp  runner.Operation
-	warning    string // transient flash message, cleared on next keypress
+	warning string
 
 	// Screen 2: progress
 	steps       []stepState
@@ -637,7 +639,7 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 
-		m.warning = "" // clear transient warning on any keypress
+		m.warning = ""
 
 		switch key {
 		case "q", "ctrl+c":
@@ -679,21 +681,21 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 				m.pendingOp = runner.Restart
 				m.confirming = true
 			} else {
-				m.warning = "No service is selected"
+				m.warning = warnNoSelection
 			}
 		case "d":
 			if m.selectedCount() > 0 {
 				m.pendingOp = runner.Deploy
 				m.confirming = true
 			} else {
-				m.warning = "No service is selected"
+				m.warning = warnNoSelection
 			}
 		case "s":
 			if m.selectedCount() > 0 {
 				m.pendingOp = runner.StopOnly
 				m.confirming = true
 			} else {
-				m.warning = "No service is selected"
+				m.warning = warnNoSelection
 			}
 		case "l":
 			if len(m.services) == 0 {
