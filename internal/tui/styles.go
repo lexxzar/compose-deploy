@@ -58,6 +58,9 @@ var (
 				Foreground(lipgloss.Color("8")).
 				PaddingLeft(2)
 
+	warningStyle = lipgloss.NewStyle().
+			Foreground(lipgloss.Color("3"))
+
 	helpStyle = lipgloss.NewStyle().
 			Foreground(lipgloss.Color("8")).
 			MarginTop(1)

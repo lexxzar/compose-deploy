@@ -159,6 +159,7 @@ type Model struct {
 	// Confirmation state (within container screen)
 	confirming bool
 	pendingOp  runner.Operation
+	warning    string // transient flash message, cleared on next keypress
 
 	// Screen 2: progress
 	steps       []stepState
@@ -636,6 +637,8 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 
+		m.warning = "" // clear transient warning on any keypress
+
 		switch key {
 		case "q", "ctrl+c":
 			return m, tea.Quit
@@ -675,16 +678,22 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			if m.selectedCount() > 0 {
 				m.pendingOp = runner.Restart
 				m.confirming = true
+			} else {
+				m.warning = "No service is selected"
 			}
 		case "d":
 			if m.selectedCount() > 0 {
 				m.pendingOp = runner.Deploy
 				m.confirming = true
+			} else {
+				m.warning = "No service is selected"
 			}
 		case "s":
 			if m.selectedCount() > 0 {
 				m.pendingOp = runner.StopOnly
 				m.confirming = true
+			} else {
+				m.warning = "No service is selected"
 			}
 		case "l":
 			if len(m.services) == 0 {
@@ -1345,6 +1354,9 @@ func (m Model) viewSelectContainers() string {
 			strings.Join(containers, ", "),
 		)))
 	} else {
+		if m.warning != "" {
+			b.WriteString("\n  " + warningStyle.Render(m.warning))
+		}
 		back := "q quit"
 		if m.showPicker {
 			back = "esc back"

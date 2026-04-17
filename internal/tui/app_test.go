@@ -829,6 +829,39 @@ func TestActionKey_IgnoredWithNoSelection(t *testing.T) {
 	}
 }
 
+func TestWarning_ShownWhenNoSelection(t *testing.T) {
+	for _, key := range []rune{'r', 'd', 's'} {
+		t.Run(string(key), func(t *testing.T) {
+			mc := &mockComposer{services: []string{"nginx", "redis"}}
+			m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
+			m.screen = screenSelectContainers
+			m.services = mc.services
+
+			updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{key}})
+			m = updated.(Model)
+
+			if m.warning != "No service is selected" {
+				t.Errorf("warning = %q, want %q", m.warning, "No service is selected")
+			}
+		})
+	}
+}
+
+func TestWarning_ClearedOnNextKeypress(t *testing.T) {
+	mc := &mockComposer{services: []string{"nginx"}}
+	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
+	m.screen = screenSelectContainers
+	m.services = mc.services
+	m.warning = "No service is selected"
+
+	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'j'}})
+	m = updated.(Model)
+
+	if m.warning != "" {
+		t.Errorf("warning should be cleared after keypress, got %q", m.warning)
+	}
+}
+
 func TestConfirmation_EnterProceeds(t *testing.T) {
 	mc := &mockComposer{services: []string{"nginx"}}
 	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
