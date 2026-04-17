@@ -3185,7 +3185,7 @@ func TestServerBadge_RemoteServer(t *testing.T) {
 	}
 }
 
-func TestServerBadge_DefaultColor(t *testing.T) {
+func TestServerBadge_NoColorUsesPlainServerName(t *testing.T) {
 	mc := &mockComposer{}
 	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
 	m.serverName = "staging"
@@ -3193,8 +3193,8 @@ func TestServerBadge_DefaultColor(t *testing.T) {
 	m.serverColor = ""
 
 	badge := m.serverBadge()
-	if !strings.Contains(badge, "staging") {
-		t.Errorf("server badge should render with default color, got: %q", badge)
+	if badge != "staging" {
+		t.Errorf("server badge without color should fall back to plain server name, got: %q", badge)
 	}
 }
 
@@ -3211,6 +3211,19 @@ func TestBreadcrumb_ServerBadgeInline(t *testing.T) {
 	}
 	if !strings.Contains(bc, "myapp") {
 		t.Errorf("breadcrumb should contain project name, got: %q", bc)
+	}
+}
+
+func TestBreadcrumb_ServerNameWithoutColor(t *testing.T) {
+	mc := &mockComposer{}
+	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
+	m.serverName = "staging"
+	m.serverColor = ""
+	m.projName = "myapp"
+
+	bc := m.breadcrumb()
+	if bc != "cdeploy > staging > myapp" {
+		t.Errorf("breadcrumb without server color should use plain server name, got: %q", bc)
 	}
 }
 
@@ -3243,6 +3256,27 @@ func TestViewSelectContainers_WithBadge(t *testing.T) {
 	view := m.viewSelectContainers()
 	if !strings.Contains(view, "prod") {
 		t.Errorf("container view with server should contain badge with server name, got: %q", view)
+	}
+}
+
+func TestViewSelectContainers_WithoutServerColorUsesPlainBreadcrumb(t *testing.T) {
+	mc := &mockComposer{
+		services: []string{"web"},
+		status:   map[string]runner.ServiceStatus{"web": {Running: true}},
+	}
+	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
+	m.services = mc.services
+	m.svcStatus = mc.status
+	m.screen = screenSelectContainers
+	m.width = 120
+	m.height = 24
+	m.serverName = "staging"
+	m.serverHost = "user@staging"
+	m.serverColor = ""
+
+	view := m.viewSelectContainers()
+	if !strings.Contains(view, "cdeploy > staging > services") {
+		t.Errorf("container view without server color should use plain breadcrumb, got: %q", view)
 	}
 }
 

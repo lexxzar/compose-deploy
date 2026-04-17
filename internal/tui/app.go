@@ -141,9 +141,9 @@ type Model struct {
 	hasPreselection   bool // true when --server was specified
 
 	// Local state (preserved across server selection changes)
-	localComposer       runner.Composer
-	localFactory        ComposerFactory
-	localProjectLoader  ProjectLoader
+	localComposer      runner.Composer
+	localFactory       ComposerFactory
+	localProjectLoader ProjectLoader
 
 	// Screen: project select
 	projects        []compose.Project
@@ -163,7 +163,7 @@ type Model struct {
 	// Confirmation state (within container screen)
 	confirming bool
 	pendingOp  runner.Operation
-	warning string
+	warning    string
 
 	// Screen 2: progress
 	steps       []stepState
@@ -190,14 +190,14 @@ type Model struct {
 	logsRawOff    int                // byte offset into logsContent: everything before this is in logsFormatted
 
 	// Screen: config
-	configContent  []byte             // raw compose file content
-	configResolved []byte             // resolved/interpolated config (cached)
-	configViewport viewport.Model     // viewport for config content
-	configShowRes  bool               // true = showing resolved, false = showing raw
-	configErr      error              // error from config operations
-	configValid    *bool              // nil = not checked, true = valid, false = invalid
-	configValidMsg string             // validation error message
-	configSession  uint64             // monotonic counter for stale message rejection
+	configContent  []byte         // raw compose file content
+	configResolved []byte         // resolved/interpolated config (cached)
+	configViewport viewport.Model // viewport for config content
+	configShowRes  bool           // true = showing resolved, false = showing raw
+	configErr      error          // error from config operations
+	configValid    *bool          // nil = not checked, true = valid, false = invalid
+	configValidMsg string         // validation error message
+	configSession  uint64         // monotonic counter for stale message rejection
 
 	// Shared
 	ctx       context.Context
@@ -1251,7 +1251,7 @@ func (m Model) breadcrumb() string {
 func (m Model) serverBadge() string {
 	color := m.serverColor
 	if color == "" {
-		color = "gray"
+		return m.serverName
 	}
 	style := serverBadgeStyle(color)
 	return style.Render(" " + m.serverName + " ")
