@@ -69,4 +69,26 @@ var (
 			BorderStyle(lipgloss.NormalBorder()).
 			BorderForeground(lipgloss.Color("8")).
 			Padding(0, 1)
+
+	colorMap = map[string]lipgloss.Color{
+		"red":     lipgloss.Color("1"),
+		"green":   lipgloss.Color("2"),
+		"yellow":  lipgloss.Color("3"),
+		"blue":    lipgloss.Color("4"),
+		"magenta": lipgloss.Color("5"),
+		"cyan":    lipgloss.Color("6"),
+		"white":   lipgloss.Color("7"),
+		"gray":    lipgloss.Color("8"),
+	}
 )
+
+func serverBadgeStyle(color string) lipgloss.Style {
+	c, ok := colorMap[color]
+	if !ok {
+		c = colorMap["gray"]
+	}
+	return lipgloss.NewStyle().
+		Background(c).
+		Foreground(lipgloss.Color("0")).
+		Bold(true)
+}

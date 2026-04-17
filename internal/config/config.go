@@ -14,6 +14,12 @@ type Server struct {
 	Host       string `yaml:"host"`
 	ProjectDir string `yaml:"project_dir,omitempty"`
 	Group      string `yaml:"group,omitempty"`
+	Color      string `yaml:"color,omitempty"`
+}
+
+var validColors = map[string]bool{
+	"red": true, "green": true, "yellow": true, "blue": true,
+	"magenta": true, "cyan": true, "white": true, "gray": true,
 }
 
 // Config holds the cdeploy configuration.
@@ -58,6 +64,9 @@ func (c *Config) Validate() error {
 		}
 		if s.Host == "" {
 			return fmt.Errorf("server %q: host is required", s.Name)
+		}
+		if s.Color != "" && !validColors[s.Color] {
+			return fmt.Errorf("server %q: unknown color %q", s.Name, s.Color)
 		}
 		if seen[s.Name] {
 			return fmt.Errorf("duplicate server name %q", s.Name)

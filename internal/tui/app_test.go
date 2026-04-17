@@ -1405,8 +1405,14 @@ func TestBreadcrumb_WithServerName(t *testing.T) {
 	m.projName = "my-app"
 
 	bc := m.breadcrumb()
-	if bc != "cdeploy > prod > my-app" {
-		t.Errorf("breadcrumb = %q, want %q", bc, "cdeploy > prod > my-app")
+	if !strings.Contains(bc, "prod") {
+		t.Errorf("breadcrumb should contain server name badge, got: %q", bc)
+	}
+	if !strings.Contains(bc, "my-app") {
+		t.Errorf("breadcrumb should contain project name, got: %q", bc)
+	}
+	if !strings.HasPrefix(bc, "cdeploy > ") {
+		t.Errorf("breadcrumb should start with 'cdeploy > ', got: %q", bc)
 	}
 }
 
@@ -1416,8 +1422,11 @@ func TestBreadcrumb_ServerOnly(t *testing.T) {
 	m.serverName = "staging"
 
 	bc := m.breadcrumb()
-	if bc != "cdeploy > staging" {
-		t.Errorf("breadcrumb = %q, want %q", bc, "cdeploy > staging")
+	if !strings.Contains(bc, "staging") {
+		t.Errorf("breadcrumb should contain server name badge, got: %q", bc)
+	}
+	if !strings.HasPrefix(bc, "cdeploy > ") {
+		t.Errorf("breadcrumb should start with 'cdeploy > ', got: %q", bc)
 	}
 }
 
@@ -3140,5 +3149,119 @@ func TestViewSelectContainers_ShowsConfigKey(t *testing.T) {
 	view := m.viewSelectContainers()
 	if !strings.Contains(view, "c config") {
 		t.Errorf("container screen help should mention 'c config', got: %q", view)
+	}
+}
+
+func TestServerBadgeStyle_KnownColor(t *testing.T) {
+	for _, name := range []string{"red", "green", "yellow", "blue", "magenta", "cyan", "white", "gray"} {
+		s := serverBadgeStyle(name)
+		rendered := s.Render("test")
+		if rendered == "" {
+			t.Errorf("serverBadgeStyle(%q) rendered empty", name)
+		}
+	}
+}
+
+func TestServerBadgeStyle_UnknownAndEmpty(t *testing.T) {
+	gray := serverBadgeStyle("gray").Render("x")
+	for _, input := range []string{"", "purple", "unknown"} {
+		got := serverBadgeStyle(input).Render("x")
+		if got != gray {
+			t.Errorf("serverBadgeStyle(%q) = %q, want gray %q", input, got, gray)
+		}
+	}
+}
+
+func TestServerBadge_RemoteServer(t *testing.T) {
+	mc := &mockComposer{}
+	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
+	m.serverName = "prod-web"
+	m.serverHost = "user@10.0.1.50"
+	m.serverColor = "red"
+
+	badge := m.serverBadge()
+	if !strings.Contains(badge, "prod-web") {
+		t.Errorf("server badge should contain server name, got: %q", badge)
+	}
+}
+
+func TestServerBadge_DefaultColor(t *testing.T) {
+	mc := &mockComposer{}
+	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
+	m.serverName = "staging"
+	m.serverHost = "user@staging"
+	m.serverColor = ""
+
+	badge := m.serverBadge()
+	if !strings.Contains(badge, "staging") {
+		t.Errorf("server badge should render with default color, got: %q", badge)
+	}
+}
+
+func TestBreadcrumb_ServerBadgeInline(t *testing.T) {
+	mc := &mockComposer{}
+	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
+	m.serverName = "prod"
+	m.serverColor = "red"
+	m.projName = "myapp"
+
+	bc := m.breadcrumb()
+	if !strings.Contains(bc, "prod") {
+		t.Errorf("breadcrumb should contain server badge, got: %q", bc)
+	}
+	if !strings.Contains(bc, "myapp") {
+		t.Errorf("breadcrumb should contain project name, got: %q", bc)
+	}
+}
+
+func TestBreadcrumb_NoBadgeForLocal(t *testing.T) {
+	mc := &mockComposer{}
+	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
+	m.serverName = ""
+
+	bc := m.breadcrumb()
+	if bc != "cdeploy" {
+		t.Errorf("breadcrumb without server should be 'cdeploy', got: %q", bc)
+	}
+}
+
+func TestViewSelectContainers_WithBadge(t *testing.T) {
+	mc := &mockComposer{
+		services: []string{"web"},
+		status:   map[string]runner.ServiceStatus{"web": {Running: true}},
+	}
+	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
+	m.services = mc.services
+	m.svcStatus = mc.status
+	m.screen = screenSelectContainers
+	m.width = 120
+	m.height = 24
+	m.serverName = "prod"
+	m.serverHost = "user@prod"
+	m.serverColor = "red"
+
+	view := m.viewSelectContainers()
+	if !strings.Contains(view, "prod") {
+		t.Errorf("container view with server should contain badge with server name, got: %q", view)
+	}
+}
+
+func TestViewSelectContainers_WithoutBadge(t *testing.T) {
+	mc := &mockComposer{
+		services: []string{"web"},
+		status:   map[string]runner.ServiceStatus{"web": {Running: true}},
+	}
+	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
+	m.services = mc.services
+	m.svcStatus = mc.status
+	m.screen = screenSelectContainers
+	m.width = 120
+	m.height = 24
+	m.serverName = ""
+
+	view := m.viewSelectContainers()
+	// With no server, breadcrumb starts with "cdeploy > services"
+	if !strings.Contains(view, "cdeploy > services") {
+		t.Errorf("container view without server should show plain breadcrumb, got: %q", view)
 	}
 }

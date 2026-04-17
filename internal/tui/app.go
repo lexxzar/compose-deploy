@@ -132,6 +132,8 @@ type Model struct {
 	serverCursor      int
 	serverErr         error
 	serverName        string // selected server name, for breadcrumbs
+	serverHost        string // selected server host, for status bar
+	serverColor       string // selected server color, for status bar
 	connectCb         ConnectCallback
 	disconnectFunc    func() error
 	projectLoader     ProjectLoader
@@ -413,6 +415,8 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case preselectedConnectMsg:
 		server := m.servers[m.preselectedServer]
 		m.serverName = server.Name
+		m.serverHost = server.Host
+		m.serverColor = server.Color
 		connectCmd, factory, loader, disconnect := m.connectCb(server)
 		m.composerFactory = factory
 		m.projectLoader = loader
@@ -427,6 +431,8 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.composerFactory = m.localFactory
 			m.projectLoader = m.localProjectLoader
 			m.disconnectFunc = nil
+			m.serverHost = ""
+			m.serverColor = ""
 			return m, nil
 		}
 		m.serverErr = nil
@@ -551,6 +557,8 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			switch entry.kind {
 			case entryLocal:
 				m.serverName = ""
+				m.serverHost = ""
+				m.serverColor = ""
 				m.composerFactory = m.localFactory
 				m.projectLoader = m.localProjectLoader
 				m.disconnectFunc = nil
@@ -566,6 +574,8 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			case entryServer:
 				server := m.servers[entry.serverIdx]
 				m.serverName = server.Name
+				m.serverHost = server.Host
+				m.serverColor = server.Color
 				connectCmd, factory, loader, disconnect := m.connectCb(server)
 				m.composerFactory = factory
 				m.projectLoader = loader
@@ -588,6 +598,8 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 				disconnectFn := m.disconnectFunc
 				m.screen = screenSelectServer
 				m.serverName = ""
+				m.serverHost = ""
+				m.serverColor = ""
 				m.disconnectFunc = nil
 				m.projectLoader = m.localProjectLoader
 				m.composerFactory = m.localFactory
@@ -1228,12 +1240,21 @@ func shortenPath(dir string) string {
 func (m Model) breadcrumb() string {
 	parts := []string{"cdeploy"}
 	if m.serverName != "" {
-		parts = append(parts, m.serverName)
+		parts = append(parts, m.serverBadge())
 	}
 	if m.projName != "" {
 		parts = append(parts, m.projName)
 	}
 	return strings.Join(parts, " > ")
+}
+
+func (m Model) serverBadge() string {
+	color := m.serverColor
+	if color == "" {
+		color = "gray"
+	}
+	style := serverBadgeStyle(color)
+	return style.Render(" " + m.serverName + " ")
 }
 
 func (m Model) viewSelectProject() string {

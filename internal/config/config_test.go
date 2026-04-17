@@ -106,6 +106,53 @@ func TestLoad_WithoutGroups_BackwardCompat(t *testing.T) {
 	}
 }
 
+func TestLoad_WithColor(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "servers.yml")
+	data := `servers:
+  - name: prod
+    host: user@prod
+    color: red
+`
+	if err := os.WriteFile(path, []byte(data), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if cfg.Servers[0].Color != "red" {
+		t.Errorf("Servers[0].Color = %q, want %q", cfg.Servers[0].Color, "red")
+	}
+}
+
+func TestValidate_InvalidColor(t *testing.T) {
+	cfg := &Config{
+		Servers: []Server{
+			{Name: "prod", Host: "user@host", Color: "purple"},
+		},
+	}
+	err := cfg.Validate()
+	if err == nil {
+		t.Fatal("expected error for invalid color")
+	}
+	if !strings.Contains(err.Error(), "unknown color") {
+		t.Errorf("error = %q, want it to contain 'unknown color'", err.Error())
+	}
+}
+
+func TestValidate_EmptyColor(t *testing.T) {
+	cfg := &Config{
+		Servers: []Server{
+			{Name: "prod", Host: "user@host", Color: ""},
+		},
+	}
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("empty color should be valid, got: %v", err)
+	}
+}
+
 func TestLoad_MissingFile(t *testing.T) {
 	cfg, err := Load("/nonexistent/path/servers.yml")
 	if err != nil {
