@@ -30,6 +30,8 @@ Run without arguments to launch the interactive interface:
 cdeploy
 ```
 
+After you select a remote server, the server name is shown in the breadcrumb on subsequent screens. If that server has a `color` set in `~/.cdeploy/servers.yml`, the breadcrumb renders it as a colored badge; if `color` is omitted, the breadcrumb stays plain text.
+
 The TUI walks through up to six screens:
 
 1. **Server select** — choose a remote server or "Local" (only shown when servers are configured)
@@ -103,16 +105,20 @@ servers:
   - name: app.dev
     host: deploy@app.dev
     group: Dev
+    color: green
   - name: discovery.dev
     host: deploy@discovery.dev
     group: Dev
+    color: cyan
   - name: app.prod
     host: deploy@app.prod
     group: Production
+    color: red
   - name: discovery.prod
     host: deploy@discovery.prod
     project_dir: /opt/apps/web
     group: Production
+    color: red
 ```
 
 | Field | Required | Description |
@@ -121,6 +127,9 @@ servers:
 | `host` | yes | SSH destination (`user@hostname`) |
 | `project_dir` | no | Default project directory on the remote host |
 | `group` | no | Visual group label in the TUI server picker — servers with the same group are displayed together under a shared header |
+| `color` | no | Breadcrumb badge color for the selected server on post-selection TUI screens; when omitted, the breadcrumb uses plain text |
+
+Allowed `color` values: `red`, `green`, `yellow`, `blue`, `magenta`, `cyan`, `white`, `gray`. A common pattern is to mark production servers red so they stand out before you run an operation.
 
 SSH-specific options (keys, jump hosts, tunnels, ports) belong in `~/.ssh/config` — cdeploy uses the system `ssh` binary and inherits its configuration.
 
