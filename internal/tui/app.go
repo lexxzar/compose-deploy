@@ -158,6 +158,7 @@ type Model struct {
 	svcStatus map[string]runner.ServiceStatus // service name → status
 	selected  map[int]bool
 	svcCursor int
+	svcOffset int // index of first visible service in scroll window
 	svcErr    error
 
 	// Confirmation state (within container screen)
@@ -364,6 +365,9 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 			m.configViewport.Height = h
 		}
+		if m.screen == screenSelectContainers {
+			m.fixSvcOffset()
+		}
 		if m.screen == screenLogs {
 			m.logsViewport.Width = msg.Width - 4
 			h := msg.Height - 6
@@ -398,6 +402,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.svcStatus = msg.status
 		m.selected = make(map[int]bool)
 		m.svcCursor = 0
+		m.svcOffset = 0
 		return m, nil
 
 	case statusMsg:
@@ -407,6 +412,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		m.svcErr = nil
 		m.svcStatus = msg.status
+		m.fixSvcOffset()
 		return m, nil
 
 	case stepEventMsg:
@@ -646,6 +652,7 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 				return m.enterProgress(containers)
 			case "esc":
 				m.confirming = false
+				m.fixSvcOffset()
 				return m, nil
 			}
 			return m, nil
@@ -665,6 +672,7 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 				m.svcStatus = nil
 				m.selected = make(map[int]bool)
 				m.svcCursor = 0
+				m.svcOffset = 0
 				m.svcErr = nil
 				if m.projects == nil {
 					return m, m.loadProjects()
@@ -675,10 +683,12 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			if m.svcCursor > 0 {
 				m.svcCursor--
 			}
+			m.fixSvcOffset()
 		case "down", "j":
 			if m.svcCursor < len(m.services)-1 {
 				m.svcCursor++
 			}
+			m.fixSvcOffset()
 		case " ":
 			if len(m.services) > 0 {
 				m.selected[m.svcCursor] = !m.selected[m.svcCursor]
@@ -695,6 +705,7 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			} else {
 				m.warning = warnNoSelection
 			}
+			m.fixSvcOffset()
 		case "d":
 			if m.selectedCount() > 0 {
 				m.pendingOp = runner.Deploy
@@ -702,6 +713,7 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			} else {
 				m.warning = warnNoSelection
 			}
+			m.fixSvcOffset()
 		case "s":
 			if m.selectedCount() > 0 {
 				m.pendingOp = runner.StopOnly
@@ -709,6 +721,7 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			} else {
 				m.warning = warnNoSelection
 			}
+			m.fixSvcOffset()
 		case "l":
 			if len(m.services) == 0 {
 				return m, nil
@@ -1143,6 +1156,76 @@ func (m Model) selectedCount() int {
 	return count
 }
 
+// svcVisibleCount returns the number of services that fit in the terminal.
+// Header: breadcrumb + blank line = 2 lines.
+// Footer varies by state: confirming = 2; normal = 2 (one-line help) or 3 (two-line help).
+// Warning adds 1 extra line.
+// When m.height is 0 (no WindowSizeMsg received), returns len(m.services) for backward compat.
+func (m Model) svcVisibleCount() int {
+	if m.height == 0 {
+		return len(m.services)
+	}
+
+	// headerLines: breadcrumb (1) + titleStyle MarginBottom space-line (1) + gap/indicator (1) = 3
+	headerLines := 3
+
+	var footerLines int
+	if m.confirming {
+		// helpStyle MarginTop space-line (1) + gap-or-indicator (1) + confirm text (1) = 3
+		footerLines = 3
+	} else {
+		// Compute whether help fits on one line (same logic as viewSelectContainers)
+		back := "q quit"
+		if m.showPicker {
+			back = "esc back"
+		}
+		line1 := fmt.Sprintf("  space toggle  •  a all  •  %s", back)
+		line2 := "  r restart  •  d deploy  •  s stop  •  l logs  •  c config"
+		oneLine := line1 + "  •  " + line2[2:]
+		if m.width >= len(oneLine)+2 {
+			// helpStyle MarginTop (1) + gap-or-indicator (1) + one help line (1) = 3
+			footerLines = 3
+		} else {
+			// helpStyle MarginTop (1) + gap-or-indicator (1) + two help lines (2) = 4
+			footerLines = 4
+		}
+		if m.warning != "" {
+			footerLines++ // warning line
+		}
+	}
+
+	visible := m.height - headerLines - footerLines
+	if visible < 1 {
+		visible = 1
+	}
+	if visible > len(m.services) {
+		visible = len(m.services)
+	}
+	return visible
+}
+
+// fixSvcOffset adjusts svcOffset so that svcCursor is within the visible window.
+func (m *Model) fixSvcOffset() {
+	visible := m.svcVisibleCount()
+
+	// Cursor moved below visible window
+	if m.svcCursor >= m.svcOffset+visible {
+		m.svcOffset = m.svcCursor - visible + 1
+	}
+	// Cursor moved above visible window
+	if m.svcCursor < m.svcOffset {
+		m.svcOffset = m.svcCursor
+	}
+	// Clamp offset
+	maxOffset := len(m.services) - visible
+	if maxOffset < 0 {
+		maxOffset = 0
+	}
+	if m.svcOffset > maxOffset {
+		m.svcOffset = maxOffset
+	}
+}
+
 func sortServices(services []string) []string {
 	sorted := slices.Clone(services)
 	slices.SortFunc(sorted, func(a, b string) int {
@@ -1330,14 +1413,15 @@ func (m Model) viewSelectContainers() string {
 		m.selectedCount(),
 		len(m.services),
 	)))
-	b.WriteString("\n\n")
 
 	if m.services == nil && m.svcErr == nil {
+		b.WriteString("\n\n")
 		b.WriteString("  Loading services...\n")
 		return b.String()
 	}
 
 	if m.svcErr != nil {
+		b.WriteString("\n\n")
 		b.WriteString(stepFailed.Render(fmt.Sprintf("  Error: %v\n", m.svcErr)))
 		if m.showPicker {
 			b.WriteString(helpStyle.Render("\n  esc back  •  q quit"))
@@ -1347,7 +1431,25 @@ func (m Model) viewSelectContainers() string {
 		return b.String()
 	}
 
-	for i, svc := range m.services {
+	// Windowed rendering
+	visible := m.svcVisibleCount()
+	start := m.svcOffset
+	end := start + visible
+	if end > len(m.services) {
+		end = len(m.services)
+	}
+
+	// Top gap: show scroll-up indicator or blank line
+	if start > 0 {
+		b.WriteString("\n")
+		b.WriteString(descStyle.Render(fmt.Sprintf("  ▲ %d more", start)))
+		b.WriteString("\n")
+	} else {
+		b.WriteString("\n\n")
+	}
+
+	for i := start; i < end; i++ {
+		svc := m.services[i]
 		cursor := "  "
 		if i == m.svcCursor {
 			cursor = "> "
@@ -1369,10 +1471,23 @@ func (m Model) viewSelectContainers() string {
 		b.WriteString(fmt.Sprintf("%s%s %s %s %s\n", cursor, checkbox, health, dot, svc))
 	}
 
+	// Bottom: scroll-down indicator replaces the blank-line gap before the
+	// help/confirm bar so the total line count stays constant.
+	below := len(m.services) - end
+	if below > 0 {
+		b.WriteString(descStyle.Render(fmt.Sprintf("  ▼ %d more", below)))
+		b.WriteString("\n")
+	}
+
 	if m.confirming {
 		containers := m.selectedContainers()
+		gap := "\n"
+		if below > 0 {
+			gap = ""
+		}
 		b.WriteString(helpStyle.Render(fmt.Sprintf(
-			"\n  %s %s?  enter confirm  •  esc cancel",
+			"%s  %s %s?  enter confirm  •  esc cancel",
+			gap,
 			m.pendingOp.String(),
 			strings.Join(containers, ", "),
 		)))
@@ -1387,10 +1502,14 @@ func (m Model) viewSelectContainers() string {
 		line1 := fmt.Sprintf("  space toggle  •  a all  •  %s", back)
 		line2 := "  r restart  •  d deploy  •  s stop  •  l logs  •  c config"
 		oneLine := line1 + "  •  " + line2[2:]
+		gap := "\n"
+		if below > 0 && m.warning == "" {
+			gap = ""
+		}
 		if m.width >= len(oneLine)+2 {
-			b.WriteString(helpStyle.Render("\n" + oneLine))
+			b.WriteString(helpStyle.Render(gap + oneLine))
 		} else {
-			b.WriteString(helpStyle.Render("\n" + line1 + "\n" + line2))
+			b.WriteString(helpStyle.Render(gap + line1 + "\n" + line2))
 		}
 	}
 	return b.String()

@@ -3299,3 +3299,421 @@ func TestViewSelectContainers_WithoutBadge(t *testing.T) {
 		t.Errorf("container view without server should show plain breadcrumb, got: %q", view)
 	}
 }
+
+// --- Scroll offset tests ---
+
+func TestSvcVisibleCount_HeightZero(t *testing.T) {
+	mc := &mockComposer{}
+	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
+	m.services = []string{"a", "b", "c", "d", "e"}
+	m.height = 0
+
+	got := m.svcVisibleCount()
+	if got != 5 {
+		t.Errorf("svcVisibleCount() with height=0 = %d, want 5 (all services)", got)
+	}
+}
+
+func TestSvcVisibleCount_NormalHeight(t *testing.T) {
+	mc := &mockComposer{}
+	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
+	m.services = []string{"a", "b", "c", "d", "e", "f", "g", "h", "i", "j"}
+	m.width = 120 // wide enough for one-line help
+	m.height = 10
+
+	// header=3, footer=3 (one-line help on wide terminal) → 10-3-3 = 4
+	got := m.svcVisibleCount()
+	if got != 4 {
+		t.Errorf("svcVisibleCount() = %d, want 4", got)
+	}
+}
+
+func TestSvcVisibleCount_NarrowWidth(t *testing.T) {
+	mc := &mockComposer{}
+	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
+	m.services = []string{"a", "b", "c", "d", "e", "f", "g", "h", "i", "j"}
+	m.width = 40 // too narrow for one-line help
+	m.height = 10
+
+	// header=3, footer=4 (two-line help) → 10-3-4 = 3
+	got := m.svcVisibleCount()
+	if got != 3 {
+		t.Errorf("svcVisibleCount() narrow = %d, want 3", got)
+	}
+}
+
+func TestSvcVisibleCount_Confirming(t *testing.T) {
+	mc := &mockComposer{}
+	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
+	m.services = []string{"a", "b", "c", "d", "e", "f", "g", "h", "i", "j"}
+	m.width = 120
+	m.height = 10
+	m.confirming = true
+
+	// header=3, footer=3 (confirming) → 10-3-3 = 4
+	got := m.svcVisibleCount()
+	if got != 4 {
+		t.Errorf("svcVisibleCount() confirming = %d, want 4", got)
+	}
+}
+
+func TestSvcVisibleCount_Warning(t *testing.T) {
+	mc := &mockComposer{}
+	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
+	m.services = []string{"a", "b", "c", "d", "e", "f", "g", "h", "i", "j"}
+	m.width = 120
+	m.height = 10
+	m.warning = "something wrong"
+
+	// header=3, footer=3+1 (warning) → 10-3-4 = 3
+	got := m.svcVisibleCount()
+	if got != 3 {
+		t.Errorf("svcVisibleCount() warning = %d, want 3", got)
+	}
+}
+
+func TestSvcVisibleCount_AllFit(t *testing.T) {
+	mc := &mockComposer{}
+	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
+	m.services = []string{"a", "b"}
+	m.width = 120
+	m.height = 20
+
+	// Plenty of room; visible capped at len(services)=2
+	got := m.svcVisibleCount()
+	if got != 2 {
+		t.Errorf("svcVisibleCount() all fit = %d, want 2", got)
+	}
+}
+
+func TestSvcVisibleCount_MinOne(t *testing.T) {
+	mc := &mockComposer{}
+	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
+	m.services = []string{"a", "b", "c"}
+	m.width = 120
+	m.height = 5 // header=3, footer=3 → 5-6=-1 → clamped to 1
+
+	got := m.svcVisibleCount()
+	if got != 1 {
+		t.Errorf("svcVisibleCount() tiny height = %d, want 1", got)
+	}
+}
+
+func TestFixSvcOffset_CursorBelowWindow(t *testing.T) {
+	mc := &mockComposer{}
+	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
+	m.services = []string{"a", "b", "c", "d", "e"}
+	m.width = 120
+	m.height = 9 // visible = 9-3-3 = 3
+	m.svcCursor = 4
+	m.svcOffset = 0
+
+	m.fixSvcOffset()
+	// cursor=4, visible=3 → offset should be 4-3+1=2
+	if m.svcOffset != 2 {
+		t.Errorf("fixSvcOffset cursor below: svcOffset = %d, want 2", m.svcOffset)
+	}
+}
+
+func TestFixSvcOffset_CursorAboveWindow(t *testing.T) {
+	mc := &mockComposer{}
+	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
+	m.services = []string{"a", "b", "c", "d", "e"}
+	m.width = 120
+	m.height = 9 // visible = 9-3-3 = 3
+	m.svcCursor = 1
+	m.svcOffset = 3
+
+	m.fixSvcOffset()
+	// cursor=1 < offset=3 → offset should become 1
+	if m.svcOffset != 1 {
+		t.Errorf("fixSvcOffset cursor above: svcOffset = %d, want 1", m.svcOffset)
+	}
+}
+
+func TestFixSvcOffset_AllItemsFit(t *testing.T) {
+	mc := &mockComposer{}
+	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
+	m.services = []string{"a", "b"}
+	m.width = 120
+	m.height = 20 // visible = all
+	m.svcCursor = 1
+	m.svcOffset = 0
+
+	m.fixSvcOffset()
+	if m.svcOffset != 0 {
+		t.Errorf("fixSvcOffset all fit: svcOffset = %d, want 0", m.svcOffset)
+	}
+}
+
+func TestFixSvcOffset_HeightZeroNoOp(t *testing.T) {
+	mc := &mockComposer{}
+	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
+	m.services = []string{"a", "b", "c"}
+	m.height = 0
+	m.svcCursor = 2
+	m.svcOffset = 0
+
+	m.fixSvcOffset()
+	// height=0 → visible=len(services)=3 → all fit → offset stays 0
+	if m.svcOffset != 0 {
+		t.Errorf("fixSvcOffset height=0: svcOffset = %d, want 0", m.svcOffset)
+	}
+}
+
+func TestFixSvcOffset_ClampsMaxOffset(t *testing.T) {
+	mc := &mockComposer{}
+	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
+	m.services = []string{"a", "b", "c", "d", "e"}
+	m.width = 120
+	m.height = 9 // visible = 9-3-3 = 3
+	m.svcCursor = 4
+	m.svcOffset = 10 // way too high
+
+	m.fixSvcOffset()
+	// maxOffset = 5-3 = 2; cursor=4 wants offset=2
+	if m.svcOffset != 2 {
+		t.Errorf("fixSvcOffset clamped: svcOffset = %d, want 2", m.svcOffset)
+	}
+}
+
+func TestScrollDown_PastVisibleWindow(t *testing.T) {
+	mc := &mockComposer{services: []string{"a", "b", "c", "d", "e"}}
+	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
+	m.screen = screenSelectContainers
+	m.services = mc.services
+	m.width = 120
+	m.height = 9 // visible = 9-3-3 = 3
+
+	// Set initial size
+	updated, _ := m.Update(tea.WindowSizeMsg{Width: 120, Height: 9})
+	m = updated.(Model)
+
+	// Press down 4 times to reach index 4
+	for i := 0; i < 4; i++ {
+		updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyDown})
+		m = updated.(Model)
+	}
+
+	if m.svcCursor != 4 {
+		t.Errorf("cursor = %d, want 4", m.svcCursor)
+	}
+	// visible=3, cursor=4 → offset should be 2
+	if m.svcOffset != 2 {
+		t.Errorf("svcOffset after scrolling down = %d, want 2", m.svcOffset)
+	}
+}
+
+func TestScrollUp_PastTopOfWindow(t *testing.T) {
+	mc := &mockComposer{services: []string{"a", "b", "c", "d", "e"}}
+	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
+	m.screen = screenSelectContainers
+	m.services = mc.services
+	m.width = 120
+	m.height = 9 // visible = 9-3-3 = 3
+	m.svcCursor = 4
+	m.svcOffset = 2
+
+	// Press up 3 times to reach index 1
+	for i := 0; i < 3; i++ {
+		updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyUp})
+		m = updated.(Model)
+	}
+
+	if m.svcCursor != 1 {
+		t.Errorf("cursor = %d, want 1", m.svcCursor)
+	}
+	if m.svcOffset != 1 {
+		t.Errorf("svcOffset after scrolling up = %d, want 1", m.svcOffset)
+	}
+}
+
+func TestConfirming_CallsFixSvcOffset(t *testing.T) {
+	mc := &mockComposer{services: []string{"a", "b", "c", "d", "e", "f", "g", "h"}}
+	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
+	m.screen = screenSelectContainers
+	m.services = mc.services
+	m.width = 120
+	m.height = 8 // visible normal = 4, confirming = 4
+
+	// Navigate to last item and select it
+	m.svcCursor = 7
+	m.svcOffset = 4 // near bottom
+	m.selected[7] = true
+
+	// Press 'r' to enter confirming
+	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'r'}})
+	m = updated.(Model)
+
+	if !m.confirming {
+		t.Error("expected confirming=true after 'r'")
+	}
+	// Cursor should still be visible
+	visible := m.svcVisibleCount()
+	if m.svcCursor < m.svcOffset || m.svcCursor >= m.svcOffset+visible {
+		t.Errorf("cursor %d not in visible window [%d, %d)", m.svcCursor, m.svcOffset, m.svcOffset+visible)
+	}
+}
+
+func TestSelectAll_DoesNotChangeOffset(t *testing.T) {
+	mc := &mockComposer{services: []string{"a", "b", "c", "d", "e"}}
+	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
+	m.screen = screenSelectContainers
+	m.services = mc.services
+	m.width = 120
+	m.height = 9 // visible = 3
+	m.svcCursor = 3
+	m.svcOffset = 1
+
+	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'a'}})
+	m = updated.(Model)
+
+	if m.svcOffset != 1 {
+		t.Errorf("svcOffset changed after 'a': got %d, want 1", m.svcOffset)
+	}
+}
+
+func TestWindowResize_FixesOffset(t *testing.T) {
+	mc := &mockComposer{services: []string{"a", "b", "c", "d", "e"}}
+	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
+	m.screen = screenSelectContainers
+	m.services = mc.services
+	m.width = 120
+	m.height = 20 // all fit
+	m.svcCursor = 4
+	m.svcOffset = 0
+
+	// Shrink terminal
+	updated, _ := m.Update(tea.WindowSizeMsg{Width: 120, Height: 9}) // visible=3
+	m = updated.(Model)
+
+	// cursor=4 should force offset adjustment
+	if m.svcOffset < 2 {
+		t.Errorf("svcOffset after resize = %d, want >= 2", m.svcOffset)
+	}
+}
+
+// --- View scroll indicator tests ---
+
+func TestViewSelectContainers_UpIndicator(t *testing.T) {
+	mc := &mockComposer{services: []string{"a", "b", "c", "d", "e"}}
+	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
+	m.screen = screenSelectContainers
+	m.services = mc.services
+	m.svcStatus = map[string]runner.ServiceStatus{}
+	m.width = 120
+	m.height = 9 // visible = 3
+	m.svcCursor = 3
+	m.svcOffset = 2
+
+	view := m.viewSelectContainers()
+	if !strings.Contains(view, "▲ 2 more") {
+		t.Errorf("expected up indicator '▲ 2 more' in view, got:\n%s", view)
+	}
+}
+
+func TestViewSelectContainers_DownIndicator(t *testing.T) {
+	mc := &mockComposer{services: []string{"a", "b", "c", "d", "e"}}
+	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
+	m.screen = screenSelectContainers
+	m.services = mc.services
+	m.svcStatus = map[string]runner.ServiceStatus{}
+	m.width = 120
+	m.height = 9 // visible = 3
+	m.svcCursor = 0
+	m.svcOffset = 0
+
+	view := m.viewSelectContainers()
+	if !strings.Contains(view, "▼ 2 more") {
+		t.Errorf("expected down indicator '▼ 2 more' in view, got:\n%s", view)
+	}
+}
+
+func TestViewSelectContainers_NoIndicatorsWhenAllFit(t *testing.T) {
+	mc := &mockComposer{services: []string{"a", "b"}}
+	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
+	m.screen = screenSelectContainers
+	m.services = mc.services
+	m.svcStatus = map[string]runner.ServiceStatus{}
+	m.width = 120
+	m.height = 20 // plenty of room
+	m.svcCursor = 0
+	m.svcOffset = 0
+
+	view := m.viewSelectContainers()
+	if strings.Contains(view, "▲") {
+		t.Errorf("unexpected up indicator when all items fit:\n%s", view)
+	}
+	if strings.Contains(view, "▼") {
+		t.Errorf("unexpected down indicator when all items fit:\n%s", view)
+	}
+}
+
+func TestViewSelectContainers_BothIndicators(t *testing.T) {
+	mc := &mockComposer{services: []string{"a", "b", "c", "d", "e"}}
+	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
+	m.screen = screenSelectContainers
+	m.services = mc.services
+	m.svcStatus = map[string]runner.ServiceStatus{}
+	m.width = 120
+	m.height = 9 // visible = 3
+	m.svcCursor = 2
+	m.svcOffset = 1
+
+	view := m.viewSelectContainers()
+	if !strings.Contains(view, "▲ 1 more") {
+		t.Errorf("expected up indicator in view, got:\n%s", view)
+	}
+	if !strings.Contains(view, "▼ 1 more") {
+		t.Errorf("expected down indicator in view, got:\n%s", view)
+	}
+}
+
+func TestViewSelectContainers_HeightZeroRendersAll(t *testing.T) {
+	mc := &mockComposer{services: []string{"a", "b", "c", "d", "e"}}
+	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
+	m.screen = screenSelectContainers
+	m.services = mc.services
+	m.svcStatus = map[string]runner.ServiceStatus{}
+	m.width = 0
+	m.height = 0
+
+	view := m.viewSelectContainers()
+	for _, svc := range mc.services {
+		if !strings.Contains(view, svc) {
+			t.Errorf("expected service %q in view when height=0", svc)
+		}
+	}
+	if strings.Contains(view, "▲") || strings.Contains(view, "▼") {
+		t.Errorf("unexpected indicators when height=0")
+	}
+}
+
+func TestViewSelectContainers_WindowedOnlyShowsVisibleServices(t *testing.T) {
+	mc := &mockComposer{services: []string{"aaa", "bbb", "ccc", "ddd", "eee"}}
+	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
+	m.screen = screenSelectContainers
+	m.services = mc.services
+	m.svcStatus = map[string]runner.ServiceStatus{}
+	m.width = 120
+	m.height = 9 // visible = 3
+	m.svcCursor = 2
+	m.svcOffset = 1 // showing bbb, ccc, ddd
+
+	view := m.viewSelectContainers()
+	if strings.Contains(view, "aaa") {
+		t.Error("service 'aaa' should not be visible (above window)")
+	}
+	if !strings.Contains(view, "bbb") {
+		t.Error("service 'bbb' should be visible")
+	}
+	if !strings.Contains(view, "ccc") {
+		t.Error("service 'ccc' should be visible")
+	}
+	if !strings.Contains(view, "ddd") {
+		t.Error("service 'ddd' should be visible")
+	}
+	if strings.Contains(view, "eee") {
+		t.Error("service 'eee' should not be visible (below window)")
+	}
+}
