@@ -611,6 +611,22 @@ func TestViewSelectProject_Error(t *testing.T) {
 	if !strings.Contains(v, "connection refused") {
 		t.Error("view should show error message")
 	}
+	if strings.Contains(v, "esc back") {
+		t.Error("local-only error should not show 'esc back'")
+	}
+}
+
+func TestViewSelectProject_ErrorWithPicker(t *testing.T) {
+	mc := &mockComposer{}
+	m := NewModel(nil, io.Discard, mockFactory(mc), testServers, nil)
+	m.screen = screenSelectProject
+	m.showPicker = true
+	m.projErr = fmt.Errorf("connection refused")
+
+	v := m.View()
+	if !strings.Contains(v, "esc back") {
+		t.Error("error state should show 'esc back' when server picker is available")
+	}
 }
 
 func TestViewSelectProject_Empty(t *testing.T) {
@@ -621,6 +637,22 @@ func TestViewSelectProject_Empty(t *testing.T) {
 	v := m.View()
 	if !strings.Contains(v, "No Docker Compose projects found") {
 		t.Error("view should show empty state message")
+	}
+	if strings.Contains(v, "esc back") {
+		t.Error("local-only empty should not show 'esc back'")
+	}
+}
+
+func TestViewSelectProject_EmptyWithPicker(t *testing.T) {
+	mc := &mockComposer{}
+	m := NewModel(nil, io.Discard, mockFactory(mc), testServers, nil)
+	m.screen = screenSelectProject
+	m.showPicker = true
+	m.projects = []compose.Project{}
+
+	v := m.View()
+	if !strings.Contains(v, "esc back") {
+		t.Error("empty state should show 'esc back' when server picker is available")
 	}
 }
 
@@ -1501,6 +1533,29 @@ func TestBuildServerEntries_MixedGroupedAndUngrouped(t *testing.T) {
 	}
 	if entries[2].kind != entryGroupHeader {
 		t.Errorf("entries[2].kind = %d, want entryGroupHeader", entries[2].kind)
+	}
+}
+
+func TestBuildServerEntries_UngroupedAfterGrouped(t *testing.T) {
+	// Bug case: grouped server appears before ungrouped in YAML.
+	// Ungrouped servers must still appear right after Local.
+	servers := []config.Server{
+		{Name: "app.dev", Host: "user@app.dev", Group: "Dev"},
+		{Name: "standalone", Host: "user@standalone"},
+	}
+	entries := buildServerEntries(servers)
+	// Should be: Local, standalone (no header), Header-Dev, app.dev
+	if len(entries) != 4 {
+		t.Fatalf("got %d entries, want 4", len(entries))
+	}
+	if entries[1].kind != entryServer || servers[entries[1].serverIdx].Name != "standalone" {
+		t.Errorf("entries[1] should be ungrouped 'standalone', got %+v", entries[1])
+	}
+	if entries[2].kind != entryGroupHeader || entries[2].group != "Dev" {
+		t.Errorf("entries[2] should be group header 'Dev', got %+v", entries[2])
+	}
+	if entries[3].kind != entryServer || servers[entries[3].serverIdx].Name != "app.dev" {
+		t.Errorf("entries[3] should be 'app.dev', got %+v", entries[3])
 	}
 }
 

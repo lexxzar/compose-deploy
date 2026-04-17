@@ -78,12 +78,21 @@ func buildServerEntries(servers []config.Server) []serverEntry {
 		}
 	}
 
+	// Ungrouped servers (empty group) first, right after Local
+	for _, g := range groups {
+		if g.name == "" {
+			for _, idx := range g.indices {
+				entries = append(entries, serverEntry{kind: entryServer, serverIdx: idx})
+			}
+		}
+	}
+	// Then named groups with headers
 	for _, g := range groups {
 		if g.name != "" {
 			entries = append(entries, serverEntry{kind: entryGroupHeader, group: g.name})
-		}
-		for _, idx := range g.indices {
-			entries = append(entries, serverEntry{kind: entryServer, serverIdx: idx})
+			for _, idx := range g.indices {
+				entries = append(entries, serverEntry{kind: entryServer, serverIdx: idx})
+			}
 		}
 	}
 
@@ -1352,13 +1361,21 @@ func (m Model) viewSelectProject() string {
 
 	if m.projErr != nil {
 		b.WriteString(stepFailed.Render(fmt.Sprintf("  Error: %v\n", m.projErr)))
-		b.WriteString(helpStyle.Render("\n  q quit"))
+		help := "  q quit"
+		if len(m.servers) > 0 {
+			help = "  esc back  q quit"
+		}
+		b.WriteString(helpStyle.Render("\n" + help))
 		return b.String()
 	}
 
 	if len(m.projects) == 0 {
 		b.WriteString("  No Docker Compose projects found\n")
-		b.WriteString(helpStyle.Render("\n  q quit"))
+		help := "  q quit"
+		if len(m.servers) > 0 {
+			help = "  esc back  q quit"
+		}
+		b.WriteString(helpStyle.Render("\n" + help))
 		return b.String()
 	}
 

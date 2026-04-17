@@ -339,19 +339,17 @@ func runList(ctx context.Context, jsonOutput bool) error {
 		return printMultiProject(grouped, jsonOutput)
 	}
 
-	// Local mode: single-project if -C given or compose file in CWD
+	// Local mode: single-project only when -C is explicitly given
 	c := newLocalComposer(dir)
 
-	if hasLocalCompose(dir) {
+	if projectDir != "" {
+		if !hasLocalCompose(dir) {
+			return fmt.Errorf("no compose file found in %s", dir)
+		}
 		if err := c.Detect(ctx); err != nil {
 			return err
 		}
 		return listSingleProject(ctx, c, jsonOutput)
-	}
-
-	// Explicit -C but no compose file → error, don't fall through to discovery
-	if projectDir != "" {
-		return fmt.Errorf("no compose file found in %s", dir)
 	}
 
 	// Local multi-project: discover all projects on the system

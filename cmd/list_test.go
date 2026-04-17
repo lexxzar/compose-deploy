@@ -778,7 +778,7 @@ func TestRunList_LocalSingleProject(t *testing.T) {
 		)
 		return c
 	}
-	projectDir = ""
+	projectDir = "/explicit/dir"
 
 	out := captureStdout(t, func() {
 		err := runList(context.Background(), false)
@@ -789,6 +789,56 @@ func TestRunList_LocalSingleProject(t *testing.T) {
 
 	if !strings.Contains(out, "web") || !strings.Contains(out, "db") {
 		t.Errorf("output should contain service names, got: %q", out)
+	}
+}
+
+func TestRunList_LocalDiscoveryFromComposeDir(t *testing.T) {
+	oldHas := hasLocalCompose
+	oldNew := newLocalComposer
+	oldProj := projectDir
+	t.Cleanup(func() {
+		hasLocalCompose = oldHas
+		newLocalComposer = oldNew
+		projectDir = oldProj
+	})
+
+	// CWD has a compose file but -C is NOT given → should discover all projects
+	hasLocalCompose = func(dir string) bool { return true }
+	newLocalComposer = func(dir string) *compose.Compose {
+		c := compose.New(dir)
+		c.SetTestHooks(
+			nil,
+			func(cmd *exec.Cmd) ([]byte, error) {
+				args := strings.Join(cmd.Args, " ")
+				if strings.Contains(args, "version") {
+					return []byte("Docker Compose version v2.24.0\n"), nil
+				}
+				if strings.Contains(args, "ls") && strings.Contains(args, "--format") {
+					return []byte(`[{"Name":"myapp","Status":"running(1)","ConfigFiles":"/app/compose.yml"},{"Name":"other","Status":"running(1)","ConfigFiles":"/other/compose.yml"}]`), nil
+				}
+				if strings.Contains(args, "config") && strings.Contains(args, "--services") {
+					return []byte("web\n"), nil
+				}
+				if strings.Contains(args, "ps") {
+					return []byte(`[{"Service":"web","State":"running"}]`), nil
+				}
+				return nil, nil
+			},
+		)
+		return c
+	}
+	projectDir = ""
+
+	out := captureStdout(t, func() {
+		err := runList(context.Background(), false)
+		if err != nil {
+			t.Errorf("unexpected error: %v", err)
+		}
+	})
+
+	// Should show multiple projects, not just a flat single-project list
+	if !strings.Contains(out, "myapp") || !strings.Contains(out, "other") {
+		t.Errorf("should discover all projects, got: %q", out)
 	}
 }
 
@@ -999,7 +1049,7 @@ func TestRunList_LocalDetectFailure(t *testing.T) {
 		)
 		return c
 	}
-	projectDir = ""
+	projectDir = "/explicit/dir"
 	serverName = ""
 
 	err := runList(context.Background(), false)
