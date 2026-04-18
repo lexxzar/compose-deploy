@@ -498,10 +498,20 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 		if msg.err != nil {
-			m.configErr = msg.err
+			m.configShowRes = false
+			if m.configContent != nil {
+				m.configViewport.SetContent(string(m.configContent))
+				v := false
+				m.configValid = &v
+				m.configValidMsg = fmt.Sprintf("resolved config failed: %v", msg.err)
+			} else {
+				m.configErr = msg.err
+			}
 			return m, nil
 		}
 		m.configErr = nil
+		m.configValid = nil
+		m.configValidMsg = ""
 		m.configResolved = msg.data
 		if m.configShowRes {
 			m.configViewport.SetContent(string(msg.data))

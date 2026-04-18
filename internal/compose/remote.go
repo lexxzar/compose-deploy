@@ -347,10 +347,17 @@ func (r *RemoteCompose) ConfigFile(ctx context.Context) ([]byte, error) {
 // (output of `docker compose config`).
 func (r *RemoteCompose) ConfigResolved(ctx context.Context) ([]byte, error) {
 	cmd := r.remoteCommand(ctx, "config")
+	var out []byte
+	var err error
 	if r.outputCmd != nil {
-		return r.outputCmd(cmd)
+		out, err = r.outputCmd(cmd)
+	} else {
+		out, err = cmd.Output()
 	}
-	return cmd.Output()
+	if err != nil {
+		return nil, withStderr(err)
+	}
+	return out, nil
 }
 
 // EditCommand returns an exec.Cmd that opens the remote compose file in an editor

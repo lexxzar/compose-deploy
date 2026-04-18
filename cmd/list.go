@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"os/signal"
 	"sort"
 	"strings"
 
@@ -286,6 +287,9 @@ func runList(ctx context.Context, jsonOutput bool) error {
 			return fmt.Errorf("getting current directory: %w", err)
 		}
 	}
+
+	ctx, stop := signal.NotifyContext(ctx, os.Interrupt)
+	defer stop()
 
 	if serverName != "" {
 		cfg, err := config.Load(config.DefaultPath())

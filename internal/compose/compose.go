@@ -129,10 +129,17 @@ func (c *Compose) ConfigFile(ctx context.Context) ([]byte, error) {
 // (output of `docker compose config`).
 func (c *Compose) ConfigResolved(ctx context.Context) ([]byte, error) {
 	cmd := c.command(ctx, "config")
+	var out []byte
+	var err error
 	if c.outputCmd != nil {
-		return c.outputCmd(cmd)
+		out, err = c.outputCmd(cmd)
+	} else {
+		out, err = cmd.Output()
 	}
-	return cmd.Output()
+	if err != nil {
+		return nil, withStderr(err)
+	}
+	return out, nil
 }
 
 // EditCommand returns an exec.Cmd that opens the compose file in the user's editor.
@@ -151,6 +158,9 @@ func (c *Compose) EditCommand(ctx context.Context) (*exec.Cmd, error) {
 		editor = "vi"
 	}
 	parts := strings.Fields(editor)
+	if len(parts) == 0 {
+		parts = []string{"vi"}
+	}
 	args := append(parts[1:], path)
 	return exec.CommandContext(ctx, parts[0], args...), nil
 }

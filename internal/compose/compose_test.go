@@ -1494,3 +1494,47 @@ func TestValidateConfig_CombinedOutputErrorIncludesStderr(t *testing.T) {
 		t.Fatalf("error = %q, want stderr text included", err.Error())
 	}
 }
+
+func TestEditCommand_WhitespaceEditor(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "compose.yml"), []byte("test"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	origEditor := os.Getenv("EDITOR")
+	origVisual := os.Getenv("VISUAL")
+	defer func() {
+		os.Setenv("EDITOR", origEditor)
+		os.Setenv("VISUAL", origVisual)
+	}()
+
+	os.Setenv("EDITOR", "   ")
+	os.Setenv("VISUAL", "\t")
+
+	c := &Compose{ProjectDir: dir}
+	cmd, err := c.EditCommand(context.Background())
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if cmd.Args[0] != "vi" {
+		t.Errorf("editor = %q, want 'vi' when EDITOR is whitespace", cmd.Args[0])
+	}
+}
+
+func TestConfigResolved_ErrorIncludesStderr(t *testing.T) {
+	c := &Compose{
+		ProjectDir: "/proj",
+		UID:        "1000:1000",
+		outputCmd: func(cmd *exec.Cmd) ([]byte, error) {
+			return nil, &exec.ExitError{Stderr: []byte("invalid config: missing service")}
+		},
+	}
+
+	_, err := c.ConfigResolved(context.Background())
+	if err == nil {
+		t.Fatal("expected error, got nil")
+	}
+	if !strings.Contains(err.Error(), "invalid config: missing service") {
+		t.Errorf("error = %q, want stderr text included", err.Error())
+	}
+}

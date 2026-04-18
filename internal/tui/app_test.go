@@ -3772,3 +3772,61 @@ func TestViewSelectContainers_WindowedOnlyShowsVisibleServices(t *testing.T) {
 		t.Error("service 'eee' should not be visible (below window)")
 	}
 }
+
+func TestConfigScreen_ResolvedErrorResetsToggle(t *testing.T) {
+	mc := &mockConfigComposer{
+		mockComposer: mockComposer{
+			services: []string{"web"},
+			status:   map[string]runner.ServiceStatus{"web": {Running: true}},
+		},
+		configFile: []byte("raw content"),
+	}
+	m := NewModel(mc, io.Discard, mockConfigFactory(mc), nil, nil)
+	m.screen = screenConfig
+	m.configSession = 1
+	m.configContent = mc.configFile
+	m.configViewport = viewport.New(76, 18)
+	m.configViewport.SetContent(string(mc.configFile))
+
+	// Simulate resolved fetch error
+	result, _ := m.Update(configResolvedMsg{err: fmt.Errorf("config error"), session: 1})
+	model := result.(Model)
+
+	if model.configShowRes {
+		t.Error("configShowRes should be false after resolved fetch error")
+	}
+	if model.configErr != nil {
+		t.Error("configErr should be nil when raw content is available")
+	}
+	// Error should be surfaced via validation status
+	if model.configValid == nil || *model.configValid {
+		t.Error("configValid should be false after resolved fetch error")
+	}
+	if model.configValidMsg == "" {
+		t.Error("configValidMsg should describe the error")
+	}
+	// Viewport should still show raw content
+	if !strings.Contains(model.configViewport.View(), "raw content") {
+		t.Error("viewport should show raw content after resolved fetch error")
+	}
+
+	// Press r should re-attempt the fetch (configResolved is still nil)
+	result, cmd := model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'r'}})
+	model = result.(Model)
+	if !model.configShowRes {
+		t.Error("configShowRes should be true after r press")
+	}
+	if cmd == nil {
+		t.Error("expected a cmd to re-fetch resolved config")
+	}
+
+	// Simulate successful retry
+	result, _ = model.Update(configResolvedMsg{data: []byte("resolved output"), session: 1})
+	model = result.(Model)
+	if model.configValid != nil {
+		t.Error("configValid should be cleared after successful resolved fetch")
+	}
+	if model.configValidMsg != "" {
+		t.Errorf("configValidMsg should be empty, got %q", model.configValidMsg)
+	}
+}

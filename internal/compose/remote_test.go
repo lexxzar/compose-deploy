@@ -1197,3 +1197,22 @@ func TestRemoteValidateConfig_CombinedOutputErrorIncludesStderr(t *testing.T) {
 		t.Fatalf("error = %q, want stderr text included", err.Error())
 	}
 }
+
+func TestRemoteConfigResolved_ErrorIncludesStderr(t *testing.T) {
+	r := &RemoteCompose{
+		Host:       "user@example.com",
+		ProjectDir: "/app",
+		SocketPath: "/tmp/cdeploy-ctrl-abc-99",
+		outputCmd: func(cmd *exec.Cmd) ([]byte, error) {
+			return nil, &exec.ExitError{Stderr: []byte("remote config parse error")}
+		},
+	}
+
+	_, err := r.ConfigResolved(context.Background())
+	if err == nil {
+		t.Fatal("expected error, got nil")
+	}
+	if !strings.Contains(err.Error(), "remote config parse error") {
+		t.Errorf("error = %q, want stderr text included", err.Error())
+	}
+}

@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"os/signal"
 	"strings"
 
 	"github.com/charmbracelet/lipgloss"
@@ -122,6 +123,9 @@ func runOperation(ctx context.Context, op runner.Operation, all bool, containers
 			return fmt.Errorf("getting current directory: %w", err)
 		}
 	}
+
+	ctx, stop := signal.NotifyContext(ctx, os.Interrupt)
+	defer stop()
 
 	var c runner.Composer
 	if serverName != "" {
