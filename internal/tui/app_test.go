@@ -3316,6 +3316,46 @@ func TestBreadcrumb_NoBadgeForLocal(t *testing.T) {
 	}
 }
 
+func TestResolveServerColor_GroupedServer(t *testing.T) {
+	mc := &mockComposer{}
+	cfg := &config.Config{
+		Groups:  []config.Group{{Name: "production", Color: "red"}},
+		Servers: []config.Server{{Name: "web", Host: "user@host", Group: "production"}},
+	}
+	m := NewModel(nil, io.Discard, mockFactory(mc), cfg.Servers, mockConnectCb(mc),
+		WithConfig(cfg))
+
+	got := m.resolveServerColor(cfg.Servers[0])
+	if got != "red" {
+		t.Errorf("resolveServerColor(grouped) = %q, want %q", got, "red")
+	}
+}
+
+func TestResolveServerColor_UngroupedServer(t *testing.T) {
+	mc := &mockComposer{}
+	cfg := &config.Config{
+		Servers: []config.Server{{Name: "dev", Host: "user@host", Color: "cyan"}},
+	}
+	m := NewModel(nil, io.Discard, mockFactory(mc), cfg.Servers, mockConnectCb(mc),
+		WithConfig(cfg))
+
+	got := m.resolveServerColor(cfg.Servers[0])
+	if got != "cyan" {
+		t.Errorf("resolveServerColor(ungrouped) = %q, want %q", got, "cyan")
+	}
+}
+
+func TestResolveServerColor_NilConfig(t *testing.T) {
+	mc := &mockComposer{}
+	srv := config.Server{Name: "web", Host: "user@host", Group: "production", Color: "blue"}
+	m := NewModel(nil, io.Discard, mockFactory(mc), []config.Server{srv}, mockConnectCb(mc))
+
+	got := m.resolveServerColor(srv)
+	if got != "blue" {
+		t.Errorf("resolveServerColor(nil config) = %q, want %q (fallback to server.Color)", got, "blue")
+	}
+}
+
 func TestViewSelectContainers_WithBadge(t *testing.T) {
 	mc := &mockComposer{
 		services: []string{"web"},
@@ -4682,5 +4722,228 @@ func TestSettingsList_DeleteLastServer_FixesCursor(t *testing.T) {
 
 	if m.settingsCursor != 0 {
 		t.Errorf("cursor = %d, want 0 (should clamp after deleting last)", m.settingsCursor)
+	}
+}
+
+func TestSettingsList_ShowsGroupColorForGroupedServer(t *testing.T) {
+	mc := &mockComposer{}
+	cfg := &config.Config{
+		Groups:  []config.Group{{Name: "production", Color: "red"}},
+		Servers: []config.Server{{Name: "web", Host: "user@host", Group: "production"}},
+	}
+	m := NewModel(nil, io.Discard, mockFactory(mc), cfg.Servers, mockConnectCb(mc),
+		WithConfig(cfg))
+
+	// Open settings list
+	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'s'}})
+	m = updated.(Model)
+
+	view := m.viewSettingsList()
+	if !strings.Contains(view, "red") {
+		t.Errorf("settings list should show group color 'red', got: %q", view)
+	}
+	if !strings.Contains(view, "(group)") {
+		t.Errorf("settings list should show '(group)' indicator for grouped servers, got: %q", view)
+	}
+}
+
+func TestSettingsList_ShowsServerColorForUngroupedServer(t *testing.T) {
+	mc := &mockComposer{}
+	cfg := &config.Config{
+		Servers: []config.Server{{Name: "dev", Host: "user@host", Color: "cyan"}},
+	}
+	m := NewModel(nil, io.Discard, mockFactory(mc), cfg.Servers, mockConnectCb(mc),
+		WithConfig(cfg))
+
+	// Open settings list
+	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'s'}})
+	m = updated.(Model)
+
+	view := m.viewSettingsList()
+	if !strings.Contains(view, "cyan") {
+		t.Errorf("settings list should show server color 'cyan', got: %q", view)
+	}
+	if strings.Contains(view, "(group)") {
+		t.Errorf("settings list should NOT show '(group)' for ungrouped servers, got: %q", view)
+	}
+}
+
+func TestSettingsForm_GroupedServer_ColorGoesToGroup(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "servers.yml")
+
+	mc := &mockComposer{}
+	cfg := &config.Config{
+		Groups:  []config.Group{{Name: "production", Color: "red"}},
+		Servers: []config.Server{{Name: "web", Host: "user@host", Group: "production"}},
+	}
+	m := NewModel(nil, io.Discard, mockFactory(mc), cfg.Servers, mockConnectCb(mc),
+		WithConfig(cfg), WithConfigPath(path))
+
+	// Open settings, edit server
+	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'s'}})
+	m = updated.(Model)
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	m = updated.(Model)
+
+	// settingsColor should be loaded from group
+	if m.settingsColor != "red" {
+		t.Fatalf("settingsColor = %q, want %q (from group)", m.settingsColor, "red")
+	}
+
+	// Save without changes
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	m = updated.(Model)
+
+	if m.screen != screenSettingsList {
+		t.Fatalf("screen = %d, want screenSettingsList", m.screen)
+	}
+	// Color should be on group, not server
+	if m.config.Servers[0].Color != "" {
+		t.Errorf("server color = %q, want empty (should be on group)", m.config.Servers[0].Color)
+	}
+	if m.config.Groups[0].Color != "red" {
+		t.Errorf("group color = %q, want %q", m.config.Groups[0].Color, "red")
+	}
+}
+
+func TestSettingsForm_AutoCreateGroup(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "servers.yml")
+
+	mc := &mockComposer{}
+	cfg := &config.Config{
+		Servers: []config.Server{{Name: "web", Host: "user@host"}},
+	}
+	m := NewModel(nil, io.Discard, mockFactory(mc), cfg.Servers, mockConnectCb(mc),
+		WithConfig(cfg), WithConfigPath(path))
+
+	// Open settings, edit server
+	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'s'}})
+	m = updated.(Model)
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	m = updated.(Model)
+
+	// Tab to group field (field 3) and type group name
+	for i := 0; i < 3; i++ {
+		updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyTab})
+		m = updated.(Model)
+	}
+	for _, r := range "staging" {
+		updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{r}})
+		m = updated.(Model)
+	}
+
+	// Save
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	m = updated.(Model)
+
+	if m.screen != screenSettingsList {
+		t.Fatalf("screen = %d, want screenSettingsList", m.screen)
+	}
+	if len(m.config.Groups) != 1 {
+		t.Fatalf("got %d groups, want 1", len(m.config.Groups))
+	}
+	if m.config.Groups[0].Name != "staging" {
+		t.Errorf("group name = %q, want %q", m.config.Groups[0].Name, "staging")
+	}
+}
+
+func TestSettingsForm_OrphanedGroupCleanup(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "servers.yml")
+
+	mc := &mockComposer{}
+	cfg := &config.Config{
+		Groups:  []config.Group{{Name: "production", Color: "red"}},
+		Servers: []config.Server{{Name: "web", Host: "user@host", Group: "production"}},
+	}
+	m := NewModel(nil, io.Discard, mockFactory(mc), cfg.Servers, mockConnectCb(mc),
+		WithConfig(cfg), WithConfigPath(path))
+
+	// Open settings, edit server, clear the group
+	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'s'}})
+	m = updated.(Model)
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	m = updated.(Model)
+
+	// Tab to group field (field 3) and clear it
+	for i := 0; i < 3; i++ {
+		updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyTab})
+		m = updated.(Model)
+	}
+	// Select all and delete group text
+	for i := 0; i < len("production"); i++ {
+		updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyBackspace})
+		m = updated.(Model)
+	}
+
+	// Save
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	m = updated.(Model)
+
+	if m.screen != screenSettingsList {
+		t.Fatalf("screen = %d, want screenSettingsList", m.screen)
+	}
+	// Group should be cleaned up since no server references it
+	if len(m.config.Groups) != 0 {
+		t.Errorf("got %d groups, want 0 (orphaned group should be cleaned)", len(m.config.Groups))
+	}
+}
+
+func TestSettingsForm_OrphanedGroupCleanup_Delete(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "servers.yml")
+
+	mc := &mockComposer{}
+	cfg := &config.Config{
+		Groups:  []config.Group{{Name: "production", Color: "red"}},
+		Servers: []config.Server{{Name: "web", Host: "user@host", Group: "production"}},
+	}
+	m := NewModel(nil, io.Discard, mockFactory(mc), cfg.Servers, mockConnectCb(mc),
+		WithConfig(cfg), WithConfigPath(path))
+
+	// Open settings, delete server
+	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'s'}})
+	m = updated.(Model)
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'d'}})
+	m = updated.(Model)
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'y'}})
+	m = updated.(Model)
+
+	// Group should be cleaned up
+	if len(m.config.Groups) != 0 {
+		t.Errorf("got %d groups, want 0 (orphaned group should be cleaned after delete)", len(m.config.Groups))
+	}
+}
+
+func TestSettingsForm_ColorAccessibleWhenGrouped(t *testing.T) {
+	mc := &mockComposer{}
+	cfg := &config.Config{
+		Groups:  []config.Group{{Name: "prod", Color: "red"}},
+		Servers: []config.Server{{Name: "web", Host: "user@host", Group: "prod"}},
+	}
+	m := NewModel(nil, io.Discard, mockFactory(mc), cfg.Servers, mockConnectCb(mc),
+		WithConfig(cfg))
+
+	// Open settings, edit server
+	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'s'}})
+	m = updated.(Model)
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	m = updated.(Model)
+
+	// Tab through fields 0→1→2→3→4 (color picker must be reachable)
+	for i := 0; i < 4; i++ {
+		updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyTab})
+		m = updated.(Model)
+	}
+	if m.settingsField != 4 {
+		t.Errorf("settingsField after 4 tabs = %d, want 4 (color picker should be accessible)", m.settingsField)
+	}
+
+	// View should show "(group)" label
+	view := m.viewSettingsForm()
+	if !strings.Contains(view, "(group)") {
+		t.Errorf("form should show '(group)' label for grouped server color, got: %q", view)
 	}
 }

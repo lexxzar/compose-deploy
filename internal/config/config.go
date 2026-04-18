@@ -9,6 +9,12 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
+// Group represents a named server group with a shared color.
+type Group struct {
+	Name  string `yaml:"name"`
+	Color string `yaml:"color,omitempty"`
+}
+
 // Server represents a configured remote server.
 type Server struct {
 	Name       string `yaml:"name"`
@@ -25,7 +31,18 @@ var ValidColors = []string{
 
 // Config holds the cdeploy configuration.
 type Config struct {
+	Groups  []Group  `yaml:"groups,omitempty"`
 	Servers []Server `yaml:"servers"`
+}
+
+// GroupColor returns the color for the named group, or "" if not found.
+func (c *Config) GroupColor(groupName string) string {
+	for _, g := range c.Groups {
+		if g.Name == groupName {
+			return g.Color
+		}
+	}
+	return ""
 }
 
 // DefaultPath returns the default config file path: ~/.cdeploy/servers.yml.
@@ -53,11 +70,59 @@ func Load(path string) (*Config, error) {
 		return nil, fmt.Errorf("parsing config: %w", err)
 	}
 
+	cfg.migrate()
+
 	return &cfg, nil
+}
+
+// migrate converts old-format configs (per-server colors on grouped servers)
+// to the new format (colors on Group entries). It also auto-creates Group
+// entries for any group names referenced by servers but missing from Groups.
+// This is idempotent — already-migrated configs are unaffected.
+func (c *Config) migrate() {
+	// Build lookup of existing groups
+	existing := make(map[string]int) // group name → index in c.Groups
+	for i, g := range c.Groups {
+		existing[g.Name] = i
+	}
+
+	for i, s := range c.Servers {
+		if s.Group == "" {
+			continue
+		}
+		if idx, ok := existing[s.Group]; ok {
+			// Group exists; adopt server's color if group has none (first-server-wins)
+			if c.Groups[idx].Color == "" && s.Color != "" {
+				c.Groups[idx].Color = s.Color
+			}
+		} else {
+			// Auto-create group with server's color
+			c.Groups = append(c.Groups, Group{Name: s.Group, Color: s.Color})
+			existing[s.Group] = len(c.Groups) - 1
+		}
+		// Strip color from grouped server
+		c.Servers[i].Color = ""
+	}
 }
 
 // Validate checks required fields and uniqueness constraints.
 func (c *Config) Validate() error {
+	// Validate groups
+	seenGroup := make(map[string]bool)
+	for i, g := range c.Groups {
+		if g.Name == "" {
+			return fmt.Errorf("group[%d]: name is required", i)
+		}
+		if g.Color != "" && !slices.Contains(ValidColors, g.Color) {
+			return fmt.Errorf("group %q: unknown color %q", g.Name, g.Color)
+		}
+		if seenGroup[g.Name] {
+			return fmt.Errorf("duplicate group name %q", g.Name)
+		}
+		seenGroup[g.Name] = true
+	}
+
+	// Validate servers
 	seen := make(map[string]bool)
 	for i, s := range c.Servers {
 		if s.Name == "" {
@@ -68,6 +133,9 @@ func (c *Config) Validate() error {
 		}
 		if s.Color != "" && !slices.Contains(ValidColors, s.Color) {
 			return fmt.Errorf("server %q: unknown color %q", s.Name, s.Color)
+		}
+		if s.Group != "" && !seenGroup[s.Group] {
+			return fmt.Errorf("server %q: references unknown group %q", s.Name, s.Group)
 		}
 		if seen[s.Name] {
 			return fmt.Errorf("duplicate server name %q", s.Name)

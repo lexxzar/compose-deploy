@@ -461,7 +461,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		server := m.servers[m.preselectedServer]
 		m.serverName = server.Name
 		m.serverHost = server.Host
-		m.serverColor = server.Color
+		m.serverColor = m.resolveServerColor(server)
 		connectCmd, factory, loader, disconnect := m.connectCb(server)
 		m.composerFactory = factory
 		m.projectLoader = loader
@@ -630,7 +630,7 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 				server := m.servers[entry.serverIdx]
 				m.serverName = server.Name
 				m.serverHost = server.Host
-				m.serverColor = server.Color
+				m.serverColor = m.resolveServerColor(server)
 				connectCmd, factory, loader, disconnect := m.connectCb(server)
 				m.composerFactory = factory
 				m.projectLoader = loader
@@ -888,12 +888,16 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 				newServers := slices.Clone(m.config.Servers)
 				newServers = slices.Delete(newServers, idx, idx+1)
 
-				tmpCfg := &config.Config{Servers: newServers}
+				// Clean up orphaned groups
+				newGroups := cleanOrphanedGroups(m.config.Groups, newServers)
+
+				tmpCfg := &config.Config{Groups: newGroups, Servers: newServers}
 				if err := tmpCfg.Save(m.configPath); err != nil {
 					m.settingsErr = fmt.Sprintf("save failed: %v", err)
 					m.settingsDelete = false
 					return m, nil
 				}
+				m.config.Groups = newGroups
 				m.config.Servers = newServers
 				m.servers = m.config.Servers
 				m.serverEntries = buildServerEntries(m.servers)
@@ -940,7 +944,11 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			srv := m.config.Servers[m.settingsCursor]
 			m.settingsEditing = m.settingsCursor
 			m.settingsField = 0
-			m.settingsColor = srv.Color
+			if srv.Group != "" {
+				m.settingsColor = m.config.GroupColor(srv.Group)
+			} else {
+				m.settingsColor = srv.Color
+			}
 			m.settingsErr = ""
 			m.settingsInputs = initSettingsInputs()
 			m.settingsInputs[0].SetValue(srv.Name)
@@ -989,12 +997,16 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 				m.settingsColor = cycleColor(m.settingsColor, 1)
 			}
 		case "enter":
+			srvGroup := strings.TrimSpace(m.settingsInputs[3].Value())
 			srv := config.Server{
 				Name:       strings.TrimSpace(m.settingsInputs[0].Value()),
 				Host:       strings.TrimSpace(m.settingsInputs[1].Value()),
 				ProjectDir: strings.TrimSpace(m.settingsInputs[2].Value()),
-				Group:      strings.TrimSpace(m.settingsInputs[3].Value()),
-				Color:      m.settingsColor,
+				Group:      srvGroup,
+			}
+			// Grouped servers have no per-server color; ungrouped keep it
+			if srvGroup == "" {
+				srv.Color = m.settingsColor
 			}
 
 			// Build temporary config for validation and save
@@ -1004,7 +1016,25 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			} else {
 				tmpServers[m.settingsEditing] = srv
 			}
-			tmpCfg := &config.Config{Servers: tmpServers}
+			tmpGroups := slices.Clone(m.config.Groups)
+			// Auto-create group if server references a new group name
+			if srvGroup != "" {
+				found := false
+				for i, g := range tmpGroups {
+					if g.Name == srvGroup {
+						found = true
+						// Apply settingsColor to the group
+						tmpGroups[i].Color = m.settingsColor
+						break
+					}
+				}
+				if !found {
+					tmpGroups = append(tmpGroups, config.Group{Name: srvGroup, Color: m.settingsColor})
+				}
+			}
+			// Clean up orphaned groups
+			tmpGroups = cleanOrphanedGroups(tmpGroups, tmpServers)
+			tmpCfg := &config.Config{Groups: tmpGroups, Servers: tmpServers}
 			if err := tmpCfg.Validate(); err != nil {
 				m.settingsErr = err.Error()
 				return m, nil
@@ -1015,6 +1045,7 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 				m.settingsErr = fmt.Sprintf("save failed: %v", err)
 				return m, nil
 			}
+			m.config.Groups = tmpGroups
 			m.config.Servers = tmpServers
 			m.servers = m.config.Servers
 			m.serverEntries = buildServerEntries(m.servers)
@@ -1482,6 +1513,33 @@ func initSettingsInputs() [4]textinput.Model {
 	return inputs
 }
 
+// resolveServerColor returns the effective color for a server: group color
+// if the server belongs to a group and m.config is available, otherwise the
+// server's own Color field.
+func (m Model) resolveServerColor(server config.Server) string {
+	if server.Group != "" && m.config != nil {
+		return m.config.GroupColor(server.Group)
+	}
+	return server.Color
+}
+
+// cleanOrphanedGroups returns groups that are still referenced by at least one server.
+func cleanOrphanedGroups(groups []config.Group, servers []config.Server) []config.Group {
+	used := make(map[string]bool)
+	for _, s := range servers {
+		if s.Group != "" {
+			used[s.Group] = true
+		}
+	}
+	var result []config.Group
+	for _, g := range groups {
+		if used[g.Name] {
+			result = append(result, g)
+		}
+	}
+	return result
+}
+
 // cycleColor moves through the color options: "" → ValidColors[0..N-1] → "" → ...
 func cycleColor(current string, dir int) string {
 	all := append([]string{""}, config.ValidColors...)
@@ -1931,9 +1989,19 @@ func (m Model) viewSettingsList() string {
 				style = selectedItemStyle
 			}
 
+			// Resolve color: group color for grouped servers, server color for ungrouped
+			effectiveColor := s.Color
+			isGroupColor := false
+			if s.Group != "" {
+				effectiveColor = m.config.GroupColor(s.Group)
+				isGroupColor = true
+			}
 			colorDisplay := descStyle.Render("-")
-			if s.Color != "" {
-				colorDisplay = serverBadgeStyle(s.Color).Render(" " + s.Color + " ")
+			if effectiveColor != "" {
+				colorDisplay = serverBadgeStyle(effectiveColor).Render(" " + effectiveColor + " ")
+				if isGroupColor {
+					colorDisplay += " " + descStyle.Render("(group)")
+				}
 			}
 
 			groupDisplay := s.Group
@@ -1986,11 +2054,21 @@ func (m Model) viewSettingsForm() string {
 	if m.settingsField == 4 {
 		indicator = "> "
 	}
+	hasGroup := strings.TrimSpace(m.settingsInputs[3].Value()) != ""
 	colorVal := "(none)"
 	if m.settingsColor != "" {
 		colorVal = serverBadgeStyle(m.settingsColor).Render(" " + m.settingsColor + " ")
 	}
-	b.WriteString(fmt.Sprintf("  %s%-12s < %s >\n", indicator, "Color:", colorVal))
+	if hasGroup {
+		if m.settingsColor != "" {
+			colorVal += " " + descStyle.Render("(group)")
+		} else {
+			colorVal = descStyle.Render("(group)")
+		}
+		b.WriteString(fmt.Sprintf("  %s%-12s %s\n", indicator, "Color:", colorVal))
+	} else {
+		b.WriteString(fmt.Sprintf("  %s%-12s < %s >\n", indicator, "Color:", colorVal))
+	}
 
 	b.WriteString(helpStyle.Render("\n  tab/shift-tab cycle fields  •  ←/→ color  •  enter save  •  esc discard"))
 	return b.String()
