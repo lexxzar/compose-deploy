@@ -286,3 +286,78 @@ func TestDefaultPath(t *testing.T) {
 		t.Errorf("DefaultPath() = %q, want it to end with .cdeploy/servers.yml", path)
 	}
 }
+
+func TestSave_RoundTrip(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "servers.yml")
+
+	cfg := &Config{
+		Servers: []Server{
+			{Name: "prod", Host: "user@prod", ProjectDir: "/opt/app", Group: "Production", Color: "red"},
+			{Name: "staging", Host: "deploy@staging"},
+		},
+	}
+
+	if err := cfg.Save(path); err != nil {
+		t.Fatalf("Save() error: %v", err)
+	}
+
+	loaded, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load() error: %v", err)
+	}
+
+	if len(loaded.Servers) != 2 {
+		t.Fatalf("got %d servers, want 2", len(loaded.Servers))
+	}
+	s := loaded.Servers[0]
+	if s.Name != "prod" || s.Host != "user@prod" || s.ProjectDir != "/opt/app" || s.Group != "Production" || s.Color != "red" {
+		t.Errorf("server[0] = %+v, want prod/user@prod//opt/app/Production/red", s)
+	}
+	s = loaded.Servers[1]
+	if s.Name != "staging" || s.Host != "deploy@staging" || s.ProjectDir != "" || s.Group != "" || s.Color != "" {
+		t.Errorf("server[1] = %+v, want staging/deploy@staging with empty optional fields", s)
+	}
+}
+
+func TestSave_CreatesParentDir(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "sub", "deep", "servers.yml")
+
+	cfg := &Config{
+		Servers: []Server{{Name: "test", Host: "user@host"}},
+	}
+
+	if err := cfg.Save(path); err != nil {
+		t.Fatalf("Save() error: %v", err)
+	}
+
+	loaded, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load() error: %v", err)
+	}
+	if len(loaded.Servers) != 1 {
+		t.Fatalf("got %d servers, want 1", len(loaded.Servers))
+	}
+	if loaded.Servers[0].Name != "test" {
+		t.Errorf("Name = %q, want %q", loaded.Servers[0].Name, "test")
+	}
+}
+
+func TestSave_EmptyConfig(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "servers.yml")
+
+	cfg := &Config{}
+	if err := cfg.Save(path); err != nil {
+		t.Fatalf("Save() error: %v", err)
+	}
+
+	loaded, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load() error: %v", err)
+	}
+	if len(loaded.Servers) != 0 {
+		t.Fatalf("got %d servers, want 0", len(loaded.Servers))
+	}
+}

@@ -7,6 +7,7 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -157,6 +158,28 @@ func TestWithLocalProjectLoader(t *testing.T) {
 	}
 	if len(pm.projects) != 1 || pm.projects[0].Name != "test" {
 		t.Errorf("projects = %v, want [{test /test}]", pm.projects)
+	}
+}
+
+func TestWithConfigPath(t *testing.T) {
+	mc := &mockComposer{}
+	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil, WithConfigPath("/tmp/test-servers.yml"))
+	if m.configPath != "/tmp/test-servers.yml" {
+		t.Errorf("configPath = %q, want %q", m.configPath, "/tmp/test-servers.yml")
+	}
+}
+
+func TestWithConfig(t *testing.T) {
+	mc := &mockComposer{}
+	cfg := &config.Config{
+		Servers: []config.Server{{Name: "test", Host: "user@host"}},
+	}
+	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil, WithConfig(cfg))
+	if m.config == nil {
+		t.Fatal("config should be set")
+	}
+	if len(m.config.Servers) != 1 || m.config.Servers[0].Name != "test" {
+		t.Errorf("config.Servers = %v, want [{test user@host}]", m.config.Servers)
 	}
 }
 
@@ -3828,5 +3851,836 @@ func TestConfigScreen_ResolvedErrorResetsToggle(t *testing.T) {
 	}
 	if model.configValidMsg != "" {
 		t.Errorf("configValidMsg should be empty, got %q", model.configValidMsg)
+	}
+}
+
+// --- Settings editor tests ---
+
+func settingsModel(servers []config.Server) Model {
+	mc := &mockComposer{}
+	cfg := &config.Config{Servers: servers}
+	return NewModel(nil, io.Discard, mockFactory(mc), servers, mockConnectCb(mc),
+		WithConfig(cfg), WithConfigPath("/tmp/test-settings.yml"))
+}
+
+func TestSettingsList_SKeyOpensSettings(t *testing.T) {
+	m := settingsModel(testServers)
+	if m.screen != screenSelectServer {
+		t.Fatalf("screen = %d, want screenSelectServer", m.screen)
+	}
+
+	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'s'}})
+	m = updated.(Model)
+
+	if m.screen != screenSettingsList {
+		t.Errorf("screen = %d, want screenSettingsList", m.screen)
+	}
+	if m.settingsCursor != 0 {
+		t.Errorf("settingsCursor = %d, want 0", m.settingsCursor)
+	}
+}
+
+func TestSettingsList_SKeyIgnoredWithoutConfig(t *testing.T) {
+	mc := &mockComposer{}
+	m := NewModel(nil, io.Discard, mockFactory(mc), testServers, mockConnectCb(mc))
+	// No WithConfig → config is nil
+
+	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'s'}})
+	m = updated.(Model)
+
+	if m.screen != screenSelectServer {
+		t.Errorf("screen = %d, want screenSelectServer (s should be ignored)", m.screen)
+	}
+}
+
+func TestSettingsList_Navigation(t *testing.T) {
+	m := settingsModel(testServers)
+	// Go to settings
+	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'s'}})
+	m = updated.(Model)
+
+	// Move down
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyDown})
+	m = updated.(Model)
+	if m.settingsCursor != 1 {
+		t.Errorf("settingsCursor = %d, want 1", m.settingsCursor)
+	}
+
+	// Can't go past last
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyDown})
+	m = updated.(Model)
+	if m.settingsCursor != 1 {
+		t.Errorf("settingsCursor = %d, want 1 (should stay at end)", m.settingsCursor)
+	}
+
+	// Move up
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyUp})
+	m = updated.(Model)
+	if m.settingsCursor != 0 {
+		t.Errorf("settingsCursor = %d, want 0", m.settingsCursor)
+	}
+
+	// Can't go before 0
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyUp})
+	m = updated.(Model)
+	if m.settingsCursor != 0 {
+		t.Errorf("settingsCursor = %d, want 0 (should stay at start)", m.settingsCursor)
+	}
+}
+
+func TestSettingsList_EscBackToServerSelect(t *testing.T) {
+	m := settingsModel(testServers)
+	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'s'}})
+	m = updated.(Model)
+
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyEsc})
+	m = updated.(Model)
+
+	if m.screen != screenSelectServer {
+		t.Errorf("screen = %d, want screenSelectServer", m.screen)
+	}
+}
+
+func TestSettingsForm_AKeyOpensBlankForm(t *testing.T) {
+	m := settingsModel(testServers)
+	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'s'}})
+	m = updated.(Model)
+
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'a'}})
+	m = updated.(Model)
+
+	if m.screen != screenSettingsForm {
+		t.Errorf("screen = %d, want screenSettingsForm", m.screen)
+	}
+	if m.settingsEditing != -1 {
+		t.Errorf("settingsEditing = %d, want -1 (add mode)", m.settingsEditing)
+	}
+	if m.settingsInputs[0].Value() != "" {
+		t.Errorf("name input should be empty, got %q", m.settingsInputs[0].Value())
+	}
+}
+
+func TestSettingsForm_EnterOpensPrefilledForm(t *testing.T) {
+	m := settingsModel(testServers)
+	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'s'}})
+	m = updated.(Model)
+
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	m = updated.(Model)
+
+	if m.screen != screenSettingsForm {
+		t.Errorf("screen = %d, want screenSettingsForm", m.screen)
+	}
+	if m.settingsEditing != 0 {
+		t.Errorf("settingsEditing = %d, want 0 (edit first server)", m.settingsEditing)
+	}
+	if m.settingsInputs[0].Value() != "prod" {
+		t.Errorf("name = %q, want %q", m.settingsInputs[0].Value(), "prod")
+	}
+	if m.settingsInputs[1].Value() != "user@prod.example.com" {
+		t.Errorf("host = %q, want %q", m.settingsInputs[1].Value(), "user@prod.example.com")
+	}
+}
+
+func TestSettingsForm_TabCyclesFields(t *testing.T) {
+	m := settingsModel(testServers)
+	// s → a → form
+	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'s'}})
+	m = updated.(Model)
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'a'}})
+	m = updated.(Model)
+
+	if m.settingsField != 0 {
+		t.Fatalf("initial field = %d, want 0", m.settingsField)
+	}
+
+	// Tab through all fields
+	for i := 1; i <= 4; i++ {
+		updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyTab})
+		m = updated.(Model)
+		if m.settingsField != i%5 {
+			t.Errorf("after tab %d: field = %d, want %d", i, m.settingsField, i%5)
+		}
+	}
+
+	// Tab wraps around
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyTab})
+	m = updated.(Model)
+	if m.settingsField != 0 {
+		t.Errorf("after wrap tab: field = %d, want 0", m.settingsField)
+	}
+}
+
+func TestSettingsForm_ShiftTabCyclesBackward(t *testing.T) {
+	m := settingsModel(testServers)
+	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'s'}})
+	m = updated.(Model)
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'a'}})
+	m = updated.(Model)
+
+	// Shift+tab from 0 → 4
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyShiftTab})
+	m = updated.(Model)
+	if m.settingsField != 4 {
+		t.Errorf("field = %d, want 4", m.settingsField)
+	}
+}
+
+func TestSettingsForm_ColorCycling(t *testing.T) {
+	m := settingsModel(testServers)
+	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'s'}})
+	m = updated.(Model)
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'a'}})
+	m = updated.(Model)
+
+	// Navigate to color field (field 4)
+	for i := 0; i < 4; i++ {
+		updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyTab})
+		m = updated.(Model)
+	}
+	if m.settingsField != 4 {
+		t.Fatalf("field = %d, want 4", m.settingsField)
+	}
+
+	// Initial color is ""
+	if m.settingsColor != "" {
+		t.Errorf("initial color = %q, want empty", m.settingsColor)
+	}
+
+	// Right → first color
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyRight})
+	m = updated.(Model)
+	if m.settingsColor != "red" {
+		t.Errorf("color = %q, want %q", m.settingsColor, "red")
+	}
+
+	// Left back to ""
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyLeft})
+	m = updated.(Model)
+	if m.settingsColor != "" {
+		t.Errorf("color = %q, want empty", m.settingsColor)
+	}
+
+	// Left wraps to last color
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyLeft})
+	m = updated.(Model)
+	if m.settingsColor != "gray" {
+		t.Errorf("color = %q, want %q", m.settingsColor, "gray")
+	}
+}
+
+func TestSettingsForm_EscDiscardsBack(t *testing.T) {
+	m := settingsModel(testServers)
+	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'s'}})
+	m = updated.(Model)
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'a'}})
+	m = updated.(Model)
+
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyEsc})
+	m = updated.(Model)
+
+	if m.screen != screenSettingsList {
+		t.Errorf("screen = %d, want screenSettingsList", m.screen)
+	}
+}
+
+func TestSettingsForm_AddServer(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "servers.yml")
+
+	mc := &mockComposer{}
+	cfg := &config.Config{Servers: []config.Server{
+		{Name: "existing", Host: "user@existing"},
+	}}
+	m := NewModel(nil, io.Discard, mockFactory(mc), cfg.Servers, mockConnectCb(mc),
+		WithConfig(cfg), WithConfigPath(path))
+
+	// s → settings list
+	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'s'}})
+	m = updated.(Model)
+	// a → add form
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'a'}})
+	m = updated.(Model)
+
+	// Type name
+	for _, r := range "newserver" {
+		updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{r}})
+		m = updated.(Model)
+	}
+	// Tab to host
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyTab})
+	m = updated.(Model)
+	// Type host
+	for _, r := range "user@newhost" {
+		updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{r}})
+		m = updated.(Model)
+	}
+	// Enter to save
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	m = updated.(Model)
+
+	if m.screen != screenSettingsList {
+		t.Errorf("screen = %d, want screenSettingsList after save", m.screen)
+	}
+	if len(m.config.Servers) != 2 {
+		t.Fatalf("got %d servers, want 2", len(m.config.Servers))
+	}
+	if m.config.Servers[1].Name != "newserver" {
+		t.Errorf("new server name = %q, want %q", m.config.Servers[1].Name, "newserver")
+	}
+	if m.config.Servers[1].Host != "user@newhost" {
+		t.Errorf("new server host = %q, want %q", m.config.Servers[1].Host, "user@newhost")
+	}
+	// Verify servers synced
+	if len(m.servers) != 2 {
+		t.Errorf("m.servers has %d entries, want 2", len(m.servers))
+	}
+	// Verify cursor moved to new entry
+	if m.settingsCursor != 1 {
+		t.Errorf("settingsCursor = %d, want 1 (new server)", m.settingsCursor)
+	}
+}
+
+func TestSettingsForm_EditServer(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "servers.yml")
+
+	mc := &mockComposer{}
+	cfg := &config.Config{Servers: []config.Server{
+		{Name: "prod", Host: "user@prod"},
+	}}
+	m := NewModel(nil, io.Discard, mockFactory(mc), cfg.Servers, mockConnectCb(mc),
+		WithConfig(cfg), WithConfigPath(path))
+
+	// s → enter (edit)
+	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'s'}})
+	m = updated.(Model)
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	m = updated.(Model)
+
+	if m.settingsInputs[0].Value() != "prod" {
+		t.Fatalf("name = %q, want %q", m.settingsInputs[0].Value(), "prod")
+	}
+
+	// Tab to host, clear and type new host
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyTab})
+	m = updated.(Model)
+	// Select all + delete existing host text
+	m.settingsInputs[1].SetValue("")
+	for _, r := range "user@newprod" {
+		updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{r}})
+		m = updated.(Model)
+	}
+
+	// Enter to save
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	m = updated.(Model)
+
+	if m.screen != screenSettingsList {
+		t.Errorf("screen = %d, want screenSettingsList", m.screen)
+	}
+	if m.config.Servers[0].Host != "user@newprod" {
+		t.Errorf("host = %q, want %q", m.config.Servers[0].Host, "user@newprod")
+	}
+}
+
+func TestSettingsList_DeleteServer(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "servers.yml")
+
+	mc := &mockComposer{}
+	cfg := &config.Config{Servers: []config.Server{
+		{Name: "prod", Host: "user@prod"},
+		{Name: "staging", Host: "user@staging"},
+	}}
+	m := NewModel(nil, io.Discard, mockFactory(mc), cfg.Servers, mockConnectCb(mc),
+		WithConfig(cfg), WithConfigPath(path))
+
+	// s → d → y (delete first server)
+	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'s'}})
+	m = updated.(Model)
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'d'}})
+	m = updated.(Model)
+
+	if !m.settingsDelete {
+		t.Fatal("settingsDelete should be true")
+	}
+
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'y'}})
+	m = updated.(Model)
+
+	if m.settingsDelete {
+		t.Error("settingsDelete should be false after confirm")
+	}
+	if len(m.config.Servers) != 1 {
+		t.Fatalf("got %d servers, want 1", len(m.config.Servers))
+	}
+	if m.config.Servers[0].Name != "staging" {
+		t.Errorf("remaining server = %q, want %q", m.config.Servers[0].Name, "staging")
+	}
+	if len(m.servers) != 1 {
+		t.Errorf("m.servers = %d, want 1", len(m.servers))
+	}
+}
+
+func TestSettingsList_DeleteCancel(t *testing.T) {
+	m := settingsModel(testServers)
+	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'s'}})
+	m = updated.(Model)
+
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'d'}})
+	m = updated.(Model)
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'n'}})
+	m = updated.(Model)
+
+	if m.settingsDelete {
+		t.Error("settingsDelete should be false after cancel")
+	}
+	if len(m.config.Servers) != 2 {
+		t.Errorf("servers should be unchanged, got %d", len(m.config.Servers))
+	}
+}
+
+func TestSettingsForm_ValidationError_EmptyName(t *testing.T) {
+	m := settingsModel(testServers)
+	// s → a → form
+	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'s'}})
+	m = updated.(Model)
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'a'}})
+	m = updated.(Model)
+
+	// Skip name, tab to host, type host
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyTab})
+	m = updated.(Model)
+	for _, r := range "user@host" {
+		updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{r}})
+		m = updated.(Model)
+	}
+
+	// Try to save — should fail validation
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	m = updated.(Model)
+
+	if m.screen != screenSettingsForm {
+		t.Errorf("screen = %d, want screenSettingsForm (should stay on form)", m.screen)
+	}
+	if m.settingsErr == "" {
+		t.Error("settingsErr should be set for empty name")
+	}
+	if !strings.Contains(m.settingsErr, "name is required") {
+		t.Errorf("settingsErr = %q, want it to contain 'name is required'", m.settingsErr)
+	}
+}
+
+func TestSettingsForm_ValidationError_DuplicateName(t *testing.T) {
+	m := settingsModel(testServers)
+	// s → a → form
+	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'s'}})
+	m = updated.(Model)
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'a'}})
+	m = updated.(Model)
+
+	// Type duplicate name "prod"
+	for _, r := range "prod" {
+		updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{r}})
+		m = updated.(Model)
+	}
+	// Tab to host, type host
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyTab})
+	m = updated.(Model)
+	for _, r := range "user@newhost" {
+		updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{r}})
+		m = updated.(Model)
+	}
+
+	// Try to save
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	m = updated.(Model)
+
+	if m.screen != screenSettingsForm {
+		t.Errorf("screen = %d, want screenSettingsForm", m.screen)
+	}
+	if !strings.Contains(m.settingsErr, "duplicate") {
+		t.Errorf("settingsErr = %q, want it to contain 'duplicate'", m.settingsErr)
+	}
+}
+
+func TestSettingsList_EmptyState(t *testing.T) {
+	mc := &mockComposer{}
+	cfg := &config.Config{}
+	m := NewModel(nil, io.Discard, mockFactory(mc), nil, nil,
+		WithConfig(cfg), WithConfigPath("/tmp/test.yml"))
+
+	// With config set and no servers, starts on server screen — navigate to settings
+	if m.screen != screenSelectServer {
+		t.Fatalf("screen = %d, want screenSelectServer", m.screen)
+	}
+	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'s'}})
+	m = updated.(Model)
+
+	view := m.View()
+	if !strings.Contains(view, "No servers configured") {
+		t.Errorf("empty list view should show empty state message")
+	}
+}
+
+func TestSettingsList_DeleteOnEmptyList(t *testing.T) {
+	mc := &mockComposer{}
+	cfg := &config.Config{}
+	m := NewModel(nil, io.Discard, mockFactory(mc), nil, nil,
+		WithConfig(cfg), WithConfigPath("/tmp/test.yml"))
+	// Navigate to settings
+	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'s'}})
+	m = updated.(Model)
+
+	// d should do nothing on empty list
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'d'}})
+	m = updated.(Model)
+	if m.settingsDelete {
+		t.Error("settingsDelete should not activate on empty list")
+	}
+}
+
+func TestSettingsList_EnterOnEmptyList(t *testing.T) {
+	mc := &mockComposer{}
+	cfg := &config.Config{}
+	m := NewModel(nil, io.Discard, mockFactory(mc), nil, nil,
+		WithConfig(cfg), WithConfigPath("/tmp/test.yml"))
+	// Navigate to settings
+	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'s'}})
+	m = updated.(Model)
+
+	// enter should do nothing on empty list
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	m = updated.(Model)
+	if m.screen != screenSettingsList {
+		t.Errorf("screen = %d, want screenSettingsList (enter on empty should be noop)", m.screen)
+	}
+}
+
+func TestViewSettingsForm_ShowsTitle(t *testing.T) {
+	m := settingsModel(testServers)
+	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'s'}})
+	m = updated.(Model)
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'a'}})
+	m = updated.(Model)
+
+	view := m.View()
+	if !strings.Contains(view, "Add Server") {
+		t.Errorf("add form should show 'Add Server' title")
+	}
+}
+
+func TestViewSettingsForm_EditShowsEditTitle(t *testing.T) {
+	m := settingsModel(testServers)
+	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'s'}})
+	m = updated.(Model)
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	m = updated.(Model)
+
+	view := m.View()
+	if !strings.Contains(view, "Edit Server") {
+		t.Errorf("edit form should show 'Edit Server' title")
+	}
+}
+
+func TestSettingsForm_SaveError(t *testing.T) {
+	mc := &mockComposer{}
+	cfg := &config.Config{Servers: []config.Server{
+		{Name: "prod", Host: "user@prod"},
+	}}
+	// Use invalid path to trigger save error
+	m := NewModel(nil, io.Discard, mockFactory(mc), cfg.Servers, mockConnectCb(mc),
+		WithConfig(cfg), WithConfigPath("/nonexistent/deeply/nested/readonly/servers.yml"))
+
+	// s → a → fill → enter
+	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'s'}})
+	m = updated.(Model)
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'a'}})
+	m = updated.(Model)
+	for _, r := range "new" {
+		updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{r}})
+		m = updated.(Model)
+	}
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyTab})
+	m = updated.(Model)
+	for _, r := range "user@host" {
+		updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{r}})
+		m = updated.(Model)
+	}
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	m = updated.(Model)
+
+	if m.screen != screenSettingsForm {
+		t.Errorf("screen = %d, want screenSettingsForm (should stay on form after save error)", m.screen)
+	}
+	if !strings.Contains(m.settingsErr, "save failed") {
+		t.Errorf("settingsErr = %q, want it to contain 'save failed'", m.settingsErr)
+	}
+	// P2 fix: live state must NOT be mutated on save failure
+	if len(m.config.Servers) != 1 {
+		t.Errorf("config.Servers has %d entries after failed save, want 1 (should be unchanged)", len(m.config.Servers))
+	}
+	if m.config.Servers[0].Name != "prod" {
+		t.Errorf("config.Servers[0].Name = %q, want %q (original should be preserved)", m.config.Servers[0].Name, "prod")
+	}
+}
+
+func TestSettingsList_ServerEntryRebuildAfterAdd(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "servers.yml")
+
+	mc := &mockComposer{}
+	cfg := &config.Config{Servers: []config.Server{
+		{Name: "prod", Host: "user@prod"},
+	}}
+	m := NewModel(nil, io.Discard, mockFactory(mc), cfg.Servers, mockConnectCb(mc),
+		WithConfig(cfg), WithConfigPath(path))
+
+	// s → a → add server → save
+	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'s'}})
+	m = updated.(Model)
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'a'}})
+	m = updated.(Model)
+	for _, r := range "staging" {
+		updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{r}})
+		m = updated.(Model)
+	}
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyTab})
+	m = updated.(Model)
+	for _, r := range "user@staging" {
+		updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{r}})
+		m = updated.(Model)
+	}
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	m = updated.(Model)
+
+	// Back to server select — entries should include new server
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyEsc})
+	m = updated.(Model)
+
+	if m.screen != screenSelectServer {
+		t.Fatalf("screen = %d, want screenSelectServer", m.screen)
+	}
+	// serverEntries should have: Local + 2 servers = 3
+	if len(m.serverEntries) != 3 {
+		t.Errorf("serverEntries = %d, want 3 (Local + 2 servers)", len(m.serverEntries))
+	}
+}
+
+func TestViewSelectServer_ShowsSettingsHint(t *testing.T) {
+	m := settingsModel(testServers)
+	view := m.View()
+	if !strings.Contains(view, "s settings") {
+		t.Errorf("server select view should show 's settings' hint when config is set")
+	}
+}
+
+func TestViewSelectServer_NoSettingsHintWithoutConfig(t *testing.T) {
+	mc := &mockComposer{}
+	m := NewModel(nil, io.Discard, mockFactory(mc), testServers, mockConnectCb(mc))
+	view := m.View()
+	if strings.Contains(view, "s settings") {
+		t.Errorf("server select view should not show 's settings' hint without config")
+	}
+}
+
+func TestSettingsReachable_EmptyServerList(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "servers.yml")
+
+	mc := &mockComposer{}
+	cfg := &config.Config{}
+	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil,
+		WithConfig(cfg), WithConfigPath(path))
+
+	// With config set, should start on server select even with 0 servers
+	if m.screen != screenSelectServer {
+		t.Fatalf("screen = %d, want screenSelectServer", m.screen)
+	}
+
+	// s opens settings
+	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'s'}})
+	m = updated.(Model)
+	if m.screen != screenSettingsList {
+		t.Fatalf("screen = %d, want screenSettingsList", m.screen)
+	}
+
+	// a → add form → fill → save
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'a'}})
+	m = updated.(Model)
+	for _, r := range "myserver" {
+		updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{r}})
+		m = updated.(Model)
+	}
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyTab})
+	m = updated.(Model)
+	for _, r := range "user@host" {
+		updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{r}})
+		m = updated.(Model)
+	}
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	m = updated.(Model)
+
+	if m.screen != screenSettingsList {
+		t.Fatalf("screen = %d, want screenSettingsList after save", m.screen)
+	}
+	if len(m.config.Servers) != 1 {
+		t.Fatalf("got %d servers, want 1", len(m.config.Servers))
+	}
+
+	// esc back to server select — should now show the new server
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyEsc})
+	m = updated.(Model)
+	if m.screen != screenSelectServer {
+		t.Fatalf("screen = %d, want screenSelectServer", m.screen)
+	}
+	// Local + 1 server = 2 entries
+	if len(m.serverEntries) != 2 {
+		t.Errorf("serverEntries = %d, want 2", len(m.serverEntries))
+	}
+}
+
+func TestSettingsEdit_AddGroup_ClampsServerCursor(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "servers.yml")
+
+	mc := &mockComposer{}
+	cfg := &config.Config{Servers: []config.Server{
+		{Name: "prod", Host: "user@prod"},
+		{Name: "staging", Host: "user@staging"},
+	}}
+	m := NewModel(nil, io.Discard, mockFactory(mc), cfg.Servers, mockConnectCb(mc),
+		WithConfig(cfg), WithConfigPath(path))
+
+	// Move server picker cursor to staging (index 2: Local=0, prod=1, staging=2)
+	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyDown})
+	m = updated.(Model)
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyDown})
+	m = updated.(Model)
+	if m.serverCursor != 2 {
+		t.Fatalf("serverCursor = %d, want 2", m.serverCursor)
+	}
+
+	// Go to settings, edit "prod" (index 0), add a group
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'s'}})
+	m = updated.(Model)
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	m = updated.(Model)
+
+	// Tab to group field (field 3) and type a group name
+	for i := 0; i < 3; i++ {
+		updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyTab})
+		m = updated.(Model)
+	}
+	for _, r := range "Production" {
+		updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{r}})
+		m = updated.(Model)
+	}
+	// Save
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	m = updated.(Model)
+
+	if m.screen != screenSettingsList {
+		t.Fatalf("screen = %d, want screenSettingsList", m.screen)
+	}
+
+	// Back to server select
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyEsc})
+	m = updated.(Model)
+
+	// serverEntries now has a group header. serverCursor must be selectable.
+	entry := m.serverEntries[m.serverCursor]
+	if entry.kind == entryGroupHeader {
+		t.Fatalf("serverCursor %d points to a group header — would panic on Enter", m.serverCursor)
+	}
+
+	// Pressing Enter should not panic
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	_ = updated.(Model) // would panic without the fix
+}
+
+func TestCycleColor(t *testing.T) {
+	// Forward from empty
+	if c := cycleColor("", 1); c != "red" {
+		t.Errorf("cycleColor(\"\", 1) = %q, want %q", c, "red")
+	}
+	// Backward from empty wraps to last
+	if c := cycleColor("", -1); c != "gray" {
+		t.Errorf("cycleColor(\"\", -1) = %q, want %q", c, "gray")
+	}
+	// Forward from last wraps to empty
+	if c := cycleColor("gray", 1); c != "" {
+		t.Errorf("cycleColor(\"gray\", 1) = %q, want empty", c)
+	}
+	// Forward from red → green
+	if c := cycleColor("red", 1); c != "green" {
+		t.Errorf("cycleColor(\"red\", 1) = %q, want %q", c, "green")
+	}
+}
+
+func TestSettingsList_DeleteClampsServerCursor(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "servers.yml")
+
+	mc := &mockComposer{}
+	cfg := &config.Config{Servers: []config.Server{
+		{Name: "prod", Host: "user@prod"},
+	}}
+	m := NewModel(nil, io.Discard, mockFactory(mc), cfg.Servers, mockConnectCb(mc),
+		WithConfig(cfg), WithConfigPath(path))
+
+	// Move server picker cursor to the server entry (index 1, after Local)
+	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyDown})
+	m = updated.(Model)
+	if m.serverCursor != 1 {
+		t.Fatalf("serverCursor = %d, want 1", m.serverCursor)
+	}
+
+	// Go to settings and delete the only server
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'s'}})
+	m = updated.(Model)
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'d'}})
+	m = updated.(Model)
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'y'}})
+	m = updated.(Model)
+
+	// serverEntries now has only Local (index 0)
+	if len(m.serverEntries) != 1 {
+		t.Fatalf("serverEntries = %d, want 1", len(m.serverEntries))
+	}
+	// serverCursor must be clamped
+	if m.serverCursor != 0 {
+		t.Errorf("serverCursor = %d, want 0 (should be clamped after delete)", m.serverCursor)
+	}
+}
+
+func TestSettingsList_DeleteLastServer_FixesCursor(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "servers.yml")
+
+	mc := &mockComposer{}
+	cfg := &config.Config{Servers: []config.Server{
+		{Name: "prod", Host: "user@prod"},
+		{Name: "staging", Host: "user@staging"},
+	}}
+	m := NewModel(nil, io.Discard, mockFactory(mc), cfg.Servers, mockConnectCb(mc),
+		WithConfig(cfg), WithConfigPath(path))
+
+	// s → navigate to last → d → y
+	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'s'}})
+	m = updated.(Model)
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyDown})
+	m = updated.(Model)
+	if m.settingsCursor != 1 {
+		t.Fatalf("cursor should be at 1")
+	}
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'d'}})
+	m = updated.(Model)
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'y'}})
+	m = updated.(Model)
+
+	if m.settingsCursor != 0 {
+		t.Errorf("cursor = %d, want 0 (should clamp after deleting last)", m.settingsCursor)
 	}
 }

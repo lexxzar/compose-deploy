@@ -10,6 +10,7 @@ import (
 	"strings"
 
 	"github.com/charmbracelet/bubbles/spinner"
+	"github.com/charmbracelet/bubbles/textinput"
 	"github.com/charmbracelet/bubbles/viewport"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/lexxzar/compose-deploy/internal/compose"
@@ -129,11 +130,17 @@ const (
 	screenProgress
 	screenLogs
 	screenConfig
+	screenSettingsList
+	screenSettingsForm
 )
 
 // Model is the Bubble Tea model for the cdeploy TUI.
 type Model struct {
 	screen screen
+
+	// Config persistence
+	configPath string         // path to servers.yml for Save()
+	config     *config.Config // live config for settings editor
 
 	// Screen: server select
 	servers           []config.Server
@@ -208,6 +215,17 @@ type Model struct {
 	configValid    *bool          // nil = not checked, true = valid, false = invalid
 	configValidMsg string         // validation error message
 	configSession  uint64         // monotonic counter for stale message rejection
+
+	// Screen: settings list
+	settingsCursor int  // cursor in settings list
+	settingsDelete bool // inline delete confirmation active
+
+	// Screen: settings form
+	settingsEditing int // -1 = add new, >=0 = edit index into config.Servers
+	settingsField   int // focused field: 0-3 = text inputs, 4 = color picker
+	settingsInputs  [4]textinput.Model
+	settingsColor   string // currently selected color value
+	settingsErr     string // validation / save error message
 
 	// Shared
 	ctx       context.Context
@@ -300,25 +318,27 @@ func WithLocalProjectLoader(loader ProjectLoader) Option {
 	}
 }
 
+// WithConfigPath sets the file path used by the settings editor to save config changes.
+func WithConfigPath(path string) Option {
+	return func(m *Model) {
+		m.configPath = path
+	}
+}
+
+// WithConfig sets the live Config used by the settings editor for CRUD operations.
+func WithConfig(cfg *config.Config) Option {
+	return func(m *Model) {
+		m.config = cfg
+	}
+}
+
 func NewModel(composer runner.Composer, logWriter io.Writer, factory ComposerFactory, servers []config.Server, connectCb ConnectCallback, opts ...Option) Model {
 	s := spinner.New()
 	s.Spinner = spinner.Dot
 
-	startScreen := screenSelectContainers
-	showPicker := false
-
-	if len(servers) > 0 {
-		startScreen = screenSelectServer
-	} else if composer == nil {
-		startScreen = screenSelectProject
-		showPicker = true
-	}
-
 	ctx, cancel := context.WithCancel(context.Background())
 
 	m := Model{
-		screen:          startScreen,
-		showPicker:      showPicker,
 		composerFactory: factory,
 		localComposer:   composer,
 		localFactory:    factory,
@@ -335,6 +355,16 @@ func NewModel(composer runner.Composer, logWriter io.Writer, factory ComposerFac
 
 	for _, opt := range opts {
 		opt(&m)
+	}
+
+	// Determine start screen after options are applied (config may be set).
+	if len(servers) > 0 || m.config != nil {
+		m.screen = screenSelectServer
+	} else if composer == nil {
+		m.screen = screenSelectProject
+		m.showPicker = true
+	} else {
+		m.screen = screenSelectContainers
 	}
 
 	return m
@@ -611,6 +641,13 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			default:
 				panic("unhandled default case")
 			}
+		case "s":
+			if m.config != nil {
+				m.screen = screenSettingsList
+				m.settingsCursor = 0
+				m.settingsDelete = false
+				return m, nil
+			}
 		}
 
 	case screenSelectProject:
@@ -841,6 +878,160 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			var cmd tea.Cmd
 			m.configViewport, cmd = m.configViewport.Update(msg)
 			return m, cmd
+		}
+
+	case screenSettingsList:
+		if m.settingsDelete {
+			switch key {
+			case "y":
+				idx := m.settingsCursor
+				newServers := slices.Clone(m.config.Servers)
+				newServers = slices.Delete(newServers, idx, idx+1)
+
+				tmpCfg := &config.Config{Servers: newServers}
+				if err := tmpCfg.Save(m.configPath); err != nil {
+					m.settingsErr = fmt.Sprintf("save failed: %v", err)
+					m.settingsDelete = false
+					return m, nil
+				}
+				m.config.Servers = newServers
+				m.servers = m.config.Servers
+				m.serverEntries = buildServerEntries(m.servers)
+				if m.settingsCursor >= len(m.config.Servers) && m.settingsCursor > 0 {
+					m.settingsCursor--
+				}
+				m.fixServerCursor()
+				m.settingsDelete = false
+				m.settingsErr = ""
+			case "n", "esc":
+				m.settingsDelete = false
+			}
+			return m, nil
+		}
+
+		switch key {
+		case "q", "ctrl+c":
+			return m, tea.Quit
+		case "esc":
+			m.screen = screenSelectServer
+			m.settingsErr = ""
+			return m, nil
+		case "up", "k":
+			if m.settingsCursor > 0 {
+				m.settingsCursor--
+			}
+		case "down", "j":
+			if m.settingsCursor < len(m.config.Servers)-1 {
+				m.settingsCursor++
+			}
+		case "a":
+			m.settingsEditing = -1
+			m.settingsField = 0
+			m.settingsColor = ""
+			m.settingsErr = ""
+			m.settingsInputs = initSettingsInputs()
+			m.settingsInputs[0].Focus()
+			m.screen = screenSettingsForm
+			return m, nil
+		case "enter", "e":
+			if len(m.config.Servers) == 0 {
+				return m, nil
+			}
+			srv := m.config.Servers[m.settingsCursor]
+			m.settingsEditing = m.settingsCursor
+			m.settingsField = 0
+			m.settingsColor = srv.Color
+			m.settingsErr = ""
+			m.settingsInputs = initSettingsInputs()
+			m.settingsInputs[0].SetValue(srv.Name)
+			m.settingsInputs[1].SetValue(srv.Host)
+			m.settingsInputs[2].SetValue(srv.ProjectDir)
+			m.settingsInputs[3].SetValue(srv.Group)
+			m.settingsInputs[0].Focus()
+			m.screen = screenSettingsForm
+			return m, nil
+		case "d":
+			if len(m.config.Servers) > 0 {
+				m.settingsDelete = true
+			}
+		}
+
+	case screenSettingsForm:
+		switch key {
+		case "ctrl+c":
+			return m, tea.Quit
+		case "esc":
+			m.screen = screenSettingsList
+			m.settingsErr = ""
+			return m, nil
+		case "tab", "down":
+			if m.settingsField < 4 {
+				m.settingsInputs[m.settingsField].Blur()
+			}
+			m.settingsField = (m.settingsField + 1) % 5
+			if m.settingsField < 4 {
+				m.settingsInputs[m.settingsField].Focus()
+			}
+		case "shift+tab", "up":
+			if m.settingsField < 4 {
+				m.settingsInputs[m.settingsField].Blur()
+			}
+			m.settingsField = (m.settingsField + 4) % 5
+			if m.settingsField < 4 {
+				m.settingsInputs[m.settingsField].Focus()
+			}
+		case "left":
+			if m.settingsField == 4 {
+				m.settingsColor = cycleColor(m.settingsColor, -1)
+			}
+		case "right":
+			if m.settingsField == 4 {
+				m.settingsColor = cycleColor(m.settingsColor, 1)
+			}
+		case "enter":
+			srv := config.Server{
+				Name:       strings.TrimSpace(m.settingsInputs[0].Value()),
+				Host:       strings.TrimSpace(m.settingsInputs[1].Value()),
+				ProjectDir: strings.TrimSpace(m.settingsInputs[2].Value()),
+				Group:      strings.TrimSpace(m.settingsInputs[3].Value()),
+				Color:      m.settingsColor,
+			}
+
+			// Build temporary config for validation and save
+			tmpServers := slices.Clone(m.config.Servers)
+			if m.settingsEditing < 0 {
+				tmpServers = append(tmpServers, srv)
+			} else {
+				tmpServers[m.settingsEditing] = srv
+			}
+			tmpCfg := &config.Config{Servers: tmpServers}
+			if err := tmpCfg.Validate(); err != nil {
+				m.settingsErr = err.Error()
+				return m, nil
+			}
+
+			// Save first, only mutate live state on success
+			if err := tmpCfg.Save(m.configPath); err != nil {
+				m.settingsErr = fmt.Sprintf("save failed: %v", err)
+				return m, nil
+			}
+			m.config.Servers = tmpServers
+			m.servers = m.config.Servers
+			m.serverEntries = buildServerEntries(m.servers)
+			m.fixServerCursor()
+			// Fix cursor for add
+			if m.settingsEditing < 0 {
+				m.settingsCursor = len(m.config.Servers) - 1
+			}
+			m.settingsErr = ""
+			m.screen = screenSettingsList
+			return m, nil
+		default:
+			if m.settingsField < 4 {
+				var cmd tea.Cmd
+				m.settingsInputs[m.settingsField], cmd = m.settingsInputs[m.settingsField].Update(msg)
+				return m, cmd
+			}
 		}
 
 	case screenProgress:
@@ -1224,6 +1415,28 @@ func (m Model) svcVisibleCount() int {
 }
 
 // fixSvcOffset adjusts svcOffset so that svcCursor is within the visible window.
+// fixServerCursor clamps serverCursor to a valid selectable entry after
+// serverEntries has been rebuilt (e.g. after settings add/edit/delete).
+func (m *Model) fixServerCursor() {
+	if len(m.serverEntries) == 0 {
+		m.serverCursor = 0
+		return
+	}
+	if m.serverCursor >= len(m.serverEntries) {
+		m.serverCursor = len(m.serverEntries) - 1
+	}
+	// If cursor landed on a group header, move to nearest selectable
+	if m.serverEntries[m.serverCursor].kind == entryGroupHeader {
+		// Try forward first
+		next := nextSelectable(m.serverEntries, m.serverCursor)
+		if next != m.serverCursor {
+			m.serverCursor = next
+		} else {
+			m.serverCursor = prevSelectable(m.serverEntries, m.serverCursor)
+		}
+	}
+}
+
 func (m *Model) fixSvcOffset() {
 	visible := m.svcVisibleCount()
 
@@ -1256,6 +1469,33 @@ func sortServices(services []string) []string {
 	return sorted
 }
 
+func initSettingsInputs() [4]textinput.Model {
+	var inputs [4]textinput.Model
+	placeholders := [4]string{"server-name", "user@hostname", "/path/to/project", "group-name"}
+	limits := [4]int{64, 128, 256, 64}
+	for i := range inputs {
+		inputs[i] = textinput.New()
+		inputs[i].Placeholder = placeholders[i]
+		inputs[i].CharLimit = limits[i]
+		inputs[i].Width = 40
+	}
+	return inputs
+}
+
+// cycleColor moves through the color options: "" → ValidColors[0..N-1] → "" → ...
+func cycleColor(current string, dir int) string {
+	all := append([]string{""}, config.ValidColors...)
+	idx := 0
+	for i, c := range all {
+		if c == current {
+			idx = i
+			break
+		}
+	}
+	idx = (idx + dir + len(all)) % len(all)
+	return all[idx]
+}
+
 func (m Model) View() string {
 	switch m.screen {
 	case screenSelectServer:
@@ -1270,6 +1510,10 @@ func (m Model) View() string {
 		return m.viewLogs()
 	case screenConfig:
 		return m.viewConfig()
+	case screenSettingsList:
+		return m.viewSettingsList()
+	case screenSettingsForm:
+		return m.viewSettingsForm()
 	}
 	return ""
 }
@@ -1328,7 +1572,11 @@ func (m Model) viewSelectServer() string {
 		}
 	}
 
-	b.WriteString(helpStyle.Render("\n  up/down navigate  •  enter select  •  q quit"))
+	help := "  up/down navigate  •  enter select  •  q quit"
+	if m.config != nil {
+		help = "  up/down navigate  •  enter select  •  s settings  •  q quit"
+	}
+	b.WriteString(helpStyle.Render("\n" + help))
 	return b.String()
 }
 
@@ -1639,6 +1887,112 @@ func (m Model) viewProgress() string {
 		b.WriteString(helpStyle.Render("\n  esc cancel"))
 	}
 
+	return b.String()
+}
+
+func (m Model) viewSettingsList() string {
+	var b strings.Builder
+	b.WriteString(titleStyle.Render("cdeploy > settings > servers"))
+	b.WriteString("\n\n")
+
+	if m.settingsErr != "" {
+		b.WriteString(stepFailed.Render("  "+m.settingsErr) + "\n\n")
+	}
+
+	if len(m.config.Servers) == 0 {
+		b.WriteString(descStyle.Render("  No servers configured. Press 'a' to add one."))
+		b.WriteString("\n")
+	} else {
+		// Compute column widths
+		maxName, maxHost, maxGroup := 4, 4, 5 // "Name", "Host", "Group"
+		for _, s := range m.config.Servers {
+			if len(s.Name) > maxName {
+				maxName = len(s.Name)
+			}
+			if len(s.Host) > maxHost {
+				maxHost = len(s.Host)
+			}
+			if len(s.Group) > maxGroup {
+				maxGroup = len(s.Group)
+			}
+		}
+
+		// Header
+		header := fmt.Sprintf("     %-*s  %-*s  %-*s  %s",
+			maxName, "Name", maxHost, "Host", maxGroup, "Group", "Color")
+		b.WriteString(descStyle.Render(header))
+		b.WriteString("\n")
+
+		for i, s := range m.config.Servers {
+			cursor := "  "
+			style := itemStyle
+			if i == m.settingsCursor {
+				cursor = "> "
+				style = selectedItemStyle
+			}
+
+			colorDisplay := descStyle.Render("-")
+			if s.Color != "" {
+				colorDisplay = serverBadgeStyle(s.Color).Render(" " + s.Color + " ")
+			}
+
+			groupDisplay := s.Group
+			if groupDisplay == "" {
+				groupDisplay = "-"
+			}
+
+			line := fmt.Sprintf("%s%-*s  %-*s  %-*s  %s",
+				cursor, maxName, s.Name, maxHost, s.Host, maxGroup, groupDisplay, colorDisplay)
+			b.WriteString(style.Render(line))
+			b.WriteString("\n")
+		}
+	}
+
+	if m.settingsDelete {
+		name := m.config.Servers[m.settingsCursor].Name
+		b.WriteString("\n")
+		b.WriteString(warningStyle.Render(fmt.Sprintf("  Delete server %q? (y/n)", name)))
+	}
+
+	b.WriteString(helpStyle.Render("\n  a add  •  enter edit  •  d delete  •  esc back"))
+	return b.String()
+}
+
+func (m Model) viewSettingsForm() string {
+	var b strings.Builder
+
+	title := "Add Server"
+	if m.settingsEditing >= 0 {
+		title = "Edit Server"
+	}
+	b.WriteString(titleStyle.Render("cdeploy > settings > " + title))
+	b.WriteString("\n\n")
+
+	if m.settingsErr != "" {
+		b.WriteString(stepFailed.Render("  "+m.settingsErr) + "\n\n")
+	}
+
+	labels := [4]string{"Name", "Host", "Project Dir", "Group"}
+	for i, label := range labels {
+		indicator := "  "
+		if i == m.settingsField {
+			indicator = "> "
+		}
+		b.WriteString(fmt.Sprintf("  %s%-12s %s\n", indicator, label+":", m.settingsInputs[i].View()))
+	}
+
+	// Color picker
+	indicator := "  "
+	if m.settingsField == 4 {
+		indicator = "> "
+	}
+	colorVal := "(none)"
+	if m.settingsColor != "" {
+		colorVal = serverBadgeStyle(m.settingsColor).Render(" " + m.settingsColor + " ")
+	}
+	b.WriteString(fmt.Sprintf("  %s%-12s < %s >\n", indicator, "Color:", colorVal))
+
+	b.WriteString(helpStyle.Render("\n  tab/shift-tab cycle fields  •  ←/→ color  •  enter save  •  esc discard"))
 	return b.String()
 }
 

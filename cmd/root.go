@@ -140,7 +140,11 @@ Remote server configuration (~/.cdeploy/servers.yml):
 			}
 			defer logger.Close()
 
-			tuiOpts := []tui.Option{tui.WithLocalProjectLoader(localLoader)}
+			tuiOpts := []tui.Option{
+				tui.WithLocalProjectLoader(localLoader),
+				tui.WithConfigPath(config.DefaultPath()),
+				tui.WithConfig(cfg),
+			}
 			if serverName != "" && len(cfg.Servers) == 0 {
 				return fmt.Errorf("--server %q specified but no servers configured in %s", serverName, config.DefaultPath())
 			}

@@ -103,12 +103,12 @@ Only `cmd/root.go` and new settings tests need these options. Existing test call
 - Modify: `internal/config/config.go`
 - Modify: `internal/config/config_test.go`
 
-- [ ] Add `Save(path string) error` method to `*Config` — creates parent dir, writes temp file, renames atomically
-- [ ] Replace unexported `validColors` map with exported `ValidColors` slice (ordered, for cycle picker); update `Validate()` to use `slices.Contains(ValidColors, s.Color)` instead of map lookup — single source of truth
-- [ ] Write test for Save round-trip (save then load, compare)
-- [ ] Write test for Save creating parent directory
-- [ ] Write test for Save with empty config (no servers)
-- [ ] Run tests: `go test ./internal/config/ -v` — must pass before task 2
+- [x] Add `Save(path string) error` method to `*Config` — creates parent dir, writes temp file, renames atomically
+- [x] Replace unexported `validColors` map with exported `ValidColors` slice (ordered, for cycle picker); update `Validate()` to use `slices.Contains(ValidColors, s.Color)` instead of map lookup — single source of truth
+- [x] Write test for Save round-trip (save then load, compare)
+- [x] Write test for Save creating parent directory
+- [x] Write test for Save with empty config (no servers)
+- [x] Run tests: `go test ./internal/config/ -v` — must pass before task 2
 
 ### Task 2: Thread config path into TUI via functional options
 
@@ -116,13 +116,13 @@ Only `cmd/root.go` and new settings tests need these options. Existing test call
 - Modify: `internal/tui/app.go`
 - Modify: `cmd/root.go`
 
-- [ ] Add `configPath string` and `config *config.Config` fields to `Model`
-- [ ] Add `WithConfigPath(path string) Option` functional option
-- [ ] Add `WithConfig(cfg *config.Config) Option` functional option
-- [ ] Update `cmd/root.go` to pass `tui.WithConfigPath(config.DefaultPath())` and `tui.WithConfig(cfg)` as options — no changes to `NewModel()`/`Run()` signatures
-- [ ] Existing test call sites remain untouched (no new positional params)
-- [ ] Write test verifying WithConfigPath/WithConfig options set fields correctly
-- [ ] Run tests: `go test ./internal/tui/ ./cmd/ -v` — must pass before task 3
+- [x] Add `configPath string` and `config *config.Config` fields to `Model`
+- [x] Add `WithConfigPath(path string) Option` functional option
+- [x] Add `WithConfig(cfg *config.Config) Option` functional option
+- [x] Update `cmd/root.go` to pass `tui.WithConfigPath(config.DefaultPath())` and `tui.WithConfig(cfg)` as options — no changes to `NewModel()`/`Run()` signatures
+- [x] Existing test call sites remain untouched (no new positional params)
+- [x] Write test verifying WithConfigPath/WithConfig options set fields correctly
+- [x] Run tests: `go test ./internal/tui/ ./cmd/ -v` — must pass before task 3
 
 ### Task 3: Settings list screen — navigation and display
 
@@ -130,76 +130,76 @@ Only `cmd/root.go` and new settings tests need these options. Existing test call
 - Modify: `internal/tui/app.go`
 - Modify: `internal/tui/styles.go`
 
-- [ ] Add `screenSettingsList` and `screenSettingsForm` to the `screen` enum
-- [ ] Add settings model fields: `settingsCursor int`, `settingsDelete bool`
-- [ ] Add `s` key handler in `screenSelectServer` — transitions to `screenSettingsList`, resets `settingsCursor` to 0
-- [ ] Update `viewSelectServer()` help line to include `s settings` hint (so users can discover the feature)
-- [ ] Add `handleKey` case for `screenSettingsList`: up/down navigation, `esc` back to server select, `q` quit
-- [ ] Add `viewSettingsList()` — tabular display with Name, Host, Group, Color columns; cursor indicator; empty state message
-- [ ] Add any new styles needed (table header, color swatch rendering)
-- [ ] Add help line: `a add  •  enter edit  •  d delete  •  esc back`
-- [ ] Wire into `View()` switch and `handleKey()` switch
-- [ ] Write tests for `s` key → settings list transition
-- [ ] Write tests for up/down navigation in settings list
-- [ ] Write tests for `esc` back to server select
-- [ ] Run tests: `go test ./internal/tui/ -v` — must pass before task 4
+- [x] Add `screenSettingsList` and `screenSettingsForm` to the `screen` enum
+- [x] Add settings model fields: `settingsCursor int`, `settingsDelete bool`
+- [x] Add `s` key handler in `screenSelectServer` — transitions to `screenSettingsList`, resets `settingsCursor` to 0
+- [x] Update `viewSelectServer()` help line to include `s settings` hint (so users can discover the feature)
+- [x] Add `handleKey` case for `screenSettingsList`: up/down navigation, `esc` back to server select, `q` quit
+- [x] Add `viewSettingsList()` — tabular display with Name, Host, Group, Color columns; cursor indicator; empty state message
+- [x] Add any new styles needed (table header, color swatch rendering)
+- [x] Add help line: `a add  •  enter edit  •  d delete  •  esc back`
+- [x] Wire into `View()` switch and `handleKey()` switch
+- [x] Write tests for `s` key → settings list transition
+- [x] Write tests for up/down navigation in settings list
+- [x] Write tests for `esc` back to server select
+- [x] Run tests: `go test ./internal/tui/ -v` — must pass before task 4
 
 ### Task 4: Settings form screen — field navigation and display
 
 **Files:**
 - Modify: `internal/tui/app.go`
 
-- [ ] Add form model fields: `settingsEditing int`, `settingsField int`, `settingsInputs [4]textinput.Model`, `settingsColor string`, `settingsErr string`
-- [ ] Add helper `initSettingsInputs()` to create the 4 `textinput.Model` instances with placeholders (Name: "server-name", Host: "user@hostname", Project Dir: "/path/to/project", Group: "group-name")
-- [ ] Add `a` key handler in settings list — sets `settingsEditing = -1`, initializes blank form, transitions to `screenSettingsForm`
-- [ ] Add `enter`/`e` key handler in settings list — sets `settingsEditing` to server index, pre-fills form fields, transitions to `screenSettingsForm`
-- [ ] Add `handleKey` for `screenSettingsForm`: tab/shift-tab/up/down cycle `settingsField`, left/right on color field cycle through `ValidColors`, `esc` discard and return to list
-- [ ] Forward key events to focused `textinput.Model` via its `Update()` when `settingsField` is 0-3
-- [ ] Add `viewSettingsForm()` — labels + inputs, color picker with `< value >` rendered in color, error display, help line
-- [ ] Wire into `View()` switch and `handleKey()` switch
-- [ ] Write tests for `a` key → blank form transition
-- [ ] Write tests for `enter` on server → pre-filled form
-- [ ] Write tests for tab cycling through fields
-- [ ] Write tests for color cycling (left/right)
-- [ ] Write tests for `esc` discard back to list
-- [ ] Run tests: `go test ./internal/tui/ -v` — must pass before task 5
+- [x] Add form model fields: `settingsEditing int`, `settingsField int`, `settingsInputs [4]textinput.Model`, `settingsColor string`, `settingsErr string`
+- [x] Add helper `initSettingsInputs()` to create the 4 `textinput.Model` instances with placeholders (Name: "server-name", Host: "user@hostname", Project Dir: "/path/to/project", Group: "group-name")
+- [x] Add `a` key handler in settings list — sets `settingsEditing = -1`, initializes blank form, transitions to `screenSettingsForm`
+- [x] Add `enter`/`e` key handler in settings list — sets `settingsEditing` to server index, pre-fills form fields, transitions to `screenSettingsForm`
+- [x] Add `handleKey` for `screenSettingsForm`: tab/shift-tab/up/down cycle `settingsField`, left/right on color field cycle through `ValidColors`, `esc` discard and return to list
+- [x] Forward key events to focused `textinput.Model` via its `Update()` when `settingsField` is 0-3
+- [x] Add `viewSettingsForm()` — labels + inputs, color picker with `< value >` rendered in color, error display, help line
+- [x] Wire into `View()` switch and `handleKey()` switch
+- [x] Write tests for `a` key → blank form transition
+- [x] Write tests for `enter` on server → pre-filled form
+- [x] Write tests for tab cycling through fields
+- [x] Write tests for color cycling (left/right)
+- [x] Write tests for `esc` discard back to list
+- [x] Run tests: `go test ./internal/tui/ -v` — must pass before task 5
 
 ### Task 5: Save, delete, and validation logic
 
 **Files:**
 - Modify: `internal/tui/app.go`
 
-- [ ] Add `enter` handler in settings form — build temporary config with modified servers, call `config.Validate()`, map errors to user-friendly `settingsErr`, stay on form if invalid
-- [ ] On valid save (add): append new `Server` to `m.config.Servers`, call `m.config.Save(m.configPath)`, sync `m.servers = m.config.Servers`, rebuild `m.serverEntries`, return to settings list
-- [ ] On valid save (edit): update `m.config.Servers[settingsEditing]` in place, save, sync `m.servers`, rebuild, return to list
-- [ ] Add `d` key handler in settings list — set `settingsDelete = true` (inline confirmation)
-- [ ] Add `y`/`n` handlers when `settingsDelete` is true — `y` removes server from config, saves, rebuilds entries, fixes cursor bounds; `n` cancels
-- [ ] Handle save errors — display via `settingsErr` on form or `svcErr`-like field on list
-- [ ] Update `viewSettingsList()` to show delete confirmation line when `settingsDelete` is true
-- [ ] Write tests for add server flow (form → save → list updated)
-- [ ] Write tests for edit server flow (form → save → list updated)
-- [ ] Write tests for delete server flow (d → y → removed)
-- [ ] Write tests for delete cancel (d → n → unchanged)
-- [ ] Write tests for validation errors (empty name, empty host, duplicate name)
-- [ ] Write test for save error handling
-- [ ] Run tests: `go test ./internal/tui/ -v` — must pass before task 6
+- [x] Add `enter` handler in settings form — build temporary config with modified servers, call `config.Validate()`, map errors to user-friendly `settingsErr`, stay on form if invalid
+- [x] On valid save (add): append new `Server` to `m.config.Servers`, call `m.config.Save(m.configPath)`, sync `m.servers = m.config.Servers`, rebuild `m.serverEntries`, return to settings list
+- [x] On valid save (edit): update `m.config.Servers[settingsEditing]` in place, save, sync `m.servers`, rebuild, return to list
+- [x] Add `d` key handler in settings list — set `settingsDelete = true` (inline confirmation)
+- [x] Add `y`/`n` handlers when `settingsDelete` is true — `y` removes server from config, saves, rebuilds entries, fixes cursor bounds; `n` cancels
+- [x] Handle save errors — display via `settingsErr` on form or `svcErr`-like field on list
+- [x] Update `viewSettingsList()` to show delete confirmation line when `settingsDelete` is true
+- [x] Write tests for add server flow (form → save → list updated)
+- [x] Write tests for edit server flow (form → save → list updated)
+- [x] Write tests for delete server flow (d → y → removed)
+- [x] Write tests for delete cancel (d → n → unchanged)
+- [x] Write tests for validation errors (empty name, empty host, duplicate name)
+- [x] Write test for save error handling
+- [x] Run tests: `go test ./internal/tui/ -v` — must pass before task 6
 
 ### Task 6: Verify acceptance criteria
 
-- [ ] Verify all server CRUD operations work end-to-end in tests
-- [ ] Verify backward compatibility — existing tests still pass with new parameters
-- [ ] Verify empty server list shows proper empty state
-- [ ] Verify server select screen rebuilds correctly after settings changes
-- [ ] Run full test suite: `go test ./... -count=1`
+- [x] Verify all server CRUD operations work end-to-end in tests
+- [x] Verify backward compatibility — existing tests still pass with new parameters
+- [x] Verify empty server list shows proper empty state
+- [x] Verify server select screen rebuilds correctly after settings changes
+- [x] Run full test suite: `go test ./... -count=1`
 
 ### Task 7: [Final] Update documentation
 
 **Files:**
 - Modify: `CLAUDE.md`
 
-- [ ] Add settings editor section to CLAUDE.md documenting: new screens, model fields, navigation flow, state cleanup rules
-- [ ] Document the `Save()` method and config path threading
-- [ ] Move this plan to `docs/plans/completed/`
+- [x] Add settings editor section to CLAUDE.md documenting: new screens, model fields, navigation flow, state cleanup rules
+- [x] Document the `Save()` method and config path threading
+- [x] Move this plan to `docs/plans/completed/`
 
 ## Post-Completion
 

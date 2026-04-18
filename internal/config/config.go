@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 
 	"gopkg.in/yaml.v3"
 )
@@ -17,9 +18,9 @@ type Server struct {
 	Color      string `yaml:"color,omitempty"`
 }
 
-var validColors = map[string]bool{
-	"red": true, "green": true, "yellow": true, "blue": true,
-	"magenta": true, "cyan": true, "white": true, "gray": true,
+// ValidColors lists the allowed server badge color names, in cycle order.
+var ValidColors = []string{
+	"red", "green", "yellow", "blue", "magenta", "cyan", "white", "gray",
 }
 
 // Config holds the cdeploy configuration.
@@ -65,13 +66,49 @@ func (c *Config) Validate() error {
 		if s.Host == "" {
 			return fmt.Errorf("server %q: host is required", s.Name)
 		}
-		if s.Color != "" && !validColors[s.Color] {
+		if s.Color != "" && !slices.Contains(ValidColors, s.Color) {
 			return fmt.Errorf("server %q: unknown color %q", s.Name, s.Color)
 		}
 		if seen[s.Name] {
 			return fmt.Errorf("duplicate server name %q", s.Name)
 		}
 		seen[s.Name] = true
+	}
+	return nil
+}
+
+// Save writes the config to the given path atomically.
+// It creates parent directories if needed.
+func (c *Config) Save(path string) error {
+	data, err := yaml.Marshal(c)
+	if err != nil {
+		return fmt.Errorf("marshaling config: %w", err)
+	}
+
+	dir := filepath.Dir(path)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return fmt.Errorf("creating config directory: %w", err)
+	}
+
+	tmp, err := os.CreateTemp(dir, ".servers-*.yml")
+	if err != nil {
+		return fmt.Errorf("creating temp file: %w", err)
+	}
+	tmpName := tmp.Name()
+
+	if _, err := tmp.Write(data); err != nil {
+		tmp.Close()
+		os.Remove(tmpName)
+		return fmt.Errorf("writing config: %w", err)
+	}
+	if err := tmp.Close(); err != nil {
+		os.Remove(tmpName)
+		return fmt.Errorf("closing temp file: %w", err)
+	}
+
+	if err := os.Rename(tmpName, path); err != nil {
+		os.Remove(tmpName)
+		return fmt.Errorf("renaming config: %w", err)
 	}
 	return nil
 }
