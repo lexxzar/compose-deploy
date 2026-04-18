@@ -296,10 +296,8 @@ func runList(ctx context.Context, jsonOutput bool) error {
 		if err != nil {
 			return fmt.Errorf("loading config: %w", err)
 		}
-		if len(cfg.Servers) > 0 {
-			if err := cfg.Validate(); err != nil {
-				return err
-			}
+		if err := cfg.Validate(); err != nil {
+			return err
 		}
 		server, err := cfg.FindServer(serverName)
 		if err != nil {

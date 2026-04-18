@@ -599,6 +599,44 @@ func TestMigrate_AutoCreateGroupWithoutColor(t *testing.T) {
 	}
 }
 
+func TestMigrate_NewFormatUnknownGroupNotCreated(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "servers.yml")
+	data := `groups:
+  - name: production
+    color: red
+servers:
+  - name: prod-1
+    host: user@prod1
+    group: production
+  - name: staging
+    host: user@staging
+    group: prodction
+`
+	if err := os.WriteFile(path, []byte(data), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load() error: %v", err)
+	}
+
+	// migrate should NOT auto-create "prodction" — explicit groups exist
+	if len(cfg.Groups) != 1 {
+		t.Fatalf("got %d groups, want 1 (typo should not create a phantom group)", len(cfg.Groups))
+	}
+
+	// Validate should catch the typo
+	err = cfg.Validate()
+	if err == nil {
+		t.Fatal("expected validation error for misspelled group reference")
+	}
+	if !strings.Contains(err.Error(), "unknown group") {
+		t.Errorf("error = %q, want it to contain 'unknown group'", err.Error())
+	}
+}
+
 func TestSave_CreatesParentDir(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "sub", "deep", "servers.yml")

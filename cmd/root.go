@@ -54,10 +54,8 @@ Remote server configuration (~/.cdeploy/servers.yml):
 			if err != nil {
 				return err
 			}
-			if len(cfg.Servers) > 0 {
-				if err := cfg.Validate(); err != nil {
-					return err
-				}
+			if err := cfg.Validate(); err != nil {
+				return err
 			}
 
 			// localDetector is lazily initialized on first Detect() call.

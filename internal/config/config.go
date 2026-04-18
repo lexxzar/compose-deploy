@@ -86,6 +86,11 @@ func (c *Config) migrate() {
 		existing[g.Name] = i
 	}
 
+	// Only auto-create groups for legacy configs (no explicit groups declared).
+	// When groups are already declared, unmatched references are likely typos
+	// and should be caught by Validate().
+	isLegacy := len(c.Groups) == 0
+
 	for i, s := range c.Servers {
 		if s.Group == "" {
 			continue
@@ -95,13 +100,14 @@ func (c *Config) migrate() {
 			if c.Groups[idx].Color == "" && s.Color != "" {
 				c.Groups[idx].Color = s.Color
 			}
-		} else {
-			// Auto-create group with server's color
+			// Strip color from grouped server
+			c.Servers[i].Color = ""
+		} else if isLegacy {
+			// Auto-create group with server's color (legacy format only)
 			c.Groups = append(c.Groups, Group{Name: s.Group, Color: s.Color})
 			existing[s.Group] = len(c.Groups) - 1
+			c.Servers[i].Color = ""
 		}
-		// Strip color from grouped server
-		c.Servers[i].Color = ""
 	}
 }
 
