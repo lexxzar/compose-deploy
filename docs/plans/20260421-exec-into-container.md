@@ -83,16 +83,16 @@
 - Modify: `internal/tui/app.go`
 - Modify: `internal/tui/app_test.go`
 
-- [ ] Define `ExecProvider` interface in `app.go`: `ExecCommand(ctx context.Context, service string, command []string) (*exec.Cmd, error)`
-- [ ] Add `x` key handler in `screenSelectContainers`: type-assert `m.composer.(ExecProvider)` first (no-op if fails), then check `st, ok := m.svcStatus[m.services[m.svcCursor]]; ok && st.Running` — if not running, set `m.warning = "Container is not running"` and return
-- [ ] If running, set `m.confirming = true` and `m.pendingExec = true`
-- [ ] Modify the `enter` case in the `if m.confirming` block: if `m.pendingExec`, type-assert `ExecProvider`, call `ExecCommand(ctx, cursorService, nil)`, return `tea.ExecProcess`; otherwise fall through to existing `enterProgress`
-- [ ] Define `execDoneMsg{err error}` type; use it as the `tea.ExecProcess` callback message
-- [ ] Handle `execDoneMsg` in Update: reset `pendingExec`, call `refreshStatus()` to update container state
-- [ ] Update confirmation view rendering: when `pendingExec`, show "Exec into <service>? enter confirm / esc cancel" instead of the operation + selected containers format
-- [ ] Add `x exec` to help text on container screen (verify it fits in layout or split to second line)
-- [ ] Write tests: `x` on running service triggers confirm, `x` on stopped service shows warning, confirm dispatches ExecProcess-like command, `x` when composer doesn't implement ExecProvider is no-op
-- [ ] Run tests - must pass before next task
+- [x] Define `ExecProvider` interface in `app.go`: `ExecCommand(ctx context.Context, service string, command []string) (*exec.Cmd, error)`
+- [x] Add `x` key handler in `screenSelectContainers`: type-assert `m.composer.(ExecProvider)` first (no-op if fails), then check `st, ok := m.svcStatus[m.services[m.svcCursor]]; ok && st.Running` — if not running, set `m.warning = "Container is not running"` and return
+- [x] If running, set `m.confirming = true` and `m.pendingExec = true`
+- [x] Modify the `enter` case in the `if m.confirming` block: if `m.pendingExec`, type-assert `ExecProvider`, call `ExecCommand(ctx, cursorService, nil)`, return `tea.ExecProcess`; otherwise fall through to existing `enterProgress`
+- [x] Define `execDoneMsg{err error}` type; use it as the `tea.ExecProcess` callback message
+- [x] Handle `execDoneMsg` in Update: reset `pendingExec`, call `refreshStatus()` to update container state
+- [x] Update confirmation view rendering: when `pendingExec`, show "Exec into <service>? enter confirm / esc cancel" instead of the operation + selected containers format
+- [x] Add `x exec` to help text on container screen (verify it fits in layout or split to second line)
+- [x] Write tests: `x` on running service triggers confirm, `x` on stopped service shows warning, confirm dispatches ExecProcess-like command, `x` when composer doesn't implement ExecProvider is no-op
+- [x] Run tests - must pass before next task
 
 ### Task 4: Add CLI exec subcommand
 

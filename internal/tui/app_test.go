@@ -85,6 +85,23 @@ func mockConfigFactory(mc *mockConfigComposer) ComposerFactory {
 	return func(string) runner.Composer { return mc }
 }
 
+// mockExecComposer implements both runner.Composer and ExecProvider.
+type mockExecComposer struct {
+	mockComposer
+	execErr error
+}
+
+func (m *mockExecComposer) ExecCommand(ctx context.Context, service string, command []string) (*exec.Cmd, error) {
+	if m.execErr != nil {
+		return nil, m.execErr
+	}
+	return exec.Command("echo", "exec", service), nil
+}
+
+func mockExecFactory(mc *mockExecComposer) ComposerFactory {
+	return func(string) runner.Composer { return mc }
+}
+
 func TestNewModel_InitialState(t *testing.T) {
 	mc := &mockComposer{}
 	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
@@ -3437,7 +3454,7 @@ func TestSvcVisibleCount_NormalHeight(t *testing.T) {
 	mc := &mockComposer{}
 	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
 	m.services = []string{"a", "b", "c", "d", "e", "f", "g", "h", "i", "j"}
-	m.width = 120 // wide enough for one-line help
+	m.width = 130 // wide enough for one-line help
 	m.height = 10
 
 	// header=3, footer=3 (one-line help on wide terminal) → 10-3-3 = 4
@@ -3480,7 +3497,7 @@ func TestSvcVisibleCount_Warning(t *testing.T) {
 	mc := &mockComposer{}
 	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
 	m.services = []string{"a", "b", "c", "d", "e", "f", "g", "h", "i", "j"}
-	m.width = 120
+	m.width = 130
 	m.height = 10
 	m.warning = "something wrong"
 
@@ -3522,7 +3539,7 @@ func TestSvcVisibleCount_WithStatusColumns(t *testing.T) {
 	mc := &mockComposer{}
 	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
 	m.services = []string{"a", "b", "c", "d", "e", "f", "g", "h", "i", "j"}
-	m.width = 120
+	m.width = 130
 	m.height = 10
 	m.svcStatus = map[string]runner.ServiceStatus{
 		"a": {Running: true, Created: "2024-01-15 09:30", Uptime: "3h"},
@@ -3583,7 +3600,7 @@ func TestFixSvcOffset_CursorBelowWindow(t *testing.T) {
 	mc := &mockComposer{}
 	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
 	m.services = []string{"a", "b", "c", "d", "e"}
-	m.width = 120
+	m.width = 130
 	m.height = 9 // visible = 9-3-3 = 3
 	m.svcCursor = 4
 	m.svcOffset = 0
@@ -3645,7 +3662,7 @@ func TestFixSvcOffset_ClampsMaxOffset(t *testing.T) {
 	mc := &mockComposer{}
 	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
 	m.services = []string{"a", "b", "c", "d", "e"}
-	m.width = 120
+	m.width = 130
 	m.height = 9 // visible = 9-3-3 = 3
 	m.svcCursor = 4
 	m.svcOffset = 10 // way too high
@@ -3662,11 +3679,11 @@ func TestScrollDown_PastVisibleWindow(t *testing.T) {
 	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
 	m.screen = screenSelectContainers
 	m.services = mc.services
-	m.width = 120
+	m.width = 130
 	m.height = 9 // visible = 9-3-3 = 3
 
 	// Set initial size
-	updated, _ := m.Update(tea.WindowSizeMsg{Width: 120, Height: 9})
+	updated, _ := m.Update(tea.WindowSizeMsg{Width: 130, Height: 9})
 	m = updated.(Model)
 
 	// Press down 4 times to reach index 4
@@ -3689,7 +3706,7 @@ func TestScrollUp_PastTopOfWindow(t *testing.T) {
 	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
 	m.screen = screenSelectContainers
 	m.services = mc.services
-	m.width = 120
+	m.width = 130
 	m.height = 9 // visible = 9-3-3 = 3
 	m.svcCursor = 4
 	m.svcOffset = 2
@@ -3740,7 +3757,7 @@ func TestSelectAll_DoesNotChangeOffset(t *testing.T) {
 	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
 	m.screen = screenSelectContainers
 	m.services = mc.services
-	m.width = 120
+	m.width = 130
 	m.height = 9 // visible = 3
 	m.svcCursor = 3
 	m.svcOffset = 1
@@ -3758,13 +3775,13 @@ func TestWindowResize_FixesOffset(t *testing.T) {
 	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
 	m.screen = screenSelectContainers
 	m.services = mc.services
-	m.width = 120
+	m.width = 130
 	m.height = 20 // all fit
 	m.svcCursor = 4
 	m.svcOffset = 0
 
 	// Shrink terminal
-	updated, _ := m.Update(tea.WindowSizeMsg{Width: 120, Height: 9}) // visible=3
+	updated, _ := m.Update(tea.WindowSizeMsg{Width: 130, Height: 9}) // visible=3
 	m = updated.(Model)
 
 	// cursor=4 should force offset adjustment
@@ -3781,7 +3798,7 @@ func TestViewSelectContainers_UpIndicator(t *testing.T) {
 	m.screen = screenSelectContainers
 	m.services = mc.services
 	m.svcStatus = map[string]runner.ServiceStatus{}
-	m.width = 120
+	m.width = 130
 	m.height = 9 // visible = 3
 	m.svcCursor = 3
 	m.svcOffset = 2
@@ -3798,7 +3815,7 @@ func TestViewSelectContainers_DownIndicator(t *testing.T) {
 	m.screen = screenSelectContainers
 	m.services = mc.services
 	m.svcStatus = map[string]runner.ServiceStatus{}
-	m.width = 120
+	m.width = 130
 	m.height = 9 // visible = 3
 	m.svcCursor = 0
 	m.svcOffset = 0
@@ -3835,7 +3852,7 @@ func TestViewSelectContainers_BothIndicators(t *testing.T) {
 	m.screen = screenSelectContainers
 	m.services = mc.services
 	m.svcStatus = map[string]runner.ServiceStatus{}
-	m.width = 120
+	m.width = 130
 	m.height = 9 // visible = 3
 	m.svcCursor = 2
 	m.svcOffset = 1
@@ -3875,7 +3892,7 @@ func TestViewSelectContainers_WindowedOnlyShowsVisibleServices(t *testing.T) {
 	m.screen = screenSelectContainers
 	m.services = mc.services
 	m.svcStatus = map[string]runner.ServiceStatus{}
-	m.width = 120
+	m.width = 130
 	m.height = 9 // visible = 3
 	m.svcCursor = 2
 	m.svcOffset = 1 // showing bbb, ccc, ddd
@@ -5534,5 +5551,335 @@ func TestColumnCaptions_Alignment(t *testing.T) {
 	if headerCreatedIdx != dataCreatedIdx {
 		t.Errorf("Created label rune offset (%d) != data rune offset (%d)\nheader: %q\ndata:   %q",
 			headerCreatedIdx, dataCreatedIdx, headerLine, dataLine)
+	}
+}
+
+// --- Exec screen tests ---
+
+func TestExec_XKeyOnRunningServiceTriggersConfirm(t *testing.T) {
+	mc := &mockExecComposer{
+		mockComposer: mockComposer{
+			services: []string{"web", "db"},
+			status: map[string]runner.ServiceStatus{
+				"web": {Running: true},
+				"db":  {Running: false},
+			},
+		},
+	}
+	m := NewModel(mc, io.Discard, mockExecFactory(mc), nil, nil)
+	m.services = mc.services
+	m.svcStatus = mc.status
+	m.screen = screenSelectContainers
+	m.svcCursor = 0 // "web" is running
+	m.width = 120
+	m.height = 24
+
+	result, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'x'}})
+	model := result.(Model)
+
+	if !model.confirming {
+		t.Error("expected confirming=true after 'x' on running service")
+	}
+	if !model.pendingExec {
+		t.Error("expected pendingExec=true after 'x' on running service")
+	}
+}
+
+func TestExec_XKeyOnStoppedServiceShowsWarning(t *testing.T) {
+	mc := &mockExecComposer{
+		mockComposer: mockComposer{
+			services: []string{"web", "db"},
+			status: map[string]runner.ServiceStatus{
+				"web": {Running: true},
+				"db":  {Running: false},
+			},
+		},
+	}
+	m := NewModel(mc, io.Discard, mockExecFactory(mc), nil, nil)
+	m.services = mc.services
+	m.svcStatus = mc.status
+	m.screen = screenSelectContainers
+	m.svcCursor = 1 // "db" is stopped
+	m.width = 120
+	m.height = 24
+
+	result, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'x'}})
+	model := result.(Model)
+
+	if model.confirming {
+		t.Error("should not enter confirming state for stopped service")
+	}
+	if model.pendingExec {
+		t.Error("should not set pendingExec for stopped service")
+	}
+	if model.warning != "Container is not running" {
+		t.Errorf("warning = %q, want %q", model.warning, "Container is not running")
+	}
+}
+
+func TestExec_XKeyWithoutExecProviderIsNoOp(t *testing.T) {
+	// Plain mockComposer does NOT implement ExecProvider
+	mc := &mockComposer{
+		services: []string{"web"},
+		status:   map[string]runner.ServiceStatus{"web": {Running: true}},
+	}
+	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
+	m.services = mc.services
+	m.svcStatus = mc.status
+	m.screen = screenSelectContainers
+	m.svcCursor = 0
+	m.width = 120
+	m.height = 24
+
+	result, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'x'}})
+	model := result.(Model)
+
+	if model.confirming {
+		t.Error("should not enter confirming state when composer doesn't implement ExecProvider")
+	}
+	if model.pendingExec {
+		t.Error("should not set pendingExec when composer doesn't implement ExecProvider")
+	}
+	if model.screen != screenSelectContainers {
+		t.Errorf("screen = %d, want %d (should stay on containers)", model.screen, screenSelectContainers)
+	}
+}
+
+func TestExec_XKeyOnNoServicesIsNoOp(t *testing.T) {
+	mc := &mockExecComposer{
+		mockComposer: mockComposer{
+			services: []string{},
+			status:   map[string]runner.ServiceStatus{},
+		},
+	}
+	m := NewModel(mc, io.Discard, mockExecFactory(mc), nil, nil)
+	m.services = mc.services
+	m.svcStatus = mc.status
+	m.screen = screenSelectContainers
+	m.width = 120
+	m.height = 24
+
+	result, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'x'}})
+	model := result.(Model)
+
+	if model.confirming {
+		t.Error("should not enter confirming state with no services")
+	}
+}
+
+func TestExec_ConfirmEnterDispatchesExecProcess(t *testing.T) {
+	mc := &mockExecComposer{
+		mockComposer: mockComposer{
+			services: []string{"web"},
+			status:   map[string]runner.ServiceStatus{"web": {Running: true}},
+		},
+	}
+	m := NewModel(mc, io.Discard, mockExecFactory(mc), nil, nil)
+	m.services = mc.services
+	m.svcStatus = mc.status
+	m.screen = screenSelectContainers
+	m.svcCursor = 0
+	m.confirming = true
+	m.pendingExec = true
+	m.width = 120
+	m.height = 24
+
+	_, cmd := m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+
+	if cmd == nil {
+		t.Error("expected a cmd (tea.ExecProcess) when confirming exec")
+	}
+}
+
+func TestExec_ConfirmEscClearsPendingExec(t *testing.T) {
+	mc := &mockExecComposer{
+		mockComposer: mockComposer{
+			services: []string{"web"},
+			status:   map[string]runner.ServiceStatus{"web": {Running: true}},
+		},
+	}
+	m := NewModel(mc, io.Discard, mockExecFactory(mc), nil, nil)
+	m.services = mc.services
+	m.svcStatus = mc.status
+	m.screen = screenSelectContainers
+	m.svcCursor = 0
+	m.confirming = true
+	m.pendingExec = true
+	m.width = 120
+	m.height = 24
+
+	result, _ := m.Update(tea.KeyMsg{Type: tea.KeyEsc})
+	model := result.(Model)
+
+	if model.confirming {
+		t.Error("confirming should be false after esc")
+	}
+	if model.pendingExec {
+		t.Error("pendingExec should be false after esc")
+	}
+}
+
+func TestExec_ExecDoneMsgRefreshesStatus(t *testing.T) {
+	mc := &mockExecComposer{
+		mockComposer: mockComposer{
+			services: []string{"web"},
+			status:   map[string]runner.ServiceStatus{"web": {Running: true}},
+		},
+	}
+	m := NewModel(mc, io.Discard, mockExecFactory(mc), nil, nil)
+	m.services = mc.services
+	m.svcStatus = mc.status
+	m.screen = screenSelectContainers
+	m.pendingExec = true
+	m.confirming = true
+
+	result, cmd := m.Update(execDoneMsg{err: nil})
+	model := result.(Model)
+
+	if model.pendingExec {
+		t.Error("pendingExec should be false after execDoneMsg")
+	}
+	if model.confirming {
+		t.Error("confirming should be false after execDoneMsg")
+	}
+	if cmd == nil {
+		t.Error("expected a cmd (refreshStatus) after execDoneMsg")
+	}
+}
+
+func TestExec_ExecDoneMsgWithErrorStillResetsState(t *testing.T) {
+	mc := &mockExecComposer{
+		mockComposer: mockComposer{
+			services: []string{"web"},
+			status:   map[string]runner.ServiceStatus{"web": {Running: true}},
+		},
+	}
+	m := NewModel(mc, io.Discard, mockExecFactory(mc), nil, nil)
+	m.services = mc.services
+	m.svcStatus = mc.status
+	m.screen = screenSelectContainers
+	m.pendingExec = true
+	m.confirming = true
+
+	result, cmd := m.Update(execDoneMsg{err: fmt.Errorf("exec failed: exit status 1")})
+	model := result.(Model)
+
+	if model.pendingExec {
+		t.Error("pendingExec should be false after execDoneMsg with error")
+	}
+	if model.confirming {
+		t.Error("confirming should be false after execDoneMsg with error")
+	}
+	if cmd == nil {
+		t.Error("expected a cmd (refreshStatus) after execDoneMsg with error")
+	}
+	if model.warning == "" {
+		t.Error("expected warning to be set after execDoneMsg with error")
+	}
+	if !strings.Contains(model.warning, "exit status 1") {
+		t.Errorf("warning should contain error message, got: %s", model.warning)
+	}
+}
+
+func TestExec_ExecDoneMsgStaleMessageGuard(t *testing.T) {
+	mc := &mockExecComposer{
+		mockComposer: mockComposer{
+			services: []string{"web"},
+			status:   map[string]runner.ServiceStatus{"web": {Running: true}},
+		},
+	}
+	m := NewModel(mc, io.Discard, mockExecFactory(mc), nil, nil)
+	m.services = mc.services
+	m.svcStatus = mc.status
+	m.screen = screenLogs // not on container screen
+	m.pendingExec = true
+	m.confirming = true
+
+	result, cmd := m.Update(execDoneMsg{err: fmt.Errorf("some error")})
+	model := result.(Model)
+
+	// Stale message should be discarded — state unchanged
+	if !model.pendingExec {
+		t.Error("pendingExec should remain true when message is stale")
+	}
+	if !model.confirming {
+		t.Error("confirming should remain true when message is stale")
+	}
+	if cmd != nil {
+		t.Error("expected nil cmd when message is stale")
+	}
+	if model.warning != "" {
+		t.Error("warning should not be set when message is stale")
+	}
+}
+
+func TestExec_ViewShowsExecConfirmation(t *testing.T) {
+	mc := &mockExecComposer{
+		mockComposer: mockComposer{
+			services: []string{"web"},
+			status:   map[string]runner.ServiceStatus{"web": {Running: true}},
+		},
+	}
+	m := NewModel(mc, io.Discard, mockExecFactory(mc), nil, nil)
+	m.services = mc.services
+	m.svcStatus = mc.status
+	m.screen = screenSelectContainers
+	m.svcCursor = 0
+	m.confirming = true
+	m.pendingExec = true
+	m.width = 120
+	m.height = 24
+
+	view := m.viewSelectContainers()
+	if !strings.Contains(view, "Exec into web") {
+		t.Errorf("exec confirmation should mention 'Exec into web', got: %q", view)
+	}
+	if !strings.Contains(view, "enter confirm") {
+		t.Errorf("exec confirmation should mention 'enter confirm', got: %q", view)
+	}
+}
+
+func TestViewSelectContainers_ShowsExecKey(t *testing.T) {
+	mc := &mockComposer{
+		services: []string{"web"},
+		status:   map[string]runner.ServiceStatus{"web": {Running: true}},
+	}
+	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
+	m.services = mc.services
+	m.svcStatus = mc.status
+	m.screen = screenSelectContainers
+	m.width = 120
+	m.height = 24
+
+	view := m.viewSelectContainers()
+	if !strings.Contains(view, "x exec") {
+		t.Errorf("container screen help should mention 'x exec', got: %q", view)
+	}
+}
+
+func TestExec_XKeyOnServiceWithNoStatus(t *testing.T) {
+	// Service exists but has no status entry — treated as not running
+	mc := &mockExecComposer{
+		mockComposer: mockComposer{
+			services: []string{"web"},
+			status:   map[string]runner.ServiceStatus{},
+		},
+	}
+	m := NewModel(mc, io.Discard, mockExecFactory(mc), nil, nil)
+	m.services = mc.services
+	m.svcStatus = mc.status
+	m.screen = screenSelectContainers
+	m.svcCursor = 0
+	m.width = 120
+	m.height = 24
+
+	result, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'x'}})
+	model := result.(Model)
+
+	if model.confirming {
+		t.Error("should not enter confirming state for service with no status")
+	}
+	if model.warning != "Container is not running" {
+		t.Errorf("warning = %q, want %q", model.warning, "Container is not running")
 	}
 }
