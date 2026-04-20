@@ -4947,3 +4947,344 @@ func TestSettingsForm_ColorAccessibleWhenGrouped(t *testing.T) {
 		t.Errorf("form should show '(group)' label for grouped server color, got: %q", view)
 	}
 }
+
+// --- Quit confirmation tests ---
+
+func TestQuitConfirmation_RemoteConnection_ShowsPrompt(t *testing.T) {
+	// When connected to a remote server (disconnectFunc != nil),
+	// pressing q should set quitting = true and NOT return tea.Quit.
+	mc := &mockComposer{services: []string{"nginx"}}
+	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
+	m.screen = screenSelectContainers
+	m.services = mc.services
+	m.selected = make(map[int]bool)
+	m.disconnectFunc = func() error { return nil }
+	m.serverName = "prod"
+
+	updated, cmd := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'q'}})
+	um := updated.(Model)
+
+	if cmd != nil {
+		t.Fatal("expected nil command (no quit), got non-nil")
+	}
+	if !um.quitting {
+		t.Error("quitting should be true after pressing q on remote connection")
+	}
+	if um.screen != screenSelectContainers {
+		t.Errorf("screen should remain unchanged, got %d", um.screen)
+	}
+}
+
+func TestQuitConfirmation_LocalSession_QuitsImmediately(t *testing.T) {
+	// Without a remote connection (disconnectFunc == nil),
+	// pressing q should return tea.Quit directly.
+	mc := &mockComposer{services: []string{"nginx"}}
+	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
+	m.screen = screenSelectContainers
+	m.services = mc.services
+	m.selected = make(map[int]bool)
+
+	updated, cmd := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'q'}})
+	um := updated.(Model)
+
+	if cmd == nil {
+		t.Fatal("expected quit command, got nil")
+	}
+	if um.quitting {
+		t.Error("quitting should be false for local session")
+	}
+}
+
+func TestQuitConfirmation_NoCancels(t *testing.T) {
+	// When quitting is true, pressing n should cancel (set quitting = false).
+	mc := &mockComposer{services: []string{"nginx"}}
+	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
+	m.screen = screenSelectContainers
+	m.services = mc.services
+	m.selected = make(map[int]bool)
+	m.quitting = true
+	m.disconnectFunc = func() error { return nil }
+
+	updated, cmd := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'n'}})
+	um := updated.(Model)
+
+	if cmd != nil {
+		t.Fatal("expected nil command after pressing n, got non-nil")
+	}
+	if um.quitting {
+		t.Error("quitting should be false after pressing n")
+	}
+	if um.screen != screenSelectContainers {
+		t.Errorf("screen should remain unchanged after cancel, got %d", um.screen)
+	}
+}
+
+func TestQuitConfirmation_EscCancels(t *testing.T) {
+	// When quitting is true, pressing esc should cancel (set quitting = false).
+	mc := &mockComposer{services: []string{"nginx"}}
+	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
+	m.screen = screenSelectContainers
+	m.services = mc.services
+	m.selected = make(map[int]bool)
+	m.quitting = true
+	m.disconnectFunc = func() error { return nil }
+
+	updated, cmd := m.Update(tea.KeyMsg{Type: tea.KeyEsc})
+	um := updated.(Model)
+
+	if cmd != nil {
+		t.Fatal("expected nil command after pressing esc, got non-nil")
+	}
+	if um.quitting {
+		t.Error("quitting should be false after pressing esc")
+	}
+}
+
+func TestQuitConfirmation_OtherKeysSwallowed(t *testing.T) {
+	// When quitting is true, other keys should be swallowed (no effect).
+	mc := &mockComposer{services: []string{"nginx"}}
+	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
+	m.screen = screenSelectContainers
+	m.services = mc.services
+	m.selected = make(map[int]bool)
+	m.quitting = true
+	m.disconnectFunc = func() error { return nil }
+
+	for _, key := range []rune{'j', 'k', 'd', 'r', 'a', 'x'} {
+		updated, cmd := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{key}})
+		um := updated.(Model)
+
+		if cmd != nil {
+			t.Errorf("key %c: expected nil command, got non-nil", key)
+		}
+		if !um.quitting {
+			t.Errorf("key %c: quitting should remain true", key)
+		}
+	}
+
+	// ctrl+c should also be swallowed when quitting prompt is active
+	updated, cmd := m.Update(tea.KeyMsg{Type: tea.KeyCtrlC})
+	um := updated.(Model)
+	if cmd != nil {
+		t.Error("ctrl+c: expected nil command, got non-nil")
+	}
+	if !um.quitting {
+		t.Error("ctrl+c: quitting should remain true")
+	}
+}
+
+func TestQuitConfirmation_ServerSelectAlwaysQuitsDirectly(t *testing.T) {
+	// On the server select screen, q should always quit directly,
+	// even if disconnectFunc is set (should not happen in practice).
+	mc := &mockComposer{}
+	m := NewModel(nil, io.Discard, mockFactory(mc), testServers, mockConnectCb(mc))
+	m.screen = screenSelectServer
+
+	_, cmd := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'q'}})
+
+	if cmd == nil {
+		t.Fatal("expected quit command on server select, got nil")
+	}
+}
+
+func TestQuitConfirmation_AllRemoteScreens(t *testing.T) {
+	// Verify that tryQuit is used across all non-server-select screens
+	// by testing q on each screen with a remote connection.
+	tests := []struct {
+		name   string
+		screen screen
+		key    string
+		setup  func(m *Model)
+	}{
+		{"project select", screenSelectProject, "q", func(m *Model) {
+			m.projects = []compose.Project{{Name: "app", ConfigDir: "/app"}}
+		}},
+		{"containers normal", screenSelectContainers, "q", func(m *Model) {
+			m.services = []string{"nginx"}
+			m.selected = make(map[int]bool)
+		}},
+		{"containers confirming", screenSelectContainers, "q", func(m *Model) {
+			m.services = []string{"nginx"}
+			m.selected = map[int]bool{0: true}
+			m.confirming = true
+			m.pendingOp = runner.Deploy
+		}},
+		{"logs", screenLogs, "q", func(m *Model) {
+			m.logsService = "nginx"
+		}},
+		{"config", screenConfig, "q", func(m *Model) {
+			m.configContent = []byte("version: '3'")
+		}},
+		{"settings list", screenSettingsList, "q", func(m *Model) {
+			m.config = &config.Config{Servers: testServers}
+		}},
+		{"settings form ctrl+c", screenSettingsForm, "ctrl+c", func(m *Model) {
+			m.config = &config.Config{Servers: testServers}
+			m.settingsInputs = initSettingsInputs()
+		}},
+		{"progress done", screenProgress, "q", func(m *Model) {
+			m.done = true
+		}},
+		{"progress failed", screenProgress, "q", func(m *Model) {
+			m.failed = true
+		}},
+		{"containers ctrl+c", screenSelectContainers, "ctrl+c", func(m *Model) {
+			m.services = []string{"nginx"}
+			m.selected = make(map[int]bool)
+		}},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			mc := &mockComposer{}
+			m := NewModel(nil, io.Discard, mockFactory(mc), testServers, mockConnectCb(mc))
+			m.screen = tt.screen
+			m.disconnectFunc = func() error { return nil }
+			m.serverName = "prod"
+			if tt.setup != nil {
+				tt.setup(&m)
+			}
+
+			var keyMsg tea.KeyMsg
+			if tt.key == "ctrl+c" {
+				keyMsg = tea.KeyMsg{Type: tea.KeyCtrlC}
+			} else {
+				keyMsg = tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune(tt.key)}
+			}
+
+			updated, cmd := m.Update(keyMsg)
+			um := updated.(Model)
+
+			if cmd != nil {
+				t.Errorf("screen %q: expected nil command (quit intercepted), got non-nil", tt.name)
+			}
+			if !um.quitting {
+				t.Errorf("screen %q: quitting should be true after pressing %s on remote connection", tt.name, tt.key)
+			}
+		})
+	}
+}
+
+func TestQuitConfirmation_ViewRendersDisconnectPrompt(t *testing.T) {
+	mc := &mockComposer{}
+	m := NewModel(nil, io.Discard, mockFactory(mc), testServers, mockConnectCb(mc))
+	m.screen = screenSelectContainers
+	m.services = []string{"nginx"}
+	m.selected = make(map[int]bool)
+	m.disconnectFunc = func() error { return nil }
+	m.serverName = "prod-server"
+	m.quitting = true
+
+	output := m.View()
+
+	if !strings.Contains(output, "Disconnect from prod-server? (y/n)") {
+		t.Errorf("expected View to contain disconnect prompt, got:\n%s", output)
+	}
+	if !strings.Contains(output, "cdeploy") {
+		t.Errorf("expected View to contain title 'cdeploy', got:\n%s", output)
+	}
+}
+
+func TestQuitConfirmation_ConnectErrorResetsQuitting(t *testing.T) {
+	// When a remote connection attempt fails, quitting should be reset to false.
+	mc := &mockComposer{}
+	m := NewModel(nil, io.Discard, mockFactory(mc), testServers, mockConnectCb(mc))
+	m.screen = screenSelectServer
+	m.quitting = true
+	m.disconnectFunc = func() error { return nil }
+
+	updated, _ := m.Update(connectResultMsg{err: errors.New("connection refused")})
+	um := updated.(Model)
+
+	if um.quitting {
+		t.Error("quitting should be reset to false after connectResultMsg error")
+	}
+	if um.disconnectFunc != nil {
+		t.Error("disconnectFunc should be nil after connectResultMsg error")
+	}
+	if um.serverErr == nil {
+		t.Error("serverErr should be set after connectResultMsg error")
+	}
+}
+
+func TestQuitConfirmation_YesReturnsQuitMsg(t *testing.T) {
+	// Verify that pressing y during quit confirmation returns a command
+	// that produces tea.QuitMsg.
+	mc := &mockComposer{services: []string{"nginx"}}
+	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
+	m.screen = screenSelectContainers
+	m.services = mc.services
+	m.selected = make(map[int]bool)
+	m.quitting = true
+	m.disconnectFunc = func() error { return nil }
+
+	_, cmd := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'y'}})
+
+	if cmd == nil {
+		t.Fatal("expected quit command after pressing y, got nil")
+	}
+	msg := cmd()
+	if _, ok := msg.(tea.QuitMsg); !ok {
+		t.Errorf("expected tea.QuitMsg, got %T", msg)
+	}
+}
+
+func TestQuitConfirmation_LocalQuitReturnsQuitMsg(t *testing.T) {
+	// Verify that quitting a local session returns a command
+	// that produces tea.QuitMsg.
+	mc := &mockComposer{services: []string{"nginx"}}
+	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
+	m.screen = screenSelectContainers
+	m.services = mc.services
+	m.selected = make(map[int]bool)
+
+	_, cmd := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'q'}})
+
+	if cmd == nil {
+		t.Fatal("expected quit command, got nil")
+	}
+	msg := cmd()
+	if _, ok := msg.(tea.QuitMsg); !ok {
+		t.Errorf("expected tea.QuitMsg, got %T", msg)
+	}
+}
+
+func TestQuitConfirmation_ServerSelectReturnsQuitMsg(t *testing.T) {
+	// Verify that quitting from server select returns a command
+	// that produces tea.QuitMsg.
+	mc := &mockComposer{}
+	m := NewModel(nil, io.Discard, mockFactory(mc), testServers, mockConnectCb(mc))
+	m.screen = screenSelectServer
+
+	_, cmd := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'q'}})
+
+	if cmd == nil {
+		t.Fatal("expected quit command on server select, got nil")
+	}
+	msg := cmd()
+	if _, ok := msg.(tea.QuitMsg); !ok {
+		t.Errorf("expected tea.QuitMsg, got %T", msg)
+	}
+}
+
+func TestQuitConfirmation_ProgressInProgressIgnoresQ(t *testing.T) {
+	// When an operation is in progress (not done, not failed), pressing q
+	// should NOT trigger quit or set quitting = true.
+	mc := &mockComposer{services: []string{"nginx"}}
+	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
+	m.screen = screenProgress
+	m.done = false
+	m.failed = false
+	m.disconnectFunc = func() error { return nil }
+	m.serverName = "prod"
+
+	result, cmd := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'q'}})
+	updated := result.(Model)
+
+	if updated.quitting {
+		t.Error("pressing q during in-progress operation should not set quitting")
+	}
+	if cmd != nil {
+		t.Error("pressing q during in-progress operation should not return a command")
+	}
+}

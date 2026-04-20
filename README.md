@@ -6,6 +6,12 @@ Instead of SSH-ing into each machine and running `docker compose stop && docker 
 
 No daemon. No agents to install on your servers. No cluster orchestrator. Single binary. Plain SSH.
 
+## Prerequisites
+
+- Go 1.26+
+- Docker with either Compose v2 plugin (`docker compose`) or standalone Compose (`docker-compose`)
+- SSH client (for remote server support)
+
 ## Install
 
 ```bash
@@ -18,6 +24,32 @@ Or build from source:
 git clone https://github.com/lexxzar/compose-deploy.git
 cd compose-deploy
 go build -o cdeploy .
+```
+
+## Quick Start
+
+### Local project
+
+From a directory that contains a Compose file (`compose.yml`, `compose.yaml`, `docker-compose.yml`, or `docker-compose.yaml`):
+
+```bash
+# Launch the TUI
+cdeploy
+
+# Or use the CLI directly
+cdeploy list
+cdeploy deploy -a
+```
+
+### Remote server
+
+1. Define one or more servers in `~/.cdeploy/servers.yml`
+2. Make sure `ssh <host>` works with your normal SSH config
+3. Run a command against the configured server
+
+```bash
+cdeploy -s prod list
+cdeploy -s prod -C /opt/myapp deploy -a
 ```
 
 ## Usage
@@ -40,6 +72,35 @@ The TUI walks through up to six screens:
 4. **Progress** — watch step-by-step execution with status indicators
 5. **Logs** — live-stream logs for the selected service
 6. **Config** — inspect or edit the compose file, toggle between raw and resolved config, and see validation status
+
+#### TUI Keys
+
+**Service screen**
+
+- `space` toggle selection
+- `a` select or clear all
+- `r` restart selected services
+- `d` deploy selected services
+- `s` stop selected services
+- `l` open the log viewer for the focused service
+- `c` open the config viewer/editor for the current project
+- `esc` go back
+- `q` quit (shows a confirmation prompt when connected to a remote server)
+
+**Log viewer**
+
+- `w` toggle soft wrap
+- `p` toggle JSON pretty-printing
+- `G` jump to bottom
+- `esc` return to the service screen
+- `q` quit (shows a confirmation prompt when connected to a remote server)
+
+**Config screen**
+
+- `r` toggle raw vs resolved `docker compose config`
+- `e` edit the compose file in `$EDITOR`
+- `esc` return to the service screen
+- `q` quit (shows a confirmation prompt when connected to a remote server)
 
 ### CLI Mode
 
@@ -92,9 +153,15 @@ cdeploy logs nginx -s prod -C /opt/myapp
 
 ```
 -s, --server string        Remote server name from ~/.cdeploy/servers.yml
--C, --project-dir string   Docker compose project directory (default: current directory)
+-C, --project-dir string   Docker Compose project directory
     --log-dir string       Log directory (default ~/.cdeploy/logs/)
 ```
+
+Notes:
+
+- For `deploy`, `restart`, `stop`, and `logs`, omitting `-C` means "use the current directory" in local mode
+- For remote `deploy`, `restart`, `stop`, and `logs`, `-C` can come from the CLI flag or `project_dir` in server config
+- For `list`, omitting `-C` enables project discovery locally or on the remote host; adding `-C` targets exactly one project
 
 ## Remote Server Configuration
 
@@ -163,7 +230,7 @@ For scaled services, the worst-case health is shown (unhealthy > starting > heal
 
 ## Logging
 
-All docker compose output is logged to `~/.cdeploy/logs/`. Each log file is named `cdeploy_on_{hostname}_{timestamp}.log`, so you get a per-host, timestamped record of every operation. Override the directory with `--log-dir`.
+Operation output is logged to `~/.cdeploy/logs/`. Each log file is named `cdeploy_on_{hostname}_{timestamp}.log`, so you get a per-host, timestamped record of deploy/restart/stop runs and TUI-triggered operations. Override the directory with `--log-dir`.
 
 ## Compose Config Screen
 
@@ -181,8 +248,9 @@ cdeploy is not a replacement for Kubernetes, Docker Swarm, or full deployment pl
 
 [MIT](LICENSE)
 
-## Requirements
+## Troubleshooting
 
-- Go 1.26+
-- Docker with Compose v2 plugin (`docker compose`)
-- SSH client (for remote server support)
+- `neither 'docker compose' nor 'docker-compose' found`: install Docker Compose on the local machine or remote host you are targeting
+- `no compose file found`: run from a project directory with a Compose file or pass `-C /path/to/project`
+- `--server ... requires --project-dir or project_dir in config`: set `project_dir` in `~/.cdeploy/servers.yml` or pass `-C` explicitly
+- SSH prompts or host key verification issues: test the same host with plain `ssh` first, because cdeploy uses the system SSH client and inherits `~/.ssh/config`
