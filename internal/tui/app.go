@@ -182,6 +182,9 @@ type Model struct {
 	pendingOp  runner.Operation
 	warning    string
 
+	// Quit confirmation state (for remote connections)
+	quitting bool
+
 	// Screen 2: progress
 	steps       []stepState
 	logContent  string
@@ -476,6 +479,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.composerFactory = m.localFactory
 			m.projectLoader = m.localProjectLoader
 			m.disconnectFunc = nil
+			m.quitting = false
 			m.serverHost = ""
 			m.serverColor = ""
 			return m, nil
@@ -595,8 +599,32 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	return m, nil
 }
 
+// tryQuit returns tea.Quit immediately for local sessions.
+// For remote connections (disconnectFunc != nil), it sets quitting = true
+// to show a confirmation prompt instead.
+func (m Model) tryQuit() (tea.Model, tea.Cmd) {
+	if m.disconnectFunc != nil {
+		m.quitting = true
+		return m, nil
+	}
+	return m, tea.Quit
+}
+
 func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	key := msg.String()
+
+	// Quit confirmation intercept: when quitting is true, handle y/n/esc
+	// and swallow all other keys.
+	if m.quitting {
+		switch key {
+		case "y":
+			return m, tea.Quit
+		case "n", "esc":
+			m.quitting = false
+			return m, nil
+		}
+		return m, nil
+	}
 
 	switch m.screen {
 	case screenSelectServer:
@@ -617,6 +645,7 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 				m.composerFactory = m.localFactory
 				m.projectLoader = m.localProjectLoader
 				m.disconnectFunc = nil
+				m.quitting = false
 				if m.localComposer != nil {
 					m.composer = m.localComposer
 					m.showPicker = true
@@ -653,7 +682,7 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case screenSelectProject:
 		switch key {
 		case "q", "ctrl+c":
-			return m, tea.Quit
+			return m.tryQuit()
 		case "esc":
 			if len(m.servers) > 0 {
 				// Back to server screen — disconnect if remote
@@ -663,6 +692,7 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 				m.serverHost = ""
 				m.serverColor = ""
 				m.disconnectFunc = nil
+				m.quitting = false
 				m.projectLoader = m.localProjectLoader
 				m.composerFactory = m.localFactory
 				m.composer = nil
@@ -702,7 +732,7 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		if m.confirming {
 			switch key {
 			case "q", "ctrl+c":
-				return m, tea.Quit
+				return m.tryQuit()
 			case "enter":
 				containers := m.selectedContainers()
 				return m.enterProgress(containers)
@@ -718,7 +748,7 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 
 		switch key {
 		case "q", "ctrl+c":
-			return m, tea.Quit
+			return m.tryQuit()
 		case "esc":
 			if m.showPicker {
 				m.screen = screenSelectProject
@@ -792,7 +822,7 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case screenLogs:
 		switch key {
 		case "q", "ctrl+c":
-			return m, tea.Quit
+			return m.tryQuit()
 		case "esc":
 			if m.logsCancel != nil {
 				m.logsCancel()
@@ -835,7 +865,7 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case screenConfig:
 		switch key {
 		case "q", "ctrl+c":
-			return m, tea.Quit
+			return m.tryQuit()
 		case "esc":
 			m.configContent = nil
 			m.configResolved = nil
@@ -915,7 +945,7 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 
 		switch key {
 		case "q", "ctrl+c":
-			return m, tea.Quit
+			return m.tryQuit()
 		case "esc":
 			m.screen = screenSelectServer
 			m.settingsErr = ""
@@ -967,7 +997,7 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case screenSettingsForm:
 		switch key {
 		case "ctrl+c":
-			return m, tea.Quit
+			return m.tryQuit()
 		case "esc":
 			m.screen = screenSettingsList
 			m.settingsErr = ""
@@ -1069,7 +1099,7 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		switch key {
 		case "q", "ctrl+c":
 			if m.done || m.failed {
-				return m, tea.Quit
+				return m.tryQuit()
 			}
 		case "esc":
 			if m.done || m.failed {
@@ -1555,6 +1585,10 @@ func cycleColor(current string, dir int) string {
 }
 
 func (m Model) View() string {
+	if m.quitting {
+		return m.viewQuitConfirm()
+	}
+
 	switch m.screen {
 	case screenSelectServer:
 		return m.viewSelectServer()
@@ -1574,6 +1608,15 @@ func (m Model) View() string {
 		return m.viewSettingsForm()
 	}
 	return ""
+}
+
+func (m Model) viewQuitConfirm() string {
+	var b strings.Builder
+	b.WriteString(titleStyle.Render("cdeploy"))
+	b.WriteString("\n\n")
+	b.WriteString(warningStyle.Render(fmt.Sprintf("  Disconnect from %s? (y/n)", m.serverName)))
+	b.WriteString("\n")
+	return b.String()
 }
 
 func (m Model) viewSelectServer() string {
