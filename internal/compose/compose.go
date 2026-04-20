@@ -10,6 +10,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/lexxzar/compose-deploy/internal/runner"
 )
@@ -332,9 +333,11 @@ func (c *Compose) command(ctx context.Context, args ...string) *exec.Cmd {
 
 // psEntry matches the JSON schema of `docker compose ps --format json`.
 type psEntry struct {
-	Service string `json:"Service"`
-	State   string `json:"State"`
-	Health  string `json:"Health"`
+	Service   string `json:"Service"`
+	State     string `json:"State"`
+	Health    string `json:"Health"`
+	CreatedAt string `json:"CreatedAt"`
+	Status    string `json:"Status"`
 }
 
 // ContainerStatus returns a map of service name to ServiceStatus.
@@ -368,6 +371,21 @@ func healthPriority(h string) int {
 	}
 }
 
+// parseCreatedAt attempts to parse Docker's CreatedAt timestamp string.
+// Docker uses the format "2006-01-02 15:04:05 -0700 MST".
+// Returns the parsed time and whether parsing succeeded.
+func parseCreatedAt(s string) (time.Time, bool) {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return time.Time{}, false
+	}
+	t, err := time.Parse("2006-01-02 15:04:05 -0700 MST", s)
+	if err != nil {
+		return time.Time{}, false
+	}
+	return t, true
+}
+
 // parseContainerStatus parses the JSON output of `docker compose ps --format json`.
 // Docker Compose v2.21+ outputs a JSON array; older versions output NDJSON (one object per line).
 func parseContainerStatus(data []byte) (map[string]runner.ServiceStatus, error) {
@@ -398,16 +416,71 @@ func parseContainerStatus(data []byte) (map[string]runner.ServiceStatus, error) 
 		}
 	}
 
+	// Track aggregation state for scaled services.
+	type svcAgg struct {
+		oldestCreated      time.Time     // oldest CreatedAt across all replicas
+		oldestCreatedValid bool          //
+		longestUpDur       time.Duration // longest actual uptime among running replicas
+		longestUpStr       string        // uptime string of the longest-running replica
+		longestFromRunning bool          // true if longestUpStr came from a running replica
+	}
+	agg := make(map[string]*svcAgg)
+
 	status := make(map[string]runner.ServiceStatus)
 	for _, entry := range entries {
-		if entry.Service != "" {
-			prev := status[entry.Service]
-			prev.Running = prev.Running || entry.State == "running"
-			if healthPriority(entry.Health) > healthPriority(prev.Health) {
-				prev.Health = entry.Health
-			}
-			status[entry.Service] = prev
+		if entry.Service == "" {
+			continue
 		}
+		prev := status[entry.Service]
+		prev.Running = prev.Running || entry.State == "running"
+		if healthPriority(entry.Health) > healthPriority(prev.Health) {
+			prev.Health = entry.Health
+		}
+
+		// Initialize aggregation tracking for this service.
+		a := agg[entry.Service]
+		if a == nil {
+			a = &svcAgg{}
+			agg[entry.Service] = a
+		}
+
+		// Parse CreatedAt for this replica.
+		entryCreated, entryValid := parseCreatedAt(entry.CreatedAt)
+		entryUptime := formatUptime(entry.Status)
+
+		// Track oldest CreatedAt across all replicas (for the Created column).
+		if entryValid {
+			if !a.oldestCreatedValid || entryCreated.Before(a.oldestCreated) {
+				a.oldestCreated = entryCreated
+				a.oldestCreatedValid = true
+			}
+		}
+
+		// Track longest-running replica (for the Uptime column).
+		// Use entry.State to determine running status rather than parsing Status text.
+		// Running replicas always take priority over restarting ones.
+		if entry.State == "running" && entryUptime != "" {
+			dur := parseUptimeDuration(entryUptime)
+			if !a.longestFromRunning || dur > a.longestUpDur {
+				a.longestUpDur = dur
+				a.longestUpStr = entryUptime
+				a.longestFromRunning = true
+			}
+		} else if entryUptime == "restarting" && a.longestUpStr == "" {
+			a.longestUpStr = entryUptime
+		}
+
+		status[entry.Service] = prev
+	}
+
+	// Apply aggregated Created and Uptime to final status.
+	for svc, a := range agg {
+		st := status[svc]
+		if a.oldestCreatedValid {
+			st.Created = a.oldestCreated.Format("2006-01-02 15:04")
+		}
+		st.Uptime = a.longestUpStr
+		status[svc] = st
 	}
 
 	return status, nil
