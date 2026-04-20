@@ -851,6 +851,7 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			svc := m.services[m.svcCursor]
 			if st, ok := m.svcStatus[svc]; !ok || !st.Running {
 				m.warning = "Container is not running"
+				m.fixSvcOffset()
 				return m, nil
 			}
 			m.confirming = true
@@ -1268,6 +1269,7 @@ func (m *Model) enterExec() (tea.Model, tea.Cmd) {
 		m.warning = fmt.Sprintf("exec failed: %v", err)
 		m.confirming = false
 		m.pendingExec = false
+		m.fixSvcOffset()
 		return *m, nil
 	}
 	return *m, tea.ExecProcess(cmd, func(err error) tea.Msg {

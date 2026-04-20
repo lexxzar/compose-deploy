@@ -101,15 +101,15 @@
 - Create: `cmd/exec_test.go`
 - Modify: `cmd/root.go`
 
-- [ ] Create `newExecCmd()` following `cmd/logs.go` pattern
-- [ ] Use: `exec <service> [-- command...]`, Args: `cobra.MinimumNArgs(1)`
-- [ ] Parse args: first arg is service, everything after `--` (via `cmd.ArgsLenAtDash()`) is the command
-- [ ] Implement `runExec(ctx, service, command)`: local/remote setup identical to `runLogs` pattern
-- [ ] Call `ExecCommand`, attach stdin/stdout/stderr, run with `cmd.Run()`
-- [ ] Register in `root.go` via `rootCmd.AddCommand(newExecCmd())`
-- [ ] Write tests: flag registration, arg parsing with and without `--`, service name required, `--server` flag exists
-- [ ] Run full test suite: `go test ./... -count=1`
-- [ ] Run tests - must pass before next task
+- [x] Create `newExecCmd()` following `cmd/logs.go` pattern
+- [x] Use: `exec <service> [-- command...]`, Args: `cobra.MinimumNArgs(1)`
+- [x] Parse args: first arg is service, everything after `--` (via `cmd.ArgsLenAtDash()`) is the command
+- [x] Implement `runExec(ctx, service, command)`: local/remote setup identical to `runLogs` pattern
+- [x] Call `ExecCommand`, attach stdin/stdout/stderr, run with `cmd.Run()`
+- [x] Register in `root.go` via `rootCmd.AddCommand(newExecCmd())`
+- [x] Write tests: flag registration, arg parsing with and without `--`, service name required, `--server` flag exists
+- [x] Run full test suite: `go test ./... -count=1`
+- [x] Run tests - must pass before next task
 
 ### Task 5: [Final] Update documentation
 
