@@ -52,7 +52,7 @@ func TestRootCmd_Subcommands(t *testing.T) {
 		subcommands[sub.Name()] = true
 	}
 
-	for _, name := range []string{"deploy", "restart", "stop", "list", "logs"} {
+	for _, name := range []string{"deploy", "restart", "stop", "list", "logs", "exec"} {
 		if !subcommands[name] {
 			t.Errorf("subcommand %q not found", name)
 		}

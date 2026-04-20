@@ -384,6 +384,44 @@ func (r *RemoteCompose) EditCommand(ctx context.Context) (*exec.Cmd, error) {
 	), nil
 }
 
+// ExecCommand returns an exec.Cmd that runs `docker compose exec <service> <command...>`
+// on the remote host via SSH with TTY allocation (-t). When command is empty, it defaults
+// to DefaultExecCommand which tries bash, falling back to sh.
+// The caller is responsible for attaching stdin/stdout/stderr and running the command.
+func (r *RemoteCompose) ExecCommand(ctx context.Context, service string, command []string) (*exec.Cmd, error) {
+	if len(command) == 0 {
+		command = DefaultExecCommand
+	}
+
+	composeBin := "docker compose"
+	if r.Standalone {
+		composeBin = "docker-compose"
+	}
+
+	// Build the exec args: exec <service> <command...>
+	var escapedArgs []string
+	escapedArgs = append(escapedArgs, shellEscape("exec"))
+	escapedArgs = append(escapedArgs, shellEscape(service))
+	for _, a := range command {
+		escapedArgs = append(escapedArgs, shellEscape(a))
+	}
+
+	remoteCmd := fmt.Sprintf("CURRENT_UID=$(id -u):$(id -g) %s %s",
+		composeBin, strings.Join(escapedArgs, " "))
+
+	if r.ProjectDir != "" {
+		remoteCmd = fmt.Sprintf("cd %s && %s", shellEscape(r.ProjectDir), remoteCmd)
+	}
+
+	return exec.CommandContext(ctx, "ssh",
+		"-t",
+		"-S", r.SocketPath,
+		"-o", "ControlMaster=no",
+		r.Host,
+		remoteCmd,
+	), nil
+}
+
 // ValidateConfig runs `docker compose config --quiet` on the remote host and returns
 // any error with stderr captured so users see why validation failed.
 func (r *RemoteCompose) ValidateConfig(ctx context.Context) error {

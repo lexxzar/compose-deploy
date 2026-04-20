@@ -58,11 +58,11 @@
 - Modify: `internal/compose/compose.go`
 - Modify: `internal/compose/compose_test.go`
 
-- [ ] Add `ExecCommand(ctx context.Context, service string, command []string) (*exec.Cmd, error)` method to `Compose`
-- [ ] When `command` is empty, use default: `[]string{"/bin/sh", "-c", "exec bash 2>/dev/null || exec sh"}`
-- [ ] Build command via `c.command(ctx, append([]string{"exec", service}, command...)...)`
-- [ ] Write tests verifying command args for: default shell, custom command, standalone mode
-- [ ] Run tests - must pass before next task
+- [x] Add `ExecCommand(ctx context.Context, service string, command []string) (*exec.Cmd, error)` method to `Compose`
+- [x] When `command` is empty, use default: `[]string{"/bin/sh", "-c", "exec bash 2>/dev/null || exec sh"}`
+- [x] Build command via `c.command(ctx, append([]string{"exec", service}, command...)...)`
+- [x] Write tests verifying command args for: default shell, custom command, standalone mode
+- [x] Run tests - must pass before next task
 
 ### Task 2: Add ExecCommand to RemoteCompose
 
@@ -70,12 +70,12 @@
 - Modify: `internal/compose/remote.go`
 - Modify: `internal/compose/remote_test.go`
 
-- [ ] Add `ExecCommand(ctx context.Context, service string, command []string) (*exec.Cmd, error)` method to `RemoteCompose`
-- [ ] When `command` is empty, use same default as local
-- [ ] Build SSH command directly (like `EditCommand` pattern) — construct remote shell string with `cd`, `CURRENT_UID`, compose binary, `exec` subcommand, then `exec.CommandContext(ctx, "ssh", "-t", "-S", socketPath, "-o", "ControlMaster=no", host, remoteCmd)`
-- [ ] Do NOT use `remoteCommand()` — it doesn't include `-t` and retrofitting is fragile
-- [ ] Write tests verifying SSH args include `-t`, shell escaping is correct, default shell works
-- [ ] Run tests - must pass before next task
+- [x] Add `ExecCommand(ctx context.Context, service string, command []string) (*exec.Cmd, error)` method to `RemoteCompose`
+- [x] When `command` is empty, use same default as local
+- [x] Build SSH command directly (like `EditCommand` pattern) — construct remote shell string with `cd`, `CURRENT_UID`, compose binary, `exec` subcommand, then `exec.CommandContext(ctx, "ssh", "-t", "-S", socketPath, "-o", "ControlMaster=no", host, remoteCmd)`
+- [x] Do NOT use `remoteCommand()` — it doesn't include `-t` and retrofitting is fragile
+- [x] Write tests verifying SSH args include `-t`, shell escaping is correct, default shell works
+- [x] Run tests - must pass before next task
 
 ### Task 3: Add ExecProvider interface and TUI handler
 
@@ -83,16 +83,16 @@
 - Modify: `internal/tui/app.go`
 - Modify: `internal/tui/app_test.go`
 
-- [ ] Define `ExecProvider` interface in `app.go`: `ExecCommand(ctx context.Context, service string, command []string) (*exec.Cmd, error)`
-- [ ] Add `x` key handler in `screenSelectContainers`: type-assert `m.composer.(ExecProvider)` first (no-op if fails), then check `st, ok := m.svcStatus[m.services[m.svcCursor]]; ok && st.Running` — if not running, set `m.warning = "Container is not running"` and return
-- [ ] If running, set `m.confirming = true` and `m.pendingExec = true`
-- [ ] Modify the `enter` case in the `if m.confirming` block: if `m.pendingExec`, type-assert `ExecProvider`, call `ExecCommand(ctx, cursorService, nil)`, return `tea.ExecProcess`; otherwise fall through to existing `enterProgress`
-- [ ] Define `execDoneMsg{err error}` type; use it as the `tea.ExecProcess` callback message
-- [ ] Handle `execDoneMsg` in Update: reset `pendingExec`, call `refreshStatus()` to update container state
-- [ ] Update confirmation view rendering: when `pendingExec`, show "Exec into <service>? enter confirm / esc cancel" instead of the operation + selected containers format
-- [ ] Add `x exec` to help text on container screen (verify it fits in layout or split to second line)
-- [ ] Write tests: `x` on running service triggers confirm, `x` on stopped service shows warning, confirm dispatches ExecProcess-like command, `x` when composer doesn't implement ExecProvider is no-op
-- [ ] Run tests - must pass before next task
+- [x] Define `ExecProvider` interface in `app.go`: `ExecCommand(ctx context.Context, service string, command []string) (*exec.Cmd, error)`
+- [x] Add `x` key handler in `screenSelectContainers`: type-assert `m.composer.(ExecProvider)` first (no-op if fails), then check `st, ok := m.svcStatus[m.services[m.svcCursor]]; ok && st.Running` — if not running, set `m.warning = "Container is not running"` and return
+- [x] If running, set `m.confirming = true` and `m.pendingExec = true`
+- [x] Modify the `enter` case in the `if m.confirming` block: if `m.pendingExec`, type-assert `ExecProvider`, call `ExecCommand(ctx, cursorService, nil)`, return `tea.ExecProcess`; otherwise fall through to existing `enterProgress`
+- [x] Define `execDoneMsg{err error}` type; use it as the `tea.ExecProcess` callback message
+- [x] Handle `execDoneMsg` in Update: reset `pendingExec`, call `refreshStatus()` to update container state
+- [x] Update confirmation view rendering: when `pendingExec`, show "Exec into <service>? enter confirm / esc cancel" instead of the operation + selected containers format
+- [x] Add `x exec` to help text on container screen (verify it fits in layout or split to second line)
+- [x] Write tests: `x` on running service triggers confirm, `x` on stopped service shows warning, confirm dispatches ExecProcess-like command, `x` when composer doesn't implement ExecProvider is no-op
+- [x] Run tests - must pass before next task
 
 ### Task 4: Add CLI exec subcommand
 
@@ -101,20 +101,20 @@
 - Create: `cmd/exec_test.go`
 - Modify: `cmd/root.go`
 
-- [ ] Create `newExecCmd()` following `cmd/logs.go` pattern
-- [ ] Use: `exec <service> [-- command...]`, Args: `cobra.MinimumNArgs(1)`
-- [ ] Parse args: first arg is service, everything after `--` (via `cmd.ArgsLenAtDash()`) is the command
-- [ ] Implement `runExec(ctx, service, command)`: local/remote setup identical to `runLogs` pattern
-- [ ] Call `ExecCommand`, attach stdin/stdout/stderr, run with `cmd.Run()`
-- [ ] Register in `root.go` via `rootCmd.AddCommand(newExecCmd())`
-- [ ] Write tests: flag registration, arg parsing with and without `--`, service name required, `--server` flag exists
-- [ ] Run full test suite: `go test ./... -count=1`
-- [ ] Run tests - must pass before next task
+- [x] Create `newExecCmd()` following `cmd/logs.go` pattern
+- [x] Use: `exec <service> [-- command...]`, Args: `cobra.MinimumNArgs(1)`
+- [x] Parse args: first arg is service, everything after `--` (via `cmd.ArgsLenAtDash()`) is the command
+- [x] Implement `runExec(ctx, service, command)`: local/remote setup identical to `runLogs` pattern
+- [x] Call `ExecCommand`, attach stdin/stdout/stderr, run with `cmd.Run()`
+- [x] Register in `root.go` via `rootCmd.AddCommand(newExecCmd())`
+- [x] Write tests: flag registration, arg parsing with and without `--`, service name required, `--server` flag exists
+- [x] Run full test suite: `go test ./... -count=1`
+- [x] Run tests - must pass before next task
 
 ### Task 5: [Final] Update documentation
 
-- [ ] Update CLAUDE.md with exec feature documentation (ExecProvider pattern, key binding, CLI usage)
-- [ ] Move this plan to `docs/plans/completed/`
+- [x] Update CLAUDE.md with exec feature documentation (ExecProvider pattern, key binding, CLI usage)
+- [x] Move this plan to `docs/plans/completed/`
 
 ## Post-Completion
 

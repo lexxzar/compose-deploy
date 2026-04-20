@@ -486,6 +486,25 @@ func parseContainerStatus(data []byte) (map[string]runner.ServiceStatus, error) 
 	return status, nil
 }
 
+// DefaultExecCommand is the shell command used when no explicit command is given to ExecCommand.
+// It uses /bin/sh as outer binary (works on Alpine/minimal images) and tries bash first for better UX.
+// The bash existence check is done separately (command -v) so that exec bash runs with a clean
+// stderr — redirecting stderr on exec would silence bash's entire session, breaking prompt and
+// tab completion.
+var DefaultExecCommand = []string{"/bin/sh", "-c", "command -v bash >/dev/null 2>&1 && exec bash || exec sh"}
+
+// ExecCommand returns an exec.Cmd that runs `docker compose exec <service> <command...>`.
+// When command is empty, it defaults to DefaultExecCommand which tries bash, falling back to sh.
+// The caller is responsible for attaching stdin/stdout/stderr and running the command.
+func (c *Compose) ExecCommand(ctx context.Context, service string, command []string) (*exec.Cmd, error) {
+	if len(command) == 0 {
+		command = DefaultExecCommand
+	}
+	args := append([]string{"exec", service}, command...)
+	cmd := c.command(ctx, args...)
+	return cmd, nil
+}
+
 // Logs streams docker compose logs for a single service.
 func (c *Compose) Logs(ctx context.Context, service string, follow bool, tail int, w io.Writer) error {
 	args := []string{"logs"}

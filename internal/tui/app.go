@@ -28,6 +28,13 @@ type ConfigProvider interface {
 	ValidateConfig(ctx context.Context) error
 }
 
+// ExecProvider provides interactive exec into a container.
+// Defined in the tui package (like ConfigProvider) because it returns *exec.Cmd
+// and is TUI/CLI-only — not a pipeline operation. Both Compose and RemoteCompose implement it.
+type ExecProvider interface {
+	ExecCommand(ctx context.Context, service string, command []string) (*exec.Cmd, error)
+}
+
 // ComposerFactory creates a runner.Composer for the given project directory.
 type ComposerFactory func(projectDir string) runner.Composer
 
@@ -178,9 +185,10 @@ type Model struct {
 	svcErr    error
 
 	// Confirmation state (within container screen)
-	confirming bool
-	pendingOp  runner.Operation
-	warning    string
+	confirming  bool
+	pendingOp   runner.Operation
+	pendingExec bool
+	warning     string
 
 	// Quit confirmation state (for remote connections)
 	quitting bool
@@ -268,6 +276,7 @@ type logDoneMsg struct {
 	err     error
 	session uint64
 }
+type execDoneMsg struct{ err error }
 type connectResultMsg struct{ err error }
 type preselectedConnectMsg struct{}
 type disconnectDoneMsg struct{}
@@ -581,6 +590,17 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		return m, nil
 
+	case execDoneMsg:
+		if m.screen != screenSelectContainers {
+			return m, nil
+		}
+		m.pendingExec = false
+		m.confirming = false
+		if msg.err != nil {
+			m.warning = fmt.Sprintf("exec failed: %v", msg.err)
+		}
+		return m, m.refreshStatus()
+
 	case pipelineDoneMsg:
 		if !m.failed {
 			m.done = true
@@ -734,10 +754,14 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			case "q", "ctrl+c":
 				return m.tryQuit()
 			case "enter":
+				if m.pendingExec {
+					return m.enterExec()
+				}
 				containers := m.selectedContainers()
 				return m.enterProgress(containers)
 			case "esc":
 				m.confirming = false
+				m.pendingExec = false
 				m.fixSvcOffset()
 				return m, nil
 			}
@@ -817,6 +841,22 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			if _, ok := m.composer.(ConfigProvider); ok {
 				return m.enterConfig()
 			}
+		case "x":
+			if _, ok := m.composer.(ExecProvider); !ok {
+				return m, nil
+			}
+			if len(m.services) == 0 {
+				return m, nil
+			}
+			svc := m.services[m.svcCursor]
+			if st, ok := m.svcStatus[svc]; !ok || !st.Running {
+				m.warning = "Container is not running"
+				m.fixSvcOffset()
+				return m, nil
+			}
+			m.confirming = true
+			m.pendingExec = true
+			m.fixSvcOffset()
 		}
 
 	case screenLogs:
@@ -1216,6 +1256,27 @@ func (m *Model) enterConfig() (tea.Model, tea.Cmd) {
 	return *m, m.fetchConfigFile()
 }
 
+func (m *Model) enterExec() (tea.Model, tea.Cmd) {
+	ep, ok := m.composer.(ExecProvider)
+	if !ok {
+		m.confirming = false
+		m.pendingExec = false
+		return *m, nil
+	}
+	service := m.services[m.svcCursor]
+	cmd, err := ep.ExecCommand(m.ctx, service, nil)
+	if err != nil {
+		m.warning = fmt.Sprintf("exec failed: %v", err)
+		m.confirming = false
+		m.pendingExec = false
+		m.fixSvcOffset()
+		return *m, nil
+	}
+	return *m, tea.ExecProcess(cmd, func(err error) tea.Msg {
+		return execDoneMsg{err: err}
+	})
+}
+
 func (m Model) fetchConfigFile() tea.Cmd {
 	cp, ok := m.composer.(ConfigProvider)
 	if !ok {
@@ -1468,7 +1529,7 @@ func (m Model) svcVisibleCount() int {
 			back = "esc back"
 		}
 		line1 := fmt.Sprintf("  space toggle  •  a all  •  %s", back)
-		line2 := "  r restart  •  d deploy  •  s stop  •  l logs  •  c config"
+		line2 := "  r restart  •  d deploy  •  s stop  •  l logs  •  c config  •  x exec"
 		oneLine := line1 + "  •  " + line2[2:]
 		if m.width >= len(oneLine)+2 {
 			// helpStyle MarginTop (1) + gap-or-indicator (1) + one help line (1) = 3
@@ -1915,17 +1976,26 @@ func (m Model) viewSelectContainers() string {
 	}
 
 	if m.confirming {
-		containers := m.selectedContainers()
 		gap := "\n"
 		if below > 0 {
 			gap = ""
 		}
-		b.WriteString(helpStyle.Render(fmt.Sprintf(
-			"%s  %s %s?  enter confirm  •  esc cancel",
-			gap,
-			m.pendingOp.String(),
-			strings.Join(containers, ", "),
-		)))
+		if m.pendingExec {
+			service := m.services[m.svcCursor]
+			b.WriteString(helpStyle.Render(fmt.Sprintf(
+				"%s  Exec into %s?  enter confirm  •  esc cancel",
+				gap,
+				service,
+			)))
+		} else {
+			containers := m.selectedContainers()
+			b.WriteString(helpStyle.Render(fmt.Sprintf(
+				"%s  %s %s?  enter confirm  •  esc cancel",
+				gap,
+				m.pendingOp.String(),
+				strings.Join(containers, ", "),
+			)))
+		}
 	} else {
 		if m.warning != "" {
 			b.WriteString("\n  " + warningStyle.Render(m.warning))
@@ -1935,7 +2005,7 @@ func (m Model) viewSelectContainers() string {
 			back = "esc back"
 		}
 		line1 := fmt.Sprintf("  space toggle  •  a all  •  %s", back)
-		line2 := "  r restart  •  d deploy  •  s stop  •  l logs  •  c config"
+		line2 := "  r restart  •  d deploy  •  s stop  •  l logs  •  c config  •  x exec"
 		oneLine := line1 + "  •  " + line2[2:]
 		gap := "\n"
 		if below > 0 && m.warning == "" {
