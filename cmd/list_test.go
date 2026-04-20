@@ -113,9 +113,9 @@ func TestMergeStatus_WithHealth(t *testing.T) {
 
 func TestFormatDots_Alignment(t *testing.T) {
 	items := []serviceStatus{
-		{Name: "nginx", Running: true},
-		{Name: "postgres", Running: true},
-		{Name: "redis", Running: false},
+		{Name: "nginx", Running: true, Created: "2024-01-15 09:30", Uptime: "3h"},
+		{Name: "postgres", Running: true, Created: "2024-01-15 09:30", Uptime: "3h"},
+		{Name: "redis", Running: false, Created: "2024-01-14 08:00"},
 	}
 
 	out := formatDots(items)
@@ -125,30 +125,42 @@ func TestFormatDots_Alignment(t *testing.T) {
 		t.Fatalf("lines = %d, want 3", len(lines))
 	}
 
-	for _, line := range lines {
-		if !strings.Contains(line, "running") && !strings.Contains(line, "stopped") {
-			t.Errorf("line missing status label: %q", line)
-		}
-	}
-
+	// redis should be padded to match "postgres" (8 chars)
 	if !strings.Contains(lines[2], "redis   ") {
 		t.Errorf("redis not padded: %q", lines[2])
+	}
+
+	// Running services should show uptime
+	if !strings.Contains(lines[0], "3h") {
+		t.Errorf("nginx line missing uptime: %q", lines[0])
+	}
+
+	// All should show Created
+	for _, line := range lines {
+		if !strings.Contains(line, "2024-01") {
+			t.Errorf("line missing created column: %q", line)
+		}
 	}
 }
 
 func TestFormatDots_MixedStates(t *testing.T) {
 	items := []serviceStatus{
-		{Name: "web", Running: true},
-		{Name: "db", Running: false},
+		{Name: "web", Running: true, Created: "2024-01-15 09:30", Uptime: "2h"},
+		{Name: "db", Running: false, Created: "2024-01-15 09:30"},
 	}
 
 	out := formatDots(items)
 
-	if !strings.Contains(out, "running") {
-		t.Error("missing 'running' label")
+	// Running service should show uptime
+	if !strings.Contains(out, "2h") {
+		t.Error("missing uptime for running service")
 	}
-	if !strings.Contains(out, "stopped") {
-		t.Error("missing 'stopped' label")
+	// Stopped service should NOT show uptime
+	lines := strings.Split(out, "\n")
+	for _, line := range lines {
+		if strings.Contains(line, "db") && strings.Contains(line, "2h") {
+			t.Error("stopped service should not have uptime")
+		}
 	}
 }
 
@@ -346,6 +358,61 @@ func TestFormatDotsGrouped_HealthIcons(t *testing.T) {
 	}
 }
 
+func TestFormatDotsGrouped_CreatedAndUptime(t *testing.T) {
+	projects := []projectServices{
+		{
+			Name: "myapp",
+			Services: []serviceStatus{
+				{Name: "web", Running: true, Created: "2024-01-15 09:30", Uptime: "3h"},
+				{Name: "long-worker", Running: true, Created: "2024-01-01 00:00", Uptime: "15d 3h"},
+				{Name: "db", Running: false, Created: "2024-01-10 12:00"},
+			},
+		},
+	}
+
+	out := formatDotsGrouped(projects)
+	lines := strings.Split(out, "\n")
+
+	// First line is the project header
+	if lines[0] != "myapp" {
+		t.Errorf("first line = %q, want project header", lines[0])
+	}
+
+	// Service lines are indented and should contain Created values
+	for _, line := range lines[1:] {
+		if !strings.HasPrefix(line, "  ") {
+			t.Errorf("service line not indented: %q", line)
+		}
+		if !strings.Contains(line, "2024-") {
+			t.Errorf("line missing created column: %q", line)
+		}
+	}
+
+	// The running services should have uptime
+	if !strings.Contains(lines[1], "3h") {
+		t.Errorf("web line missing uptime: %q", lines[1])
+	}
+	if !strings.Contains(lines[2], "15d 3h") {
+		t.Errorf("long-worker line missing uptime: %q", lines[2])
+	}
+
+	// Uptime column should be padded to uniform width (maxUptime = len("15d 3h") = 6)
+	// Both running lines should have equal total length after the created column
+	webLine := lines[1]
+	workerLine := lines[2]
+	if len(webLine) != len(workerLine) {
+		t.Errorf("uptime column not aligned: web line len=%d, worker line len=%d\nweb:    %q\nworker: %q",
+			len(webLine), len(workerLine), webLine, workerLine)
+	}
+
+	// Stopped service should still have the uptime column space (padded empty)
+	dbLine := lines[3]
+	if len(dbLine) != len(webLine) {
+		t.Errorf("stopped service line not aligned with running: db len=%d, web len=%d\ndb:  %q\nweb: %q",
+			len(dbLine), len(webLine), dbLine, webLine)
+	}
+}
+
 func TestFormatJSON_OmitsEmptyProject(t *testing.T) {
 	items := []serviceStatus{
 		{Name: "nginx", Running: true},
@@ -377,6 +444,142 @@ func TestFormatJSON_IncludesProject(t *testing.T) {
 	}
 	if got[0].Project != "myapp" {
 		t.Errorf("project = %q, want %q", got[0].Project, "myapp")
+	}
+}
+
+func TestFormatDots_AlignmentVaryingWidths(t *testing.T) {
+	items := []serviceStatus{
+		{Name: "a", Running: true, Created: "2024-01-15 09:30", Uptime: "3h"},
+		{Name: "long-service-name", Running: true, Created: "2024-01-01 00:00", Uptime: "15d 3h"},
+		{Name: "mid", Running: false, Created: "2024-12-31 23:59"},
+	}
+
+	out := formatDots(items)
+	lines := strings.Split(out, "\n")
+
+	if len(lines) != 3 {
+		t.Fatalf("lines = %d, want 3", len(lines))
+	}
+
+	// All lines should have aligned created columns (max created width = 16)
+	// The name column should be padded to "long-service-name" width (17 chars)
+	for _, line := range lines {
+		if !strings.Contains(line, "2024-") {
+			t.Errorf("line missing created column: %q", line)
+		}
+	}
+
+	// The stopped service should not have uptime
+	if strings.Contains(lines[2], "15d") || strings.Contains(lines[2], "3h") {
+		t.Errorf("stopped service should not show uptime from other services: %q", lines[2])
+	}
+}
+
+func TestFormatDots_StoppedEmptyUptime(t *testing.T) {
+	items := []serviceStatus{
+		{Name: "web", Running: true, Created: "2024-01-15 09:30", Uptime: "5h"},
+		{Name: "worker", Running: false, Created: "2024-01-15 09:30"},
+	}
+
+	out := formatDots(items)
+	lines := strings.Split(out, "\n")
+
+	if len(lines) != 2 {
+		t.Fatalf("lines = %d, want 2", len(lines))
+	}
+
+	// First line (web) should have uptime
+	if !strings.Contains(lines[0], "5h") {
+		t.Errorf("running service missing uptime: %q", lines[0])
+	}
+
+	// Second line (worker) should NOT have uptime
+	if strings.Contains(lines[1], "5h") {
+		t.Errorf("stopped service should have empty uptime: %q", lines[1])
+	}
+}
+
+func TestFormatDots_NoCreatedNoUptime(t *testing.T) {
+	// When no Created or Uptime data, just show dot + health + name
+	items := []serviceStatus{
+		{Name: "web", Running: true},
+		{Name: "db", Running: false},
+	}
+
+	out := formatDots(items)
+	lines := strings.Split(out, "\n")
+
+	if len(lines) != 2 {
+		t.Fatalf("lines = %d, want 2", len(lines))
+	}
+
+	// Should contain service names but no extra columns
+	if !strings.Contains(out, "web") || !strings.Contains(out, "db") {
+		t.Errorf("output should contain service names, got: %q", out)
+	}
+}
+
+func TestFormatJSON_IncludesCreatedAndUptime(t *testing.T) {
+	items := []serviceStatus{
+		{Name: "web", Running: true, Created: "2024-01-15 09:30", Uptime: "3h"},
+		{Name: "db", Running: false, Created: "2024-01-14 08:00"},
+	}
+
+	out, err := formatJSON(items)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var got []serviceStatus
+	if err := json.Unmarshal([]byte(out), &got); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+
+	if got[0].Created != "2024-01-15 09:30" {
+		t.Errorf("got[0].Created = %q, want %q", got[0].Created, "2024-01-15 09:30")
+	}
+	if got[0].Uptime != "3h" {
+		t.Errorf("got[0].Uptime = %q, want %q", got[0].Uptime, "3h")
+	}
+	if got[1].Created != "2024-01-14 08:00" {
+		t.Errorf("got[1].Created = %q, want %q", got[1].Created, "2024-01-14 08:00")
+	}
+	// Stopped service: Uptime should be empty and omitted from JSON
+	if got[1].Uptime != "" {
+		t.Errorf("got[1].Uptime = %q, want empty", got[1].Uptime)
+	}
+	// Verify omitempty: uptime should not appear for db
+	if strings.Count(out, `"uptime"`) != 1 {
+		t.Errorf("expected uptime field exactly once (for web only), got JSON: %s", out)
+	}
+}
+
+func TestMergeStatus_CopiesCreatedAndUptime(t *testing.T) {
+	services := []string{"web", "db"}
+	status := map[string]runner.ServiceStatus{
+		"web": {Running: true, Health: "healthy", Created: "2024-01-15 09:30", Uptime: "3h"},
+		"db":  {Running: false, Created: "2024-01-14 08:00"},
+	}
+
+	got := mergeStatus(services, status)
+
+	for _, s := range got {
+		switch s.Name {
+		case "web":
+			if s.Created != "2024-01-15 09:30" {
+				t.Errorf("web Created = %q, want %q", s.Created, "2024-01-15 09:30")
+			}
+			if s.Uptime != "3h" {
+				t.Errorf("web Uptime = %q, want %q", s.Uptime, "3h")
+			}
+		case "db":
+			if s.Created != "2024-01-14 08:00" {
+				t.Errorf("db Created = %q, want %q", s.Created, "2024-01-14 08:00")
+			}
+			if s.Uptime != "" {
+				t.Errorf("db Uptime = %q, want empty", s.Uptime)
+			}
+		}
 	}
 }
 
@@ -602,8 +805,8 @@ func TestListSingleProject_Dots(t *testing.T) {
 	mock := &mockComposer{
 		services: []string{"nginx", "postgres"},
 		status: map[string]runner.ServiceStatus{
-			"nginx":    {Running: true},
-			"postgres": {Running: false},
+			"nginx":    {Running: true, Created: "2024-01-15 09:30", Uptime: "3h"},
+			"postgres": {Running: false, Created: "2024-01-14 08:00"},
 		},
 	}
 
@@ -617,8 +820,11 @@ func TestListSingleProject_Dots(t *testing.T) {
 	if !strings.Contains(out, "nginx") || !strings.Contains(out, "postgres") {
 		t.Errorf("output should contain service names, got: %q", out)
 	}
-	if !strings.Contains(out, "running") || !strings.Contains(out, "stopped") {
-		t.Errorf("output should contain status labels, got: %q", out)
+	if !strings.Contains(out, "2024-01-15 09:30") {
+		t.Errorf("output should contain created time, got: %q", out)
+	}
+	if !strings.Contains(out, "3h") {
+		t.Errorf("output should contain uptime, got: %q", out)
 	}
 }
 

@@ -1815,6 +1815,24 @@ func (m Model) viewSelectContainers() string {
 		end = len(m.services)
 	}
 
+	// Calculate max widths for alignment (across ALL services, not just visible)
+	maxName := 0
+	maxCreated := 0
+	maxUptime := 0
+	for _, svc := range m.services {
+		if len(svc) > maxName {
+			maxName = len(svc)
+		}
+		if st, ok := m.svcStatus[svc]; ok {
+			if len(st.Created) > maxCreated {
+				maxCreated = len(st.Created)
+			}
+			if len(st.Uptime) > maxUptime {
+				maxUptime = len(st.Uptime)
+			}
+		}
+	}
+
 	// Top gap: show scroll-up indicator or blank line
 	if start > 0 {
 		b.WriteString("\n")
@@ -1844,7 +1862,16 @@ func (m Model) viewSelectContainers() string {
 			dot = statusRunningDot.Render("●")
 		}
 
-		b.WriteString(fmt.Sprintf("%s%s %s %s %s\n", cursor, checkbox, health, dot, svc))
+		// Build line: cursor + checkbox + health + dot + name [+ created] [+ uptime]
+		line := fmt.Sprintf("%s%s %s %s %-*s", cursor, checkbox, health, dot, maxName, svc)
+		if maxCreated > 0 {
+			line += fmt.Sprintf("  %-*s", maxCreated, st.Created)
+		}
+		if maxUptime > 0 {
+			line += fmt.Sprintf("  %-*s", maxUptime, st.Uptime)
+		}
+		b.WriteString(line)
+		b.WriteByte('\n')
 	}
 
 	// Bottom: scroll-down indicator replaces the blank-line gap before the

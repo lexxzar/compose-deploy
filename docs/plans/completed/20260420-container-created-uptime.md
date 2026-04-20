@@ -80,17 +80,17 @@ fmt.Sprintf("%-*s  %-*s  %-*s", maxName, name, maxCreated, created, maxUptime, u
 - Create: `internal/compose/uptime.go`
 - Create: `internal/compose/uptime_test.go`
 
-- [ ] Create `internal/compose/uptime.go` with `formatUptime(status string) string`
-- [ ] Handle `"Up X"` prefix stripping and health suffix removal `"(healthy)"`, `"(unhealthy)"`, `"(health: starting)"`
-- [ ] Compact time units: `"X hours"` → `"Xh"`, `"X minutes"` → `"Xm"`, `"X days"` → `"Xd"`, `"X seconds"` → `"Xs"`, `"X weeks"` → `"Xw"`, `"X months"` → `"Xmo"`, multi-unit like `"3 hours 15 minutes"` → `"3h 15m"`
-- [ ] Handle singular forms: `"1 hour"` → `"1h"`, `"1 day"` → `"1d"`, `"1 month"` → `"1mo"`
-- [ ] Handle special cases: `"About a minute"` → `"~1m"`, `"Less than a second"` → `"<1s"`, `"About an hour"` → `"~1h"`
-- [ ] Handle `"Restarting ..."` → `"restarting"`
-- [ ] Handle non-"Up" statuses (`"Exited ..."`, `"Created"`, etc.) → `""`
-- [ ] Fallback: unrecognized `"Up ..."` → raw remainder trimmed
-- [ ] Write table-driven tests in `uptime_test.go` covering all variants above
-- [ ] Write tests for edge cases: empty string, whitespace-only, unknown format
-- [ ] Run tests: `go test ./internal/compose/ -run TestFormatUptime -v` — must pass
+- [x] Create `internal/compose/uptime.go` with `formatUptime(status string) string`
+- [x] Handle `"Up X"` prefix stripping and health suffix removal `"(healthy)"`, `"(unhealthy)"`, `"(health: starting)"`
+- [x] Compact time units: `"X hours"` → `"Xh"`, `"X minutes"` → `"Xm"`, `"X days"` → `"Xd"`, `"X seconds"` → `"Xs"`, `"X weeks"` → `"Xw"`, `"X months"` → `"Xmo"`, multi-unit like `"3 hours 15 minutes"` → `"3h 15m"`
+- [x] Handle singular forms: `"1 hour"` → `"1h"`, `"1 day"` → `"1d"`, `"1 month"` → `"1mo"`
+- [x] Handle special cases: `"About a minute"` → `"~1m"`, `"Less than a second"` → `"<1s"`, `"About an hour"` → `"~1h"`
+- [x] Handle `"Restarting ..."` → `"restarting"`
+- [x] Handle non-"Up" statuses (`"Exited ..."`, `"Created"`, etc.) → `""`
+- [x] Fallback: unrecognized `"Up ..."` → raw remainder trimmed
+- [x] Write table-driven tests in `uptime_test.go` covering all variants above
+- [x] Write tests for edge cases: empty string, whitespace-only, unknown format
+- [x] Run tests: `go test ./internal/compose/ -run TestFormatUptime -v` — must pass
 
 ### Task 2: Extend ServiceStatus and parseContainerStatus()
 
@@ -99,15 +99,15 @@ fmt.Sprintf("%-*s  %-*s  %-*s", maxName, name, maxCreated, created, maxUptime, u
 - Modify: `internal/compose/compose.go`
 - Modify: `internal/compose/compose_test.go`
 
-- [ ] Add `Created string` and `Uptime string` fields to `ServiceStatus` in `internal/runner/runner.go`
-- [ ] Add `CreatedAt string` (json:"CreatedAt") and `Status string` (json:"Status") to `psEntry` in `internal/compose/compose.go`
-- [ ] In `parseContainerStatus()` aggregation loop: parse `CreatedAt` string via `time.Parse("2006-01-02 15:04:05 -0700 MST", entry.CreatedAt)`, format as `"2006-01-02 15:04"` (empty if CreatedAt is empty or unparseable)
-- [ ] In aggregation loop: call `formatUptime(entry.Status)` for `Uptime`
-- [ ] Scaled services: parse `CreatedAt` into `time.Time` for min-comparison, track oldest and pair `Uptime` from the longest-running replica
-- [ ] Update existing `parseContainerStatus` test fixtures to include `"CreatedAt"` and `"Status"` JSON fields
-- [ ] Add new test cases: CreatedAt parsing and formatting, Uptime through parseContainerStatus, empty/missing CreatedAt → empty
-- [ ] Add test case: scaled services pick oldest Created and longest-running Uptime
-- [ ] Run tests: `go test ./internal/compose/ -v` — must pass
+- [x] Add `Created string` and `Uptime string` fields to `ServiceStatus` in `internal/runner/runner.go`
+- [x] Add `CreatedAt string` (json:"CreatedAt") and `Status string` (json:"Status") to `psEntry` in `internal/compose/compose.go`
+- [x] In `parseContainerStatus()` aggregation loop: parse `CreatedAt` string via `time.Parse("2006-01-02 15:04:05 -0700 MST", entry.CreatedAt)`, format as `"2006-01-02 15:04"` (empty if CreatedAt is empty or unparseable)
+- [x] In aggregation loop: call `formatUptime(entry.Status)` for `Uptime`
+- [x] Scaled services: parse `CreatedAt` into `time.Time` for min-comparison, track oldest and pair `Uptime` from the longest-running replica
+- [x] Update existing `parseContainerStatus` test fixtures to include `"CreatedAt"` and `"Status"` JSON fields
+- [x] Add new test cases: CreatedAt parsing and formatting, Uptime through parseContainerStatus, empty/missing CreatedAt → empty
+- [x] Add test case: scaled services pick oldest Created and longest-running Uptime
+- [x] Run tests: `go test ./internal/compose/ -v` — must pass
 
 ### Task 3: Update CLI rendering
 
@@ -115,16 +115,16 @@ fmt.Sprintf("%-*s  %-*s  %-*s", maxName, name, maxCreated, created, maxUptime, u
 - Modify: `cmd/list.go`
 - Modify: `cmd/list_test.go`
 
-- [ ] Add `Created string` and `Uptime string` (json tags with omitempty) to `serviceStatus` in `cmd/list.go`
-- [ ] Update `mergeStatus()` to copy `Created` and `Uptime` from `runner.ServiceStatus`
-- [ ] Update `formatDots()`: add max-width passes for Created and Uptime columns, replace `"running"/"stopped"` with the two time columns
-- [ ] Update `formatDotsGrouped()`: same changes, maintaining 2-space indent
-- [ ] Update broken tests: `TestFormatDots_Alignment`, `TestFormatDots_MixedStates`, `TestListSingleProject_Dots` — they currently assert `"running"`/`"stopped"` strings which are being removed
-- [ ] Add test: `formatDots` alignment with varying Created/Uptime widths
-- [ ] Add test: stopped service has empty Uptime column
-- [ ] Add test: `formatJSON` includes Created and Uptime fields
-- [ ] Update `mergeStatus` tests to verify new fields are copied
-- [ ] Run tests: `go test ./cmd/ -v` — must pass
+- [x] Add `Created string` and `Uptime string` (json tags with omitempty) to `serviceStatus` in `cmd/list.go`
+- [x] Update `mergeStatus()` to copy `Created` and `Uptime` from `runner.ServiceStatus`
+- [x] Update `formatDots()`: add max-width passes for Created and Uptime columns, replace `"running"/"stopped"` with the two time columns
+- [x] Update `formatDotsGrouped()`: same changes, maintaining 2-space indent
+- [x] Update broken tests: `TestFormatDots_Alignment`, `TestFormatDots_MixedStates`, `TestListSingleProject_Dots` — they currently assert `"running"`/`"stopped"` strings which are being removed
+- [x] Add test: `formatDots` alignment with varying Created/Uptime widths
+- [x] Add test: stopped service has empty Uptime column
+- [x] Add test: `formatJSON` includes Created and Uptime fields
+- [x] Update `mergeStatus` tests to verify new fields are copied
+- [x] Run tests: `go test ./cmd/ -v` — must pass
 
 ### Task 4: Update TUI rendering
 
@@ -132,23 +132,23 @@ fmt.Sprintf("%-*s  %-*s  %-*s", maxName, name, maxCreated, created, maxUptime, u
 - Modify: `internal/tui/app.go`
 - Modify: `internal/tui/app_test.go`
 
-- [ ] Update `viewSelectContainers()`: add max-width calculation for Created and Uptime over all services (global alignment)
-- [ ] Update per-row rendering to append Created and Uptime columns after service name
-- [ ] Verify `svcVisibleCount()` is unaffected (line count per row unchanged — still 1 line per service)
-- [ ] Add test: verify `viewSelectContainers()` output includes Created/Uptime values when `svcStatus` has them
-- [ ] Update existing TUI tests that assert on container screen output if they break
-- [ ] Run full test suite: `go test ./... -count=1` — must pass
+- [x] Update `viewSelectContainers()`: add max-width calculation for Created and Uptime over all services (global alignment)
+- [x] Update per-row rendering to append Created and Uptime columns after service name
+- [x] Verify `svcVisibleCount()` is unaffected (line count per row unchanged — still 1 line per service)
+- [x] Add test: verify `viewSelectContainers()` output includes Created/Uptime values when `svcStatus` has them
+- [x] Update existing TUI tests that assert on container screen output if they break
+- [x] Run full test suite: `go test ./... -count=1` — must pass
 
 ### Task 5: Verify acceptance criteria
 
-- [ ] Verify all requirements from Overview are implemented
-- [ ] Verify edge cases: Created=0, empty Status, Restarting, scaled services
-- [ ] Run full test suite: `go test ./... -count=1`
-- [ ] Build binary: `go build -o cdeploy .`
-- [ ] Run `go mod tidy` if any imports changed
+- [x] Verify all requirements from Overview are implemented
+- [x] Verify edge cases: Created=0, empty Status, Restarting, scaled services
+- [x] Run full test suite: `go test ./... -count=1`
+- [x] Build binary: `go build -o cdeploy .`
+- [x] Run `go mod tidy` if any imports changed
 
 ### Task 6: [Final] Update documentation
 
-- [ ] Update CLAUDE.md: add Created/Uptime to ServiceStatus description, document formatUptime() in Docker Compose section
-- [ ] Run tests: `go test ./... -count=1` — must pass
-- [ ] Move this plan to `docs/plans/completed/`
+- [x] Update CLAUDE.md: add Created/Uptime to ServiceStatus description, document formatUptime() in Docker Compose section
+- [x] Run tests: `go test ./... -count=1` — must pass
+- [x] Move this plan to `docs/plans/completed/`

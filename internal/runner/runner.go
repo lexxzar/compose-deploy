@@ -9,6 +9,8 @@ import (
 type ServiceStatus struct {
 	Running bool
 	Health  string // "healthy", "unhealthy", "starting", or "" (no healthcheck)
+	Created string // formatted creation time, e.g. "2024-01-15 09:30"
+	Uptime  string // compact uptime, e.g. "3h", "2d", or "" if not running
 }
 
 // Composer is the interface consumed by the runner, implemented by compose.Compose.
@@ -20,8 +22,10 @@ type Composer interface {
 	Start(ctx context.Context, containers []string, w io.Writer) error
 	ListServices(ctx context.Context) ([]string, error)
 	// ContainerStatus returns a map of service name to ServiceStatus.
-	// For scaled services, Running uses OR (any running = running) and
-	// Health uses worst-case priority (unhealthy > starting > healthy).
+	// For scaled services, Running uses OR (any running = running),
+	// Health uses worst-case priority (unhealthy > starting > healthy),
+	// Created uses the oldest replica's creation time, and
+	// Uptime uses the longest-running replica's uptime string.
 	ContainerStatus(ctx context.Context) (map[string]ServiceStatus, error)
 	// Logs streams docker compose logs for a single service to w.
 	// When follow is true, it streams until ctx is cancelled.

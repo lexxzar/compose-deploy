@@ -3836,6 +3836,107 @@ func TestViewSelectContainers_WindowedOnlyShowsVisibleServices(t *testing.T) {
 	}
 }
 
+func TestViewSelectContainers_CreatedAndUptime(t *testing.T) {
+	mc := &mockComposer{services: []string{"web", "db", "cache"}}
+	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
+	m.screen = screenSelectContainers
+	m.services = mc.services
+	m.svcStatus = map[string]runner.ServiceStatus{
+		"web":   {Running: true, Created: "2024-01-15 09:30", Uptime: "3h"},
+		"db":    {Running: true, Created: "2024-01-14 08:00", Uptime: "1d 3h"},
+		"cache": {Running: false, Created: "2024-01-15 10:00", Uptime: ""},
+	}
+	m.width = 120
+	m.height = 24
+
+	view := m.viewSelectContainers()
+
+	// Verify Created values are shown
+	if !strings.Contains(view, "2024-01-15 09:30") {
+		t.Errorf("expected Created '2024-01-15 09:30' in view, got:\n%s", view)
+	}
+	if !strings.Contains(view, "2024-01-14 08:00") {
+		t.Errorf("expected Created '2024-01-14 08:00' in view, got:\n%s", view)
+	}
+	if !strings.Contains(view, "2024-01-15 10:00") {
+		t.Errorf("expected Created '2024-01-15 10:00' in view, got:\n%s", view)
+	}
+
+	// Verify Uptime values are shown
+	if !strings.Contains(view, "3h") {
+		t.Errorf("expected Uptime '3h' in view, got:\n%s", view)
+	}
+	if !strings.Contains(view, "1d 3h") {
+		t.Errorf("expected Uptime '1d 3h' in view, got:\n%s", view)
+	}
+}
+
+func TestViewSelectContainers_CreatedAndUptimeAlignment(t *testing.T) {
+	mc := &mockComposer{services: []string{"nginx", "postgres-db"}}
+	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
+	m.screen = screenSelectContainers
+	m.services = mc.services
+	m.svcStatus = map[string]runner.ServiceStatus{
+		"nginx":       {Running: true, Created: "2024-01-15 09:30", Uptime: "3h"},
+		"postgres-db": {Running: true, Created: "2024-01-14 08:00", Uptime: "1d 3h"},
+	}
+	m.width = 120
+	m.height = 24
+
+	view := m.viewSelectContainers()
+
+	// Both service names should be padded to same width (postgres-db is longer)
+	// Look for "nginx" followed by spaces to align with "postgres-db"
+	lines := strings.Split(view, "\n")
+	var svcLines []string
+	for _, line := range lines {
+		if strings.Contains(line, "nginx") || strings.Contains(line, "postgres-db") {
+			svcLines = append(svcLines, line)
+		}
+	}
+	if len(svcLines) != 2 {
+		t.Fatalf("expected 2 service lines, got %d:\n%s", len(svcLines), view)
+	}
+
+	// The Created column should start at the same position in both lines
+	idx0 := strings.Index(svcLines[0], "2024-01-15")
+	idx1 := strings.Index(svcLines[1], "2024-01-14")
+	if idx0 != idx1 {
+		t.Errorf("Created columns not aligned: line0 at %d, line1 at %d\nLine0: %q\nLine1: %q",
+			idx0, idx1, svcLines[0], svcLines[1])
+	}
+}
+
+func TestViewSelectContainers_NoColumnsWhenNoStatus(t *testing.T) {
+	mc := &mockComposer{services: []string{"web", "db"}}
+	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
+	m.screen = screenSelectContainers
+	m.services = mc.services
+	m.svcStatus = map[string]runner.ServiceStatus{
+		"web": {Running: true},
+		"db":  {Running: false},
+	}
+	m.width = 120
+	m.height = 24
+
+	view := m.viewSelectContainers()
+
+	// When no Created/Uptime data exists, no extra padding columns should appear
+	// Service name should be at end of line (just trailing space from padding)
+	lines := strings.Split(view, "\n")
+	for _, line := range lines {
+		if strings.Contains(line, "web") {
+			// Should not have lots of trailing whitespace from empty columns
+			trimmed := strings.TrimRight(line, " ")
+			if strings.HasSuffix(trimmed, "web") {
+				// Good: service name is at end
+			} else if len(line)-len(trimmed) > 5 {
+				t.Errorf("unexpected trailing whitespace suggesting empty columns: %q", line)
+			}
+		}
+	}
+}
+
 func TestConfigScreen_ResolvedErrorResetsToggle(t *testing.T) {
 	mc := &mockConfigComposer{
 		mockComposer: mockComposer{

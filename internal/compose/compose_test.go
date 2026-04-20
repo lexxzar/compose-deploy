@@ -456,6 +456,174 @@ func TestParseContainerStatus(t *testing.T) {
 				"db":  {Running: true, Health: ""},
 			},
 		},
+		{
+			name:  "created at and status fields",
+			input: `{"Service":"web","State":"running","Health":"","CreatedAt":"2024-01-15 09:30:00 +0000 UTC","Status":"Up 3 hours"}` + "\n",
+			want: map[string]runner.ServiceStatus{
+				"web": {Running: true, Health: "", Created: "2024-01-15 09:30", Uptime: "3h"},
+			},
+		},
+		{
+			name:  "created at with timezone offset",
+			input: `{"Service":"api","State":"running","CreatedAt":"2024-03-20 14:15:30 +0300 MSK","Status":"Up 2 days"}` + "\n",
+			want: map[string]runner.ServiceStatus{
+				"api": {Running: true, Created: "2024-03-20 14:15", Uptime: "2d"},
+			},
+		},
+		{
+			name:  "empty created at",
+			input: `{"Service":"web","State":"running","CreatedAt":"","Status":"Up 5 minutes"}` + "\n",
+			want: map[string]runner.ServiceStatus{
+				"web": {Running: true, Created: "", Uptime: "5m"},
+			},
+		},
+		{
+			name:  "missing created at field",
+			input: `{"Service":"web","State":"running","Status":"Up 10 seconds"}` + "\n",
+			want: map[string]runner.ServiceStatus{
+				"web": {Running: true, Created: "", Uptime: "10s"},
+			},
+		},
+		{
+			name:  "exited container has no uptime",
+			input: `{"Service":"web","State":"exited","CreatedAt":"2024-01-15 09:30:00 +0000 UTC","Status":"Exited (0) 5 minutes ago"}` + "\n",
+			want: map[string]runner.ServiceStatus{
+				"web": {Running: false, Created: "2024-01-15 09:30", Uptime: ""},
+			},
+		},
+		{
+			name:  "restarting container",
+			input: `{"Service":"web","State":"restarting","CreatedAt":"2024-01-15 09:30:00 +0000 UTC","Status":"Restarting (1) 5 seconds ago"}` + "\n",
+			want: map[string]runner.ServiceStatus{
+				"web": {Running: false, Created: "2024-01-15 09:30", Uptime: "restarting"},
+			},
+		},
+		{
+			name:  "status with health suffix",
+			input: `{"Service":"web","State":"running","Health":"healthy","CreatedAt":"2024-01-15 09:30:00 +0000 UTC","Status":"Up 3 hours (healthy)"}` + "\n",
+			want: map[string]runner.ServiceStatus{
+				"web": {Running: true, Health: "healthy", Created: "2024-01-15 09:30", Uptime: "3h"},
+			},
+		},
+		{
+			name: "scaled service picks oldest created and longest uptime",
+			input: `[` +
+				`{"Service":"web","State":"running","CreatedAt":"2024-01-15 09:30:00 +0000 UTC","Status":"Up 3 hours"},` +
+				`{"Service":"web","State":"running","CreatedAt":"2024-01-15 08:00:00 +0000 UTC","Status":"Up 4 hours 30 minutes"},` +
+				`{"Service":"web","State":"running","CreatedAt":"2024-01-15 10:00:00 +0000 UTC","Status":"Up 2 hours"}` +
+				`]`,
+			want: map[string]runner.ServiceStatus{
+				"web": {Running: true, Created: "2024-01-15 08:00", Uptime: "4h 30m"},
+			},
+		},
+		{
+			name: "scaled service some exited picks oldest running",
+			input: `[` +
+				`{"Service":"web","State":"exited","CreatedAt":"2024-01-14 06:00:00 +0000 UTC","Status":"Exited (0) 1 day ago"},` +
+				`{"Service":"web","State":"running","CreatedAt":"2024-01-15 09:00:00 +0000 UTC","Status":"Up 3 hours"},` +
+				`{"Service":"web","State":"running","CreatedAt":"2024-01-15 10:00:00 +0000 UTC","Status":"Up 2 hours"}` +
+				`]`,
+			want: map[string]runner.ServiceStatus{
+				"web": {Running: true, Created: "2024-01-14 06:00", Uptime: "3h"},
+			},
+		},
+		{
+			name: "scaled service all exited no uptime",
+			input: `[` +
+				`{"Service":"web","State":"exited","CreatedAt":"2024-01-15 09:00:00 +0000 UTC","Status":"Exited (0) 1 hour ago"},` +
+				`{"Service":"web","State":"exited","CreatedAt":"2024-01-15 08:00:00 +0000 UTC","Status":"Exited (0) 2 hours ago"}` +
+				`]`,
+			want: map[string]runner.ServiceStatus{
+				"web": {Running: false, Created: "2024-01-15 08:00", Uptime: ""},
+			},
+		},
+		{
+			name:  "unparseable created at",
+			input: `{"Service":"web","State":"running","CreatedAt":"not-a-date","Status":"Up 5 minutes"}` + "\n",
+			want: map[string]runner.ServiceStatus{
+				"web": {Running: true, Created: "", Uptime: "5m"},
+			},
+		},
+		{
+			name: "scaled service mixed parseable and unparseable created at among running replicas",
+			input: `[` +
+				`{"Service":"web","State":"running","CreatedAt":"2024-01-15 09:00:00 +0000 UTC","Status":"Up 3 hours"},` +
+				`{"Service":"web","State":"running","CreatedAt":"not-a-date","Status":"Up 5 hours"},` +
+				`{"Service":"web","State":"running","CreatedAt":"2024-01-15 10:00:00 +0000 UTC","Status":"Up 2 hours"}` +
+				`]`,
+			want: map[string]runner.ServiceStatus{
+				// oldest parseable Created is 09:00.
+				// Uptime is determined by longest actual duration: 5h > 3h > 2h, so "5h" wins.
+				"web": {Running: true, Created: "2024-01-15 09:00", Uptime: "5h"},
+			},
+		},
+		{
+			name: "scaled service all running with unparseable created at uses longest uptime",
+			input: `[` +
+				`{"Service":"web","State":"running","CreatedAt":"bad-date-1","Status":"Up 2 hours"},` +
+				`{"Service":"web","State":"running","CreatedAt":"bad-date-2","Status":"Up 5 hours"}` +
+				`]`,
+			want: map[string]runner.ServiceStatus{
+				// No parseable CreatedAt at all: Created is empty, Uptime picks longest duration (5h > 2h)
+				"web": {Running: true, Created: "", Uptime: "5h"},
+			},
+		},
+		{
+			name: "scaled service restarted replica has shorter uptime despite older CreatedAt",
+			input: `[` +
+				`{"Service":"web","State":"running","CreatedAt":"2024-01-15 06:00:00 +0000 UTC","Status":"Up 5 minutes"},` +
+				`{"Service":"web","State":"running","CreatedAt":"2024-01-15 09:00:00 +0000 UTC","Status":"Up 3 hours"}` +
+				`]`,
+			want: map[string]runner.ServiceStatus{
+				// Replica created at 06:00 was restarted and has only 5m uptime.
+				// Replica created at 09:00 has been running for 3h continuously.
+				// Longest actual uptime (3h) wins over older CreatedAt.
+				"web": {Running: true, Created: "2024-01-15 06:00", Uptime: "3h"},
+			},
+		},
+		{
+			name:  "zero-duration uptime (less than a second) is recorded",
+			input: `{"Service":"web","State":"running","CreatedAt":"2024-01-15 09:30:00 +0000 UTC","Status":"Up Less than a second"}` + "\n",
+			want: map[string]runner.ServiceStatus{
+				"web": {Running: true, Created: "2024-01-15 09:30", Uptime: "<1s"},
+			},
+		},
+		{
+			name:  "non-running state with Up status text does not produce uptime",
+			input: `{"Service":"web","State":"exited","CreatedAt":"2024-01-15 09:30:00 +0000 UTC","Status":"Up 3 hours"}` + "\n",
+			want: map[string]runner.ServiceStatus{
+				"web": {Running: false, Created: "2024-01-15 09:30", Uptime: ""},
+			},
+		},
+		{
+			name: "scaled service with zero-duration uptime among multiple running replicas",
+			input: `[` +
+				`{"Service":"web","State":"running","CreatedAt":"2024-01-15 09:00:00 +0000 UTC","Status":"Up 3 hours"},` +
+				`{"Service":"web","State":"running","CreatedAt":"2024-01-15 12:30:00 +0000 UTC","Status":"Up Less than a second"}` +
+				`]`,
+			want: map[string]runner.ServiceStatus{
+				// The 3h replica has the longest uptime, zero-duration one doesn't override.
+				"web": {Running: true, Created: "2024-01-15 09:00", Uptime: "3h"},
+			},
+		},
+		{
+			name:  "single running replica with zero-duration uptime is recorded",
+			input: `[{"Service":"web","State":"running","CreatedAt":"2024-01-15 12:30:00 +0000 UTC","Status":"Up Less than a second"}]`,
+			want: map[string]runner.ServiceStatus{
+				"web": {Running: true, Created: "2024-01-15 12:30", Uptime: "<1s"},
+			},
+		},
+		{
+			name: "running replica overrides restarting even with zero-duration uptime",
+			input: `[` +
+				`{"Service":"web","State":"restarting","CreatedAt":"2024-01-15 08:00:00 +0000 UTC","Status":"Restarting (1) 5 seconds ago"},` +
+				`{"Service":"web","State":"running","CreatedAt":"2024-01-15 12:30:00 +0000 UTC","Status":"Up Less than a second"}` +
+				`]`,
+			want: map[string]runner.ServiceStatus{
+				// Running replica always takes priority over restarting for Uptime.
+				"web": {Running: true, Created: "2024-01-15 08:00", Uptime: "<1s"},
+			},
+		},
 	}
 
 	for _, tt := range tests {
@@ -480,6 +648,12 @@ func TestParseContainerStatus(t *testing.T) {
 				}
 				if gotStatus.Health != want.Health {
 					t.Errorf("status[%q].Health = %q, want %q", svc, gotStatus.Health, want.Health)
+				}
+				if gotStatus.Created != want.Created {
+					t.Errorf("status[%q].Created = %q, want %q", svc, gotStatus.Created, want.Created)
+				}
+				if gotStatus.Uptime != want.Uptime {
+					t.Errorf("status[%q].Uptime = %q, want %q", svc, gotStatus.Uptime, want.Uptime)
 				}
 			}
 		})
