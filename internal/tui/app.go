@@ -1061,10 +1061,18 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		case "left":
 			if m.settingsField == 4 {
 				m.settingsColor = cycleColor(m.settingsColor, -1)
+			} else {
+				var cmd tea.Cmd
+				m.settingsInputs[m.settingsField], cmd = m.settingsInputs[m.settingsField].Update(msg)
+				return m, cmd
 			}
 		case "right":
 			if m.settingsField == 4 {
 				m.settingsColor = cycleColor(m.settingsColor, 1)
+			} else {
+				var cmd tea.Cmd
+				m.settingsInputs[m.settingsField], cmd = m.settingsInputs[m.settingsField].Update(msg)
+				return m, cmd
 			}
 		case "enter":
 			srvGroup := strings.TrimSpace(m.settingsInputs[3].Value())
