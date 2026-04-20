@@ -26,6 +26,8 @@ type serviceStatus struct {
 	Name    string `json:"service"`
 	Running bool   `json:"running"`
 	Health  string `json:"health,omitempty"`
+	Created string `json:"created,omitempty"`
+	Uptime  string `json:"uptime,omitempty"`
 }
 
 // projectServices groups service statuses under a project name for grouped display.
@@ -44,6 +46,8 @@ func mergeStatus(services []string, status map[string]runner.ServiceStatus) []se
 			Name:    svc,
 			Running: st.Running,
 			Health:  st.Health,
+			Created: st.Created,
+			Uptime:  st.Uptime,
 		}
 	}
 	sort.Slice(result, func(i, j int) bool {
@@ -72,10 +76,18 @@ func formatDots(items []serviceStatus) string {
 		return ""
 	}
 
-	maxLen := 0
+	maxName := 0
+	maxCreated := 0
+	maxUptime := 0
 	for _, item := range items {
-		if len(item.Name) > maxLen {
-			maxLen = len(item.Name)
+		if len(item.Name) > maxName {
+			maxName = len(item.Name)
+		}
+		if len(item.Created) > maxCreated {
+			maxCreated = len(item.Created)
+		}
+		if len(item.Uptime) > maxUptime {
+			maxUptime = len(item.Uptime)
 		}
 	}
 
@@ -92,11 +104,14 @@ func formatDots(items []serviceStatus) string {
 		b.WriteByte(' ')
 		b.WriteString(healthIcon(item.Health))
 		b.WriteByte(' ')
-		b.WriteString(fmt.Sprintf("%-*s", maxLen, item.Name))
-		if item.Running {
-			b.WriteString("  running")
-		} else {
-			b.WriteString("  stopped")
+		b.WriteString(fmt.Sprintf("%-*s", maxName, item.Name))
+		if maxCreated > 0 {
+			b.WriteString("  ")
+			b.WriteString(fmt.Sprintf("%-*s", maxCreated, item.Created))
+		}
+		if maxUptime > 0 {
+			b.WriteString("  ")
+			b.WriteString(fmt.Sprintf("%-*s", maxUptime, item.Uptime))
 		}
 	}
 	return b.String()
@@ -116,10 +131,18 @@ func formatDotsGrouped(projects []projectServices) string {
 		}
 		b.WriteString(proj.Name)
 
-		maxLen := 0
+		maxName := 0
+		maxCreated := 0
+		maxUptime := 0
 		for _, item := range proj.Services {
-			if len(item.Name) > maxLen {
-				maxLen = len(item.Name)
+			if len(item.Name) > maxName {
+				maxName = len(item.Name)
+			}
+			if len(item.Created) > maxCreated {
+				maxCreated = len(item.Created)
+			}
+			if len(item.Uptime) > maxUptime {
+				maxUptime = len(item.Uptime)
 			}
 		}
 
@@ -134,11 +157,14 @@ func formatDotsGrouped(projects []projectServices) string {
 			b.WriteByte(' ')
 			b.WriteString(healthIcon(item.Health))
 			b.WriteByte(' ')
-			b.WriteString(fmt.Sprintf("%-*s", maxLen, item.Name))
-			if item.Running {
-				b.WriteString("  running")
-			} else {
-				b.WriteString("  stopped")
+			b.WriteString(fmt.Sprintf("%-*s", maxName, item.Name))
+			if maxCreated > 0 {
+				b.WriteString("  ")
+				b.WriteString(fmt.Sprintf("%-*s", maxCreated, item.Created))
+			}
+			if maxUptime > 0 {
+				b.WriteString("  ")
+				b.WriteString(fmt.Sprintf("%-*s", maxUptime, item.Uptime))
 			}
 		}
 	}
