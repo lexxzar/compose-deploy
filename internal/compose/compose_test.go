@@ -1695,6 +1695,139 @@ func TestEditCommand_WhitespaceEditor(t *testing.T) {
 	}
 }
 
+// --- ExecCommand tests ---
+
+func TestExecCommand_DefaultShell(t *testing.T) {
+	c := &Compose{ProjectDir: "/proj", UID: "1000:1000"}
+	cmd, err := c.ExecCommand(context.Background(), "web", nil)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	gotArgs := cmd.Args[1:] // skip "docker"
+	wantArgs := []string{"compose", "exec", "web", "/bin/sh", "-c", "exec bash 2>/dev/null || exec sh"}
+	if len(gotArgs) != len(wantArgs) {
+		t.Fatalf("args count = %d, want %d\ngot:  %v\nwant: %v", len(gotArgs), len(wantArgs), gotArgs, wantArgs)
+	}
+	for i, want := range wantArgs {
+		if gotArgs[i] != want {
+			t.Errorf("arg[%d] = %q, want %q", i, gotArgs[i], want)
+		}
+	}
+}
+
+func TestExecCommand_DefaultShell_EmptySlice(t *testing.T) {
+	c := &Compose{ProjectDir: "/proj", UID: "1000:1000"}
+	cmd, err := c.ExecCommand(context.Background(), "web", []string{})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	gotArgs := cmd.Args[1:]
+	wantArgs := []string{"compose", "exec", "web", "/bin/sh", "-c", "exec bash 2>/dev/null || exec sh"}
+	if len(gotArgs) != len(wantArgs) {
+		t.Fatalf("args count = %d, want %d\ngot:  %v\nwant: %v", len(gotArgs), len(wantArgs), gotArgs, wantArgs)
+	}
+	for i, want := range wantArgs {
+		if gotArgs[i] != want {
+			t.Errorf("arg[%d] = %q, want %q", i, gotArgs[i], want)
+		}
+	}
+}
+
+func TestExecCommand_CustomCommand(t *testing.T) {
+	c := &Compose{ProjectDir: "/proj", UID: "1000:1000"}
+	cmd, err := c.ExecCommand(context.Background(), "web", []string{"rails", "console"})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	gotArgs := cmd.Args[1:]
+	wantArgs := []string{"compose", "exec", "web", "rails", "console"}
+	if len(gotArgs) != len(wantArgs) {
+		t.Fatalf("args count = %d, want %d\ngot:  %v\nwant: %v", len(gotArgs), len(wantArgs), gotArgs, wantArgs)
+	}
+	for i, want := range wantArgs {
+		if gotArgs[i] != want {
+			t.Errorf("arg[%d] = %q, want %q", i, gotArgs[i], want)
+		}
+	}
+}
+
+func TestExecCommand_Standalone(t *testing.T) {
+	c := &Compose{ProjectDir: "/proj", UID: "1000:1000", Standalone: true}
+	cmd, err := c.ExecCommand(context.Background(), "api", nil)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	// Standalone mode uses docker-compose binary directly
+	if !strings.HasSuffix(cmd.Path, "docker-compose") && !strings.Contains(cmd.Args[0], "docker-compose") {
+		t.Errorf("standalone command should use docker-compose, got path=%q args[0]=%q", cmd.Path, cmd.Args[0])
+	}
+
+	gotArgs := cmd.Args[1:]
+	wantArgs := []string{"exec", "api", "/bin/sh", "-c", "exec bash 2>/dev/null || exec sh"}
+	if len(gotArgs) != len(wantArgs) {
+		t.Fatalf("args count = %d, want %d\ngot:  %v\nwant: %v", len(gotArgs), len(wantArgs), gotArgs, wantArgs)
+	}
+	for i, want := range wantArgs {
+		if gotArgs[i] != want {
+			t.Errorf("arg[%d] = %q, want %q", i, gotArgs[i], want)
+		}
+	}
+}
+
+func TestExecCommand_Env(t *testing.T) {
+	c := &Compose{ProjectDir: "/proj", UID: "1000:1000"}
+	cmd, err := c.ExecCommand(context.Background(), "web", nil)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	found := false
+	for _, env := range cmd.Env {
+		if env == "CURRENT_UID=1000:1000" {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Error("CURRENT_UID=1000:1000 not found in ExecCommand env")
+	}
+}
+
+func TestExecCommand_Dir(t *testing.T) {
+	c := &Compose{ProjectDir: "/proj", UID: "1000:1000"}
+	cmd, err := c.ExecCommand(context.Background(), "web", nil)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if cmd.Dir != "/proj" {
+		t.Errorf("Dir = %q, want %q", cmd.Dir, "/proj")
+	}
+}
+
+func TestExecCommand_StandaloneCustomCommand(t *testing.T) {
+	c := &Compose{ProjectDir: "/proj", UID: "1000:1000", Standalone: true}
+	cmd, err := c.ExecCommand(context.Background(), "db", []string{"psql", "-U", "postgres"})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	gotArgs := cmd.Args[1:]
+	wantArgs := []string{"exec", "db", "psql", "-U", "postgres"}
+	if len(gotArgs) != len(wantArgs) {
+		t.Fatalf("args count = %d, want %d\ngot:  %v\nwant: %v", len(gotArgs), len(wantArgs), gotArgs, wantArgs)
+	}
+	for i, want := range wantArgs {
+		if gotArgs[i] != want {
+			t.Errorf("arg[%d] = %q, want %q", i, gotArgs[i], want)
+		}
+	}
+}
+
 func TestConfigResolved_ErrorIncludesStderr(t *testing.T) {
 	c := &Compose{
 		ProjectDir: "/proj",

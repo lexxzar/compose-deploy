@@ -58,11 +58,11 @@
 - Modify: `internal/compose/compose.go`
 - Modify: `internal/compose/compose_test.go`
 
-- [ ] Add `ExecCommand(ctx context.Context, service string, command []string) (*exec.Cmd, error)` method to `Compose`
-- [ ] When `command` is empty, use default: `[]string{"/bin/sh", "-c", "exec bash 2>/dev/null || exec sh"}`
-- [ ] Build command via `c.command(ctx, append([]string{"exec", service}, command...)...)`
-- [ ] Write tests verifying command args for: default shell, custom command, standalone mode
-- [ ] Run tests - must pass before next task
+- [x] Add `ExecCommand(ctx context.Context, service string, command []string) (*exec.Cmd, error)` method to `Compose`
+- [x] When `command` is empty, use default: `[]string{"/bin/sh", "-c", "exec bash 2>/dev/null || exec sh"}`
+- [x] Build command via `c.command(ctx, append([]string{"exec", service}, command...)...)`
+- [x] Write tests verifying command args for: default shell, custom command, standalone mode
+- [x] Run tests - must pass before next task
 
 ### Task 2: Add ExecCommand to RemoteCompose
 
