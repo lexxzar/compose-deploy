@@ -1256,7 +1256,7 @@ func TestRemoteExecCommand_DefaultShell(t *testing.T) {
 	if !strings.Contains(remoteCmd, "'-c'") {
 		t.Errorf("remote command should contain '-c', got: %q", remoteCmd)
 	}
-	if !strings.Contains(remoteCmd, "exec bash 2>/dev/null || exec sh") {
+	if !strings.Contains(remoteCmd, "command -v bash >/dev/null 2>&1 && exec bash || exec sh") {
 		t.Errorf("remote command should contain bash fallback, got: %q", remoteCmd)
 	}
 }

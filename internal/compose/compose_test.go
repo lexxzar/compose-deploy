@@ -1705,7 +1705,7 @@ func TestExecCommand_DefaultShell(t *testing.T) {
 	}
 
 	gotArgs := cmd.Args[1:] // skip "docker"
-	wantArgs := []string{"compose", "exec", "web", "/bin/sh", "-c", "exec bash 2>/dev/null || exec sh"}
+	wantArgs := []string{"compose", "exec", "web", "/bin/sh", "-c", "command -v bash >/dev/null 2>&1 && exec bash || exec sh"}
 	if len(gotArgs) != len(wantArgs) {
 		t.Fatalf("args count = %d, want %d\ngot:  %v\nwant: %v", len(gotArgs), len(wantArgs), gotArgs, wantArgs)
 	}
@@ -1724,7 +1724,7 @@ func TestExecCommand_DefaultShell_EmptySlice(t *testing.T) {
 	}
 
 	gotArgs := cmd.Args[1:]
-	wantArgs := []string{"compose", "exec", "web", "/bin/sh", "-c", "exec bash 2>/dev/null || exec sh"}
+	wantArgs := []string{"compose", "exec", "web", "/bin/sh", "-c", "command -v bash >/dev/null 2>&1 && exec bash || exec sh"}
 	if len(gotArgs) != len(wantArgs) {
 		t.Fatalf("args count = %d, want %d\ngot:  %v\nwant: %v", len(gotArgs), len(wantArgs), gotArgs, wantArgs)
 	}
@@ -1767,7 +1767,7 @@ func TestExecCommand_Standalone(t *testing.T) {
 	}
 
 	gotArgs := cmd.Args[1:]
-	wantArgs := []string{"exec", "api", "/bin/sh", "-c", "exec bash 2>/dev/null || exec sh"}
+	wantArgs := []string{"exec", "api", "/bin/sh", "-c", "command -v bash >/dev/null 2>&1 && exec bash || exec sh"}
 	if len(gotArgs) != len(wantArgs) {
 		t.Fatalf("args count = %d, want %d\ngot:  %v\nwant: %v", len(gotArgs), len(wantArgs), gotArgs, wantArgs)
 	}
