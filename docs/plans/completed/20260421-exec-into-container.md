@@ -113,8 +113,8 @@
 
 ### Task 5: [Final] Update documentation
 
-- [ ] Update CLAUDE.md with exec feature documentation (ExecProvider pattern, key binding, CLI usage)
-- [ ] Move this plan to `docs/plans/completed/`
+- [x] Update CLAUDE.md with exec feature documentation (ExecProvider pattern, key binding, CLI usage)
+- [x] Move this plan to `docs/plans/completed/`
 
 ## Post-Completion
 
