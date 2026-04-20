@@ -34,9 +34,9 @@ After you select a remote server, the server name is shown in the breadcrumb on 
 
 The TUI walks through up to six screens:
 
-1. **Server select** — choose a remote server or "Local" (only shown when servers are configured)
+1. **Server select** — choose a remote server or "Local" (only shown when servers are configured); press `s` to open the inline settings editor for managing servers
 2. **Project select** — pick a Docker Compose project (auto-skipped if the current directory has a compose file)
-3. **Service select** — pick services and choose an action (`r` restart, `d` deploy, `s` stop, `l` logs, `c` config)
+3. **Service select** — pick services and choose an action (`r` restart, `d` deploy, `s` stop, `l` logs, `c` config, `x` exec)
 4. **Progress** — watch step-by-step execution with status indicators
 5. **Logs** — live-stream logs for the selected service
 6. **Config** — inspect or edit the compose file, toggle between raw and resolved config, and see validation status
@@ -70,6 +70,12 @@ cdeploy logs nginx
 
 # Dump last 100 lines and exit
 cdeploy logs nginx -n 100 --no-follow
+
+# Exec into a running container (default: tries bash, falls back to sh)
+cdeploy exec nginx
+
+# Run a specific command inside a container
+cdeploy exec web -- rails console
 ```
 
 #### Remote servers (CLI)
@@ -86,6 +92,9 @@ cdeploy -s prod list
 
 # Stream logs on a remote server
 cdeploy logs nginx -s prod -C /opt/myapp
+
+# Exec into a container on a remote server
+cdeploy exec nginx -s prod -C /opt/myapp
 ```
 
 ### Global Flags
