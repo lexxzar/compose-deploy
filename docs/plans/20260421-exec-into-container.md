@@ -70,12 +70,12 @@
 - Modify: `internal/compose/remote.go`
 - Modify: `internal/compose/remote_test.go`
 
-- [ ] Add `ExecCommand(ctx context.Context, service string, command []string) (*exec.Cmd, error)` method to `RemoteCompose`
-- [ ] When `command` is empty, use same default as local
-- [ ] Build SSH command directly (like `EditCommand` pattern) — construct remote shell string with `cd`, `CURRENT_UID`, compose binary, `exec` subcommand, then `exec.CommandContext(ctx, "ssh", "-t", "-S", socketPath, "-o", "ControlMaster=no", host, remoteCmd)`
-- [ ] Do NOT use `remoteCommand()` — it doesn't include `-t` and retrofitting is fragile
-- [ ] Write tests verifying SSH args include `-t`, shell escaping is correct, default shell works
-- [ ] Run tests - must pass before next task
+- [x] Add `ExecCommand(ctx context.Context, service string, command []string) (*exec.Cmd, error)` method to `RemoteCompose`
+- [x] When `command` is empty, use same default as local
+- [x] Build SSH command directly (like `EditCommand` pattern) — construct remote shell string with `cd`, `CURRENT_UID`, compose binary, `exec` subcommand, then `exec.CommandContext(ctx, "ssh", "-t", "-S", socketPath, "-o", "ControlMaster=no", host, remoteCmd)`
+- [x] Do NOT use `remoteCommand()` — it doesn't include `-t` and retrofitting is fragile
+- [x] Write tests verifying SSH args include `-t`, shell escaping is correct, default shell works
+- [x] Run tests - must pass before next task
 
 ### Task 3: Add ExecProvider interface and TUI handler
 

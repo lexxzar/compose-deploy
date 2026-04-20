@@ -1198,6 +1198,225 @@ func TestRemoteValidateConfig_CombinedOutputErrorIncludesStderr(t *testing.T) {
 	}
 }
 
+// --- RemoteCompose ExecCommand tests ---
+
+func TestRemoteExecCommand_DefaultShell(t *testing.T) {
+	r := &RemoteCompose{
+		Host:       "user@example.com",
+		ProjectDir: "/app",
+		SocketPath: "/tmp/cdeploy-ctrl-abc-99",
+	}
+
+	cmd, err := r.ExecCommand(context.Background(), "web", nil)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	// Must have -t for TTY
+	foundT := false
+	for _, a := range cmd.Args {
+		if a == "-t" {
+			foundT = true
+			break
+		}
+	}
+	if !foundT {
+		t.Error("ExecCommand should include -t for TTY allocation")
+	}
+
+	remoteCmd := cmd.Args[len(cmd.Args)-1]
+
+	// Should have cd to project dir
+	if !strings.Contains(remoteCmd, "cd '/app'") {
+		t.Errorf("remote command should start with cd, got: %q", remoteCmd)
+	}
+
+	// Should have CURRENT_UID
+	if !strings.Contains(remoteCmd, "CURRENT_UID=$(id -u):$(id -g)") {
+		t.Errorf("remote command should contain CURRENT_UID, got: %q", remoteCmd)
+	}
+
+	// Should use docker compose (plugin mode by default)
+	if !strings.Contains(remoteCmd, "docker compose") {
+		t.Errorf("remote command should contain 'docker compose', got: %q", remoteCmd)
+	}
+
+	// Should contain exec subcommand and service
+	if !strings.Contains(remoteCmd, "'exec'") {
+		t.Errorf("remote command should contain 'exec', got: %q", remoteCmd)
+	}
+	if !strings.Contains(remoteCmd, "'web'") {
+		t.Errorf("remote command should contain 'web', got: %q", remoteCmd)
+	}
+
+	// Should contain default shell command parts
+	if !strings.Contains(remoteCmd, "'/bin/sh'") {
+		t.Errorf("remote command should contain '/bin/sh', got: %q", remoteCmd)
+	}
+	if !strings.Contains(remoteCmd, "'-c'") {
+		t.Errorf("remote command should contain '-c', got: %q", remoteCmd)
+	}
+	if !strings.Contains(remoteCmd, "exec bash 2>/dev/null || exec sh") {
+		t.Errorf("remote command should contain bash fallback, got: %q", remoteCmd)
+	}
+}
+
+func TestRemoteExecCommand_CustomCommand(t *testing.T) {
+	r := &RemoteCompose{
+		Host:       "user@example.com",
+		ProjectDir: "/app",
+		SocketPath: "/tmp/cdeploy-ctrl-abc-99",
+	}
+
+	cmd, err := r.ExecCommand(context.Background(), "web", []string{"rails", "console"})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	remoteCmd := cmd.Args[len(cmd.Args)-1]
+
+	if !strings.Contains(remoteCmd, "'exec'") {
+		t.Errorf("remote command should contain 'exec', got: %q", remoteCmd)
+	}
+	if !strings.Contains(remoteCmd, "'web'") {
+		t.Errorf("remote command should contain 'web', got: %q", remoteCmd)
+	}
+	if !strings.Contains(remoteCmd, "'rails'") {
+		t.Errorf("remote command should contain 'rails', got: %q", remoteCmd)
+	}
+	if !strings.Contains(remoteCmd, "'console'") {
+		t.Errorf("remote command should contain 'console', got: %q", remoteCmd)
+	}
+
+	// Should NOT contain default shell command
+	if strings.Contains(remoteCmd, "/bin/sh") {
+		t.Errorf("remote command should NOT contain /bin/sh when custom command given, got: %q", remoteCmd)
+	}
+}
+
+func TestRemoteExecCommand_Standalone(t *testing.T) {
+	r := &RemoteCompose{
+		Host:       "user@example.com",
+		ProjectDir: "/app",
+		SocketPath: "/tmp/cdeploy-ctrl-abc-99",
+		Standalone: true,
+	}
+
+	cmd, err := r.ExecCommand(context.Background(), "web", nil)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	remoteCmd := cmd.Args[len(cmd.Args)-1]
+
+	// Should use docker-compose (standalone)
+	if !strings.Contains(remoteCmd, "docker-compose") {
+		t.Errorf("standalone remote command should contain 'docker-compose', got: %q", remoteCmd)
+	}
+	// Should NOT contain "docker compose" (with space as plugin)
+	if strings.Contains(remoteCmd, "docker compose") {
+		t.Errorf("standalone remote command should not contain 'docker compose', got: %q", remoteCmd)
+	}
+}
+
+func TestRemoteExecCommand_WithoutProjectDir(t *testing.T) {
+	r := &RemoteCompose{
+		Host:       "user@example.com",
+		SocketPath: "/tmp/cdeploy-ctrl-abc-99",
+	}
+
+	cmd, err := r.ExecCommand(context.Background(), "web", nil)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	remoteCmd := cmd.Args[len(cmd.Args)-1]
+
+	// Should NOT have cd prefix
+	if strings.HasPrefix(remoteCmd, "cd ") {
+		t.Errorf("remote command should not have cd when no project dir, got: %q", remoteCmd)
+	}
+	// Should start with CURRENT_UID
+	if !strings.HasPrefix(remoteCmd, "CURRENT_UID=$(id -u):$(id -g)") {
+		t.Errorf("remote command should start with CURRENT_UID, got: %q", remoteCmd)
+	}
+}
+
+func TestRemoteExecCommand_SSHArgs(t *testing.T) {
+	r := &RemoteCompose{
+		Host:       "user@example.com",
+		ProjectDir: "/app",
+		SocketPath: "/tmp/cdeploy-ctrl-abc-99",
+	}
+
+	cmd, err := r.ExecCommand(context.Background(), "web", nil)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	// Verify SSH arg structure: ssh -t -S <socket> -o ControlMaster=no <host> <remoteCmd>
+	wantPrefix := []string{"ssh", "-t", "-S", "/tmp/cdeploy-ctrl-abc-99", "-o", "ControlMaster=no", "user@example.com"}
+	if len(cmd.Args) < len(wantPrefix)+1 {
+		t.Fatalf("expected at least %d args, got %d: %v", len(wantPrefix)+1, len(cmd.Args), cmd.Args)
+	}
+	for i, want := range wantPrefix {
+		if cmd.Args[i] != want {
+			t.Errorf("arg[%d] = %q, want %q", i, cmd.Args[i], want)
+		}
+	}
+}
+
+func TestRemoteExecCommand_ShellEscaping(t *testing.T) {
+	r := &RemoteCompose{
+		Host:       "user@example.com",
+		ProjectDir: "/app",
+		SocketPath: "/tmp/cdeploy-ctrl-abc-99",
+	}
+
+	cmd, err := r.ExecCommand(context.Background(), "my-service", []string{"sh", "-c", "echo 'hello world'"})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	remoteCmd := cmd.Args[len(cmd.Args)-1]
+
+	// Service name should be escaped
+	if !strings.Contains(remoteCmd, "'my-service'") {
+		t.Errorf("service name should be shell-escaped, got: %q", remoteCmd)
+	}
+	// Command args should be escaped (the single quotes in the echo arg should be escaped)
+	if !strings.Contains(remoteCmd, "'sh'") {
+		t.Errorf("command arg 'sh' should be shell-escaped, got: %q", remoteCmd)
+	}
+	if !strings.Contains(remoteCmd, "'-c'") {
+		t.Errorf("command arg '-c' should be shell-escaped, got: %q", remoteCmd)
+	}
+	// The echo 'hello world' should have its inner quotes escaped
+	if !strings.Contains(remoteCmd, "'echo '\\''hello world'\\'''") {
+		t.Errorf("command with inner quotes should be properly escaped, got: %q", remoteCmd)
+	}
+}
+
+func TestRemoteExecCommand_DoesNotUseRemoteCommand(t *testing.T) {
+	// ExecCommand should build SSH command directly (like EditCommand),
+	// NOT through remoteCommand(), to ensure -t flag is included.
+	r := &RemoteCompose{
+		Host:       "user@example.com",
+		ProjectDir: "/app",
+		SocketPath: "/tmp/cdeploy-ctrl-abc-99",
+	}
+
+	cmd, err := r.ExecCommand(context.Background(), "web", nil)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	// The second arg must be "-t" (directly after "ssh")
+	if len(cmd.Args) < 2 || cmd.Args[1] != "-t" {
+		t.Errorf("second arg should be '-t', got args: %v", cmd.Args)
+	}
+}
+
 func TestRemoteConfigResolved_ErrorIncludesStderr(t *testing.T) {
 	r := &RemoteCompose{
 		Host:       "user@example.com",
