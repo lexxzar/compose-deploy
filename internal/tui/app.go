@@ -1427,8 +1427,21 @@ func (m Model) selectedCount() int {
 	return count
 }
 
+// hasStatusColumns returns true if any service in m.services has non-empty Created or Uptime data,
+// indicating that column captions should be displayed.
+func (m Model) hasStatusColumns() bool {
+	for _, svc := range m.services {
+		if st, ok := m.svcStatus[svc]; ok {
+			if st.Created != "" || st.Uptime != "" {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 // svcVisibleCount returns the number of services that fit in the terminal.
-// Header: breadcrumb + blank line = 2 lines.
+// Header: breadcrumb + blank line = 2 lines, plus 1 more when column captions are shown.
 // Footer varies by state: confirming = 2; normal = 2 (one-line help) or 3 (two-line help).
 // Warning adds 1 extra line.
 // When m.height is 0 (no WindowSizeMsg received), returns len(m.services) for backward compat.
@@ -1438,7 +1451,11 @@ func (m Model) svcVisibleCount() int {
 	}
 
 	// headerLines: breadcrumb (1) + titleStyle MarginBottom space-line (1) + gap/indicator (1) = 3
+	// +1 when column captions (Created/Uptime) are displayed
 	headerLines := 3
+	if m.hasStatusColumns() {
+		headerLines++
+	}
 
 	var footerLines int
 	if m.confirming {
@@ -1840,6 +1857,21 @@ func (m Model) viewSelectContainers() string {
 		b.WriteString("\n")
 	} else {
 		b.WriteString("\n\n")
+	}
+
+	// Column captions row (only when status data exists)
+	if maxCreated > 0 || maxUptime > 0 {
+		// Left padding: cursor(2) + checkbox(3) + space(1) + health(1) + space(1) + dot(1) + space(1) + name
+		padding := strings.Repeat(" ", 10+maxName)
+		header := padding
+		if maxCreated > 0 {
+			header += fmt.Sprintf("  %-*s", maxCreated, "Created")
+		}
+		if maxUptime > 0 {
+			header += fmt.Sprintf("  %-*s", maxUptime, "Uptime")
+		}
+		b.WriteString(descStyle.Render(header))
+		b.WriteByte('\n')
 	}
 
 	for i := start; i < end; i++ {

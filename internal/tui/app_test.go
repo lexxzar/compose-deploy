@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"testing"
 
@@ -3517,6 +3518,67 @@ func TestSvcVisibleCount_MinOne(t *testing.T) {
 	}
 }
 
+func TestSvcVisibleCount_WithStatusColumns(t *testing.T) {
+	mc := &mockComposer{}
+	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
+	m.services = []string{"a", "b", "c", "d", "e", "f", "g", "h", "i", "j"}
+	m.width = 120
+	m.height = 10
+	m.svcStatus = map[string]runner.ServiceStatus{
+		"a": {Running: true, Created: "2024-01-15 09:30", Uptime: "3h"},
+	}
+
+	// header=4 (3 + column captions), footer=3 → 10-4-3 = 3
+	got := m.svcVisibleCount()
+	if got != 3 {
+		t.Errorf("svcVisibleCount() with status columns = %d, want 3", got)
+	}
+}
+
+func TestHasStatusColumns(t *testing.T) {
+	mc := &mockComposer{}
+	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
+	m.services = []string{"a"}
+
+	// No status data
+	if m.hasStatusColumns() {
+		t.Error("hasStatusColumns() = true, want false with no status data")
+	}
+
+	// Status with only Running (no Created/Uptime)
+	m.svcStatus = map[string]runner.ServiceStatus{
+		"a": {Running: true},
+	}
+	if m.hasStatusColumns() {
+		t.Error("hasStatusColumns() = true, want false with only Running set")
+	}
+
+	// Status with Created
+	m.svcStatus = map[string]runner.ServiceStatus{
+		"a": {Created: "2024-01-15 09:30"},
+	}
+	if !m.hasStatusColumns() {
+		t.Error("hasStatusColumns() = false, want true with Created set")
+	}
+
+	// Status with Uptime
+	m.svcStatus = map[string]runner.ServiceStatus{
+		"a": {Uptime: "3h"},
+	}
+	if !m.hasStatusColumns() {
+		t.Error("hasStatusColumns() = false, want true with Uptime set")
+	}
+
+	// Status for service NOT in m.services should be ignored
+	m.services = []string{"b"}
+	m.svcStatus = map[string]runner.ServiceStatus{
+		"a": {Created: "2024-01-15 09:30", Uptime: "3h"},
+	}
+	if m.hasStatusColumns() {
+		t.Error("hasStatusColumns() = true, want false when status key not in services")
+	}
+}
+
 func TestFixSvcOffset_CursorBelowWindow(t *testing.T) {
 	mc := &mockComposer{}
 	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
@@ -5387,5 +5449,90 @@ func TestQuitConfirmation_ProgressInProgressIgnoresQ(t *testing.T) {
 	}
 	if cmd != nil {
 		t.Error("pressing q during in-progress operation should not return a command")
+	}
+}
+
+func TestColumnCaptions_ShownWithStatusData(t *testing.T) {
+	mc := &mockComposer{}
+	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
+	m.screen = screenSelectContainers
+	m.services = []string{"web", "api"}
+	m.selected = map[int]bool{}
+	m.svcStatus = map[string]runner.ServiceStatus{
+		"web": {Running: true, Created: "2024-01-15 09:30", Uptime: "3h"},
+		"api": {Running: true, Created: "2024-01-15 09:25", Uptime: "3h"},
+	}
+
+	view := m.viewSelectContainers()
+	if !strings.Contains(view, "Created") {
+		t.Errorf("expected 'Created' caption in view, got:\n%s", view)
+	}
+	if !strings.Contains(view, "Uptime") {
+		t.Errorf("expected 'Uptime' caption in view, got:\n%s", view)
+	}
+}
+
+func TestColumnCaptions_HiddenWithoutStatusData(t *testing.T) {
+	mc := &mockComposer{}
+	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
+	m.screen = screenSelectContainers
+	m.services = []string{"web", "api"}
+	m.selected = map[int]bool{}
+	m.svcStatus = map[string]runner.ServiceStatus{
+		"web": {Running: true},
+		"api": {Running: false},
+	}
+
+	view := m.viewSelectContainers()
+	if strings.Contains(view, "Created") {
+		t.Errorf("unexpected 'Created' caption when no Created data exists, got:\n%s", view)
+	}
+	if strings.Contains(view, "Uptime") {
+		t.Errorf("unexpected 'Uptime' caption when no Uptime data exists, got:\n%s", view)
+	}
+}
+
+func TestColumnCaptions_Alignment(t *testing.T) {
+	mc := &mockComposer{}
+	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
+	m.screen = screenSelectContainers
+	m.services = []string{"web", "api-service"}
+	m.selected = map[int]bool{}
+	m.svcStatus = map[string]runner.ServiceStatus{
+		"web":         {Running: true, Created: "2024-01-15 09:30", Uptime: "3h"},
+		"api-service": {Running: true, Created: "2024-01-15 09:25", Uptime: "5d"},
+	}
+
+	view := m.viewSelectContainers()
+	// Strip ANSI escape sequences for reliable offset comparison
+	ansiRe := regexp.MustCompile(`\x1b\[[0-9;]*m`)
+	clean := ansiRe.ReplaceAllString(view, "")
+	lines := strings.Split(clean, "\n")
+
+	// Find the header line containing "Created" and a data line
+	var headerLine, dataLine string
+	for _, line := range lines {
+		if strings.Contains(line, "Created") && strings.Contains(line, "Uptime") && !strings.Contains(line, "●") {
+			headerLine = line
+		}
+		if strings.Contains(line, "api-service") && strings.Contains(line, "●") {
+			dataLine = line
+		}
+	}
+
+	if headerLine == "" {
+		t.Fatalf("could not find header line in view:\n%s", clean)
+	}
+	if dataLine == "" {
+		t.Fatalf("could not find data line in view:\n%s", clean)
+	}
+
+	// "Created" label and actual created value should start at the same rune offset
+	// (byte offsets differ due to multi-byte ● character in data line)
+	headerCreatedIdx := len([]rune(headerLine[:strings.Index(headerLine, "Created")]))
+	dataCreatedIdx := len([]rune(dataLine[:strings.Index(dataLine, "2024-01-15 09:25")]))
+	if headerCreatedIdx != dataCreatedIdx {
+		t.Errorf("Created label rune offset (%d) != data rune offset (%d)\nheader: %q\ndata:   %q",
+			headerCreatedIdx, dataCreatedIdx, headerLine, dataLine)
 	}
 }
