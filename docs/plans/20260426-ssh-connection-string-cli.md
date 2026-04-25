@@ -242,10 +242,10 @@ default:
 - Modify: `cmd/root.go`
 - Modify: `cmd/deploy_test.go` (or new `cmd/root_test.go` cases)
 
-- [ ] in `cmd/root.go` (near line 171 where `--server` is registered), add `rootCmd.PersistentFlags().StringVarP(&sshTarget, "ssh", "S", "", "ad-hoc SSH connection string [user@]host[:port] (mutually exclusive with --server)")`
-- [ ] declare package-level `var sshTarget string` near existing `var serverName string`
-- [ ] add test case to existing flag-registration table in `cmd/root_test.go`: `{"ssh flag exists", "ssh", "S"}`
-- [ ] run `go test ./cmd/ -count=1` — must pass before next task
+- [x] in `cmd/root.go` (near line 171 where `--server` is registered), add `rootCmd.PersistentFlags().StringVarP(&sshTarget, "ssh", "S", "", "ad-hoc SSH connection string [user@]host[:port] (mutually exclusive with --server)")`
+- [x] declare package-level `var sshTarget string` near existing `var serverName string`
+- [x] add test case to existing flag-registration table in `cmd/root_test.go`: `{"ssh flag exists", "ssh", "S"}`
+- [x] run `go test ./cmd/ -count=1` — must pass before next task
 
 ### Task 5: Wire `--ssh` into `deploy`, `restart`, `stop` (in `cmd/deploy.go`)
 

@@ -18,6 +18,7 @@ var (
 	logDir     string
 	projectDir string
 	serverName string
+	sshTarget  string
 )
 
 func NewRootCmd() *cobra.Command {
@@ -169,6 +170,7 @@ Remote server configuration (~/.cdeploy/servers.yml):
 	rootCmd.PersistentFlags().StringVar(&logDir, "log-dir", "", "log directory (default ~/.cdeploy/logs/)")
 	rootCmd.PersistentFlags().StringVarP(&projectDir, "project-dir", "C", "", "docker compose project directory (default: current directory)")
 	rootCmd.PersistentFlags().StringVarP(&serverName, "server", "s", "", "remote server name from ~/.cdeploy/servers.yml")
+	rootCmd.PersistentFlags().StringVarP(&sshTarget, "ssh", "S", "", "ad-hoc SSH connection string [user@]host[:port] (mutually exclusive with --server)")
 
 	rootCmd.AddCommand(newDeployCmd(), newRestartCmd(), newStopCmd(), newListCmd(), newLogsCmd(), newExecCmd())
 
