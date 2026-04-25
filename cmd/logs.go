@@ -60,8 +60,19 @@ func runLogs(ctx context.Context, service string, follow bool, tail int) error {
 		}
 	}
 
+	if err := checkRemoteMutex(serverName, sshTarget); err != nil {
+		return err
+	}
+
 	var c runner.Composer
-	if serverName != "" {
+	if sshTarget != "" {
+		rc, cleanup, err := resolveSSHRemote(ctx, sshTarget, projectDir, logsNewRemote)
+		if err != nil {
+			return err
+		}
+		defer cleanup()
+		c = rc
+	} else if serverName != "" {
 		cfg, err := config.Load(config.DefaultPath())
 		if err != nil {
 			return fmt.Errorf("loading config: %w", err)

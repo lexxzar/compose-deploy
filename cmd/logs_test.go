@@ -317,6 +317,68 @@ func TestRunLogs_LocalDetectFailure(t *testing.T) {
 	}
 }
 
+func TestRunLogs_SSHAndServerMutex(t *testing.T) {
+	oldServer := serverName
+	oldSSH := sshTarget
+	oldProj := projectDir
+	t.Cleanup(func() {
+		serverName = oldServer
+		sshTarget = oldSSH
+		projectDir = oldProj
+	})
+
+	serverName = "prod"
+	sshTarget = "user@host"
+	projectDir = "/srv/app"
+
+	err := runLogs(context.Background(), "nginx", true, 50)
+	if err == nil {
+		t.Fatal("expected mutex error, got nil")
+	}
+	if !strings.Contains(err.Error(), "mutually exclusive") {
+		t.Errorf("error = %q, want it to contain 'mutually exclusive'", err.Error())
+	}
+}
+
+func TestRunLogs_SSHRequiresProjectDir(t *testing.T) {
+	oldServer := serverName
+	oldSSH := sshTarget
+	oldProj := projectDir
+	t.Cleanup(func() {
+		serverName = oldServer
+		sshTarget = oldSSH
+		projectDir = oldProj
+	})
+
+	serverName = ""
+	sshTarget = "user@host"
+	projectDir = ""
+
+	err := runLogs(context.Background(), "nginx", true, 50)
+	if err == nil {
+		t.Fatal("expected error, got nil")
+	}
+	if !strings.Contains(err.Error(), "requires --project-dir") {
+		t.Errorf("error = %q, want it to contain 'requires --project-dir'", err.Error())
+	}
+}
+
+func TestLogsCmd_SSHFlagInherited(t *testing.T) {
+	root := NewRootCmd()
+
+	cmd, _, err := root.Find([]string{"logs"})
+	if err != nil {
+		t.Fatalf("logs command not found: %v", err)
+	}
+	sshFlag := cmd.InheritedFlags().Lookup("ssh")
+	if sshFlag == nil {
+		t.Error("--ssh persistent flag not inherited by logs command")
+	}
+	if sshFlag != nil && sshFlag.Shorthand != "S" {
+		t.Errorf("--ssh shorthand = %q, want %q", sshFlag.Shorthand, "S")
+	}
+}
+
 func TestRunLogs_WithProjectDir(t *testing.T) {
 	oldHas := logsHasCompose
 	oldNew := logsNewLocal
