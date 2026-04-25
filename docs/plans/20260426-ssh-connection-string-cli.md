@@ -225,16 +225,16 @@ default:
 - Create: `cmd/remote.go`
 - Create: `cmd/remote_test.go`
 
-- [ ] create `cmd/remote.go` with `checkRemoteMutex(serverName, sshTarget string) error` returning `"--ssh and --server are mutually exclusive"` when both non-empty, else nil
-- [ ] add `resolveSSHRemote(ctx, sshTarget, projectDir string, newRemote func(host, projDir string) *compose.RemoteCompose) (*compose.RemoteCompose, func(), error)` per contract in Technical Details
-- [ ] order of operations in `resolveSSHRemote`: validate projectDir non-empty → parse target → call factory → set `SSHExtraArgs` → `Connect` → `Detect` → return `(rc, func(){ rc.Close() }, nil)`
-- [ ] on `Detect` failure, the returned cleanup must still close the connection — return cleanup AND error together, OR call `Close()` internally before returning the error (pick the latter — simpler, matches existing pattern)
-- [ ] test for `checkRemoteMutex`: both empty → nil; only ssh → nil; only server → nil; both set → error containing `"mutually exclusive"`
-- [ ] test for `resolveSSHRemote`: empty `projectDir` → error containing `"requires --project-dir"`
-- [ ] test for `resolveSSHRemote`: malformed ssh target → error wraps parser error, contains `"invalid --ssh value"`
-- [ ] test for `resolveSSHRemote` happy path: pass a stub `newRemote` factory that returns a `RemoteCompose` with `SetTestHooks` configured to no-op `runCmd` (so `Connect`/`Detect` succeed without real ssh). Assert returned `rc.Host == "user@host"`, `rc.ProjectDir == "/srv/app"`, `rc.SSHExtraArgs == ["-p","2222"]`. Assert cleanup is non-nil and calling it doesn't panic.
-- [ ] test for `resolveSSHRemote`: factory stub where `runCmd` returns error on `Connect` → helper returns error containing `"connecting to user@host"` and (since `Connect` failed) cleanup may be nil — pick a contract and document in code comment
-- [ ] run `go test ./cmd/ -count=1 -run "TestCheckRemoteMutex|TestResolveSSHRemote"` — must pass before next task
+- [x] create `cmd/remote.go` with `checkRemoteMutex(serverName, sshTarget string) error` returning `"--ssh and --server are mutually exclusive"` when both non-empty, else nil
+- [x] add `resolveSSHRemote(ctx, sshTarget, projectDir string, newRemote func(host, projDir string) *compose.RemoteCompose) (*compose.RemoteCompose, func(), error)` per contract in Technical Details
+- [x] order of operations in `resolveSSHRemote`: validate projectDir non-empty → parse target → call factory → set `SSHExtraArgs` → `Connect` → `Detect` → return `(rc, func(){ rc.Close() }, nil)`
+- [x] on `Detect` failure, the returned cleanup must still close the connection — return cleanup AND error together, OR call `Close()` internally before returning the error (pick the latter — simpler, matches existing pattern)
+- [x] test for `checkRemoteMutex`: both empty → nil; only ssh → nil; only server → nil; both set → error containing `"mutually exclusive"`
+- [x] test for `resolveSSHRemote`: empty `projectDir` → error containing `"requires --project-dir"`
+- [x] test for `resolveSSHRemote`: malformed ssh target → error wraps parser error, contains `"invalid --ssh value"`
+- [x] test for `resolveSSHRemote` happy path: pass a stub `newRemote` factory that returns a `RemoteCompose` with `SetTestHooks` configured to no-op `runCmd` (so `Connect`/`Detect` succeed without real ssh). Assert returned `rc.Host == "user@host"`, `rc.ProjectDir == "/srv/app"`, `rc.SSHExtraArgs == ["-p","2222"]`. Assert cleanup is non-nil and calling it doesn't panic.
+- [x] test for `resolveSSHRemote`: factory stub where `runCmd` returns error on `Connect` → helper returns error containing `"connecting to user@host"` and (since `Connect` failed) cleanup may be nil — pick a contract and document in code comment
+- [x] run `go test ./cmd/ -count=1 -run "TestCheckRemoteMutex|TestResolveSSHRemote"` — must pass before next task
 
 ### Task 4: Register `--ssh` persistent flag on root
 
