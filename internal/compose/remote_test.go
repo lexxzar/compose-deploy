@@ -1417,6 +1417,414 @@ func TestRemoteExecCommand_DoesNotUseRemoteCommand(t *testing.T) {
 	}
 }
 
+// --- SSHExtraArgs splicing tests ---
+
+// findHostIndex returns the index of the host argument (first arg whose value
+// equals r.Host) in cmd.Args, or -1.
+func findHostIndex(args []string, host string) int {
+	for i, a := range args {
+		if a == host {
+			return i
+		}
+	}
+	return -1
+}
+
+func TestSSHExtraArgs_NilArgvUnchanged_Detect(t *testing.T) {
+	// Regression: Detect with nil SSHExtraArgs must produce the original argv.
+	var capturedPlugin []string
+	r := &RemoteCompose{
+		Host:       "user@example.com",
+		SocketPath: "/tmp/cdeploy-ctrl-abc-99",
+		outputCmd: func(cmd *exec.Cmd) ([]byte, error) {
+			capturedPlugin = append([]string(nil), cmd.Args...)
+			return []byte("ok\n"), nil
+		},
+	}
+	if err := r.Detect(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	want := []string{"ssh", "-S", "/tmp/cdeploy-ctrl-abc-99", "-o", "ControlMaster=no", "user@example.com", "docker compose version"}
+	if len(capturedPlugin) != len(want) {
+		t.Fatalf("Detect (plugin) args = %v, want %v", capturedPlugin, want)
+	}
+	for i, w := range want {
+		if capturedPlugin[i] != w {
+			t.Errorf("Detect (plugin) arg[%d] = %q, want %q", i, capturedPlugin[i], w)
+		}
+	}
+}
+
+func TestSSHExtraArgs_NilArgvUnchanged_DetectStandalone(t *testing.T) {
+	// Force standalone branch by failing the plugin probe.
+	var capturedStandalone []string
+	r := &RemoteCompose{
+		Host:       "user@example.com",
+		SocketPath: "/tmp/cdeploy-ctrl-abc-99",
+		outputCmd: func(cmd *exec.Cmd) ([]byte, error) {
+			remoteCmd := cmd.Args[len(cmd.Args)-1]
+			if remoteCmd == "docker compose version" {
+				return nil, fmt.Errorf("not found")
+			}
+			capturedStandalone = append([]string(nil), cmd.Args...)
+			return []byte("ok\n"), nil
+		},
+	}
+	if err := r.Detect(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	want := []string{"ssh", "-S", "/tmp/cdeploy-ctrl-abc-99", "-o", "ControlMaster=no", "user@example.com", "docker-compose version"}
+	if len(capturedStandalone) != len(want) {
+		t.Fatalf("Detect (standalone) args = %v, want %v", capturedStandalone, want)
+	}
+	for i, w := range want {
+		if capturedStandalone[i] != w {
+			t.Errorf("Detect (standalone) arg[%d] = %q, want %q", i, capturedStandalone[i], w)
+		}
+	}
+}
+
+func TestSSHExtraArgs_NilArgvUnchanged_ConnectCmd(t *testing.T) {
+	r := &RemoteCompose{
+		Host:       "user@example.com",
+		SocketPath: "/tmp/cdeploy-ctrl-abc-99",
+	}
+	cmd := r.ConnectCmd(context.Background())
+	want := []string{"ssh", "-fNM", "-S", "/tmp/cdeploy-ctrl-abc-99", "user@example.com"}
+	if len(cmd.Args) != len(want) {
+		t.Fatalf("ConnectCmd args = %v, want %v", cmd.Args, want)
+	}
+	for i, w := range want {
+		if cmd.Args[i] != w {
+			t.Errorf("ConnectCmd arg[%d] = %q, want %q", i, cmd.Args[i], w)
+		}
+	}
+}
+
+func TestSSHExtraArgs_NilArgvUnchanged_Close(t *testing.T) {
+	var captured []string
+	r := &RemoteCompose{
+		Host:       "user@example.com",
+		SocketPath: "/tmp/cdeploy-ctrl-abc-99",
+		runCmd: func(cmd *exec.Cmd) error {
+			captured = append([]string(nil), cmd.Args...)
+			return nil
+		},
+	}
+	if err := r.Close(); err != nil {
+		t.Fatal(err)
+	}
+	want := []string{"ssh", "-S", "/tmp/cdeploy-ctrl-abc-99", "-O", "exit", "user@example.com"}
+	if len(captured) != len(want) {
+		t.Fatalf("Close args = %v, want %v", captured, want)
+	}
+	for i, w := range want {
+		if captured[i] != w {
+			t.Errorf("Close arg[%d] = %q, want %q", i, captured[i], w)
+		}
+	}
+}
+
+func TestSSHExtraArgs_NilArgvUnchanged_RemoteCommand(t *testing.T) {
+	r := &RemoteCompose{
+		Host:       "user@example.com",
+		ProjectDir: "/app",
+		SocketPath: "/tmp/cdeploy-ctrl-abc-99",
+	}
+	cmd := r.remoteCommand(context.Background(), "stop")
+	// Prefix before remote-cmd: ssh -S <sock> -o ControlMaster=no <host>
+	wantPrefix := []string{"ssh", "-S", "/tmp/cdeploy-ctrl-abc-99", "-o", "ControlMaster=no", "user@example.com"}
+	if len(cmd.Args) != len(wantPrefix)+1 {
+		t.Fatalf("remoteCommand args length = %d, want %d (prefix + 1 remote cmd)", len(cmd.Args), len(wantPrefix)+1)
+	}
+	for i, w := range wantPrefix {
+		if cmd.Args[i] != w {
+			t.Errorf("remoteCommand arg[%d] = %q, want %q", i, cmd.Args[i], w)
+		}
+	}
+}
+
+func TestSSHExtraArgs_NilArgvUnchanged_FindRemoteComposeFile(t *testing.T) {
+	var captured []string
+	r := &RemoteCompose{
+		Host:       "user@example.com",
+		ProjectDir: "/app",
+		SocketPath: "/tmp/cdeploy-ctrl-abc-99",
+		outputCmd: func(cmd *exec.Cmd) ([]byte, error) {
+			captured = append([]string(nil), cmd.Args...)
+			return []byte("compose.yml\n"), nil
+		},
+	}
+	if _, err := r.findRemoteComposeFile(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	wantPrefix := []string{"ssh", "-S", "/tmp/cdeploy-ctrl-abc-99", "-o", "ControlMaster=no", "user@example.com"}
+	if len(captured) != len(wantPrefix)+1 {
+		t.Fatalf("findRemoteComposeFile args length = %d, want %d", len(captured), len(wantPrefix)+1)
+	}
+	for i, w := range wantPrefix {
+		if captured[i] != w {
+			t.Errorf("findRemoteComposeFile arg[%d] = %q, want %q", i, captured[i], w)
+		}
+	}
+}
+
+func TestSSHExtraArgs_NilArgvUnchanged_ConfigFile(t *testing.T) {
+	var capturedCat []string
+	r := &RemoteCompose{
+		Host:       "user@example.com",
+		ProjectDir: "/app",
+		SocketPath: "/tmp/cdeploy-ctrl-abc-99",
+		outputCmd: func(cmd *exec.Cmd) ([]byte, error) {
+			remoteCmd := cmd.Args[len(cmd.Args)-1]
+			if strings.Contains(remoteCmd, "for f in") {
+				return []byte("compose.yml\n"), nil
+			}
+			capturedCat = append([]string(nil), cmd.Args...)
+			return []byte("content"), nil
+		},
+	}
+	if _, err := r.ConfigFile(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	wantPrefix := []string{"ssh", "-S", "/tmp/cdeploy-ctrl-abc-99", "-o", "ControlMaster=no", "user@example.com"}
+	if len(capturedCat) != len(wantPrefix)+1 {
+		t.Fatalf("ConfigFile cat args length = %d, want %d", len(capturedCat), len(wantPrefix)+1)
+	}
+	for i, w := range wantPrefix {
+		if capturedCat[i] != w {
+			t.Errorf("ConfigFile cat arg[%d] = %q, want %q", i, capturedCat[i], w)
+		}
+	}
+}
+
+func TestSSHExtraArgs_NilArgvUnchanged_EditCommand(t *testing.T) {
+	r := &RemoteCompose{
+		Host:       "user@example.com",
+		ProjectDir: "/app",
+		SocketPath: "/tmp/cdeploy-ctrl-abc-99",
+		outputCmd: func(cmd *exec.Cmd) ([]byte, error) {
+			return []byte("compose.yml\n"), nil
+		},
+	}
+	cmd, err := r.EditCommand(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantPrefix := []string{"ssh", "-t", "-S", "/tmp/cdeploy-ctrl-abc-99", "-o", "ControlMaster=no", "user@example.com"}
+	if len(cmd.Args) != len(wantPrefix)+1 {
+		t.Fatalf("EditCommand args length = %d, want %d", len(cmd.Args), len(wantPrefix)+1)
+	}
+	for i, w := range wantPrefix {
+		if cmd.Args[i] != w {
+			t.Errorf("EditCommand arg[%d] = %q, want %q", i, cmd.Args[i], w)
+		}
+	}
+}
+
+func TestSSHExtraArgs_NilArgvUnchanged_ExecCommand(t *testing.T) {
+	r := &RemoteCompose{
+		Host:       "user@example.com",
+		ProjectDir: "/app",
+		SocketPath: "/tmp/cdeploy-ctrl-abc-99",
+	}
+	cmd, err := r.ExecCommand(context.Background(), "web", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantPrefix := []string{"ssh", "-t", "-S", "/tmp/cdeploy-ctrl-abc-99", "-o", "ControlMaster=no", "user@example.com"}
+	if len(cmd.Args) != len(wantPrefix)+1 {
+		t.Fatalf("ExecCommand args length = %d, want %d", len(cmd.Args), len(wantPrefix)+1)
+	}
+	for i, w := range wantPrefix {
+		if cmd.Args[i] != w {
+			t.Errorf("ExecCommand arg[%d] = %q, want %q", i, cmd.Args[i], w)
+		}
+	}
+}
+
+// assertExtraBeforeHost verifies that SSHExtraArgs ([-p 2222]) appear immediately
+// before the host argument in argv.
+func assertExtraBeforeHost(t *testing.T, label string, args []string, host string, extras []string) {
+	t.Helper()
+	hi := findHostIndex(args, host)
+	if hi < 0 {
+		t.Fatalf("%s: host %q not found in args %v", label, host, args)
+	}
+	if hi < len(extras) {
+		t.Fatalf("%s: host index %d too small to fit extras %v in args %v", label, hi, extras, args)
+	}
+	for i, e := range extras {
+		got := args[hi-len(extras)+i]
+		if got != e {
+			t.Errorf("%s: extras arg[%d] = %q, want %q (full args: %v)", label, hi-len(extras)+i, got, e, args)
+		}
+	}
+}
+
+func TestSSHExtraArgs_SplicedBeforeHost_AllSites(t *testing.T) {
+	extras := []string{"-p", "2222"}
+	host := "user@example.com"
+
+	// Detect (plugin)
+	t.Run("Detect plugin", func(t *testing.T) {
+		var captured []string
+		r := &RemoteCompose{
+			Host:         host,
+			SocketPath:   "/tmp/cdeploy-ctrl-abc-99",
+			SSHExtraArgs: extras,
+			outputCmd: func(cmd *exec.Cmd) ([]byte, error) {
+				captured = append([]string(nil), cmd.Args...)
+				return []byte("ok\n"), nil
+			},
+		}
+		if err := r.Detect(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+		assertExtraBeforeHost(t, "Detect plugin", captured, host, extras)
+	})
+
+	// Detect (standalone)
+	t.Run("Detect standalone", func(t *testing.T) {
+		var captured []string
+		r := &RemoteCompose{
+			Host:         host,
+			SocketPath:   "/tmp/cdeploy-ctrl-abc-99",
+			SSHExtraArgs: extras,
+			outputCmd: func(cmd *exec.Cmd) ([]byte, error) {
+				remoteCmd := cmd.Args[len(cmd.Args)-1]
+				if remoteCmd == "docker compose version" {
+					return nil, fmt.Errorf("not found")
+				}
+				captured = append([]string(nil), cmd.Args...)
+				return []byte("ok\n"), nil
+			},
+		}
+		if err := r.Detect(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+		assertExtraBeforeHost(t, "Detect standalone", captured, host, extras)
+	})
+
+	// ConnectCmd
+	t.Run("ConnectCmd", func(t *testing.T) {
+		r := &RemoteCompose{
+			Host:         host,
+			SocketPath:   "/tmp/cdeploy-ctrl-abc-99",
+			SSHExtraArgs: extras,
+		}
+		cmd := r.ConnectCmd(context.Background())
+		assertExtraBeforeHost(t, "ConnectCmd", cmd.Args, host, extras)
+	})
+
+	// Close
+	t.Run("Close", func(t *testing.T) {
+		var captured []string
+		r := &RemoteCompose{
+			Host:         host,
+			SocketPath:   "/tmp/cdeploy-ctrl-abc-99",
+			SSHExtraArgs: extras,
+			runCmd: func(cmd *exec.Cmd) error {
+				captured = append([]string(nil), cmd.Args...)
+				return nil
+			},
+		}
+		if err := r.Close(); err != nil {
+			t.Fatal(err)
+		}
+		assertExtraBeforeHost(t, "Close", captured, host, extras)
+	})
+
+	// remoteCommand
+	t.Run("remoteCommand", func(t *testing.T) {
+		r := &RemoteCompose{
+			Host:         host,
+			ProjectDir:   "/app",
+			SocketPath:   "/tmp/cdeploy-ctrl-abc-99",
+			SSHExtraArgs: extras,
+		}
+		cmd := r.remoteCommand(context.Background(), "stop")
+		assertExtraBeforeHost(t, "remoteCommand", cmd.Args, host, extras)
+	})
+
+	// findRemoteComposeFile
+	t.Run("findRemoteComposeFile", func(t *testing.T) {
+		var captured []string
+		r := &RemoteCompose{
+			Host:         host,
+			ProjectDir:   "/app",
+			SocketPath:   "/tmp/cdeploy-ctrl-abc-99",
+			SSHExtraArgs: extras,
+			outputCmd: func(cmd *exec.Cmd) ([]byte, error) {
+				captured = append([]string(nil), cmd.Args...)
+				return []byte("compose.yml\n"), nil
+			},
+		}
+		if _, err := r.findRemoteComposeFile(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+		assertExtraBeforeHost(t, "findRemoteComposeFile", captured, host, extras)
+	})
+
+	// ConfigFile (cat call)
+	t.Run("ConfigFile cat", func(t *testing.T) {
+		var capturedCat []string
+		r := &RemoteCompose{
+			Host:         host,
+			ProjectDir:   "/app",
+			SocketPath:   "/tmp/cdeploy-ctrl-abc-99",
+			SSHExtraArgs: extras,
+			outputCmd: func(cmd *exec.Cmd) ([]byte, error) {
+				remoteCmd := cmd.Args[len(cmd.Args)-1]
+				if strings.Contains(remoteCmd, "for f in") {
+					// Verify find-call also has extras before host.
+					assertExtraBeforeHost(t, "ConfigFile find", cmd.Args, host, extras)
+					return []byte("compose.yml\n"), nil
+				}
+				capturedCat = append([]string(nil), cmd.Args...)
+				return []byte("content"), nil
+			},
+		}
+		if _, err := r.ConfigFile(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+		assertExtraBeforeHost(t, "ConfigFile cat", capturedCat, host, extras)
+	})
+
+	// EditCommand
+	t.Run("EditCommand", func(t *testing.T) {
+		r := &RemoteCompose{
+			Host:         host,
+			ProjectDir:   "/app",
+			SocketPath:   "/tmp/cdeploy-ctrl-abc-99",
+			SSHExtraArgs: extras,
+			outputCmd: func(cmd *exec.Cmd) ([]byte, error) {
+				return []byte("compose.yml\n"), nil
+			},
+		}
+		cmd, err := r.EditCommand(context.Background())
+		if err != nil {
+			t.Fatal(err)
+		}
+		assertExtraBeforeHost(t, "EditCommand", cmd.Args, host, extras)
+	})
+
+	// ExecCommand
+	t.Run("ExecCommand", func(t *testing.T) {
+		r := &RemoteCompose{
+			Host:         host,
+			ProjectDir:   "/app",
+			SocketPath:   "/tmp/cdeploy-ctrl-abc-99",
+			SSHExtraArgs: extras,
+		}
+		cmd, err := r.ExecCommand(context.Background(), "web", nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		assertExtraBeforeHost(t, "ExecCommand", cmd.Args, host, extras)
+	})
+}
+
 func TestRemoteConfigResolved_ErrorIncludesStderr(t *testing.T) {
 	r := &RemoteCompose{
 		Host:       "user@example.com",

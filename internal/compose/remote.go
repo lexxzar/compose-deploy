@@ -32,6 +32,14 @@ type RemoteCompose struct {
 	SocketPath string
 	Standalone bool // use standalone docker-compose binary on the remote host
 
+	// SSHExtraArgs are extra ssh CLI args spliced immediately before the host
+	// argument in every SSH argv build site (Detect, ConnectCmd, Close,
+	// remoteCommand, findRemoteComposeFile, ConfigFile, EditCommand,
+	// ExecCommand). Used by --ssh ad-hoc connections to pass things like
+	// "-p 2222" without persisting them to ~/.ssh/config. Default nil = no
+	// behavior change.
+	SSHExtraArgs []string
+
 	detected bool // true after Detect() or SetStandalone() has been called
 
 	// testing hooks; nil = use real exec
@@ -67,12 +75,11 @@ func (r *RemoteCompose) Detect(ctx context.Context) error {
 	}
 
 	// Try plugin mode: docker compose version
-	pluginCmd := exec.CommandContext(ctx, "ssh",
-		"-S", r.SocketPath,
-		"-o", "ControlMaster=no",
-		r.Host,
+	pluginArgs := r.sshArgs(
+		[]string{"-S", r.SocketPath, "-o", "ControlMaster=no"},
 		"docker compose version",
 	)
+	pluginCmd := exec.CommandContext(ctx, "ssh", pluginArgs...)
 	var pluginErr error
 	if r.outputCmd != nil {
 		_, pluginErr = r.outputCmd(pluginCmd)
@@ -86,12 +93,11 @@ func (r *RemoteCompose) Detect(ctx context.Context) error {
 	}
 
 	// Try standalone mode: docker-compose version
-	standaloneCmd := exec.CommandContext(ctx, "ssh",
-		"-S", r.SocketPath,
-		"-o", "ControlMaster=no",
-		r.Host,
+	standaloneArgs := r.sshArgs(
+		[]string{"-S", r.SocketPath, "-o", "ControlMaster=no"},
 		"docker-compose version",
 	)
+	standaloneCmd := exec.CommandContext(ctx, "ssh", standaloneArgs...)
 	var standaloneErr error
 	if r.outputCmd != nil {
 		_, standaloneErr = r.outputCmd(standaloneCmd)
@@ -118,15 +124,24 @@ func shellEscape(arg string) string {
 	return "'" + strings.ReplaceAll(arg, "'", "'\\''") + "'"
 }
 
+// sshArgs builds the ssh argv: prefix + SSHExtraArgs + host + suffix.
+// SSHExtraArgs is spliced immediately before the host argument so options
+// (like -p 2222) precede the destination, matching ssh's CLI expectations.
+func (r *RemoteCompose) sshArgs(prefix []string, suffix ...string) []string {
+	out := make([]string, 0, len(prefix)+len(r.SSHExtraArgs)+1+len(suffix))
+	out = append(out, prefix...)
+	out = append(out, r.SSHExtraArgs...)
+	out = append(out, r.Host)
+	out = append(out, suffix...)
+	return out
+}
+
 // ConnectCmd returns the SSH ControlMaster connect command without running it.
 // The TUI uses this with tea.ExecProcess to give SSH full terminal access for
 // password prompts.
 func (r *RemoteCompose) ConnectCmd(ctx context.Context) *exec.Cmd {
-	return exec.CommandContext(ctx, "ssh",
-		"-fNM",
-		"-S", r.SocketPath,
-		r.Host,
-	)
+	args := r.sshArgs([]string{"-fNM", "-S", r.SocketPath})
+	return exec.CommandContext(ctx, "ssh", args...)
 }
 
 // Connect establishes the ControlMaster connection by running ConnectCmd.
@@ -146,11 +161,8 @@ func (r *RemoteCompose) Connect(ctx context.Context) error {
 func (r *RemoteCompose) Close() error {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	cmd := exec.CommandContext(ctx, "ssh",
-		"-S", r.SocketPath,
-		"-O", "exit",
-		r.Host,
-	)
+	args := r.sshArgs([]string{"-S", r.SocketPath, "-O", "exit"})
+	cmd := exec.CommandContext(ctx, "ssh", args...)
 	if r.runCmd != nil {
 		return r.runCmd(cmd)
 	}
@@ -177,12 +189,11 @@ func (r *RemoteCompose) remoteCommand(ctx context.Context, args ...string) *exec
 		remoteCmd = fmt.Sprintf("cd %s && %s", shellEscape(r.ProjectDir), remoteCmd)
 	}
 
-	return exec.CommandContext(ctx, "ssh",
-		"-S", r.SocketPath,
-		"-o", "ControlMaster=no",
-		r.Host,
+	sshArgv := r.sshArgs(
+		[]string{"-S", r.SocketPath, "-o", "ControlMaster=no"},
 		remoteCmd,
 	)
+	return exec.CommandContext(ctx, "ssh", sshArgv...)
 }
 
 func (r *RemoteCompose) run(ctx context.Context, w io.Writer, args ...string) error {
@@ -291,12 +302,11 @@ func (r *RemoteCompose) findRemoteComposeFile(ctx context.Context) (string, erro
 		)
 	}
 
-	cmd := exec.CommandContext(ctx, "ssh",
-		"-S", r.SocketPath,
-		"-o", "ControlMaster=no",
-		r.Host,
+	sshArgv := r.sshArgs(
+		[]string{"-S", r.SocketPath, "-o", "ControlMaster=no"},
 		testExpr,
 	)
+	cmd := exec.CommandContext(ctx, "ssh", sshArgv...)
 	var out []byte
 	var err error
 	if r.outputCmd != nil {
@@ -325,12 +335,11 @@ func (r *RemoteCompose) ConfigFile(ctx context.Context) ([]byte, error) {
 		filePath = r.ProjectDir + "/" + name
 	}
 
-	cmd := exec.CommandContext(ctx, "ssh",
-		"-S", r.SocketPath,
-		"-o", "ControlMaster=no",
-		r.Host,
+	sshArgv := r.sshArgs(
+		[]string{"-S", r.SocketPath, "-o", "ControlMaster=no"},
 		"cat "+shellEscape(filePath),
 	)
+	cmd := exec.CommandContext(ctx, "ssh", sshArgv...)
 	var out []byte
 	if r.outputCmd != nil {
 		out, err = r.outputCmd(cmd)
@@ -375,13 +384,11 @@ func (r *RemoteCompose) EditCommand(ctx context.Context) (*exec.Cmd, error) {
 		remoteCmd = fmt.Sprintf("${EDITOR:-vi} %s", shellEscape(name))
 	}
 
-	return exec.CommandContext(ctx, "ssh",
-		"-t",
-		"-S", r.SocketPath,
-		"-o", "ControlMaster=no",
-		r.Host,
+	sshArgv := r.sshArgs(
+		[]string{"-t", "-S", r.SocketPath, "-o", "ControlMaster=no"},
 		remoteCmd,
-	), nil
+	)
+	return exec.CommandContext(ctx, "ssh", sshArgv...), nil
 }
 
 // ExecCommand returns an exec.Cmd that runs `docker compose exec <service> <command...>`
@@ -413,13 +420,11 @@ func (r *RemoteCompose) ExecCommand(ctx context.Context, service string, command
 		remoteCmd = fmt.Sprintf("cd %s && %s", shellEscape(r.ProjectDir), remoteCmd)
 	}
 
-	return exec.CommandContext(ctx, "ssh",
-		"-t",
-		"-S", r.SocketPath,
-		"-o", "ControlMaster=no",
-		r.Host,
+	sshArgv := r.sshArgs(
+		[]string{"-t", "-S", r.SocketPath, "-o", "ControlMaster=no"},
 		remoteCmd,
-	), nil
+	)
+	return exec.CommandContext(ctx, "ssh", sshArgv...), nil
 }
 
 // ValidateConfig runs `docker compose config --quiet` on the remote host and returns

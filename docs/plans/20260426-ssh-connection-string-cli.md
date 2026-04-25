@@ -204,8 +204,8 @@ default:
 - Modify: `internal/compose/remote.go`
 - Modify: `internal/compose/remote_test.go`
 
-- [ ] add `SSHExtraArgs []string` field to `RemoteCompose` struct (with comment: extra ssh CLI args spliced immediately before host)
-- [ ] splice `r.SSHExtraArgs...` immediately before the host argument in EVERY SSH argv build site. Confirmed sites in `internal/compose/remote.go` (verified by grep for `exec.CommandContext(ctx, "ssh"`):
+- [x] add `SSHExtraArgs []string` field to `RemoteCompose` struct (with comment: extra ssh CLI args spliced immediately before host)
+- [x] splice `r.SSHExtraArgs...` immediately before the host argument in EVERY SSH argv build site. Confirmed sites in `internal/compose/remote.go` (verified by grep for `exec.CommandContext(ctx, "ssh"`):
   - line 70: `Detect` plugin probe
   - line 89: `Detect` standalone probe
   - line 125: `ConnectCmd`
@@ -215,9 +215,9 @@ default:
   - line 328: `ConfigFile`
   - line 378: `EditCommand`
   - line 416: `ExecCommand`
-- [ ] regression test: with nil `SSHExtraArgs`, existing argv shape is unchanged for each direct site (Detect plugin, Detect standalone, ConnectCmd, Close, remoteCommand, findRemoteComposeFile, ConfigFile, EditCommand, ExecCommand). Use existing `SetTestHooks` capture pattern; assert exact argv slices.
-- [ ] new test: `SSHExtraArgs = []string{"-p","2222"}` → argv contains `-p 2222` immediately before host in each of the 9 sites above
-- [ ] run `go test ./internal/compose/ -count=1` — must pass before next task
+- [x] regression test: with nil `SSHExtraArgs`, existing argv shape is unchanged for each direct site (Detect plugin, Detect standalone, ConnectCmd, Close, remoteCommand, findRemoteComposeFile, ConfigFile, EditCommand, ExecCommand). Use existing `SetTestHooks` capture pattern; assert exact argv slices.
+- [x] new test: `SSHExtraArgs = []string{"-p","2222"}` → argv contains `-p 2222` immediately before host in each of the 9 sites above
+- [x] run `go test ./internal/compose/ -count=1` — must pass before next task
 
 ### Task 3: Add `resolveSSHRemote` and `checkRemoteMutex` helpers
 
