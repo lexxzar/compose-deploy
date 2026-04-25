@@ -69,6 +69,27 @@ func runExec(ctx context.Context, service string, command []string) error {
 		}
 	}
 
+	if err := checkRemoteMutex(serverName, sshTarget); err != nil {
+		return err
+	}
+
+	if sshTarget != "" {
+		rc, cleanup, err := resolveSSHRemote(ctx, sshTarget, projectDir, execNewRemote)
+		if err != nil {
+			return err
+		}
+		defer cleanup()
+
+		cmd, err := rc.ExecCommand(ctx, service, command)
+		if err != nil {
+			return fmt.Errorf("building exec command: %w", err)
+		}
+		cmd.Stdin = os.Stdin
+		cmd.Stdout = os.Stdout
+		cmd.Stderr = os.Stderr
+		return runInteractiveExec(cmd)
+	}
+
 	if serverName != "" {
 		cfg, err := config.Load(config.DefaultPath())
 		if err != nil {

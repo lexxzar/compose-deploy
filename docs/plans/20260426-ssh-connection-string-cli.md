@@ -269,11 +269,11 @@ default:
 - Modify: `cmd/exec.go`
 - Modify: `cmd/exec_test.go`
 
-- [ ] mirror Task 5: add `checkRemoteMutex` at top, add `sshTarget != ""` branch above existing `serverName != ""` block, pass `execNewRemote` as the factory
-- [ ] add test: exec with `--ssh` and `--server` together returns mutex error
-- [ ] add test: exec with `--ssh` but no `-C` returns "requires --project-dir" error
-- [ ] add test: persistent `--ssh` flag is inherited by exec subcommand
-- [ ] run `go test ./cmd/ -count=1 -run TestExec` — must pass before next task
+- [x] mirror Task 5: add `checkRemoteMutex` at top, add `sshTarget != ""` branch above existing `serverName != ""` block, pass `execNewRemote` as the factory
+- [x] add test: exec with `--ssh` and `--server` together returns mutex error
+- [x] add test: exec with `--ssh` but no `-C` returns "requires --project-dir" error
+- [x] add test: persistent `--ssh` flag is inherited by exec subcommand
+- [x] run `go test ./cmd/ -count=1 -run TestExec` — must pass before next task
 
 ### Task 7: Wire `--ssh` into `cmd/logs.go`
 
