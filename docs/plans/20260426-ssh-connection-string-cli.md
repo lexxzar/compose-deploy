@@ -305,10 +305,10 @@ default:
 - Modify: `README.md`
 - Modify: `CLAUDE.md`
 
-- [ ] in README.md, document the `--ssh` flag in the CLI reference section: format `[user@]host[:port]`, mutually exclusive with `--server`, requires `--project-dir`, examples for each subcommand
-- [ ] in README.md, add a brief "CI usage" note: requires passwordless SSH auth (configure via `~/.ssh/config` or `ssh-agent`); host-key verification still applies
-- [ ] in CLAUDE.md, add a paragraph under the Remote SSH section describing `-S` as the ad-hoc complement to config-based `-s`, including the `SSHExtraArgs` mechanism in `RemoteCompose` and the `resolveSSHRemote`/`checkRemoteMutex` helpers in `cmd/remote.go`
-- [ ] run `go test ./... -count=1` — full suite must pass
+- [x] in README.md, document the `--ssh` flag in the CLI reference section: format `[user@]host[:port]`, mutually exclusive with `--server`, requires `--project-dir`, examples for each subcommand
+- [x] in README.md, add a brief "CI usage" note: requires passwordless SSH auth (configure via `~/.ssh/config` or `ssh-agent`); host-key verification still applies
+- [x] in CLAUDE.md, add a paragraph under the Remote SSH section describing `-S` as the ad-hoc complement to config-based `-s`, including the `SSHExtraArgs` mechanism in `RemoteCompose` and the `resolveSSHRemote`/`checkRemoteMutex` helpers in `cmd/remote.go`
+- [x] run `go test ./... -count=1` — full suite must pass
 
 ### Task 10: Verify acceptance criteria
 
