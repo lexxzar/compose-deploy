@@ -124,13 +124,19 @@ func shellEscape(arg string) string {
 	return "'" + strings.ReplaceAll(arg, "'", "'\\''") + "'"
 }
 
-// sshArgs builds the ssh argv: prefix + SSHExtraArgs + host + suffix.
+// sshArgs builds the ssh argv: prefix + SSHExtraArgs + "--" + host + suffix.
 // SSHExtraArgs is spliced immediately before the host argument so options
 // (like -p 2222) precede the destination, matching ssh's CLI expectations.
+// A literal `--` separator is inserted between options and the destination
+// so that ssh interprets the host argument positionally even if it (or a
+// future caller) somehow starts with a `-`. This is defense-in-depth on top
+// of `config.ParseSSHTarget`, which already rejects user/host values
+// starting with `-` to prevent ssh option injection.
 func (r *RemoteCompose) sshArgs(prefix []string, suffix ...string) []string {
-	out := make([]string, 0, len(prefix)+len(r.SSHExtraArgs)+1+len(suffix))
+	out := make([]string, 0, len(prefix)+len(r.SSHExtraArgs)+2+len(suffix))
 	out = append(out, prefix...)
 	out = append(out, r.SSHExtraArgs...)
+	out = append(out, "--")
 	out = append(out, r.Host)
 	out = append(out, suffix...)
 	return out

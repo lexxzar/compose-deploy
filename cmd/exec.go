@@ -8,7 +8,6 @@ import (
 	"os/signal"
 
 	"github.com/lexxzar/compose-deploy/internal/compose"
-	"github.com/lexxzar/compose-deploy/internal/config"
 	"github.com/spf13/cobra"
 )
 
@@ -59,86 +58,53 @@ func newExecCmd() *cobra.Command {
 	return cmd
 }
 
-func runExec(ctx context.Context, service string, command []string) error {
-	dir := projectDir
-	if dir == "" {
-		var err error
-		dir, err = os.Getwd()
-		if err != nil {
-			return fmt.Errorf("getting current directory: %w", err)
-		}
-	}
+// execCommander is the minimal interface for building an exec command for
+// either a local or remote composer.
+type execCommander interface {
+	ExecCommand(ctx context.Context, service string, command []string) (*exec.Cmd, error)
+}
 
+func runExec(ctx context.Context, service string, command []string) error {
 	if err := checkRemoteMutex(serverName, sshTarget); err != nil {
 		return err
 	}
 
-	if sshTarget != "" {
+	var c execCommander
+	switch {
+	case sshTarget != "":
 		rc, cleanup, err := resolveSSHRemote(ctx, sshTarget, projectDir, execNewRemote)
 		if err != nil {
 			return err
 		}
 		defer cleanup()
-
-		cmd, err := rc.ExecCommand(ctx, service, command)
-		if err != nil {
-			return fmt.Errorf("building exec command: %w", err)
-		}
-		cmd.Stdin = os.Stdin
-		cmd.Stdout = os.Stdout
-		cmd.Stderr = os.Stderr
-		return runInteractiveExec(cmd)
-	}
-
-	if serverName != "" {
-		cfg, err := config.Load(config.DefaultPath())
-		if err != nil {
-			return fmt.Errorf("loading config: %w", err)
-		}
-		if err := cfg.Validate(); err != nil {
-			return err
-		}
-		server, err := cfg.FindServer(serverName)
+		c = rc
+	case serverName != "":
+		rc, cleanup, err := resolveServerRemote(ctx, serverName, projectDir, execNewRemote)
 		if err != nil {
 			return err
 		}
-
-		projDir := server.ProjectDir
-		if projectDir != "" {
-			projDir = projectDir
+		defer cleanup()
+		c = rc
+	default:
+		dir := projectDir
+		if dir == "" {
+			var err error
+			dir, err = os.Getwd()
+			if err != nil {
+				return fmt.Errorf("getting current directory: %w", err)
+			}
 		}
-		if projDir == "" {
-			return fmt.Errorf("--server %q requires --project-dir or project_dir in config", serverName)
+		if !execHasCompose(dir) {
+			return fmt.Errorf("no compose file found in %s (use -s to specify a remote server)", dir)
 		}
-
-		rc := execNewRemote(server.Host, projDir)
-		if err := rc.Connect(ctx); err != nil {
-			return fmt.Errorf("connecting to %s: %w", serverName, err)
-		}
-		defer rc.Close()
-		if err := rc.Detect(ctx); err != nil {
+		lc := execNewLocal(dir)
+		if err := lc.Detect(ctx); err != nil {
 			return err
 		}
-
-		cmd, err := rc.ExecCommand(ctx, service, command)
-		if err != nil {
-			return fmt.Errorf("building exec command: %w", err)
-		}
-		cmd.Stdin = os.Stdin
-		cmd.Stdout = os.Stdout
-		cmd.Stderr = os.Stderr
-		return runInteractiveExec(cmd)
+		c = lc
 	}
 
-	if !execHasCompose(dir) {
-		return fmt.Errorf("no compose file found in %s (use -s to specify a remote server)", dir)
-	}
-	lc := execNewLocal(dir)
-	if err := lc.Detect(ctx); err != nil {
-		return err
-	}
-
-	cmd, err := lc.ExecCommand(ctx, service, command)
+	cmd, err := c.ExecCommand(ctx, service, command)
 	if err != nil {
 		return fmt.Errorf("building exec command: %w", err)
 	}

@@ -136,6 +136,8 @@ The connection string format is `[user@]host[:port]`. The `-S`/`--ssh` flag is *
 
 ## Remote Server Configuration
 
+> Need a one-off connection without editing the config file? See [Ad-hoc SSH connection (`-S`/`--ssh`)](#ad-hoc-ssh-connection--s--ssh) above for a CLI-only alternative aimed at scripts and CI.
+
 Define remote servers in `~/.cdeploy/servers.yml`:
 
 ```yaml

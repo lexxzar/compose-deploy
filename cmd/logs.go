@@ -7,7 +7,6 @@ import (
 	"os/signal"
 
 	"github.com/lexxzar/compose-deploy/internal/compose"
-	"github.com/lexxzar/compose-deploy/internal/config"
 	"github.com/lexxzar/compose-deploy/internal/runner"
 	"github.com/spf13/cobra"
 )
@@ -51,58 +50,35 @@ func newLogsCmd() *cobra.Command {
 }
 
 func runLogs(ctx context.Context, service string, follow bool, tail int) error {
-	dir := projectDir
-	if dir == "" {
-		var err error
-		dir, err = os.Getwd()
-		if err != nil {
-			return fmt.Errorf("getting current directory: %w", err)
-		}
-	}
-
 	if err := checkRemoteMutex(serverName, sshTarget); err != nil {
 		return err
 	}
 
 	var c runner.Composer
-	if sshTarget != "" {
+	switch {
+	case sshTarget != "":
 		rc, cleanup, err := resolveSSHRemote(ctx, sshTarget, projectDir, logsNewRemote)
 		if err != nil {
 			return err
 		}
 		defer cleanup()
 		c = rc
-	} else if serverName != "" {
-		cfg, err := config.Load(config.DefaultPath())
-		if err != nil {
-			return fmt.Errorf("loading config: %w", err)
-		}
-		if err := cfg.Validate(); err != nil {
-			return err
-		}
-		server, err := cfg.FindServer(serverName)
+	case serverName != "":
+		rc, cleanup, err := resolveServerRemote(ctx, serverName, projectDir, logsNewRemote)
 		if err != nil {
 			return err
 		}
-
-		projDir := server.ProjectDir
-		if projectDir != "" {
-			projDir = projectDir
-		}
-		if projDir == "" {
-			return fmt.Errorf("--server %q requires --project-dir or project_dir in config", serverName)
-		}
-
-		rc := logsNewRemote(server.Host, projDir)
-		if err := rc.Connect(ctx); err != nil {
-			return fmt.Errorf("connecting to %s: %w", serverName, err)
-		}
-		defer rc.Close()
-		if err := rc.Detect(ctx); err != nil {
-			return err
-		}
+		defer cleanup()
 		c = rc
-	} else {
+	default:
+		dir := projectDir
+		if dir == "" {
+			var err error
+			dir, err = os.Getwd()
+			if err != nil {
+				return fmt.Errorf("getting current directory: %w", err)
+			}
+		}
 		if !logsHasCompose(dir) {
 			return fmt.Errorf("no compose file found in %s (use -s to specify a remote server)", dir)
 		}

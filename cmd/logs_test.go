@@ -363,6 +363,66 @@ func TestRunLogs_SSHRequiresProjectDir(t *testing.T) {
 	}
 }
 
+func TestRunLogs_SSHHappyPath(t *testing.T) {
+	oldServer := serverName
+	oldSSH := sshTarget
+	oldProj := projectDir
+	oldNewRemote := logsNewRemote
+	t.Cleanup(func() {
+		serverName = oldServer
+		sshTarget = oldSSH
+		projectDir = oldProj
+		logsNewRemote = oldNewRemote
+	})
+
+	serverName = ""
+	sshTarget = "deploy@host:2222"
+	projectDir = "/srv/app"
+
+	var capturedSSHArgs []string
+	var logsCalled bool
+	logsNewRemote = func(host, projDir string) *compose.RemoteCompose {
+		rc := compose.NewRemote(host, projDir)
+		rc.SetTestHooks(
+			func(cmd *exec.Cmd) error {
+				if cmd.Args[0] == "ssh" && len(capturedSSHArgs) == 0 {
+					// First ssh call after Detect probe is the connect (-fNM).
+					// Capture the args from any docker compose remote call to
+					// verify port splicing.
+				}
+				args := strings.Join(cmd.Args, " ")
+				if strings.Contains(args, "'logs'") {
+					logsCalled = true
+					capturedSSHArgs = append([]string(nil), cmd.Args...)
+				}
+				return nil
+			},
+			func(cmd *exec.Cmd) ([]byte, error) {
+				return []byte("Docker Compose version v2.24.0\n"), nil
+			},
+		)
+		return rc
+	}
+
+	err := runLogs(context.Background(), "nginx", true, 50)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !logsCalled {
+		t.Fatal("logs subcommand was not invoked on remote")
+	}
+
+	// Verify -p 2222 appears in SSH argv (port splicing) and that the
+	// remote command contains "logs".
+	joined := strings.Join(capturedSSHArgs, " ")
+	if !strings.Contains(joined, "-p 2222") {
+		t.Errorf("ssh argv = %v, want to contain '-p 2222'", capturedSSHArgs)
+	}
+	if !strings.Contains(joined, "'logs'") {
+		t.Errorf("ssh argv = %v, want to contain 'logs' subcommand", capturedSSHArgs)
+	}
+}
+
 func TestLogsCmd_SSHFlagInherited(t *testing.T) {
 	root := NewRootCmd()
 

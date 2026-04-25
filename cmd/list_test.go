@@ -954,17 +954,17 @@ func TestPrintMultiProject_JSON(t *testing.T) {
 }
 
 func TestRunList_LocalSingleProject(t *testing.T) {
-	oldHas := hasLocalCompose
-	oldNew := newLocalComposer
+	oldHas := listHasCompose
+	oldNew := listNewLocal
 	oldProj := projectDir
 	t.Cleanup(func() {
-		hasLocalCompose = oldHas
-		newLocalComposer = oldNew
+		listHasCompose = oldHas
+		listNewLocal = oldNew
 		projectDir = oldProj
 	})
 
-	hasLocalCompose = func(dir string) bool { return true }
-	newLocalComposer = func(dir string) *compose.Compose {
+	listHasCompose = func(dir string) bool { return true }
+	listNewLocal = func(dir string) *compose.Compose {
 		c := compose.New(dir)
 		c.SetTestHooks(
 			nil,
@@ -999,18 +999,18 @@ func TestRunList_LocalSingleProject(t *testing.T) {
 }
 
 func TestRunList_LocalDiscoveryFromComposeDir(t *testing.T) {
-	oldHas := hasLocalCompose
-	oldNew := newLocalComposer
+	oldHas := listHasCompose
+	oldNew := listNewLocal
 	oldProj := projectDir
 	t.Cleanup(func() {
-		hasLocalCompose = oldHas
-		newLocalComposer = oldNew
+		listHasCompose = oldHas
+		listNewLocal = oldNew
 		projectDir = oldProj
 	})
 
 	// CWD has a compose file but -C is NOT given → should discover all projects
-	hasLocalCompose = func(dir string) bool { return true }
-	newLocalComposer = func(dir string) *compose.Compose {
+	listHasCompose = func(dir string) bool { return true }
+	listNewLocal = func(dir string) *compose.Compose {
 		c := compose.New(dir)
 		c.SetTestHooks(
 			nil,
@@ -1049,19 +1049,19 @@ func TestRunList_LocalDiscoveryFromComposeDir(t *testing.T) {
 }
 
 func TestRunList_LocalMultiProject(t *testing.T) {
-	oldHas := hasLocalCompose
-	oldNew := newLocalComposer
+	oldHas := listHasCompose
+	oldNew := listNewLocal
 	oldProj := projectDir
 	t.Cleanup(func() {
-		hasLocalCompose = oldHas
-		newLocalComposer = oldNew
+		listHasCompose = oldHas
+		listNewLocal = oldNew
 		projectDir = oldProj
 	})
 
-	hasLocalCompose = func(dir string) bool { return false }
+	listHasCompose = func(dir string) bool { return false }
 
 	// Mock responses differ based on dir in the outputCmd
-	newLocalComposer = func(dir string) *compose.Compose {
+	listNewLocal = func(dir string) *compose.Compose {
 		c := compose.New(dir)
 		c.SetTestHooks(
 			nil,
@@ -1109,17 +1109,17 @@ func TestRunList_LocalMultiProject(t *testing.T) {
 }
 
 func TestRunList_LocalMultiProject_JSON(t *testing.T) {
-	oldHas := hasLocalCompose
-	oldNew := newLocalComposer
+	oldHas := listHasCompose
+	oldNew := listNewLocal
 	oldProj := projectDir
 	t.Cleanup(func() {
-		hasLocalCompose = oldHas
-		newLocalComposer = oldNew
+		listHasCompose = oldHas
+		listNewLocal = oldNew
 		projectDir = oldProj
 	})
 
-	hasLocalCompose = func(dir string) bool { return false }
-	newLocalComposer = func(dir string) *compose.Compose {
+	listHasCompose = func(dir string) bool { return false }
+	listNewLocal = func(dir string) *compose.Compose {
 		c := compose.New(dir)
 		c.SetTestHooks(
 			nil,
@@ -1161,17 +1161,17 @@ func TestRunList_LocalMultiProject_JSON(t *testing.T) {
 }
 
 func TestRunList_LocalListProjectsError(t *testing.T) {
-	oldHas := hasLocalCompose
-	oldNew := newLocalComposer
+	oldHas := listHasCompose
+	oldNew := listNewLocal
 	oldProj := projectDir
 	t.Cleanup(func() {
-		hasLocalCompose = oldHas
-		newLocalComposer = oldNew
+		listHasCompose = oldHas
+		listNewLocal = oldNew
 		projectDir = oldProj
 	})
 
-	hasLocalCompose = func(dir string) bool { return false }
-	newLocalComposer = func(dir string) *compose.Compose {
+	listHasCompose = func(dir string) bool { return false }
+	listNewLocal = func(dir string) *compose.Compose {
 		c := compose.New(dir)
 		c.SetTestHooks(
 			nil,
@@ -1197,17 +1197,17 @@ func TestRunList_LocalListProjectsError(t *testing.T) {
 }
 
 func TestRunList_LocalNoProjects(t *testing.T) {
-	oldHas := hasLocalCompose
-	oldNew := newLocalComposer
+	oldHas := listHasCompose
+	oldNew := listNewLocal
 	oldProj := projectDir
 	t.Cleanup(func() {
-		hasLocalCompose = oldHas
-		newLocalComposer = oldNew
+		listHasCompose = oldHas
+		listNewLocal = oldNew
 		projectDir = oldProj
 	})
 
-	hasLocalCompose = func(dir string) bool { return false }
-	newLocalComposer = func(dir string) *compose.Compose {
+	listHasCompose = func(dir string) bool { return false }
+	listNewLocal = func(dir string) *compose.Compose {
 		c := compose.New(dir)
 		c.SetTestHooks(
 			nil,
@@ -1233,19 +1233,19 @@ func TestRunList_LocalNoProjects(t *testing.T) {
 }
 
 func TestRunList_LocalDetectFailure(t *testing.T) {
-	oldHas := hasLocalCompose
-	oldNew := newLocalComposer
+	oldHas := listHasCompose
+	oldNew := listNewLocal
 	oldProj := projectDir
 	oldServer := serverName
 	t.Cleanup(func() {
-		hasLocalCompose = oldHas
-		newLocalComposer = oldNew
+		listHasCompose = oldHas
+		listNewLocal = oldNew
 		projectDir = oldProj
 		serverName = oldServer
 	})
 
-	hasLocalCompose = func(dir string) bool { return true }
-	newLocalComposer = func(dir string) *compose.Compose {
+	listHasCompose = func(dir string) bool { return true }
+	listNewLocal = func(dir string) *compose.Compose {
 		c := compose.New(dir)
 		c.SetTestHooks(
 			nil,
@@ -1268,19 +1268,19 @@ func TestRunList_LocalDetectFailure(t *testing.T) {
 }
 
 func TestRunList_LocalMultiProjectDetectFailure(t *testing.T) {
-	oldHas := hasLocalCompose
-	oldNew := newLocalComposer
+	oldHas := listHasCompose
+	oldNew := listNewLocal
 	oldProj := projectDir
 	oldServer := serverName
 	t.Cleanup(func() {
-		hasLocalCompose = oldHas
-		newLocalComposer = oldNew
+		listHasCompose = oldHas
+		listNewLocal = oldNew
 		projectDir = oldProj
 		serverName = oldServer
 	})
 
-	hasLocalCompose = func(dir string) bool { return false }
-	newLocalComposer = func(dir string) *compose.Compose {
+	listHasCompose = func(dir string) bool { return false }
+	listNewLocal = func(dir string) *compose.Compose {
 		c := compose.New(dir)
 		c.SetTestHooks(
 			nil,
@@ -1319,18 +1319,18 @@ func TestRunList_ServerSingleProject(t *testing.T) {
 
 	oldServer := serverName
 	oldProj := projectDir
-	oldNewRemote := newRemote
+	oldNewRemote := listNewRemote
 	t.Cleanup(func() {
 		serverName = oldServer
 		projectDir = oldProj
-		newRemote = oldNewRemote
+		listNewRemote = oldNewRemote
 	})
 
 	serverName = "test-srv"
 	projectDir = "/explicit/project"
 
 	// Create a RemoteCompose with hooks so Connect/Close/Detect succeed and ListServices/ContainerStatus work
-	newRemote = func(host, projDir string) *compose.RemoteCompose {
+	listNewRemote = func(host, projDir string) *compose.RemoteCompose {
 		rc := oldNewRemote(host, projDir)
 		rc.SetTestHooks(
 			func(cmd *exec.Cmd) error { return nil }, // runCmd
@@ -1382,17 +1382,17 @@ func TestRunList_ServerMultiProject(t *testing.T) {
 
 	oldServer := serverName
 	oldProj := projectDir
-	oldNewRemote := newRemote
+	oldNewRemote := listNewRemote
 	t.Cleanup(func() {
 		serverName = oldServer
 		projectDir = oldProj
-		newRemote = oldNewRemote
+		listNewRemote = oldNewRemote
 	})
 
 	serverName = "test-srv"
 	projectDir = "" // no explicit -C → multi-project discovery
 
-	newRemote = func(host, projDir string) *compose.RemoteCompose {
+	listNewRemote = func(host, projDir string) *compose.RemoteCompose {
 		rc := oldNewRemote(host, projDir)
 		rc.SetTestHooks(
 			func(cmd *exec.Cmd) error { return nil },
@@ -1453,17 +1453,17 @@ func TestListCmd_RemoteIgnoresServerProjectDir(t *testing.T) {
 	t.Cleanup(func() { projectDir = oldProj })
 
 	var capturedProjDir string
-	oldNewRemote := newRemote
-	newRemote = func(host, projDir string) *compose.RemoteCompose {
+	oldNewRemote := listNewRemote
+	listNewRemote = func(host, projDir string) *compose.RemoteCompose {
 		capturedProjDir = projDir
 		return oldNewRemote(host, projDir)
 	}
-	t.Cleanup(func() { newRemote = oldNewRemote })
+	t.Cleanup(func() { listNewRemote = oldNewRemote })
 
 	_ = runList(context.Background(), false)
 
 	if capturedProjDir != "" {
-		t.Errorf("newRemote received projDir = %q, want empty (server.ProjectDir should be ignored)", capturedProjDir)
+		t.Errorf("listNewRemote received projDir = %q, want empty (server.ProjectDir should be ignored)", capturedProjDir)
 	}
 }
 
@@ -1510,6 +1510,60 @@ func TestRunList_SSHRequiresProjectDir(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "requires --project-dir") {
 		t.Errorf("error = %q, want it to contain 'requires --project-dir'", err.Error())
+	}
+}
+
+func TestRunList_SSHHappyPath(t *testing.T) {
+	oldServer := serverName
+	oldSSH := sshTarget
+	oldProj := projectDir
+	oldNewRemote := listNewRemote
+	t.Cleanup(func() {
+		serverName = oldServer
+		sshTarget = oldSSH
+		projectDir = oldProj
+		listNewRemote = oldNewRemote
+	})
+
+	serverName = ""
+	sshTarget = "deploy@host:2222"
+	projectDir = "/srv/app"
+
+	var capturedConfigArgs []string
+	listNewRemote = func(host, projDir string) *compose.RemoteCompose {
+		rc := compose.NewRemote(host, projDir)
+		rc.SetTestHooks(
+			func(cmd *exec.Cmd) error { return nil },
+			func(cmd *exec.Cmd) ([]byte, error) {
+				args := strings.Join(cmd.Args, " ")
+				switch {
+				case strings.Contains(args, "version"):
+					return []byte("Docker Compose version v2.24.0\n"), nil
+				case strings.Contains(args, "'config'") && strings.Contains(args, "'--services'"):
+					capturedConfigArgs = append([]string(nil), cmd.Args...)
+					return []byte("nginx\nweb\n"), nil
+				case strings.Contains(args, "'ps'"):
+					return []byte("[]"), nil
+				}
+				return nil, nil
+			},
+		)
+		return rc
+	}
+
+	if err := runList(context.Background(), false); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if capturedConfigArgs == nil {
+		t.Fatal("config --services was not invoked on remote")
+	}
+	args := strings.Join(capturedConfigArgs, " ")
+	if !strings.Contains(args, "-p 2222") {
+		t.Errorf("ssh argv = %v, want to contain '-p 2222'", capturedConfigArgs)
+	}
+	if !strings.Contains(args, "'config'") {
+		t.Errorf("ssh argv = %v, want to contain 'config' subcommand", capturedConfigArgs)
 	}
 }
 

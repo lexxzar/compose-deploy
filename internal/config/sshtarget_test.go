@@ -46,7 +46,21 @@ func TestParseSSHTarget_Errors(t *testing.T) {
 		{"port not a number", "user@host:abc", `port "abc" is not a number`},
 		{"port zero", "user@host:0", "out of range"},
 		{"port too big", "user@host:99999", "out of range"},
-		{"ipv6 rejected", "[::1]:22", "IPv6 not supported"},
+		{"ipv6 rejected (bracket)", "[::1]:22", "IPv6 not supported"},
+		{"ipv6 bare loopback", "::1", "too many ':' separators"},
+		{"ipv6 bare link-local", "fe80::1", "too many ':' separators"},
+		{"too many colons typo", "host:22:30", "too many ':' separators"},
+		{"trailing colon empty port", "host:", "port is empty"},
+		{"user trailing colon empty port", "user@host:", "port is empty"},
+		{"double @", "user@@host", "at most one '@'"},
+		{"two @ separators", "user@host@host", "at most one '@'"},
+		{"colon in user", "user:pass@host", "user must not contain ':'"},
+		{"host starts with dash", "-F/tmp/cfg", "host must not start with '-'"},
+		{"host starts with dash option", "-oProxyCommand=evil", "host must not start with '-'"},
+		{"host starts with dash jump", "-Jjump", "host must not start with '-'"},
+		{"user starts with dash", "-oFoo=bar@host", "user must not start with '-'"},
+		{"user dash with port", "-x@host:22", "user must not start with '-'"},
+		{"host dash with port", "-host:22", "host must not start with '-'"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {

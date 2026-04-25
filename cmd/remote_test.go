@@ -20,7 +20,7 @@ func TestCheckRemoteMutex(t *testing.T) {
 		{name: "both empty", serverName: "", sshTarget: "", wantErr: ""},
 		{name: "only server", serverName: "prod", sshTarget: "", wantErr: ""},
 		{name: "only ssh", serverName: "", sshTarget: "user@host", wantErr: ""},
-		{name: "both set", serverName: "prod", sshTarget: "user@host", wantErr: "mutually exclusive"},
+		{name: "both set", serverName: "prod", sshTarget: "user@host", wantErr: `--ssh ("user@host") and --server ("prod") are mutually exclusive`},
 	}
 
 	for _, tt := range tests {
@@ -48,11 +48,34 @@ func stubRemoteFactory(runErr, outputErr error) (
 	func(host, projDir string) *compose.RemoteCompose,
 	func() *compose.RemoteCompose,
 ) {
+	factory, getBuilt, _ := stubRemoteFactoryWithCloseCount(runErr, outputErr)
+	return factory, getBuilt
+}
+
+// stubRemoteFactoryWithCloseCount is like stubRemoteFactory but also exposes
+// a counter for "ssh ... -O exit" invocations (i.e., Close() calls). Used to
+// assert that the helper closes the ControlMaster on Detect failure.
+func stubRemoteFactoryWithCloseCount(runErr, outputErr error) (
+	func(host, projDir string) *compose.RemoteCompose,
+	func() *compose.RemoteCompose,
+	func() int,
+) {
 	var built *compose.RemoteCompose
+	closeCount := 0
 	factory := func(host, projDir string) *compose.RemoteCompose {
 		rc := compose.NewRemote(host, projDir)
 		rc.SetTestHooks(
-			func(cmd *exec.Cmd) error { return runErr },
+			func(cmd *exec.Cmd) error {
+				// Detect a Close() invocation by looking for "-O exit" in
+				// the SSH argv (see RemoteCompose.Close).
+				for i, a := range cmd.Args {
+					if a == "-O" && i+1 < len(cmd.Args) && cmd.Args[i+1] == "exit" {
+						closeCount++
+						break
+					}
+				}
+				return runErr
+			},
 			func(cmd *exec.Cmd) ([]byte, error) {
 				if outputErr != nil {
 					return nil, outputErr
@@ -63,7 +86,7 @@ func stubRemoteFactory(runErr, outputErr error) (
 		built = rc
 		return rc
 	}
-	return factory, func() *compose.RemoteCompose { return built }
+	return factory, func() *compose.RemoteCompose { return built }, func() int { return closeCount }
 }
 
 func TestResolveSSHRemote_EmptyProjectDir(t *testing.T) {
@@ -172,8 +195,10 @@ func TestResolveSSHRemote_ConnectFailure(t *testing.T) {
 	if rc != nil {
 		t.Error("expected nil RemoteCompose on Connect failure")
 	}
-	if cleanup != nil {
-		t.Error("expected nil cleanup on Connect failure (caller must check err first)")
+	if cleanup == nil {
+		t.Error("expected non-nil (no-op) cleanup on Connect failure")
+	} else {
+		cleanup() // must be safe to call (no-op)
 	}
 	if !strings.Contains(err.Error(), "connecting to user@host") {
 		t.Errorf("error = %q, want it to contain 'connecting to user@host'", err.Error())
@@ -185,7 +210,7 @@ func TestResolveSSHRemote_ConnectFailure(t *testing.T) {
 
 func TestResolveSSHRemote_DetectFailure(t *testing.T) {
 	// Connect succeeds (runCmd returns nil), Detect fails (outputCmd returns error).
-	factory, _ := stubRemoteFactory(nil, fmt.Errorf("docker not installed"))
+	factory, _, getCloseCount := stubRemoteFactoryWithCloseCount(nil, fmt.Errorf("docker not installed"))
 
 	rc, cleanup, err := resolveSSHRemote(
 		context.Background(),
@@ -199,7 +224,14 @@ func TestResolveSSHRemote_DetectFailure(t *testing.T) {
 	if rc != nil {
 		t.Error("expected nil RemoteCompose on Detect failure")
 	}
-	if cleanup != nil {
-		t.Error("expected nil cleanup on Detect failure (helper closes internally)")
+	if cleanup == nil {
+		t.Error("expected non-nil (no-op) cleanup on Detect failure")
+	} else {
+		cleanup() // must be safe to call (no-op; helper already closed)
+	}
+	// Verify the helper actually called Close() on the established
+	// ControlMaster connection — i.e., issued an `ssh ... -O exit`.
+	if got := getCloseCount(); got != 1 {
+		t.Errorf("expected exactly 1 Close()/(-O exit) invocation, got %d", got)
 	}
 }

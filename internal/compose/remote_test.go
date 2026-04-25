@@ -100,7 +100,7 @@ func TestConnectCmd_Args(t *testing.T) {
 		t.Errorf("command path = %q, want ssh", cmd.Path)
 	}
 
-	wantArgs := []string{"ssh", "-fNM", "-S", "/tmp/cdeploy-ctrl-abc123-99", "user@example.com"}
+	wantArgs := []string{"ssh", "-fNM", "-S", "/tmp/cdeploy-ctrl-abc123-99", "--", "user@example.com"}
 	if len(cmd.Args) != len(wantArgs) {
 		t.Fatalf("args = %v, want %v", cmd.Args, wantArgs)
 	}
@@ -140,7 +140,7 @@ func TestRemoteCommand_WithContainers(t *testing.T) {
 
 	cmd := r.remoteCommand(context.Background(), "stop", "nginx", "postgres")
 
-	wantPrefix := []string{"ssh", "-S", "/tmp/cdeploy-ctrl-abc-99", "-o", "ControlMaster=no", "user@example.com"}
+	wantPrefix := []string{"ssh", "-S", "/tmp/cdeploy-ctrl-abc-99", "-o", "ControlMaster=no", "--", "user@example.com"}
 	for i, want := range wantPrefix {
 		if i >= len(cmd.Args) {
 			t.Fatalf("missing arg[%d], want %q", i, want)
@@ -550,7 +550,7 @@ func TestRemoteConnect_ViaHook(t *testing.T) {
 		t.Fatal("runCmd was not called")
 	}
 	// Verify it's the SSH ControlMaster command
-	wantArgs := []string{"ssh", "-fNM", "-S", "/tmp/cdeploy-ctrl-abc-99", "user@example.com"}
+	wantArgs := []string{"ssh", "-fNM", "-S", "/tmp/cdeploy-ctrl-abc-99", "--", "user@example.com"}
 	if len(captured.Args) != len(wantArgs) {
 		t.Fatalf("args = %v, want %v", captured.Args, wantArgs)
 	}
@@ -597,7 +597,7 @@ func TestRemoteClose_ViaHook(t *testing.T) {
 	if captured == nil {
 		t.Fatal("runCmd was not called")
 	}
-	wantArgs := []string{"ssh", "-S", "/tmp/cdeploy-ctrl-abc-99", "-O", "exit", "user@example.com"}
+	wantArgs := []string{"ssh", "-S", "/tmp/cdeploy-ctrl-abc-99", "-O", "exit", "--", "user@example.com"}
 	if len(captured.Args) != len(wantArgs) {
 		t.Fatalf("args = %v, want %v", captured.Args, wantArgs)
 	}
@@ -1354,8 +1354,8 @@ func TestRemoteExecCommand_SSHArgs(t *testing.T) {
 		t.Fatalf("unexpected error: %v", err)
 	}
 
-	// Verify SSH arg structure: ssh -t -S <socket> -o ControlMaster=no <host> <remoteCmd>
-	wantPrefix := []string{"ssh", "-t", "-S", "/tmp/cdeploy-ctrl-abc-99", "-o", "ControlMaster=no", "user@example.com"}
+	// Verify SSH arg structure: ssh -t -S <socket> -o ControlMaster=no -- <host> <remoteCmd>
+	wantPrefix := []string{"ssh", "-t", "-S", "/tmp/cdeploy-ctrl-abc-99", "-o", "ControlMaster=no", "--", "user@example.com"}
 	if len(cmd.Args) < len(wantPrefix)+1 {
 		t.Fatalf("expected at least %d args, got %d: %v", len(wantPrefix)+1, len(cmd.Args), cmd.Args)
 	}
@@ -1444,7 +1444,7 @@ func TestSSHExtraArgs_NilArgvUnchanged_Detect(t *testing.T) {
 	if err := r.Detect(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	want := []string{"ssh", "-S", "/tmp/cdeploy-ctrl-abc-99", "-o", "ControlMaster=no", "user@example.com", "docker compose version"}
+	want := []string{"ssh", "-S", "/tmp/cdeploy-ctrl-abc-99", "-o", "ControlMaster=no", "--", "user@example.com", "docker compose version"}
 	if len(capturedPlugin) != len(want) {
 		t.Fatalf("Detect (plugin) args = %v, want %v", capturedPlugin, want)
 	}
@@ -1473,7 +1473,7 @@ func TestSSHExtraArgs_NilArgvUnchanged_DetectStandalone(t *testing.T) {
 	if err := r.Detect(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	want := []string{"ssh", "-S", "/tmp/cdeploy-ctrl-abc-99", "-o", "ControlMaster=no", "user@example.com", "docker-compose version"}
+	want := []string{"ssh", "-S", "/tmp/cdeploy-ctrl-abc-99", "-o", "ControlMaster=no", "--", "user@example.com", "docker-compose version"}
 	if len(capturedStandalone) != len(want) {
 		t.Fatalf("Detect (standalone) args = %v, want %v", capturedStandalone, want)
 	}
@@ -1490,7 +1490,7 @@ func TestSSHExtraArgs_NilArgvUnchanged_ConnectCmd(t *testing.T) {
 		SocketPath: "/tmp/cdeploy-ctrl-abc-99",
 	}
 	cmd := r.ConnectCmd(context.Background())
-	want := []string{"ssh", "-fNM", "-S", "/tmp/cdeploy-ctrl-abc-99", "user@example.com"}
+	want := []string{"ssh", "-fNM", "-S", "/tmp/cdeploy-ctrl-abc-99", "--", "user@example.com"}
 	if len(cmd.Args) != len(want) {
 		t.Fatalf("ConnectCmd args = %v, want %v", cmd.Args, want)
 	}
@@ -1514,7 +1514,7 @@ func TestSSHExtraArgs_NilArgvUnchanged_Close(t *testing.T) {
 	if err := r.Close(); err != nil {
 		t.Fatal(err)
 	}
-	want := []string{"ssh", "-S", "/tmp/cdeploy-ctrl-abc-99", "-O", "exit", "user@example.com"}
+	want := []string{"ssh", "-S", "/tmp/cdeploy-ctrl-abc-99", "-O", "exit", "--", "user@example.com"}
 	if len(captured) != len(want) {
 		t.Fatalf("Close args = %v, want %v", captured, want)
 	}
@@ -1532,8 +1532,8 @@ func TestSSHExtraArgs_NilArgvUnchanged_RemoteCommand(t *testing.T) {
 		SocketPath: "/tmp/cdeploy-ctrl-abc-99",
 	}
 	cmd := r.remoteCommand(context.Background(), "stop")
-	// Prefix before remote-cmd: ssh -S <sock> -o ControlMaster=no <host>
-	wantPrefix := []string{"ssh", "-S", "/tmp/cdeploy-ctrl-abc-99", "-o", "ControlMaster=no", "user@example.com"}
+	// Prefix before remote-cmd: ssh -S <sock> -o ControlMaster=no -- <host>
+	wantPrefix := []string{"ssh", "-S", "/tmp/cdeploy-ctrl-abc-99", "-o", "ControlMaster=no", "--", "user@example.com"}
 	if len(cmd.Args) != len(wantPrefix)+1 {
 		t.Fatalf("remoteCommand args length = %d, want %d (prefix + 1 remote cmd)", len(cmd.Args), len(wantPrefix)+1)
 	}
@@ -1558,7 +1558,7 @@ func TestSSHExtraArgs_NilArgvUnchanged_FindRemoteComposeFile(t *testing.T) {
 	if _, err := r.findRemoteComposeFile(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	wantPrefix := []string{"ssh", "-S", "/tmp/cdeploy-ctrl-abc-99", "-o", "ControlMaster=no", "user@example.com"}
+	wantPrefix := []string{"ssh", "-S", "/tmp/cdeploy-ctrl-abc-99", "-o", "ControlMaster=no", "--", "user@example.com"}
 	if len(captured) != len(wantPrefix)+1 {
 		t.Fatalf("findRemoteComposeFile args length = %d, want %d", len(captured), len(wantPrefix)+1)
 	}
@@ -1587,7 +1587,7 @@ func TestSSHExtraArgs_NilArgvUnchanged_ConfigFile(t *testing.T) {
 	if _, err := r.ConfigFile(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	wantPrefix := []string{"ssh", "-S", "/tmp/cdeploy-ctrl-abc-99", "-o", "ControlMaster=no", "user@example.com"}
+	wantPrefix := []string{"ssh", "-S", "/tmp/cdeploy-ctrl-abc-99", "-o", "ControlMaster=no", "--", "user@example.com"}
 	if len(capturedCat) != len(wantPrefix)+1 {
 		t.Fatalf("ConfigFile cat args length = %d, want %d", len(capturedCat), len(wantPrefix)+1)
 	}
@@ -1611,7 +1611,7 @@ func TestSSHExtraArgs_NilArgvUnchanged_EditCommand(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	wantPrefix := []string{"ssh", "-t", "-S", "/tmp/cdeploy-ctrl-abc-99", "-o", "ControlMaster=no", "user@example.com"}
+	wantPrefix := []string{"ssh", "-t", "-S", "/tmp/cdeploy-ctrl-abc-99", "-o", "ControlMaster=no", "--", "user@example.com"}
 	if len(cmd.Args) != len(wantPrefix)+1 {
 		t.Fatalf("EditCommand args length = %d, want %d", len(cmd.Args), len(wantPrefix)+1)
 	}
@@ -1632,7 +1632,7 @@ func TestSSHExtraArgs_NilArgvUnchanged_ExecCommand(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	wantPrefix := []string{"ssh", "-t", "-S", "/tmp/cdeploy-ctrl-abc-99", "-o", "ControlMaster=no", "user@example.com"}
+	wantPrefix := []string{"ssh", "-t", "-S", "/tmp/cdeploy-ctrl-abc-99", "-o", "ControlMaster=no", "--", "user@example.com"}
 	if len(cmd.Args) != len(wantPrefix)+1 {
 		t.Fatalf("ExecCommand args length = %d, want %d", len(cmd.Args), len(wantPrefix)+1)
 	}
@@ -1644,20 +1644,27 @@ func TestSSHExtraArgs_NilArgvUnchanged_ExecCommand(t *testing.T) {
 }
 
 // assertExtraBeforeHost verifies that SSHExtraArgs ([-p 2222]) appear immediately
-// before the host argument in argv.
+// before the `--` separator (which itself precedes the host argument).
+// The argv shape is: ... <extras...> "--" <host> ...
 func assertExtraBeforeHost(t *testing.T, label string, args []string, host string, extras []string) {
 	t.Helper()
 	hi := findHostIndex(args, host)
 	if hi < 0 {
 		t.Fatalf("%s: host %q not found in args %v", label, host, args)
 	}
-	if hi < len(extras) {
-		t.Fatalf("%s: host index %d too small to fit extras %v in args %v", label, hi, extras, args)
+	// `--` separator must immediately precede the host.
+	if hi < 1 || args[hi-1] != "--" {
+		t.Fatalf("%s: expected '--' immediately before host at index %d, got args %v", label, hi, args)
+	}
+	// Extras must immediately precede the `--` separator.
+	sepIdx := hi - 1
+	if sepIdx < len(extras) {
+		t.Fatalf("%s: separator index %d too small to fit extras %v in args %v", label, sepIdx, extras, args)
 	}
 	for i, e := range extras {
-		got := args[hi-len(extras)+i]
+		got := args[sepIdx-len(extras)+i]
 		if got != e {
-			t.Errorf("%s: extras arg[%d] = %q, want %q (full args: %v)", label, hi-len(extras)+i, got, e, args)
+			t.Errorf("%s: extras arg[%d] = %q, want %q (full args: %v)", label, sepIdx-len(extras)+i, got, e, args)
 		}
 	}
 }

@@ -4,7 +4,6 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
-	"unicode"
 )
 
 // SSHTarget represents a parsed ad-hoc SSH connection string in the form
@@ -17,15 +16,18 @@ type SSHTarget struct {
 
 // ParseSSHTarget parses a connection string in the form `[user@]host[:port]`.
 // IPv6 addresses are not supported.
+//
+// Errors are returned with bare descriptive wording (e.g., `host is empty`,
+// `port "abc" is not a number`) because callers wrap them with their own
+// context (e.g., `invalid --ssh value %q: ...`). The empty-input case keeps
+// the `ssh target ...` prefix since it has no other context.
 func ParseSSHTarget(s string) (SSHTarget, error) {
 	s = strings.TrimSpace(s)
 	if s == "" {
 		return SSHTarget{}, fmt.Errorf("ssh target is empty")
 	}
-	for _, r := range s {
-		if unicode.IsSpace(r) {
-			return SSHTarget{}, fmt.Errorf("ssh target must not contain whitespace")
-		}
+	if strings.ContainsAny(s, " \t\n\r") {
+		return SSHTarget{}, fmt.Errorf("must not contain whitespace")
 	}
 	if strings.HasPrefix(s, "[") {
 		return SSHTarget{}, fmt.Errorf("IPv6 not supported")
@@ -39,12 +41,39 @@ func ParseSSHTarget(s string) (SSHTarget, error) {
 		if user == "" {
 			return SSHTarget{}, fmt.Errorf("user is empty")
 		}
+		// Reject multiple `@` — `user@host@host` and `user@@host` are not
+		// valid SSH user@host syntax. This also catches `user:pass@host`-like
+		// inputs that snuck a `@` into the user field accidentally.
+		if strings.Contains(rest, "@") {
+			return SSHTarget{}, fmt.Errorf("must contain at most one '@'")
+		}
+		// Reject `:` inside the user part — `user:pass@host` is not supported.
+		if strings.Contains(user, ":") {
+			return SSHTarget{}, fmt.Errorf("user must not contain ':'")
+		}
+		// Reject user values starting with `-` to prevent ssh option injection
+		// (e.g., `-oProxyCommand=...@host` or `-F/tmp/cfg@host`). Without this
+		// guard, the user field would land in ssh's argv as if it were an
+		// option flag, allowing arbitrary ssh configuration to be supplied.
+		if strings.HasPrefix(user, "-") {
+			return SSHTarget{}, fmt.Errorf("user must not start with '-'")
+		}
 		t.User = user
+	}
+
+	// More than one `:` in the host[:port] tail is ambiguous. This catches
+	// bare IPv6 (e.g., `::1`, `fe80::1`) as well as malformed inputs like
+	// `host:22:30`. Either way the parser cannot disambiguate, so treat them
+	// uniformly with a single descriptive error.
+	if strings.Count(rest, ":") > 1 {
+		return SSHTarget{}, fmt.Errorf("too many ':' separators (IPv6 not supported)")
 	}
 
 	hostPart := rest
 	portPart := ""
+	colonPresent := false
 	if i := strings.Index(rest, ":"); i >= 0 {
+		colonPresent = true
 		hostPart = rest[:i]
 		portPart = rest[i+1:]
 	}
@@ -52,8 +81,19 @@ func ParseSSHTarget(s string) (SSHTarget, error) {
 	if hostPart == "" {
 		return SSHTarget{}, fmt.Errorf("host is empty")
 	}
+	// Reject host values starting with `-` to prevent ssh option injection
+	// (e.g., `-Jjump@evil` or `-oProxyCommand=...`). Without this guard, the
+	// host field would land in ssh's argv as if it were an option flag,
+	// allowing arbitrary ssh configuration to be supplied via the connection
+	// string.
+	if strings.HasPrefix(hostPart, "-") {
+		return SSHTarget{}, fmt.Errorf("host must not start with '-'")
+	}
 	t.Host = hostPart
 
+	if colonPresent && portPart == "" {
+		return SSHTarget{}, fmt.Errorf("port is empty")
+	}
 	if portPart != "" {
 		port, err := strconv.Atoi(portPart)
 		if err != nil {

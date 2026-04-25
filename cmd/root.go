@@ -40,6 +40,13 @@ Remote server configuration (~/.cdeploy/servers.yml):
       host: user@staging.example.com
       group: dev`,
 		RunE: func(cmd *cobra.Command, args []string) error {
+			// `--ssh` is a CLI-only flag; the TUI doesn't support ad-hoc SSH
+			// connections (it expects a configured server entry). Reject the
+			// flag here rather than silently ignoring it.
+			if sshTarget != "" {
+				return fmt.Errorf("--ssh is not valid for the interactive TUI; use it with a subcommand")
+			}
+
 			dir := projectDir
 			if dir == "" {
 				var err error

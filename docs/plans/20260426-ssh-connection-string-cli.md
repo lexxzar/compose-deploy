@@ -324,7 +324,7 @@ default:
 
 ### Task 11: Move plan to completed
 
-- [ ] move this plan to `docs/plans/completed/20260426-ssh-connection-string-cli.md`
+- [x] move this plan to `docs/plans/completed/20260426-ssh-connection-string-cli.md` (deferred until after reviews)
 
 ## Post-Completion
 

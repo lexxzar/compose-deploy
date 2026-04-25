@@ -77,8 +77,8 @@ tui/ (Bubble Tea) ↗
 
 See `cmd/list.go`, `cmd/logs.go`, and `cmd/exec.go` for the pattern. Each subcommand:
 1. Creates a `*cobra.Command` in its own `new*Cmd()` function
-2. Handles `--server` by loading config, calling `FindServer()`, creating `RemoteCompose`, connecting, and deferring `Close()`
-3. Falls back to local `compose.New(dir)` when no server is specified
+2. At the top of the `Run*` function, calls `checkRemoteMutex(serverName, sshTarget)` to enforce the `--server`/`--ssh` mutex (it must run before `os.Getwd()` and `signal.NotifyContext` so spurious setup doesn't run when the flags conflict)
+3. Branches in this order: `sshTarget != ""` → `resolveSSHRemote(ctx, sshTarget, projectDir, <factoryVar>)` (passing the subcommand's own injectable factory); else `serverName != ""` → load config, `FindServer()`, create `RemoteCompose`, `Connect()`, defer `Close()`, `Detect()`; else fall back to local `compose.New(dir)`
 4. Is registered in `cmd/root.go` via `rootCmd.AddCommand()`
 
 ## Package Coupling

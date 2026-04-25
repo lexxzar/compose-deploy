@@ -561,6 +561,58 @@ func TestRunExec_SSHRequiresProjectDir(t *testing.T) {
 	}
 }
 
+func TestRunExec_SSHHappyPath(t *testing.T) {
+	oldServer := serverName
+	oldSSH := sshTarget
+	oldProj := projectDir
+	oldNewRemote := execNewRemote
+	oldRun := execRunCmd
+	t.Cleanup(func() {
+		serverName = oldServer
+		sshTarget = oldSSH
+		projectDir = oldProj
+		execNewRemote = oldNewRemote
+		execRunCmd = oldRun
+	})
+
+	serverName = ""
+	sshTarget = "deploy@host:2222"
+	projectDir = "/srv/app"
+
+	var capturedArgs []string
+	execRunCmd = func(cmd *exec.Cmd) error {
+		capturedArgs = append([]string(nil), cmd.Args...)
+		return nil
+	}
+
+	execNewRemote = func(host, projDir string) *compose.RemoteCompose {
+		rc := compose.NewRemote(host, projDir)
+		rc.SetTestHooks(
+			func(cmd *exec.Cmd) error { return nil },
+			func(cmd *exec.Cmd) ([]byte, error) {
+				return []byte("Docker Compose version v2.24.0\n"), nil
+			},
+		)
+		return rc
+	}
+
+	err := runExec(context.Background(), "nginx", nil)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	args := strings.Join(capturedArgs, " ")
+	if !strings.Contains(args, "-p 2222") {
+		t.Errorf("args = %q, want it to contain '-p 2222'", args)
+	}
+	if !strings.Contains(args, "'exec'") {
+		t.Errorf("args = %q, want it to contain 'exec' subcommand", args)
+	}
+	if !strings.Contains(args, "'nginx'") {
+		t.Errorf("args = %q, want it to contain 'nginx'", args)
+	}
+}
+
 func TestExecCmd_SSHFlagInherited(t *testing.T) {
 	root := NewRootCmd()
 
