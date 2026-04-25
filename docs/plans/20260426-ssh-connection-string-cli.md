@@ -190,13 +190,13 @@ default:
 - Create: `internal/config/sshtarget.go`
 - Create: `internal/config/sshtarget_test.go`
 
-- [ ] create `internal/config/sshtarget.go` with `SSHTarget` struct and `ParseSSHTarget`, `SSHHost`, `PortArgs` per Technical Details
-- [ ] implement parser per algorithm above (trim → empty → whitespace → IPv6 reject → split `@` → split last `:` → validate)
-- [ ] write table-driven happy-path tests for `ParseSSHTarget` covering all 5 cases listed in Parser test matrix
-- [ ] write table-driven error-path tests for `ParseSSHTarget` covering all 8 error cases (verify exact error message substrings)
-- [ ] write tests for `SSHHost()`: `{User:"u",Host:"h"}` → `"u@h"`; `{Host:"h"}` → `"h"`
-- [ ] write tests for `PortArgs()`: `{Port:0}` → nil; `{Port:2222}` → `["-p","2222"]`
-- [ ] run `go test ./internal/config/ -count=1` — must pass before next task
+- [x] create `internal/config/sshtarget.go` with `SSHTarget` struct and `ParseSSHTarget`, `SSHHost`, `PortArgs` per Technical Details
+- [x] implement parser per algorithm above (trim → empty → whitespace → IPv6 reject → split `@` → split last `:` → validate)
+- [x] write table-driven happy-path tests for `ParseSSHTarget` covering all 5 cases listed in Parser test matrix
+- [x] write table-driven error-path tests for `ParseSSHTarget` covering all 8 error cases (verify exact error message substrings)
+- [x] write tests for `SSHHost()`: `{User:"u",Host:"h"}` → `"u@h"`; `{Host:"h"}` → `"h"`
+- [x] write tests for `PortArgs()`: `{Port:0}` → nil; `{Port:2222}` → `["-p","2222"]`
+- [x] run `go test ./internal/config/ -count=1` — must pass before next task
 
 ### Task 2: Add `SSHExtraArgs` field to `RemoteCompose` and splice into argv
 
