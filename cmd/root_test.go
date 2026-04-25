@@ -15,6 +15,7 @@ func TestRootCmd_FlagRegistration(t *testing.T) {
 		{"log-dir flag exists", "log-dir", ""},
 		{"project-dir flag exists", "project-dir", "C"},
 		{"server flag exists", "server", "s"},
+		{"ssh flag exists", "ssh", "S"},
 	}
 
 	for _, tt := range tests {

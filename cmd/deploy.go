@@ -10,7 +10,6 @@ import (
 
 	"github.com/charmbracelet/lipgloss"
 	"github.com/lexxzar/compose-deploy/internal/compose"
-	"github.com/lexxzar/compose-deploy/internal/config"
 	"github.com/lexxzar/compose-deploy/internal/logging"
 	"github.com/lexxzar/compose-deploy/internal/runner"
 	"github.com/spf13/cobra"
@@ -102,6 +101,14 @@ func newStopCmd() *cobra.Command {
 }
 
 func runOperation(ctx context.Context, op runner.Operation, all bool, containers []string) error {
+	// Mutex check runs before container-arg validation so that misuse of
+	// `--ssh` together with `--server` reports the mutex error consistently
+	// across subcommands (matching exec/logs/list ordering), regardless of
+	// whether `-a` or container names were also supplied.
+	if err := checkRemoteMutex(serverName, sshTarget); err != nil {
+		return err
+	}
+
 	if !all && len(containers) == 0 {
 		return fmt.Errorf("specify container names or use -a for all\n\nExamples:\n  cdeploy %s nginx postgres\n  cdeploy %s -a",
 			strings.ToLower(op.String()), strings.ToLower(op.String()))
@@ -115,50 +122,34 @@ func runOperation(ctx context.Context, op runner.Operation, all bool, containers
 		containers = nil // empty slice = all containers
 	}
 
-	dir := projectDir
-	if dir == "" {
-		var err error
-		dir, err = os.Getwd()
-		if err != nil {
-			return fmt.Errorf("getting current directory: %w", err)
-		}
-	}
-
 	ctx, stop := signal.NotifyContext(ctx, os.Interrupt)
 	defer stop()
 
 	var c runner.Composer
-	if serverName != "" {
-		cfg, err := config.Load(config.DefaultPath())
-		if err != nil {
-			return fmt.Errorf("loading config: %w", err)
-		}
-		if err := cfg.Validate(); err != nil {
-			return err
-		}
-		server, err := cfg.FindServer(serverName)
+	switch {
+	case sshTarget != "":
+		rc, cleanup, err := resolveSSHRemote(ctx, sshTarget, projectDir, opNewRemote)
 		if err != nil {
 			return err
 		}
-
-		projDir := server.ProjectDir
-		if projectDir != "" {
-			projDir = projectDir
-		}
-		if projDir == "" {
-			return fmt.Errorf("--server %q requires --project-dir or project_dir in config", serverName)
-		}
-
-		rc := opNewRemote(server.Host, projDir)
-		if err := rc.Connect(ctx); err != nil {
-			return fmt.Errorf("connecting to %s: %w", serverName, err)
-		}
-		defer rc.Close()
-		if err := rc.Detect(ctx); err != nil {
-			return err
-		}
+		defer cleanup()
 		c = rc
-	} else {
+	case serverName != "":
+		rc, cleanup, err := resolveServerRemote(ctx, serverName, projectDir, opNewRemote)
+		if err != nil {
+			return err
+		}
+		defer cleanup()
+		c = rc
+	default:
+		dir := projectDir
+		if dir == "" {
+			var err error
+			dir, err = os.Getwd()
+			if err != nil {
+				return fmt.Errorf("getting current directory: %w", err)
+			}
+		}
 		lc := opNewLocal(dir)
 		if err := lc.Detect(ctx); err != nil {
 			return err

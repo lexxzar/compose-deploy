@@ -97,15 +97,46 @@ cdeploy logs nginx -s prod -C /opt/myapp
 cdeploy exec nginx -s prod -C /opt/myapp
 ```
 
+#### Ad-hoc SSH connection (`-S`/`--ssh`)
+
+For one-off remote operations (CI scripts, automation) without a `~/.cdeploy/servers.yml` entry, pass an SSH connection string directly:
+
+```bash
+# Deploy against an ad-hoc host (uses default SSH user from ~/.ssh/config)
+cdeploy deploy -S host -C /srv/app -a
+
+# Deploy with explicit user
+cdeploy deploy -S deploy@host -C /srv/app -a
+
+# Restart with a non-default SSH port
+cdeploy restart -S deploy@host:2222 -C /srv/app nginx
+
+# List services on an ad-hoc host
+cdeploy list -S deploy@host -C /srv/app
+
+# Stream logs on an ad-hoc host
+cdeploy logs nginx -S deploy@host -C /srv/app
+
+# Exec into a container on an ad-hoc host
+cdeploy exec nginx -S deploy@host -C /srv/app
+```
+
+The connection string format is `[user@]host[:port]`. The `-S`/`--ssh` flag is **mutually exclusive** with `-s`/`--server` and **requires** `-C`/`--project-dir` (no config lookup is performed).
+
+**CI usage:** `--ssh` requires passwordless SSH authentication on the target host — configure keys via `~/.ssh/config` or `ssh-agent` before running. Host-key verification still applies; either pre-populate `~/.ssh/known_hosts` or use the standard `StrictHostKeyChecking` settings in your SSH config.
+
 ### Global Flags
 
 ```
 -s, --server string        Remote server name from ~/.cdeploy/servers.yml
+-S, --ssh string           Ad-hoc SSH connection string [user@]host[:port] (mutually exclusive with --server)
 -C, --project-dir string   Docker compose project directory (default: current directory)
     --log-dir string       Log directory (default ~/.cdeploy/logs/)
 ```
 
 ## Remote Server Configuration
+
+> Need a one-off connection without editing the config file? See [Ad-hoc SSH connection (`-S`/`--ssh`)](#ad-hoc-ssh-connection--s--ssh) above for a CLI-only alternative aimed at scripts and CI.
 
 Define remote servers in `~/.cdeploy/servers.yml`:
 

@@ -18,6 +18,7 @@ var (
 	logDir     string
 	projectDir string
 	serverName string
+	sshTarget  string
 )
 
 func NewRootCmd() *cobra.Command {
@@ -39,6 +40,13 @@ Remote server configuration (~/.cdeploy/servers.yml):
       host: user@staging.example.com
       group: dev`,
 		RunE: func(cmd *cobra.Command, args []string) error {
+			// `--ssh` is a CLI-only flag; the TUI doesn't support ad-hoc SSH
+			// connections (it expects a configured server entry). Reject the
+			// flag here rather than silently ignoring it.
+			if sshTarget != "" {
+				return fmt.Errorf("--ssh is not valid for the interactive TUI; use it with a subcommand")
+			}
+
 			dir := projectDir
 			if dir == "" {
 				var err error
@@ -169,6 +177,7 @@ Remote server configuration (~/.cdeploy/servers.yml):
 	rootCmd.PersistentFlags().StringVar(&logDir, "log-dir", "", "log directory (default ~/.cdeploy/logs/)")
 	rootCmd.PersistentFlags().StringVarP(&projectDir, "project-dir", "C", "", "docker compose project directory (default: current directory)")
 	rootCmd.PersistentFlags().StringVarP(&serverName, "server", "s", "", "remote server name from ~/.cdeploy/servers.yml")
+	rootCmd.PersistentFlags().StringVarP(&sshTarget, "ssh", "S", "", "ad-hoc SSH connection string [user@]host[:port] (mutually exclusive with --server)")
 
 	rootCmd.AddCommand(newDeployCmd(), newRestartCmd(), newStopCmd(), newListCmd(), newLogsCmd(), newExecCmd())
 

@@ -147,6 +147,18 @@ func TestServerFlag_Registration(t *testing.T) {
 }
 
 func TestServerFlag_NotFound(t *testing.T) {
+	// Snapshot/restore package-level globals — cobra binds flags to them
+	// and root.Execute() will mutate them, leaking state to subsequent tests
+	// when -count >1 or -shuffle is used.
+	oldServer := serverName
+	oldSSH := sshTarget
+	oldProj := projectDir
+	t.Cleanup(func() {
+		serverName = oldServer
+		sshTarget = oldSSH
+		projectDir = oldProj
+	})
+
 	root := NewRootCmd()
 	root.SetArgs([]string{"deploy", "-s", "nonexistent", "-a"})
 
@@ -190,6 +202,17 @@ func TestNoServerFlag_LocalBehaviorUnchanged(t *testing.T) {
 }
 
 func TestDeployCmd_PersistentFlagsInherited(t *testing.T) {
+	oldServer := serverName
+	oldSSH := sshTarget
+	oldProj := projectDir
+	oldLogDir := logDir
+	t.Cleanup(func() {
+		serverName = oldServer
+		sshTarget = oldSSH
+		projectDir = oldProj
+		logDir = oldLogDir
+	})
+
 	root := NewRootCmd()
 	root.SetArgs([]string{"deploy", "--log-dir", "/tmp/test", "-C", "/proj", "-a"})
 
@@ -623,6 +646,222 @@ func TestRunOperation_ServerNoProjectDir(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "requires --project-dir") {
 		t.Errorf("error = %q, want it to contain 'requires --project-dir'", err.Error())
+	}
+}
+
+func TestRunOperation_SSHAndServerMutex(t *testing.T) {
+	oldServer := serverName
+	oldSSH := sshTarget
+	oldProj := projectDir
+	t.Cleanup(func() {
+		serverName = oldServer
+		sshTarget = oldSSH
+		projectDir = oldProj
+	})
+
+	serverName = "prod"
+	sshTarget = "user@host"
+	projectDir = "/srv/app"
+
+	err := runOperation(context.Background(), runner.Deploy, true, nil)
+	if err == nil {
+		t.Fatal("expected mutex error, got nil")
+	}
+	if !strings.Contains(err.Error(), "mutually exclusive") {
+		t.Errorf("error = %q, want it to contain 'mutually exclusive'", err.Error())
+	}
+}
+
+// TestRunOperation_MutexBeforeContainerValidation verifies that the
+// `--ssh` + `--server` mutex check fires before container-argument validation.
+// Regression: previously, `cdeploy deploy --ssh foo --server bar` (no -a, no
+// container names) returned the "specify container names or use -a" error
+// instead of the mutex error, hiding the real misuse and diverging from
+// exec/logs/list which always check the mutex first.
+func TestRunOperation_MutexBeforeContainerValidation(t *testing.T) {
+	oldServer := serverName
+	oldSSH := sshTarget
+	oldProj := projectDir
+	t.Cleanup(func() {
+		serverName = oldServer
+		sshTarget = oldSSH
+		projectDir = oldProj
+	})
+
+	serverName = "prod"
+	sshTarget = "user@host"
+	projectDir = ""
+
+	// No -a flag, no container args — the previous container-arg validation
+	// would have fired here and returned the wrong error.
+	err := runOperation(context.Background(), runner.Deploy, false, nil)
+	if err == nil {
+		t.Fatal("expected mutex error, got nil")
+	}
+	if !strings.Contains(err.Error(), "mutually exclusive") {
+		t.Errorf("error = %q, want it to contain 'mutually exclusive'", err.Error())
+	}
+}
+
+func TestRunOperation_SSHRequiresProjectDir(t *testing.T) {
+	oldServer := serverName
+	oldSSH := sshTarget
+	oldProj := projectDir
+	t.Cleanup(func() {
+		serverName = oldServer
+		sshTarget = oldSSH
+		projectDir = oldProj
+	})
+
+	serverName = ""
+	sshTarget = "user@host"
+	projectDir = ""
+
+	// Force an empty cwd so projectDir resolution doesn't pick up a default.
+	// runOperation falls back to os.Getwd() when projectDir is empty, but
+	// resolveSSHRemote checks the package-level projectDir directly.
+	err := runOperation(context.Background(), runner.Deploy, true, nil)
+	if err == nil {
+		t.Fatal("expected error, got nil")
+	}
+	if !strings.Contains(err.Error(), "requires --project-dir") {
+		t.Errorf("error = %q, want it to contain 'requires --project-dir'", err.Error())
+	}
+}
+
+func TestRunOperation_SSHHappyPath(t *testing.T) {
+	oldServer := serverName
+	oldSSH := sshTarget
+	oldProj := projectDir
+	oldNewRemote := opNewRemote
+	oldNewLogger := opNewLogger
+	t.Cleanup(func() {
+		serverName = oldServer
+		sshTarget = oldSSH
+		projectDir = oldProj
+		opNewRemote = oldNewRemote
+		opNewLogger = oldNewLogger
+	})
+
+	serverName = ""
+	sshTarget = "deploy@host:2222"
+	projectDir = "/srv/app"
+
+	var stopArgs []string
+	var pullCalled, startCalled bool
+	opNewRemote = func(host, projDir string) *compose.RemoteCompose {
+		rc := compose.NewRemote(host, projDir)
+		rc.SetTestHooks(
+			func(cmd *exec.Cmd) error {
+				args := strings.Join(cmd.Args, " ")
+				if strings.Contains(args, "'stop'") && stopArgs == nil {
+					stopArgs = append([]string(nil), cmd.Args...)
+				}
+				if strings.Contains(args, "'pull'") {
+					pullCalled = true
+				}
+				if strings.Contains(args, "'start'") {
+					startCalled = true
+				}
+				return nil
+			},
+			func(cmd *exec.Cmd) ([]byte, error) {
+				remoteCmd := cmd.Args[len(cmd.Args)-1]
+				if strings.Contains(remoteCmd, "version") {
+					return []byte("Docker Compose version v2.24.0\n"), nil
+				}
+				return nil, nil
+			},
+		)
+		return rc
+	}
+	opNewLogger = func(dir string) (*logging.Logger, error) {
+		return logging.NewLogger(t.TempDir())
+	}
+
+	err := runOperation(context.Background(), runner.Deploy, true, nil)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if stopArgs == nil {
+		t.Fatal("stop not called on remote")
+	}
+	if !pullCalled {
+		t.Error("pull not called on remote")
+	}
+	if !startCalled {
+		t.Error("start not called on remote")
+	}
+	args := strings.Join(stopArgs, " ")
+	if !strings.Contains(args, "-p 2222") {
+		t.Errorf("ssh argv = %v, want to contain '-p 2222'", stopArgs)
+	}
+	if !strings.Contains(args, "'stop'") {
+		t.Errorf("ssh argv = %v, want to contain 'stop' subcommand", stopArgs)
+	}
+}
+
+func TestRestartCmd_SSHAndServerMutex(t *testing.T) {
+	// cobra binds flags to package-level globals (sshTarget, serverName,
+	// projectDir); snapshot/restore so subsequent tests in the same package
+	// don't see leaked values.
+	oldServer := serverName
+	oldSSH := sshTarget
+	oldProj := projectDir
+	t.Cleanup(func() {
+		serverName = oldServer
+		sshTarget = oldSSH
+		projectDir = oldProj
+	})
+
+	root := NewRootCmd()
+	root.SetArgs([]string{"restart", "-s", "prod", "-S", "user@host", "-C", "/srv/app", "-a"})
+
+	err := root.Execute()
+	if err == nil {
+		t.Fatal("expected mutex error, got nil")
+	}
+	if !strings.Contains(err.Error(), "mutually exclusive") {
+		t.Errorf("error = %q, want 'mutually exclusive'", err.Error())
+	}
+}
+
+func TestStopCmd_SSHAndServerMutex(t *testing.T) {
+	oldServer := serverName
+	oldSSH := sshTarget
+	oldProj := projectDir
+	t.Cleanup(func() {
+		serverName = oldServer
+		sshTarget = oldSSH
+		projectDir = oldProj
+	})
+
+	root := NewRootCmd()
+	root.SetArgs([]string{"stop", "-s", "prod", "-S", "user@host", "-C", "/srv/app", "-a"})
+
+	err := root.Execute()
+	if err == nil {
+		t.Fatal("expected mutex error, got nil")
+	}
+	if !strings.Contains(err.Error(), "mutually exclusive") {
+		t.Errorf("error = %q, want 'mutually exclusive'", err.Error())
+	}
+}
+
+func TestDeployCmd_SSHFlagInherited(t *testing.T) {
+	root := NewRootCmd()
+
+	for _, name := range []string{"deploy", "restart", "stop"} {
+		t.Run(name, func(t *testing.T) {
+			cmd, _, err := root.Find([]string{name})
+			if err != nil {
+				t.Fatalf("%s command not found: %v", name, err)
+			}
+			sshFlag := cmd.InheritedFlags().Lookup("ssh")
+			if sshFlag == nil {
+				t.Errorf("--ssh persistent flag not inherited by %s command", name)
+			}
+		})
 	}
 }
 

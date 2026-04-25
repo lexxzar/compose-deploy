@@ -16,9 +16,9 @@ import (
 )
 
 var (
-	newRemote        = compose.NewRemote
-	newLocalComposer = func(dir string) *compose.Compose { return compose.New(dir) }
-	hasLocalCompose  = compose.HasComposeFile
+	listNewRemote  = compose.NewRemote
+	listNewLocal   = func(dir string) *compose.Compose { return compose.New(dir) }
+	listHasCompose = compose.HasComposeFile
 )
 
 type serviceStatus struct {
@@ -305,17 +305,22 @@ func printMultiProject(grouped []projectServices, jsonOutput bool) error {
 }
 
 func runList(ctx context.Context, jsonOutput bool) error {
-	dir := projectDir
-	if dir == "" {
-		var err error
-		dir, err = os.Getwd()
-		if err != nil {
-			return fmt.Errorf("getting current directory: %w", err)
-		}
+	if err := checkRemoteMutex(serverName, sshTarget); err != nil {
+		return err
 	}
 
 	ctx, stop := signal.NotifyContext(ctx, os.Interrupt)
 	defer stop()
+
+	if sshTarget != "" {
+		// --ssh always implies a single project (resolveSSHRemote requires --project-dir).
+		rc, cleanup, err := resolveSSHRemote(ctx, sshTarget, projectDir, listNewRemote)
+		if err != nil {
+			return err
+		}
+		defer cleanup()
+		return listSingleProject(ctx, rc, jsonOutput)
+	}
 
 	if serverName != "" {
 		cfg, err := config.Load(config.DefaultPath())
@@ -334,7 +339,7 @@ func runList(ctx context.Context, jsonOutput bool) error {
 		// multi-project discovery works by default.
 		projDir := projectDir
 
-		rc := newRemote(server.Host, projDir)
+		rc := listNewRemote(server.Host, projDir)
 		if err := rc.Connect(ctx); err != nil {
 			return fmt.Errorf("connecting to %s: %w", serverName, err)
 		}
@@ -359,7 +364,7 @@ func runList(ctx context.Context, jsonOutput bool) error {
 		}
 
 		factory := func(d string) runner.Composer {
-			rc2 := newRemote(server.Host, d)
+			rc2 := listNewRemote(server.Host, d)
 			rc2.SetStandalone(rc.Standalone)
 			return rc2
 		}
@@ -368,10 +373,18 @@ func runList(ctx context.Context, jsonOutput bool) error {
 	}
 
 	// Local mode: single-project only when -C is explicitly given
-	c := newLocalComposer(dir)
+	dir := projectDir
+	if dir == "" {
+		var err error
+		dir, err = os.Getwd()
+		if err != nil {
+			return fmt.Errorf("getting current directory: %w", err)
+		}
+	}
+	c := listNewLocal(dir)
 
 	if projectDir != "" {
-		if !hasLocalCompose(dir) {
+		if !listHasCompose(dir) {
 			return fmt.Errorf("no compose file found in %s", dir)
 		}
 		if err := c.Detect(ctx); err != nil {
@@ -393,7 +406,7 @@ func runList(ctx context.Context, jsonOutput bool) error {
 	}
 
 	factory := func(d string) runner.Composer {
-		lc := newLocalComposer(d)
+		lc := listNewLocal(d)
 		lc.SetStandalone(c.Standalone)
 		return lc
 	}

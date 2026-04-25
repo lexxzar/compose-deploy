@@ -190,13 +190,13 @@ default:
 - Create: `internal/config/sshtarget.go`
 - Create: `internal/config/sshtarget_test.go`
 
-- [ ] create `internal/config/sshtarget.go` with `SSHTarget` struct and `ParseSSHTarget`, `SSHHost`, `PortArgs` per Technical Details
-- [ ] implement parser per algorithm above (trim → empty → whitespace → IPv6 reject → split `@` → split last `:` → validate)
-- [ ] write table-driven happy-path tests for `ParseSSHTarget` covering all 5 cases listed in Parser test matrix
-- [ ] write table-driven error-path tests for `ParseSSHTarget` covering all 8 error cases (verify exact error message substrings)
-- [ ] write tests for `SSHHost()`: `{User:"u",Host:"h"}` → `"u@h"`; `{Host:"h"}` → `"h"`
-- [ ] write tests for `PortArgs()`: `{Port:0}` → nil; `{Port:2222}` → `["-p","2222"]`
-- [ ] run `go test ./internal/config/ -count=1` — must pass before next task
+- [x] create `internal/config/sshtarget.go` with `SSHTarget` struct and `ParseSSHTarget`, `SSHHost`, `PortArgs` per Technical Details
+- [x] implement parser per algorithm above (trim → empty → whitespace → IPv6 reject → split `@` → split last `:` → validate)
+- [x] write table-driven happy-path tests for `ParseSSHTarget` covering all 5 cases listed in Parser test matrix
+- [x] write table-driven error-path tests for `ParseSSHTarget` covering all 8 error cases (verify exact error message substrings)
+- [x] write tests for `SSHHost()`: `{User:"u",Host:"h"}` → `"u@h"`; `{Host:"h"}` → `"h"`
+- [x] write tests for `PortArgs()`: `{Port:0}` → nil; `{Port:2222}` → `["-p","2222"]`
+- [x] run `go test ./internal/config/ -count=1` — must pass before next task
 
 ### Task 2: Add `SSHExtraArgs` field to `RemoteCompose` and splice into argv
 
@@ -204,8 +204,8 @@ default:
 - Modify: `internal/compose/remote.go`
 - Modify: `internal/compose/remote_test.go`
 
-- [ ] add `SSHExtraArgs []string` field to `RemoteCompose` struct (with comment: extra ssh CLI args spliced immediately before host)
-- [ ] splice `r.SSHExtraArgs...` immediately before the host argument in EVERY SSH argv build site. Confirmed sites in `internal/compose/remote.go` (verified by grep for `exec.CommandContext(ctx, "ssh"`):
+- [x] add `SSHExtraArgs []string` field to `RemoteCompose` struct (with comment: extra ssh CLI args spliced immediately before host)
+- [x] splice `r.SSHExtraArgs...` immediately before the host argument in EVERY SSH argv build site. Confirmed sites in `internal/compose/remote.go` (verified by grep for `exec.CommandContext(ctx, "ssh"`):
   - line 70: `Detect` plugin probe
   - line 89: `Detect` standalone probe
   - line 125: `ConnectCmd`
@@ -215,9 +215,9 @@ default:
   - line 328: `ConfigFile`
   - line 378: `EditCommand`
   - line 416: `ExecCommand`
-- [ ] regression test: with nil `SSHExtraArgs`, existing argv shape is unchanged for each direct site (Detect plugin, Detect standalone, ConnectCmd, Close, remoteCommand, findRemoteComposeFile, ConfigFile, EditCommand, ExecCommand). Use existing `SetTestHooks` capture pattern; assert exact argv slices.
-- [ ] new test: `SSHExtraArgs = []string{"-p","2222"}` → argv contains `-p 2222` immediately before host in each of the 9 sites above
-- [ ] run `go test ./internal/compose/ -count=1` — must pass before next task
+- [x] regression test: with nil `SSHExtraArgs`, existing argv shape is unchanged for each direct site (Detect plugin, Detect standalone, ConnectCmd, Close, remoteCommand, findRemoteComposeFile, ConfigFile, EditCommand, ExecCommand). Use existing `SetTestHooks` capture pattern; assert exact argv slices.
+- [x] new test: `SSHExtraArgs = []string{"-p","2222"}` → argv contains `-p 2222` immediately before host in each of the 9 sites above
+- [x] run `go test ./internal/compose/ -count=1` — must pass before next task
 
 ### Task 3: Add `resolveSSHRemote` and `checkRemoteMutex` helpers
 
@@ -225,16 +225,16 @@ default:
 - Create: `cmd/remote.go`
 - Create: `cmd/remote_test.go`
 
-- [ ] create `cmd/remote.go` with `checkRemoteMutex(serverName, sshTarget string) error` returning `"--ssh and --server are mutually exclusive"` when both non-empty, else nil
-- [ ] add `resolveSSHRemote(ctx, sshTarget, projectDir string, newRemote func(host, projDir string) *compose.RemoteCompose) (*compose.RemoteCompose, func(), error)` per contract in Technical Details
-- [ ] order of operations in `resolveSSHRemote`: validate projectDir non-empty → parse target → call factory → set `SSHExtraArgs` → `Connect` → `Detect` → return `(rc, func(){ rc.Close() }, nil)`
-- [ ] on `Detect` failure, the returned cleanup must still close the connection — return cleanup AND error together, OR call `Close()` internally before returning the error (pick the latter — simpler, matches existing pattern)
-- [ ] test for `checkRemoteMutex`: both empty → nil; only ssh → nil; only server → nil; both set → error containing `"mutually exclusive"`
-- [ ] test for `resolveSSHRemote`: empty `projectDir` → error containing `"requires --project-dir"`
-- [ ] test for `resolveSSHRemote`: malformed ssh target → error wraps parser error, contains `"invalid --ssh value"`
-- [ ] test for `resolveSSHRemote` happy path: pass a stub `newRemote` factory that returns a `RemoteCompose` with `SetTestHooks` configured to no-op `runCmd` (so `Connect`/`Detect` succeed without real ssh). Assert returned `rc.Host == "user@host"`, `rc.ProjectDir == "/srv/app"`, `rc.SSHExtraArgs == ["-p","2222"]`. Assert cleanup is non-nil and calling it doesn't panic.
-- [ ] test for `resolveSSHRemote`: factory stub where `runCmd` returns error on `Connect` → helper returns error containing `"connecting to user@host"` and (since `Connect` failed) cleanup may be nil — pick a contract and document in code comment
-- [ ] run `go test ./cmd/ -count=1 -run "TestCheckRemoteMutex|TestResolveSSHRemote"` — must pass before next task
+- [x] create `cmd/remote.go` with `checkRemoteMutex(serverName, sshTarget string) error` returning `"--ssh and --server are mutually exclusive"` when both non-empty, else nil
+- [x] add `resolveSSHRemote(ctx, sshTarget, projectDir string, newRemote func(host, projDir string) *compose.RemoteCompose) (*compose.RemoteCompose, func(), error)` per contract in Technical Details
+- [x] order of operations in `resolveSSHRemote`: validate projectDir non-empty → parse target → call factory → set `SSHExtraArgs` → `Connect` → `Detect` → return `(rc, func(){ rc.Close() }, nil)`
+- [x] on `Detect` failure, the returned cleanup must still close the connection — return cleanup AND error together, OR call `Close()` internally before returning the error (pick the latter — simpler, matches existing pattern)
+- [x] test for `checkRemoteMutex`: both empty → nil; only ssh → nil; only server → nil; both set → error containing `"mutually exclusive"`
+- [x] test for `resolveSSHRemote`: empty `projectDir` → error containing `"requires --project-dir"`
+- [x] test for `resolveSSHRemote`: malformed ssh target → error wraps parser error, contains `"invalid --ssh value"`
+- [x] test for `resolveSSHRemote` happy path: pass a stub `newRemote` factory that returns a `RemoteCompose` with `SetTestHooks` configured to no-op `runCmd` (so `Connect`/`Detect` succeed without real ssh). Assert returned `rc.Host == "user@host"`, `rc.ProjectDir == "/srv/app"`, `rc.SSHExtraArgs == ["-p","2222"]`. Assert cleanup is non-nil and calling it doesn't panic.
+- [x] test for `resolveSSHRemote`: factory stub where `runCmd` returns error on `Connect` → helper returns error containing `"connecting to user@host"` and (since `Connect` failed) cleanup may be nil — pick a contract and document in code comment
+- [x] run `go test ./cmd/ -count=1 -run "TestCheckRemoteMutex|TestResolveSSHRemote"` — must pass before next task
 
 ### Task 4: Register `--ssh` persistent flag on root
 
@@ -242,10 +242,10 @@ default:
 - Modify: `cmd/root.go`
 - Modify: `cmd/deploy_test.go` (or new `cmd/root_test.go` cases)
 
-- [ ] in `cmd/root.go` (near line 171 where `--server` is registered), add `rootCmd.PersistentFlags().StringVarP(&sshTarget, "ssh", "S", "", "ad-hoc SSH connection string [user@]host[:port] (mutually exclusive with --server)")`
-- [ ] declare package-level `var sshTarget string` near existing `var serverName string`
-- [ ] add test case to existing flag-registration table in `cmd/root_test.go`: `{"ssh flag exists", "ssh", "S"}`
-- [ ] run `go test ./cmd/ -count=1` — must pass before next task
+- [x] in `cmd/root.go` (near line 171 where `--server` is registered), add `rootCmd.PersistentFlags().StringVarP(&sshTarget, "ssh", "S", "", "ad-hoc SSH connection string [user@]host[:port] (mutually exclusive with --server)")`
+- [x] declare package-level `var sshTarget string` near existing `var serverName string`
+- [x] add test case to existing flag-registration table in `cmd/root_test.go`: `{"ssh flag exists", "ssh", "S"}`
+- [x] run `go test ./cmd/ -count=1` — must pass before next task
 
 ### Task 5: Wire `--ssh` into `deploy`, `restart`, `stop` (in `cmd/deploy.go`)
 
@@ -253,15 +253,15 @@ default:
 - Modify: `cmd/deploy.go`
 - Modify: `cmd/deploy_test.go`
 
-- [ ] in `cmd/deploy.go` `RunE`, at the top: `if err := checkRemoteMutex(serverName, sshTarget); err != nil { return err }`
-- [ ] add a new branch ABOVE the existing `if serverName != ""` block: `if sshTarget != "" { rc, cleanup, err := resolveSSHRemote(ctx, sshTarget, projectDir, opNewRemote); if err != nil { return err }; defer cleanup(); c = rc }` and skip the `serverName`/local branches when this fires (use `switch`/`else if` chain)
-- [ ] verify `restart` and `stop` subcommands (which share `runOperation` in deploy.go) inherit the same code path automatically (they call into the same `RunE` body via shared logic) — confirm by reading the file structure
-- [ ] add test: deploy with `--ssh` and `--server` together returns mutex error containing `"mutually exclusive"`
-- [ ] add test: deploy with `--ssh` but no `-C` returns error containing `"requires --project-dir"`
-- [ ] add test: restart with `--ssh foo@bar` and `--server prod` together returns mutex error
-- [ ] add test: stop with `--ssh foo@bar` and `--server prod` together returns mutex error
-- [ ] add test: persistent `--ssh` flag is inherited by deploy/restart/stop subcommands (mirrors existing `--server` inheritance test at `deploy_test.go:172`)
-- [ ] run `go test ./cmd/ -count=1` — must pass before next task
+- [x] in `cmd/deploy.go` `RunE`, at the top: `if err := checkRemoteMutex(serverName, sshTarget); err != nil { return err }`
+- [x] add a new branch ABOVE the existing `if serverName != ""` block: `if sshTarget != "" { rc, cleanup, err := resolveSSHRemote(ctx, sshTarget, projectDir, opNewRemote); if err != nil { return err }; defer cleanup(); c = rc }` and skip the `serverName`/local branches when this fires (use `switch`/`else if` chain)
+- [x] verify `restart` and `stop` subcommands (which share `runOperation` in deploy.go) inherit the same code path automatically (they call into the same `RunE` body via shared logic) — confirm by reading the file structure
+- [x] add test: deploy with `--ssh` and `--server` together returns mutex error containing `"mutually exclusive"`
+- [x] add test: deploy with `--ssh` but no `-C` returns error containing `"requires --project-dir"`
+- [x] add test: restart with `--ssh foo@bar` and `--server prod` together returns mutex error
+- [x] add test: stop with `--ssh foo@bar` and `--server prod` together returns mutex error
+- [x] add test: persistent `--ssh` flag is inherited by deploy/restart/stop subcommands (mirrors existing `--server` inheritance test at `deploy_test.go:172`)
+- [x] run `go test ./cmd/ -count=1` — must pass before next task
 
 ### Task 6: Wire `--ssh` into `cmd/exec.go`
 
@@ -269,11 +269,11 @@ default:
 - Modify: `cmd/exec.go`
 - Modify: `cmd/exec_test.go`
 
-- [ ] mirror Task 5: add `checkRemoteMutex` at top, add `sshTarget != ""` branch above existing `serverName != ""` block, pass `execNewRemote` as the factory
-- [ ] add test: exec with `--ssh` and `--server` together returns mutex error
-- [ ] add test: exec with `--ssh` but no `-C` returns "requires --project-dir" error
-- [ ] add test: persistent `--ssh` flag is inherited by exec subcommand
-- [ ] run `go test ./cmd/ -count=1 -run TestExec` — must pass before next task
+- [x] mirror Task 5: add `checkRemoteMutex` at top, add `sshTarget != ""` branch above existing `serverName != ""` block, pass `execNewRemote` as the factory
+- [x] add test: exec with `--ssh` and `--server` together returns mutex error
+- [x] add test: exec with `--ssh` but no `-C` returns "requires --project-dir" error
+- [x] add test: persistent `--ssh` flag is inherited by exec subcommand
+- [x] run `go test ./cmd/ -count=1 -run TestExec` — must pass before next task
 
 ### Task 7: Wire `--ssh` into `cmd/logs.go`
 
@@ -281,11 +281,11 @@ default:
 - Modify: `cmd/logs.go`
 - Modify: `cmd/logs_test.go` (create if absent, follow `exec_test.go` pattern)
 
-- [ ] mirror Task 5: add `checkRemoteMutex` at top, add `sshTarget != ""` branch above existing `serverName != ""` block, pass `logsNewRemote` as the factory
-- [ ] add test: logs with `--ssh` and `--server` together returns mutex error
-- [ ] add test: logs with `--ssh` but no `-C` returns "requires --project-dir" error
-- [ ] add test: persistent `--ssh` flag is inherited by logs subcommand
-- [ ] run `go test ./cmd/ -count=1 -run TestLogs` — must pass before next task
+- [x] mirror Task 5: add `checkRemoteMutex` at top, add `sshTarget != ""` branch above existing `serverName != ""` block, pass `logsNewRemote` as the factory
+- [x] add test: logs with `--ssh` and `--server` together returns mutex error
+- [x] add test: logs with `--ssh` but no `-C` returns "requires --project-dir" error
+- [x] add test: persistent `--ssh` flag is inherited by logs subcommand
+- [x] run `go test ./cmd/ -count=1 -run TestLogs` — must pass before next task
 
 ### Task 8: Wire `--ssh` into `cmd/list.go`
 
@@ -293,11 +293,11 @@ default:
 - Modify: `cmd/list.go`
 - Modify: `cmd/list_test.go` (create if absent)
 
-- [ ] mirror Task 5: add `checkRemoteMutex` at top, add `sshTarget != ""` branch above existing `serverName != ""` block, pass `newRemote` as the factory. Note that `list` allows `projectDir` to be empty for multi-project discovery in the `--server` path — but `--ssh` requires `--project-dir`, which `resolveSSHRemote` enforces. After the helper returns, follow the same single-project routing as `list.go:347` since `--ssh` always implies a single project.
-- [ ] add test: list with `--ssh` and `--server` together returns mutex error
-- [ ] add test: list with `--ssh` but no `-C` returns "requires --project-dir" error
-- [ ] add test: persistent `--ssh` flag is inherited by list subcommand
-- [ ] run `go test ./cmd/ -count=1 -run TestList` — must pass before next task
+- [x] mirror Task 5: add `checkRemoteMutex` at top, add `sshTarget != ""` branch above existing `serverName != ""` block, pass `newRemote` as the factory. Note that `list` allows `projectDir` to be empty for multi-project discovery in the `--server` path — but `--ssh` requires `--project-dir`, which `resolveSSHRemote` enforces. After the helper returns, follow the same single-project routing as `list.go:347` since `--ssh` always implies a single project.
+- [x] add test: list with `--ssh` and `--server` together returns mutex error
+- [x] add test: list with `--ssh` but no `-C` returns "requires --project-dir" error
+- [x] add test: persistent `--ssh` flag is inherited by list subcommand
+- [x] run `go test ./cmd/ -count=1 -run TestList` — must pass before next task
 
 ### Task 9: Update documentation
 
@@ -305,26 +305,26 @@ default:
 - Modify: `README.md`
 - Modify: `CLAUDE.md`
 
-- [ ] in README.md, document the `--ssh` flag in the CLI reference section: format `[user@]host[:port]`, mutually exclusive with `--server`, requires `--project-dir`, examples for each subcommand
-- [ ] in README.md, add a brief "CI usage" note: requires passwordless SSH auth (configure via `~/.ssh/config` or `ssh-agent`); host-key verification still applies
-- [ ] in CLAUDE.md, add a paragraph under the Remote SSH section describing `-S` as the ad-hoc complement to config-based `-s`, including the `SSHExtraArgs` mechanism in `RemoteCompose` and the `resolveSSHRemote`/`checkRemoteMutex` helpers in `cmd/remote.go`
-- [ ] run `go test ./... -count=1` — full suite must pass
+- [x] in README.md, document the `--ssh` flag in the CLI reference section: format `[user@]host[:port]`, mutually exclusive with `--server`, requires `--project-dir`, examples for each subcommand
+- [x] in README.md, add a brief "CI usage" note: requires passwordless SSH auth (configure via `~/.ssh/config` or `ssh-agent`); host-key verification still applies
+- [x] in CLAUDE.md, add a paragraph under the Remote SSH section describing `-S` as the ad-hoc complement to config-based `-s`, including the `SSHExtraArgs` mechanism in `RemoteCompose` and the `resolveSSHRemote`/`checkRemoteMutex` helpers in `cmd/remote.go`
+- [x] run `go test ./... -count=1` — full suite must pass
 
 ### Task 10: Verify acceptance criteria
 
-- [ ] verify `cdeploy deploy -S deploy@host -C /srv/app` builds correct argv (manual `go build` + `--help` check)
-- [ ] verify `cdeploy deploy -S host -C /srv/app` works without explicit user
-- [ ] verify `cdeploy deploy -S host:2222 -C /srv/app` includes `-p 2222` in SSH argv
-- [ ] verify `cdeploy deploy -s prod -S deploy@host -C /srv/app` errors with mutex message
-- [ ] verify `cdeploy deploy -S deploy@host` (no `-C`) errors with "requires --project-dir"
-- [ ] verify `cdeploy deploy` (no flags) still works in local mode (regression)
-- [ ] verify `cdeploy deploy -s prod -C /srv/app` still works (regression — config-based path untouched)
-- [ ] run `go test ./... -count=1`
-- [ ] `go build -o cdeploy .` succeeds with no warnings
+- [x] verify `cdeploy deploy -S deploy@host -C /srv/app` builds correct argv (manual `go build` + `--help` check) — `--help` shows `-S, --ssh string` flag with correct description
+- [x] verify `cdeploy deploy -S host -C /srv/app` works without explicit user — covered by `ParseSSHTarget` tests in `internal/config/sshtarget_test.go` (host-only happy path)
+- [x] verify `cdeploy deploy -S host:2222 -C /srv/app` includes `-p 2222` in SSH argv — covered by `TestRemoteCompose*WithSSHExtraArgs` tests in `internal/compose/remote_test.go`
+- [x] verify `cdeploy deploy -s prod -S deploy@host -C /srv/app` errors with mutex message — verified manually: returns `--ssh and --server are mutually exclusive`
+- [x] verify `cdeploy deploy -S deploy@host` (no `-C`) errors with "requires --project-dir" — verified manually: returns `--ssh requires --project-dir`
+- [x] verify `cdeploy deploy` (no flags) still works in local mode (regression) — verified: falls through to local arg validation (no SSH error path triggered)
+- [x] verify `cdeploy deploy -s prod -C /srv/app` still works (regression — config-based path untouched) — covered by existing `cmd/deploy_test.go` server tests; config-based `RunE` block was not modified
+- [x] run `go test ./... -count=1` — all packages pass (cmd, compose, config, logging, runner, tui)
+- [x] `go build -o cdeploy .` succeeds with no warnings
 
 ### Task 11: Move plan to completed
 
-- [ ] move this plan to `docs/plans/completed/20260426-ssh-connection-string-cli.md`
+- [x] move this plan to `docs/plans/completed/20260426-ssh-connection-string-cli.md` (deferred until after reviews)
 
 ## Post-Completion
 

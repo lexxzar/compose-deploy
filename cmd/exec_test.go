@@ -515,6 +515,120 @@ func TestExecCmd_ArgParsingWithoutDash(t *testing.T) {
 	}
 }
 
+func TestRunExec_SSHAndServerMutex(t *testing.T) {
+	oldServer := serverName
+	oldSSH := sshTarget
+	oldProj := projectDir
+	t.Cleanup(func() {
+		serverName = oldServer
+		sshTarget = oldSSH
+		projectDir = oldProj
+	})
+
+	serverName = "prod"
+	sshTarget = "user@host"
+	projectDir = "/srv/app"
+
+	err := runExec(context.Background(), "nginx", nil)
+	if err == nil {
+		t.Fatal("expected mutex error, got nil")
+	}
+	if !strings.Contains(err.Error(), "mutually exclusive") {
+		t.Errorf("error = %q, want it to contain 'mutually exclusive'", err.Error())
+	}
+}
+
+func TestRunExec_SSHRequiresProjectDir(t *testing.T) {
+	oldServer := serverName
+	oldSSH := sshTarget
+	oldProj := projectDir
+	t.Cleanup(func() {
+		serverName = oldServer
+		sshTarget = oldSSH
+		projectDir = oldProj
+	})
+
+	serverName = ""
+	sshTarget = "user@host"
+	projectDir = ""
+
+	err := runExec(context.Background(), "nginx", nil)
+	if err == nil {
+		t.Fatal("expected error, got nil")
+	}
+	if !strings.Contains(err.Error(), "requires --project-dir") {
+		t.Errorf("error = %q, want it to contain 'requires --project-dir'", err.Error())
+	}
+}
+
+func TestRunExec_SSHHappyPath(t *testing.T) {
+	oldServer := serverName
+	oldSSH := sshTarget
+	oldProj := projectDir
+	oldNewRemote := execNewRemote
+	oldRun := execRunCmd
+	t.Cleanup(func() {
+		serverName = oldServer
+		sshTarget = oldSSH
+		projectDir = oldProj
+		execNewRemote = oldNewRemote
+		execRunCmd = oldRun
+	})
+
+	serverName = ""
+	sshTarget = "deploy@host:2222"
+	projectDir = "/srv/app"
+
+	var capturedArgs []string
+	execRunCmd = func(cmd *exec.Cmd) error {
+		capturedArgs = append([]string(nil), cmd.Args...)
+		return nil
+	}
+
+	execNewRemote = func(host, projDir string) *compose.RemoteCompose {
+		rc := compose.NewRemote(host, projDir)
+		rc.SetTestHooks(
+			func(cmd *exec.Cmd) error { return nil },
+			func(cmd *exec.Cmd) ([]byte, error) {
+				return []byte("Docker Compose version v2.24.0\n"), nil
+			},
+		)
+		return rc
+	}
+
+	err := runExec(context.Background(), "nginx", nil)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	args := strings.Join(capturedArgs, " ")
+	if !strings.Contains(args, "-p 2222") {
+		t.Errorf("args = %q, want it to contain '-p 2222'", args)
+	}
+	if !strings.Contains(args, "'exec'") {
+		t.Errorf("args = %q, want it to contain 'exec' subcommand", args)
+	}
+	if !strings.Contains(args, "'nginx'") {
+		t.Errorf("args = %q, want it to contain 'nginx'", args)
+	}
+}
+
+func TestExecCmd_SSHFlagInherited(t *testing.T) {
+	root := NewRootCmd()
+
+	cmd, _, err := root.Find([]string{"exec"})
+	if err != nil {
+		t.Fatalf("exec command not found: %v", err)
+	}
+	sshFlag := cmd.InheritedFlags().Lookup("ssh")
+	if sshFlag == nil {
+		t.Error("--ssh persistent flag not inherited by exec command")
+	}
+	if sshFlag != nil && sshFlag.Shorthand != "S" {
+		t.Errorf("--ssh shorthand = %q, want %q", sshFlag.Shorthand, "S")
+	}
+}
+
 func TestExecCmd_ArgParsingExtraArgsWithoutDash(t *testing.T) {
 	// Test that extra positional args without -- are treated as the command
 	// (e.g. "cdeploy exec web rails console" should run "rails console" in "web")
