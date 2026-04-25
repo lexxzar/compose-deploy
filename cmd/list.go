@@ -317,6 +317,20 @@ func runList(ctx context.Context, jsonOutput bool) error {
 	ctx, stop := signal.NotifyContext(ctx, os.Interrupt)
 	defer stop()
 
+	if err := checkRemoteMutex(serverName, sshTarget); err != nil {
+		return err
+	}
+
+	if sshTarget != "" {
+		// --ssh always implies a single project (resolveSSHRemote requires --project-dir).
+		rc, cleanup, err := resolveSSHRemote(ctx, sshTarget, projectDir, newRemote)
+		if err != nil {
+			return err
+		}
+		defer cleanup()
+		return listSingleProject(ctx, rc, jsonOutput)
+	}
+
 	if serverName != "" {
 		cfg, err := config.Load(config.DefaultPath())
 		if err != nil {

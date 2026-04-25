@@ -1466,3 +1466,65 @@ func TestListCmd_RemoteIgnoresServerProjectDir(t *testing.T) {
 		t.Errorf("newRemote received projDir = %q, want empty (server.ProjectDir should be ignored)", capturedProjDir)
 	}
 }
+
+func TestRunList_SSHAndServerMutex(t *testing.T) {
+	oldServer := serverName
+	oldSSH := sshTarget
+	oldProj := projectDir
+	t.Cleanup(func() {
+		serverName = oldServer
+		sshTarget = oldSSH
+		projectDir = oldProj
+	})
+
+	serverName = "prod"
+	sshTarget = "user@host"
+	projectDir = "/srv/app"
+
+	err := runList(context.Background(), false)
+	if err == nil {
+		t.Fatal("expected mutex error, got nil")
+	}
+	if !strings.Contains(err.Error(), "mutually exclusive") {
+		t.Errorf("error = %q, want it to contain 'mutually exclusive'", err.Error())
+	}
+}
+
+func TestRunList_SSHRequiresProjectDir(t *testing.T) {
+	oldServer := serverName
+	oldSSH := sshTarget
+	oldProj := projectDir
+	t.Cleanup(func() {
+		serverName = oldServer
+		sshTarget = oldSSH
+		projectDir = oldProj
+	})
+
+	serverName = ""
+	sshTarget = "user@host"
+	projectDir = ""
+
+	err := runList(context.Background(), false)
+	if err == nil {
+		t.Fatal("expected error, got nil")
+	}
+	if !strings.Contains(err.Error(), "requires --project-dir") {
+		t.Errorf("error = %q, want it to contain 'requires --project-dir'", err.Error())
+	}
+}
+
+func TestListCmd_SSHFlagInherited(t *testing.T) {
+	root := NewRootCmd()
+
+	cmd, _, err := root.Find([]string{"list"})
+	if err != nil {
+		t.Fatalf("list command not found: %v", err)
+	}
+	sshFlag := cmd.InheritedFlags().Lookup("ssh")
+	if sshFlag == nil {
+		t.Error("--ssh persistent flag not inherited by list command")
+	}
+	if sshFlag != nil && sshFlag.Shorthand != "S" {
+		t.Errorf("--ssh shorthand = %q, want %q", sshFlag.Shorthand, "S")
+	}
+}

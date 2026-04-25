@@ -293,11 +293,11 @@ default:
 - Modify: `cmd/list.go`
 - Modify: `cmd/list_test.go` (create if absent)
 
-- [ ] mirror Task 5: add `checkRemoteMutex` at top, add `sshTarget != ""` branch above existing `serverName != ""` block, pass `newRemote` as the factory. Note that `list` allows `projectDir` to be empty for multi-project discovery in the `--server` path — but `--ssh` requires `--project-dir`, which `resolveSSHRemote` enforces. After the helper returns, follow the same single-project routing as `list.go:347` since `--ssh` always implies a single project.
-- [ ] add test: list with `--ssh` and `--server` together returns mutex error
-- [ ] add test: list with `--ssh` but no `-C` returns "requires --project-dir" error
-- [ ] add test: persistent `--ssh` flag is inherited by list subcommand
-- [ ] run `go test ./cmd/ -count=1 -run TestList` — must pass before next task
+- [x] mirror Task 5: add `checkRemoteMutex` at top, add `sshTarget != ""` branch above existing `serverName != ""` block, pass `newRemote` as the factory. Note that `list` allows `projectDir` to be empty for multi-project discovery in the `--server` path — but `--ssh` requires `--project-dir`, which `resolveSSHRemote` enforces. After the helper returns, follow the same single-project routing as `list.go:347` since `--ssh` always implies a single project.
+- [x] add test: list with `--ssh` and `--server` together returns mutex error
+- [x] add test: list with `--ssh` but no `-C` returns "requires --project-dir" error
+- [x] add test: persistent `--ssh` flag is inherited by list subcommand
+- [x] run `go test ./cmd/ -count=1 -run TestList` — must pass before next task
 
 ### Task 9: Update documentation
 
