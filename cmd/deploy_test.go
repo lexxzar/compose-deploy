@@ -626,6 +626,98 @@ func TestRunOperation_ServerNoProjectDir(t *testing.T) {
 	}
 }
 
+func TestRunOperation_SSHAndServerMutex(t *testing.T) {
+	oldServer := serverName
+	oldSSH := sshTarget
+	oldProj := projectDir
+	t.Cleanup(func() {
+		serverName = oldServer
+		sshTarget = oldSSH
+		projectDir = oldProj
+	})
+
+	serverName = "prod"
+	sshTarget = "user@host"
+	projectDir = "/srv/app"
+
+	err := runOperation(context.Background(), runner.Deploy, true, nil)
+	if err == nil {
+		t.Fatal("expected mutex error, got nil")
+	}
+	if !strings.Contains(err.Error(), "mutually exclusive") {
+		t.Errorf("error = %q, want it to contain 'mutually exclusive'", err.Error())
+	}
+}
+
+func TestRunOperation_SSHRequiresProjectDir(t *testing.T) {
+	oldServer := serverName
+	oldSSH := sshTarget
+	oldProj := projectDir
+	t.Cleanup(func() {
+		serverName = oldServer
+		sshTarget = oldSSH
+		projectDir = oldProj
+	})
+
+	serverName = ""
+	sshTarget = "user@host"
+	projectDir = ""
+
+	// Force an empty cwd so projectDir resolution doesn't pick up a default.
+	// runOperation falls back to os.Getwd() when projectDir is empty, but
+	// resolveSSHRemote checks the package-level projectDir directly.
+	err := runOperation(context.Background(), runner.Deploy, true, nil)
+	if err == nil {
+		t.Fatal("expected error, got nil")
+	}
+	if !strings.Contains(err.Error(), "requires --project-dir") {
+		t.Errorf("error = %q, want it to contain 'requires --project-dir'", err.Error())
+	}
+}
+
+func TestRestartCmd_SSHAndServerMutex(t *testing.T) {
+	root := NewRootCmd()
+	root.SetArgs([]string{"restart", "-s", "prod", "-S", "user@host", "-C", "/srv/app", "-a"})
+
+	err := root.Execute()
+	if err == nil {
+		t.Fatal("expected mutex error, got nil")
+	}
+	if !strings.Contains(err.Error(), "mutually exclusive") {
+		t.Errorf("error = %q, want 'mutually exclusive'", err.Error())
+	}
+}
+
+func TestStopCmd_SSHAndServerMutex(t *testing.T) {
+	root := NewRootCmd()
+	root.SetArgs([]string{"stop", "-s", "prod", "-S", "user@host", "-C", "/srv/app", "-a"})
+
+	err := root.Execute()
+	if err == nil {
+		t.Fatal("expected mutex error, got nil")
+	}
+	if !strings.Contains(err.Error(), "mutually exclusive") {
+		t.Errorf("error = %q, want 'mutually exclusive'", err.Error())
+	}
+}
+
+func TestDeployCmd_SSHFlagInherited(t *testing.T) {
+	root := NewRootCmd()
+
+	for _, name := range []string{"deploy", "restart", "stop"} {
+		t.Run(name, func(t *testing.T) {
+			cmd, _, err := root.Find([]string{name})
+			if err != nil {
+				t.Fatalf("%s command not found: %v", name, err)
+			}
+			sshFlag := cmd.InheritedFlags().Lookup("ssh")
+			if sshFlag == nil {
+				t.Errorf("--ssh persistent flag not inherited by %s command", name)
+			}
+		})
+	}
+}
+
 func TestRunOperation_LocalDetectFailure(t *testing.T) {
 	oldNew := opNewLocal
 	oldProj := projectDir

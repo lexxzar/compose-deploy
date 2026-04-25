@@ -253,15 +253,15 @@ default:
 - Modify: `cmd/deploy.go`
 - Modify: `cmd/deploy_test.go`
 
-- [ ] in `cmd/deploy.go` `RunE`, at the top: `if err := checkRemoteMutex(serverName, sshTarget); err != nil { return err }`
-- [ ] add a new branch ABOVE the existing `if serverName != ""` block: `if sshTarget != "" { rc, cleanup, err := resolveSSHRemote(ctx, sshTarget, projectDir, opNewRemote); if err != nil { return err }; defer cleanup(); c = rc }` and skip the `serverName`/local branches when this fires (use `switch`/`else if` chain)
-- [ ] verify `restart` and `stop` subcommands (which share `runOperation` in deploy.go) inherit the same code path automatically (they call into the same `RunE` body via shared logic) — confirm by reading the file structure
-- [ ] add test: deploy with `--ssh` and `--server` together returns mutex error containing `"mutually exclusive"`
-- [ ] add test: deploy with `--ssh` but no `-C` returns error containing `"requires --project-dir"`
-- [ ] add test: restart with `--ssh foo@bar` and `--server prod` together returns mutex error
-- [ ] add test: stop with `--ssh foo@bar` and `--server prod` together returns mutex error
-- [ ] add test: persistent `--ssh` flag is inherited by deploy/restart/stop subcommands (mirrors existing `--server` inheritance test at `deploy_test.go:172`)
-- [ ] run `go test ./cmd/ -count=1` — must pass before next task
+- [x] in `cmd/deploy.go` `RunE`, at the top: `if err := checkRemoteMutex(serverName, sshTarget); err != nil { return err }`
+- [x] add a new branch ABOVE the existing `if serverName != ""` block: `if sshTarget != "" { rc, cleanup, err := resolveSSHRemote(ctx, sshTarget, projectDir, opNewRemote); if err != nil { return err }; defer cleanup(); c = rc }` and skip the `serverName`/local branches when this fires (use `switch`/`else if` chain)
+- [x] verify `restart` and `stop` subcommands (which share `runOperation` in deploy.go) inherit the same code path automatically (they call into the same `RunE` body via shared logic) — confirm by reading the file structure
+- [x] add test: deploy with `--ssh` and `--server` together returns mutex error containing `"mutually exclusive"`
+- [x] add test: deploy with `--ssh` but no `-C` returns error containing `"requires --project-dir"`
+- [x] add test: restart with `--ssh foo@bar` and `--server prod` together returns mutex error
+- [x] add test: stop with `--ssh foo@bar` and `--server prod` together returns mutex error
+- [x] add test: persistent `--ssh` flag is inherited by deploy/restart/stop subcommands (mirrors existing `--server` inheritance test at `deploy_test.go:172`)
+- [x] run `go test ./cmd/ -count=1` — must pass before next task
 
 ### Task 6: Wire `--ssh` into `cmd/exec.go`
 

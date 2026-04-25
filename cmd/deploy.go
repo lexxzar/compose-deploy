@@ -124,11 +124,23 @@ func runOperation(ctx context.Context, op runner.Operation, all bool, containers
 		}
 	}
 
+	if err := checkRemoteMutex(serverName, sshTarget); err != nil {
+		return err
+	}
+
 	ctx, stop := signal.NotifyContext(ctx, os.Interrupt)
 	defer stop()
 
 	var c runner.Composer
-	if serverName != "" {
+	switch {
+	case sshTarget != "":
+		rc, cleanup, err := resolveSSHRemote(ctx, sshTarget, projectDir, opNewRemote)
+		if err != nil {
+			return err
+		}
+		defer cleanup()
+		c = rc
+	case serverName != "":
 		cfg, err := config.Load(config.DefaultPath())
 		if err != nil {
 			return fmt.Errorf("loading config: %w", err)
@@ -158,7 +170,7 @@ func runOperation(ctx context.Context, op runner.Operation, all bool, containers
 			return err
 		}
 		c = rc
-	} else {
+	default:
 		lc := opNewLocal(dir)
 		if err := lc.Detect(ctx); err != nil {
 			return err
