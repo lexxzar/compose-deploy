@@ -312,15 +312,15 @@ default:
 
 ### Task 10: Verify acceptance criteria
 
-- [ ] verify `cdeploy deploy -S deploy@host -C /srv/app` builds correct argv (manual `go build` + `--help` check)
-- [ ] verify `cdeploy deploy -S host -C /srv/app` works without explicit user
-- [ ] verify `cdeploy deploy -S host:2222 -C /srv/app` includes `-p 2222` in SSH argv
-- [ ] verify `cdeploy deploy -s prod -S deploy@host -C /srv/app` errors with mutex message
-- [ ] verify `cdeploy deploy -S deploy@host` (no `-C`) errors with "requires --project-dir"
-- [ ] verify `cdeploy deploy` (no flags) still works in local mode (regression)
-- [ ] verify `cdeploy deploy -s prod -C /srv/app` still works (regression — config-based path untouched)
-- [ ] run `go test ./... -count=1`
-- [ ] `go build -o cdeploy .` succeeds with no warnings
+- [x] verify `cdeploy deploy -S deploy@host -C /srv/app` builds correct argv (manual `go build` + `--help` check) — `--help` shows `-S, --ssh string` flag with correct description
+- [x] verify `cdeploy deploy -S host -C /srv/app` works without explicit user — covered by `ParseSSHTarget` tests in `internal/config/sshtarget_test.go` (host-only happy path)
+- [x] verify `cdeploy deploy -S host:2222 -C /srv/app` includes `-p 2222` in SSH argv — covered by `TestRemoteCompose*WithSSHExtraArgs` tests in `internal/compose/remote_test.go`
+- [x] verify `cdeploy deploy -s prod -S deploy@host -C /srv/app` errors with mutex message — verified manually: returns `--ssh and --server are mutually exclusive`
+- [x] verify `cdeploy deploy -S deploy@host` (no `-C`) errors with "requires --project-dir" — verified manually: returns `--ssh requires --project-dir`
+- [x] verify `cdeploy deploy` (no flags) still works in local mode (regression) — verified: falls through to local arg validation (no SSH error path triggered)
+- [x] verify `cdeploy deploy -s prod -C /srv/app` still works (regression — config-based path untouched) — covered by existing `cmd/deploy_test.go` server tests; config-based `RunE` block was not modified
+- [x] run `go test ./... -count=1` — all packages pass (cmd, compose, config, logging, runner, tui)
+- [x] `go build -o cdeploy .` succeeds with no warnings
 
 ### Task 11: Move plan to completed
 
