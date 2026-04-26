@@ -3594,6 +3594,15 @@ func TestHasStatusColumns(t *testing.T) {
 	if m.hasStatusColumns() {
 		t.Error("hasStatusColumns() = true, want false when status key not in services")
 	}
+
+	// Status with only Ports (no Created/Uptime)
+	m.services = []string{"a"}
+	m.svcStatus = map[string]runner.ServiceStatus{
+		"a": {Running: true, Ports: []runner.Port{{Host: "0.0.0.0", HostPort: 80, ContainerPort: 80, Protocol: "tcp"}}},
+	}
+	if !m.hasStatusColumns() {
+		t.Error("hasStatusColumns() = false, want true with Ports set")
+	}
 }
 
 func TestFixSvcOffset_CursorBelowWindow(t *testing.T) {
@@ -3983,6 +3992,103 @@ func TestViewSelectContainers_CreatedAndUptimeAlignment(t *testing.T) {
 	if idx0 != idx1 {
 		t.Errorf("Created columns not aligned: line0 at %d, line1 at %d\nLine0: %q\nLine1: %q",
 			idx0, idx1, svcLines[0], svcLines[1])
+	}
+}
+
+func TestViewSelectContainers_Ports(t *testing.T) {
+	mc := &mockComposer{services: []string{"web", "db"}}
+	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
+	m.screen = screenSelectContainers
+	m.services = mc.services
+	m.svcStatus = map[string]runner.ServiceStatus{
+		"web": {Running: true, Ports: []runner.Port{
+			{Host: "0.0.0.0", HostPort: 8080, ContainerPort: 80, Protocol: "tcp"},
+			{Host: "0.0.0.0", HostPort: 8443, ContainerPort: 443, Protocol: "tcp"},
+		}},
+		"db": {Running: true},
+	}
+	m.width = 200
+	m.height = 24
+
+	view := m.viewSelectContainers()
+
+	// Verify Ports caption appears
+	if !strings.Contains(view, "Ports") {
+		t.Errorf("expected 'Ports' caption in view, got:\n%s", view)
+	}
+
+	// Verify formatted ports appear
+	if !strings.Contains(view, "0.0.0.0:8080→80") {
+		t.Errorf("expected formatted port '0.0.0.0:8080→80' in view, got:\n%s", view)
+	}
+	if !strings.Contains(view, "0.0.0.0:8443→443") {
+		t.Errorf("expected formatted port '0.0.0.0:8443→443' in view, got:\n%s", view)
+	}
+}
+
+func TestViewSelectContainers_PortsAlignment(t *testing.T) {
+	mc := &mockComposer{services: []string{"nginx", "api"}}
+	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
+	m.screen = screenSelectContainers
+	m.services = mc.services
+	m.svcStatus = map[string]runner.ServiceStatus{
+		"nginx": {Running: true, Ports: []runner.Port{
+			{Host: "0.0.0.0", HostPort: 80, ContainerPort: 80, Protocol: "tcp"},
+		}},
+		"api": {Running: true},
+	}
+	m.width = 200
+	m.height = 24
+
+	view := m.viewSelectContainers()
+	lines := strings.Split(view, "\n")
+
+	// Find lines for both services
+	var nginxLine, apiLine string
+	for _, line := range lines {
+		// Avoid matching captions or headers
+		if strings.Contains(line, "● ") && strings.Contains(line, "nginx") {
+			nginxLine = line
+		}
+		if strings.Contains(line, "● ") && strings.Contains(line, "api") && !strings.Contains(line, "nginx") {
+			apiLine = line
+		}
+	}
+	if nginxLine == "" || apiLine == "" {
+		t.Fatalf("expected service rows, got:\n%s", view)
+	}
+
+	// nginx line must contain the formatted port
+	if !strings.Contains(nginxLine, "0.0.0.0:80→80") {
+		t.Errorf("expected formatted port in nginx line, got: %q", nginxLine)
+	}
+
+	// Both lines should be padded to similar lengths so columns align.
+	// api line should still have padding for the empty Ports cell to keep alignment.
+	// We check that api line ends with trailing spaces (padding) at least the width of the empty Ports cell.
+	trimmedAPI := strings.TrimRight(apiLine, " ")
+	padLen := len(apiLine) - len(trimmedAPI)
+	// nginx ports formatted is "0.0.0.0:80→80" — 13 runes; we just check api padding > 0
+	if padLen < 1 {
+		t.Errorf("expected api line to have padding for empty Ports cell, got: %q (padLen=%d)", apiLine, padLen)
+	}
+}
+
+func TestViewSelectContainers_NoPortsColumnWhenAllEmpty(t *testing.T) {
+	mc := &mockComposer{services: []string{"web", "db"}}
+	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
+	m.screen = screenSelectContainers
+	m.services = mc.services
+	m.svcStatus = map[string]runner.ServiceStatus{
+		"web": {Running: true, Created: "2024-01-15 09:30", Uptime: "3h"},
+		"db":  {Running: false, Created: "2024-01-15 09:30"},
+	}
+	m.width = 200
+	m.height = 24
+
+	view := m.viewSelectContainers()
+	if strings.Contains(view, "Ports") {
+		t.Errorf("did not expect 'Ports' caption when no service has ports, got:\n%s", view)
 	}
 }
 

@@ -232,13 +232,13 @@ Captions row gains "Ports" label when any service has non-empty `Ports`.
 - Modify: `internal/tui/app.go`
 - Modify: `internal/tui/app_test.go`
 
-- [ ] extend `hasStatusColumns()` to return true also when any service has non-empty `Ports`
-- [ ] **no changes to `svcVisibleCount()`** — Ports column shares the same captions row that already triggers the existing `+1` to `headerLines`. Do not add a second bump.
-- [ ] in `viewSelectContainers` row rendering (around app.go:1900-1975), add `maxPorts` width tracking alongside `maxCreated`/`maxUptime`
-- [ ] append captions cell `"Ports"` after `"Uptime"` when `maxPorts > 0`
-- [ ] append per-row `compose.FormatPorts(st.Ports)` cell after Uptime gated on `maxPorts > 0`, padded with `%-*s` to `maxPorts` width — empty Ports cells still render as padded whitespace, matching the existing Created/Uptime pattern
-- [ ] write tests: row rendering with ports — formatted string appears in `View()` output; captions row includes "Ports" when any service has ports; `hasStatusColumns()` returns true with only Ports populated (existing test extended); row with empty Ports for a service in a list where another service has ports — alignment preserved (padded whitespace)
-- [ ] run `go test ./internal/tui/...` — must pass
+- [x] extend `hasStatusColumns()` to return true also when any service has non-empty `Ports`
+- [x] **no changes to `svcVisibleCount()`** — Ports column shares the same captions row that already triggers the existing `+1` to `headerLines`. Do not add a second bump.
+- [x] in `viewSelectContainers` row rendering (around app.go:1900-1975), add `maxPorts` width tracking alongside `maxCreated`/`maxUptime`
+- [x] append captions cell `"Ports"` after `"Uptime"` when `maxPorts > 0`
+- [x] append per-row `compose.FormatPorts(st.Ports)` cell after Uptime gated on `maxPorts > 0`, padded with `%-*s` to `maxPorts` width — empty Ports cells still render as padded whitespace, matching the existing Created/Uptime pattern
+- [x] write tests: row rendering with ports — formatted string appears in `View()` output; captions row includes "Ports" when any service has ports; `hasStatusColumns()` returns true with only Ports populated (existing test extended); row with empty Ports for a service in a list where another service has ports — alignment preserved (padded whitespace)
+- [x] run `go test ./internal/tui/...` — must pass
 
 ### Task 8: Verify acceptance criteria
 
