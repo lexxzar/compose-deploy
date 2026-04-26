@@ -183,12 +183,12 @@ Captions row gains "Ports" label when any service has non-empty `Ports`.
 - Modify: `internal/compose/compose.go`
 - Modify: `internal/compose/compose_test.go`
 
-- [ ] add `parsePortsString(text string) []runner.Port` — parses comma-separated entries like `0.0.0.0:8080->80/tcp, :::8080->80/tcp, [::1]:8443->443/tcp`
-- [ ] handle IPv6 bracket syntax (`[::]:8080->80/tcp`); strip brackets in parsed `Host`
-- [ ] dedupe IPv4/IPv6 mirrors same as `extractPorts`
-- [ ] skip malformed entries silently (do not error — text format is best-effort fallback)
-- [ ] write tests: empty string; single entry; multi-entry comma-split; IPv4/IPv6 mirror dedup; bracketed IPv6; malformed entry skipped; all-malformed input → empty slice (no panic); UDP suffix preserved
-- [ ] run `go test ./internal/compose/...` — must pass
+- [x] add `parsePortsString(text string) []runner.Port` — parses comma-separated entries like `0.0.0.0:8080->80/tcp, :::8080->80/tcp, [::1]:8443->443/tcp`
+- [x] handle IPv6 bracket syntax (`[::]:8080->80/tcp`); strip brackets in parsed `Host`
+- [x] dedupe IPv4/IPv6 mirrors same as `extractPorts`
+- [x] skip malformed entries silently (do not error — text format is best-effort fallback)
+- [x] write tests: empty string; single entry; multi-entry comma-split; IPv4/IPv6 mirror dedup; bracketed IPv6; malformed entry skipped; all-malformed input → empty slice (no panic); UDP suffix preserved
+- [x] run `go test ./internal/compose/...` — must pass
 
 ### Task 4: Wire ports into `parseContainerStatus` aggregation
 

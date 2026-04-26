@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
@@ -403,6 +404,127 @@ func extractPorts(entry psEntry) []runner.Port {
 // to be replaced by an IPv4 mirror of the same (HostPort, ContainerPort, Protocol).
 func isIPv6Wildcard(host string) bool {
 	return strings.Contains(host, ":")
+}
+
+// parsePortsString is a fallback parser for Compose's `Ports` text field, used when
+// the structured `Publishers` array is empty/missing (older Compose versions).
+//
+// It accepts a comma-separated list of entries shaped like:
+//
+//	0.0.0.0:8080->80/tcp
+//	:::8080->80/tcp
+//	[::]:8080->80/tcp
+//	[::1]:8443->443/tcp
+//	0.0.0.0:1812->1812/udp
+//
+// Entries without a `->` (e.g. plain "80/tcp" exposed-only) are skipped. Malformed
+// entries are skipped silently (best-effort). IPv4/IPv6 mirrors of the same
+// (HostPort, ContainerPort, Protocol) tuple are deduped, preferring the IPv4 form.
+func parsePortsString(text string) []runner.Port {
+	text = strings.TrimSpace(text)
+	if text == "" {
+		return nil
+	}
+	type key struct {
+		hostPort      int
+		containerPort int
+		protocol      string
+	}
+	idx := make(map[key]int)
+	var ports []runner.Port
+	for _, raw := range strings.Split(text, ",") {
+		entry := strings.TrimSpace(raw)
+		if entry == "" {
+			continue
+		}
+		// Must contain "->"; otherwise it's an internal-only entry like "80/tcp".
+		arrowIdx := strings.Index(entry, "->")
+		if arrowIdx < 0 {
+			continue
+		}
+		left := entry[:arrowIdx]
+		right := entry[arrowIdx+2:]
+
+		// Parse host portion: either "host:port" or "[ipv6]:port" or ":::port" (IPv6 unspecified).
+		host, hostPortStr, ok := splitHostPort(left)
+		if !ok {
+			continue
+		}
+		hp, err := strconv.Atoi(hostPortStr)
+		if err != nil || hp <= 0 {
+			continue
+		}
+
+		// Parse container portion: "port/proto" or "port".
+		cpStr := right
+		proto := ""
+		if slash := strings.Index(right, "/"); slash >= 0 {
+			cpStr = right[:slash]
+			proto = right[slash+1:]
+		}
+		cp, err := strconv.Atoi(cpStr)
+		if err != nil || cp <= 0 {
+			continue
+		}
+
+		if host == "" {
+			host = "0.0.0.0"
+		}
+
+		k := key{hostPort: hp, containerPort: cp, protocol: proto}
+		if existing, ok := idx[k]; ok {
+			if isIPv6Wildcard(ports[existing].Host) && !isIPv6Wildcard(host) {
+				ports[existing].Host = host
+			}
+			continue
+		}
+		idx[k] = len(ports)
+		ports = append(ports, runner.Port{
+			Host:          host,
+			HostPort:      hp,
+			ContainerPort: cp,
+			Protocol:      proto,
+		})
+	}
+	return ports
+}
+
+// splitHostPort splits a "host:port" or "[ipv6]:port" string into (host, port).
+// Returns ok=false if the input has no port separator or is malformed.
+// IPv6 brackets are stripped from the returned host. The bare "::port" form
+// (Compose's IPv6 unspecified shorthand, three colons total) is recognized:
+// host becomes "::" and port becomes whatever follows the third colon.
+func splitHostPort(s string) (host, port string, ok bool) {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return "", "", false
+	}
+	// Bracketed IPv6: "[..]:port"
+	if strings.HasPrefix(s, "[") {
+		closeIdx := strings.Index(s, "]")
+		if closeIdx < 0 || closeIdx+1 >= len(s) || s[closeIdx+1] != ':' {
+			return "", "", false
+		}
+		host = s[1:closeIdx]
+		port = s[closeIdx+2:]
+		if port == "" {
+			return "", "", false
+		}
+		return host, port, true
+	}
+	// Find last colon — split host:port. Handles bare-IPv6 forms like "::8080"
+	// (which Compose emits for the unspecified IPv6 address); the last colon is
+	// the host:port separator, leaving "::" as the host.
+	lastColon := strings.LastIndex(s, ":")
+	if lastColon < 0 {
+		return "", "", false
+	}
+	host = s[:lastColon]
+	port = s[lastColon+1:]
+	if port == "" {
+		return "", "", false
+	}
+	return host, port, true
 }
 
 // ContainerStatus returns a map of service name to ServiceStatus.

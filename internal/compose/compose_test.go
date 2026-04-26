@@ -1963,3 +1963,131 @@ func TestExtractPorts(t *testing.T) {
 		})
 	}
 }
+
+func TestParsePortsString(t *testing.T) {
+	tests := []struct {
+		name string
+		in   string
+		want []runner.Port
+	}{
+		{
+			name: "empty string returns nil",
+			in:   "",
+			want: nil,
+		},
+		{
+			name: "whitespace-only returns nil",
+			in:   "   ",
+			want: nil,
+		},
+		{
+			name: "single ipv4 entry",
+			in:   "0.0.0.0:8080->80/tcp",
+			want: []runner.Port{
+				{Host: "0.0.0.0", HostPort: 8080, ContainerPort: 80, Protocol: "tcp"},
+			},
+		},
+		{
+			name: "comma split with ipv4/ipv6 mirror dedupes to ipv4",
+			in:   "0.0.0.0:8080->80/tcp, :::8080->80/tcp",
+			want: []runner.Port{
+				{Host: "0.0.0.0", HostPort: 8080, ContainerPort: 80, Protocol: "tcp"},
+			},
+		},
+		{
+			name: "bracketed ipv6 host strips brackets",
+			in:   "[::]:8080->80/tcp",
+			want: []runner.Port{
+				{Host: "::", HostPort: 8080, ContainerPort: 80, Protocol: "tcp"},
+			},
+		},
+		{
+			name: "bracketed ipv6 then ipv4 mirror collapses to ipv4",
+			in:   "[::]:8080->80/tcp, 0.0.0.0:8080->80/tcp",
+			want: []runner.Port{
+				{Host: "0.0.0.0", HostPort: 8080, ContainerPort: 80, Protocol: "tcp"},
+			},
+		},
+		{
+			name: "specific ipv6 host (loopback) preserved",
+			in:   "[::1]:8443->443/tcp",
+			want: []runner.Port{
+				{Host: "::1", HostPort: 8443, ContainerPort: 443, Protocol: "tcp"},
+			},
+		},
+		{
+			name: "udp suffix preserved",
+			in:   "0.0.0.0:1812->1812/udp",
+			want: []runner.Port{
+				{Host: "0.0.0.0", HostPort: 1812, ContainerPort: 1812, Protocol: "udp"},
+			},
+		},
+		{
+			name: "multiple distinct entries preserved in order",
+			in:   "0.0.0.0:80->80/tcp, 0.0.0.0:443->443/tcp, 127.0.0.1:9000->9000/tcp",
+			want: []runner.Port{
+				{Host: "0.0.0.0", HostPort: 80, ContainerPort: 80, Protocol: "tcp"},
+				{Host: "0.0.0.0", HostPort: 443, ContainerPort: 443, Protocol: "tcp"},
+				{Host: "127.0.0.1", HostPort: 9000, ContainerPort: 9000, Protocol: "tcp"},
+			},
+		},
+		{
+			name: "internal-only entry without arrow is skipped",
+			in:   "80/tcp, 0.0.0.0:8080->80/tcp",
+			want: []runner.Port{
+				{Host: "0.0.0.0", HostPort: 8080, ContainerPort: 80, Protocol: "tcp"},
+			},
+		},
+		{
+			name: "malformed entry skipped silently",
+			in:   "garbage, 0.0.0.0:8080->80/tcp, also-bad->nothing",
+			want: []runner.Port{
+				{Host: "0.0.0.0", HostPort: 8080, ContainerPort: 80, Protocol: "tcp"},
+			},
+		},
+		{
+			name: "all-malformed input returns nil without panic",
+			in:   "garbage, more-garbage, ->",
+			want: nil,
+		},
+		{
+			name: "non-numeric port skipped",
+			in:   "0.0.0.0:abc->80/tcp",
+			want: nil,
+		},
+		{
+			name: "non-numeric container port skipped",
+			in:   "0.0.0.0:8080->xyz/tcp",
+			want: nil,
+		},
+		{
+			name: "missing protocol still parses (no slash)",
+			in:   "0.0.0.0:8080->80",
+			want: []runner.Port{
+				{Host: "0.0.0.0", HostPort: 8080, ContainerPort: 80, Protocol: ""},
+			},
+		},
+		{
+			name: "different protocols are not mirrors",
+			in:   "0.0.0.0:53->53/tcp, 0.0.0.0:53->53/udp",
+			want: []runner.Port{
+				{Host: "0.0.0.0", HostPort: 53, ContainerPort: 53, Protocol: "tcp"},
+				{Host: "0.0.0.0", HostPort: 53, ContainerPort: 53, Protocol: "udp"},
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := parsePortsString(tt.in)
+			if len(got) != len(tt.want) {
+				t.Fatalf("parsePortsString() len = %d, want %d: got=%+v", len(got), len(tt.want), got)
+			}
+			for i, w := range tt.want {
+				if got[i] != w {
+					t.Errorf("parsePortsString()[%d] = %+v, want %+v", i, got[i], w)
+				}
+			}
+		})
+	}
+}
