@@ -208,10 +208,10 @@ Captions row gains "Ports" label when any service has non-empty `Ports`.
 - Create: `internal/compose/ports.go`
 - Create: `internal/compose/ports_test.go`
 
-- [ ] create `internal/compose/ports.go` with `FormatPort(p runner.Port) string` returning `host:hp→cp` plus `/proto` suffix when protocol is non-empty and not `tcp`
-- [ ] add `FormatPorts(ports []runner.Port) string` that returns `""` for empty slice and comma-joined `FormatPort` values otherwise
-- [ ] write tests: TCP omits suffix; UDP shows `/udp`; SCTP shows `/sctp`; empty protocol omits suffix; localhost bind preserved (`127.0.0.1:9000→9000`); arrow rune is exactly `→` (U+2192) — not `->`; empty slice → empty string; multi-port join
-- [ ] run `go test ./internal/compose/...` — must pass
+- [x] create `internal/compose/ports.go` with `FormatPort(p runner.Port) string` returning `host:hp→cp` plus `/proto` suffix when protocol is non-empty and not `tcp`
+- [x] add `FormatPorts(ports []runner.Port) string` that returns `""` for empty slice and comma-joined `FormatPort` values otherwise
+- [x] write tests: TCP omits suffix; UDP shows `/udp`; SCTP shows `/sctp`; empty protocol omits suffix; localhost bind preserved (`127.0.0.1:9000→9000`); arrow rune is exactly `→` (U+2192) — not `->`; empty slice → empty string; multi-port join
+- [x] run `go test ./internal/compose/...` — must pass
 
 ### Task 6: Surface ports in CLI `list` output
 
