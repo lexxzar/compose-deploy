@@ -8,6 +8,7 @@ import (
 	"os/signal"
 	"sort"
 	"strings"
+	"unicode/utf8"
 
 	"github.com/lexxzar/compose-deploy/internal/compose"
 	"github.com/lexxzar/compose-deploy/internal/config"
@@ -22,12 +23,13 @@ var (
 )
 
 type serviceStatus struct {
-	Project string `json:"project,omitempty"`
-	Name    string `json:"service"`
-	Running bool   `json:"running"`
-	Health  string `json:"health,omitempty"`
-	Created string `json:"created,omitempty"`
-	Uptime  string `json:"uptime,omitempty"`
+	Project string        `json:"project,omitempty"`
+	Name    string        `json:"service"`
+	Running bool          `json:"running"`
+	Health  string        `json:"health,omitempty"`
+	Created string        `json:"created,omitempty"`
+	Uptime  string        `json:"uptime,omitempty"`
+	Ports   []runner.Port `json:"ports,omitempty"`
 }
 
 // projectServices groups service statuses under a project name for grouped display.
@@ -48,6 +50,7 @@ func mergeStatus(services []string, status map[string]runner.ServiceStatus) []se
 			Health:  st.Health,
 			Created: st.Created,
 			Uptime:  st.Uptime,
+			Ports:   st.Ports,
 		}
 	}
 	sort.Slice(result, func(i, j int) bool {
@@ -79,7 +82,9 @@ func formatDots(items []serviceStatus) string {
 	maxName := 0
 	maxCreated := 0
 	maxUptime := 0
-	for _, item := range items {
+	maxPorts := 0
+	portsStr := make([]string, len(items))
+	for i, item := range items {
 		if len(item.Name) > maxName {
 			maxName = len(item.Name)
 		}
@@ -88,6 +93,10 @@ func formatDots(items []serviceStatus) string {
 		}
 		if len(item.Uptime) > maxUptime {
 			maxUptime = len(item.Uptime)
+		}
+		portsStr[i] = compose.FormatPorts(item.Ports)
+		if w := utf8.RuneCountInString(portsStr[i]); w > maxPorts {
+			maxPorts = w
 		}
 	}
 
@@ -113,6 +122,10 @@ func formatDots(items []serviceStatus) string {
 			b.WriteString("  ")
 			b.WriteString(fmt.Sprintf("%-*s", maxUptime, item.Uptime))
 		}
+		if maxPorts > 0 {
+			b.WriteString("  ")
+			b.WriteString(fmt.Sprintf("%-*s", maxPorts, portsStr[i]))
+		}
 	}
 	return b.String()
 }
@@ -134,7 +147,9 @@ func formatDotsGrouped(projects []projectServices) string {
 		maxName := 0
 		maxCreated := 0
 		maxUptime := 0
-		for _, item := range proj.Services {
+		maxPorts := 0
+		portsStr := make([]string, len(proj.Services))
+		for i, item := range proj.Services {
 			if len(item.Name) > maxName {
 				maxName = len(item.Name)
 			}
@@ -144,9 +159,13 @@ func formatDotsGrouped(projects []projectServices) string {
 			if len(item.Uptime) > maxUptime {
 				maxUptime = len(item.Uptime)
 			}
+			portsStr[i] = compose.FormatPorts(item.Ports)
+			if w := utf8.RuneCountInString(portsStr[i]); w > maxPorts {
+				maxPorts = w
+			}
 		}
 
-		for _, item := range proj.Services {
+		for i, item := range proj.Services {
 			b.WriteByte('\n')
 			b.WriteString("  ")
 			if item.Running {
@@ -165,6 +184,10 @@ func formatDotsGrouped(projects []projectServices) string {
 			if maxUptime > 0 {
 				b.WriteString("  ")
 				b.WriteString(fmt.Sprintf("%-*s", maxUptime, item.Uptime))
+			}
+			if maxPorts > 0 {
+				b.WriteString("  ")
+				b.WriteString(fmt.Sprintf("%-*s", maxPorts, portsStr[i]))
 			}
 		}
 	}

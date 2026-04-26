@@ -8,6 +8,7 @@ import (
 	"os/exec"
 	"slices"
 	"strings"
+	"unicode/utf8"
 
 	"github.com/charmbracelet/bubbles/spinner"
 	"github.com/charmbracelet/bubbles/textinput"
@@ -1496,12 +1497,12 @@ func (m Model) selectedCount() int {
 	return count
 }
 
-// hasStatusColumns returns true if any service in m.services has non-empty Created or Uptime data,
-// indicating that column captions should be displayed.
+// hasStatusColumns returns true if any service in m.services has non-empty Created, Uptime,
+// or Ports data, indicating that column captions should be displayed.
 func (m Model) hasStatusColumns() bool {
 	for _, svc := range m.services {
 		if st, ok := m.svcStatus[svc]; ok {
-			if st.Created != "" || st.Uptime != "" {
+			if st.Created != "" || st.Uptime != "" || len(st.Ports) > 0 {
 				return true
 			}
 		}
@@ -1901,10 +1902,15 @@ func (m Model) viewSelectContainers() string {
 		end = len(m.services)
 	}
 
-	// Calculate max widths for alignment (across ALL services, not just visible)
+	// Calculate max widths for alignment (across ALL services, not just visible).
+	// portsStr caches FormatPorts(...) per service so the render loop below can
+	// reuse the formatted strings without re-calling FormatPorts (mirrors the
+	// pattern in cmd/list.go formatDots/formatDotsGrouped).
 	maxName := 0
 	maxCreated := 0
 	maxUptime := 0
+	maxPorts := 0
+	portsStr := make(map[string]string, len(m.services))
 	for _, svc := range m.services {
 		if len(svc) > maxName {
 			maxName = len(svc)
@@ -1915,6 +1921,11 @@ func (m Model) viewSelectContainers() string {
 			}
 			if len(st.Uptime) > maxUptime {
 				maxUptime = len(st.Uptime)
+			}
+			s := compose.FormatPorts(st.Ports)
+			portsStr[svc] = s
+			if w := utf8.RuneCountInString(s); w > maxPorts {
+				maxPorts = w
 			}
 		}
 	}
@@ -1928,8 +1939,19 @@ func (m Model) viewSelectContainers() string {
 		b.WriteString("\n\n")
 	}
 
-	// Column captions row (only when status data exists)
-	if maxCreated > 0 || maxUptime > 0 {
+	// Column captions row (only when status data exists). Widen each active
+	// column to at least its caption width so the caption never overflows and
+	// shifts the following columns rightward.
+	if maxCreated > 0 || maxUptime > 0 || maxPorts > 0 {
+		if maxCreated > 0 && len("Created") > maxCreated {
+			maxCreated = len("Created")
+		}
+		if maxUptime > 0 && len("Uptime") > maxUptime {
+			maxUptime = len("Uptime")
+		}
+		if maxPorts > 0 && len("Ports") > maxPorts {
+			maxPorts = len("Ports")
+		}
 		// Left padding: cursor(2) + checkbox(3) + space(1) + health(1) + space(1) + dot(1) + space(1) + name
 		padding := strings.Repeat(" ", 10+maxName)
 		header := padding
@@ -1938,6 +1960,9 @@ func (m Model) viewSelectContainers() string {
 		}
 		if maxUptime > 0 {
 			header += fmt.Sprintf("  %-*s", maxUptime, "Uptime")
+		}
+		if maxPorts > 0 {
+			header += fmt.Sprintf("  %-*s", maxPorts, "Ports")
 		}
 		b.WriteString(descStyle.Render(header))
 		b.WriteByte('\n')
@@ -1963,13 +1988,16 @@ func (m Model) viewSelectContainers() string {
 			dot = statusRunningDot.Render("●")
 		}
 
-		// Build line: cursor + checkbox + health + dot + name [+ created] [+ uptime]
+		// Build line: cursor + checkbox + health + dot + name [+ created] [+ uptime] [+ ports]
 		line := fmt.Sprintf("%s%s %s %s %-*s", cursor, checkbox, health, dot, maxName, svc)
 		if maxCreated > 0 {
 			line += fmt.Sprintf("  %-*s", maxCreated, st.Created)
 		}
 		if maxUptime > 0 {
 			line += fmt.Sprintf("  %-*s", maxUptime, st.Uptime)
+		}
+		if maxPorts > 0 {
+			line += fmt.Sprintf("  %-*s", maxPorts, portsStr[svc])
 		}
 		b.WriteString(line)
 		b.WriteByte('\n')

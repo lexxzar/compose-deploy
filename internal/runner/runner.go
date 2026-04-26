@@ -5,12 +5,27 @@ import (
 	"io"
 )
 
+// Port describes a single published port mapping for a service.
+// Aggregated across replicas at the ServiceStatus level: deduped by
+// (Host, HostPort, ContainerPort, Protocol) and sorted ascending by HostPort.
+//
+// JSON tags are intentionally present: cmd/list.go re-exports runner.Port
+// directly in its `--json` output, so the wire shape is owned here. Other
+// runner types are wire-format-agnostic.
+type Port struct {
+	Host          string `json:"host"`           // bind interface, e.g. "0.0.0.0", "127.0.0.1"
+	HostPort      int    `json:"host_port"`      // published host port
+	ContainerPort int    `json:"container_port"` // target container port
+	Protocol      string `json:"protocol"`       // "tcp", "udp", "sctp"
+}
+
 // ServiceStatus holds the running state and health check status of a service.
 type ServiceStatus struct {
 	Running bool
 	Health  string // "healthy", "unhealthy", "starting", or "" (no healthcheck)
 	Created string // formatted creation time, e.g. "2024-01-15 09:30"
 	Uptime  string // compact uptime, e.g. "3h", "2d", or "" if not running
+	Ports   []Port // aggregated/deduped/sorted across replicas; see Port doc
 }
 
 // Composer is the interface consumed by the runner, implemented by compose.Compose.
@@ -26,6 +41,8 @@ type Composer interface {
 	// Health uses worst-case priority (unhealthy > starting > healthy),
 	// Created uses the oldest replica's creation time, and
 	// Uptime uses the longest-running replica's uptime string.
+	// Ports are deduped across replicas by (Host, HostPort, ContainerPort,
+	// Protocol) and sorted ascending by HostPort.
 	ContainerStatus(ctx context.Context) (map[string]ServiceStatus, error)
 	// Logs streams docker compose logs for a single service to w.
 	// When follow is true, it streams until ctx is cancelled.

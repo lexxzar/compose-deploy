@@ -11,6 +11,7 @@ import (
 	"regexp"
 	"strings"
 	"testing"
+	"unicode/utf8"
 
 	"github.com/charmbracelet/bubbles/viewport"
 	tea "github.com/charmbracelet/bubbletea"
@@ -3594,6 +3595,15 @@ func TestHasStatusColumns(t *testing.T) {
 	if m.hasStatusColumns() {
 		t.Error("hasStatusColumns() = true, want false when status key not in services")
 	}
+
+	// Status with only Ports (no Created/Uptime)
+	m.services = []string{"a"}
+	m.svcStatus = map[string]runner.ServiceStatus{
+		"a": {Running: true, Ports: []runner.Port{{Host: "0.0.0.0", HostPort: 80, ContainerPort: 80, Protocol: "tcp"}}},
+	}
+	if !m.hasStatusColumns() {
+		t.Error("hasStatusColumns() = false, want true with Ports set")
+	}
 }
 
 func TestFixSvcOffset_CursorBelowWindow(t *testing.T) {
@@ -3983,6 +3993,119 @@ func TestViewSelectContainers_CreatedAndUptimeAlignment(t *testing.T) {
 	if idx0 != idx1 {
 		t.Errorf("Created columns not aligned: line0 at %d, line1 at %d\nLine0: %q\nLine1: %q",
 			idx0, idx1, svcLines[0], svcLines[1])
+	}
+}
+
+func TestViewSelectContainers_Ports(t *testing.T) {
+	mc := &mockComposer{services: []string{"web", "db"}}
+	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
+	m.screen = screenSelectContainers
+	m.services = mc.services
+	m.svcStatus = map[string]runner.ServiceStatus{
+		"web": {Running: true, Ports: []runner.Port{
+			{Host: "0.0.0.0", HostPort: 8080, ContainerPort: 80, Protocol: "tcp"},
+			{Host: "0.0.0.0", HostPort: 8443, ContainerPort: 443, Protocol: "tcp"},
+		}},
+		"db": {Running: true},
+	}
+	m.width = 200
+	m.height = 24
+
+	view := m.viewSelectContainers()
+
+	// Verify Ports caption appears
+	if !strings.Contains(view, "Ports") {
+		t.Errorf("expected 'Ports' caption in view, got:\n%s", view)
+	}
+
+	// Verify formatted ports appear (wildcard host hidden)
+	if !strings.Contains(view, "8080→80") {
+		t.Errorf("expected formatted port '8080→80' in view, got:\n%s", view)
+	}
+	if !strings.Contains(view, "8443→443") {
+		t.Errorf("expected formatted port '8443→443' in view, got:\n%s", view)
+	}
+}
+
+func TestViewSelectContainers_PortsAlignment(t *testing.T) {
+	mc := &mockComposer{services: []string{"nginx", "api"}}
+	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
+	m.screen = screenSelectContainers
+	m.services = mc.services
+	m.svcStatus = map[string]runner.ServiceStatus{
+		"nginx": {Running: true, Ports: []runner.Port{
+			{Host: "0.0.0.0", HostPort: 80, ContainerPort: 80, Protocol: "tcp"},
+		}},
+		"api": {Running: true},
+	}
+	m.width = 200
+	m.height = 24
+
+	view := m.viewSelectContainers()
+	lines := strings.Split(view, "\n")
+
+	// Find caption row and both service rows
+	var captionLine, nginxLine, apiLine string
+	for _, line := range lines {
+		if strings.Contains(line, "Ports") && !strings.Contains(line, "●") {
+			captionLine = line
+		}
+		if strings.Contains(line, "● ") && strings.Contains(line, "nginx") {
+			nginxLine = line
+		}
+		if strings.Contains(line, "● ") && strings.Contains(line, "api") && !strings.Contains(line, "nginx") {
+			apiLine = line
+		}
+	}
+	if captionLine == "" {
+		t.Fatalf("expected captions row containing 'Ports', got:\n%s", view)
+	}
+	if nginxLine == "" || apiLine == "" {
+		t.Fatalf("expected service rows, got:\n%s", view)
+	}
+
+	// nginx line must contain the formatted port (wildcard host hidden)
+	if !strings.Contains(nginxLine, "80→80") {
+		t.Errorf("expected formatted port in nginx line, got: %q", nginxLine)
+	}
+
+	// Strong alignment check: both rows must have the exact same visible (rune)
+	// width. The empty-ports row pads the Ports column with spaces to match the
+	// formatted-port row, so widths must be equal — mirrors the CLI's parallel
+	// assertion in TestFormatDots_PortsColumn_Mixed.
+	wNginx := utf8.RuneCountInString(nginxLine)
+	wAPI := utf8.RuneCountInString(apiLine)
+	if wNginx != wAPI {
+		t.Errorf("ports column not aligned (rune width): nginx=%d, api=%d\nnginx: %q\napi:   %q",
+			wNginx, wAPI, nginxLine, apiLine)
+	}
+
+	// Column-boundary check: locate the rune-index of "Ports" in the captions row,
+	// then assert that both data rows have a rune at that column position (padding
+	// or content) — i.e., both rows are at least as wide as the captions column starts.
+	captionRuneIdx := utf8.RuneCountInString(captionLine[:strings.Index(captionLine, "Ports")])
+	for _, line := range []string{nginxLine, apiLine} {
+		if utf8.RuneCountInString(line) < captionRuneIdx {
+			t.Errorf("data row shorter than 'Ports' caption start (%d runes): %q", captionRuneIdx, line)
+		}
+	}
+}
+
+func TestViewSelectContainers_NoPortsColumnWhenAllEmpty(t *testing.T) {
+	mc := &mockComposer{services: []string{"web", "db"}}
+	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
+	m.screen = screenSelectContainers
+	m.services = mc.services
+	m.svcStatus = map[string]runner.ServiceStatus{
+		"web": {Running: true, Created: "2024-01-15 09:30", Uptime: "3h"},
+		"db":  {Running: false, Created: "2024-01-15 09:30"},
+	}
+	m.width = 200
+	m.height = 24
+
+	view := m.viewSelectContainers()
+	if strings.Contains(view, "Ports") {
+		t.Errorf("did not expect 'Ports' caption when no service has ports, got:\n%s", view)
 	}
 }
 

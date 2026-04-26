@@ -159,11 +159,11 @@ Captions row gains "Ports" label when any service has non-empty `Ports`.
 **Files:**
 - Modify: `internal/runner/runner.go`
 
-- [ ] add `Port` struct with `Host`, `HostPort`, `ContainerPort`, `Protocol` fields and JSON tags (`host`, `host_port`, `container_port`, `protocol`)
-- [ ] append `Ports []Port` field to `ServiceStatus`
-- [ ] update `ServiceStatus` doc comment to describe `Ports` aggregation rule (deduped, sorted by HostPort)
-- [ ] verify `runner` package still compiles (no Composer interface change required)
-- [ ] run `go test ./internal/runner/...` — must pass
+- [x] add `Port` struct with `Host`, `HostPort`, `ContainerPort`, `Protocol` fields and JSON tags (`host`, `host_port`, `container_port`, `protocol`)
+- [x] append `Ports []Port` field to `ServiceStatus`
+- [x] update `ServiceStatus` doc comment to describe `Ports` aggregation rule (deduped, sorted by HostPort)
+- [x] verify `runner` package still compiles (no Composer interface change required)
+- [x] run `go test ./internal/runner/...` — must pass
 
 ### Task 2: Extend `psEntry` and add `extractPorts` helper
 
@@ -171,11 +171,11 @@ Captions row gains "Ports" label when any service has non-empty `Ports`.
 - Modify: `internal/compose/compose.go`
 - Modify: `internal/compose/compose_test.go`
 
-- [ ] add `psPublisher` struct with `URL`, `TargetPort`, `PublishedPort`, `Protocol` JSON tags
-- [ ] extend `psEntry` with `Publishers []psPublisher` and `Ports string` fields
-- [ ] add `extractPorts(entry psEntry) []runner.Port` — converts `Publishers`, skips `PublishedPort == 0`, dedupes IPv4/IPv6 mirrors (collapse `::` mirror to its `0.0.0.0` sibling when `(HostPort, ContainerPort, Protocol)` matches), preserves order
-- [ ] write tests for `extractPorts`: single publisher; `PublishedPort == 0` skipped; IPv4/IPv6 mirror dedup; multiple distinct publishers preserved
-- [ ] run `go test ./internal/compose/...` — must pass
+- [x] add `psPublisher` struct with `URL`, `TargetPort`, `PublishedPort`, `Protocol` JSON tags
+- [x] extend `psEntry` with `Publishers []psPublisher` and `Ports string` fields
+- [x] add `extractPorts(entry psEntry) []runner.Port` — converts `Publishers`, skips `PublishedPort == 0`, dedupes IPv4/IPv6 mirrors (collapse `::` mirror to its `0.0.0.0` sibling when `(HostPort, ContainerPort, Protocol)` matches), preserves order
+- [x] write tests for `extractPorts`: single publisher; `PublishedPort == 0` skipped; IPv4/IPv6 mirror dedup; multiple distinct publishers preserved
+- [x] run `go test ./internal/compose/...` — must pass
 
 ### Task 3: Add `parsePortsString` fallback for older Compose
 
@@ -183,12 +183,12 @@ Captions row gains "Ports" label when any service has non-empty `Ports`.
 - Modify: `internal/compose/compose.go`
 - Modify: `internal/compose/compose_test.go`
 
-- [ ] add `parsePortsString(text string) []runner.Port` — parses comma-separated entries like `0.0.0.0:8080->80/tcp, :::8080->80/tcp, [::1]:8443->443/tcp`
-- [ ] handle IPv6 bracket syntax (`[::]:8080->80/tcp`); strip brackets in parsed `Host`
-- [ ] dedupe IPv4/IPv6 mirrors same as `extractPorts`
-- [ ] skip malformed entries silently (do not error — text format is best-effort fallback)
-- [ ] write tests: empty string; single entry; multi-entry comma-split; IPv4/IPv6 mirror dedup; bracketed IPv6; malformed entry skipped; all-malformed input → empty slice (no panic); UDP suffix preserved
-- [ ] run `go test ./internal/compose/...` — must pass
+- [x] add `parsePortsString(text string) []runner.Port` — parses comma-separated entries like `0.0.0.0:8080->80/tcp, :::8080->80/tcp, [::1]:8443->443/tcp`
+- [x] handle IPv6 bracket syntax (`[::]:8080->80/tcp`); strip brackets in parsed `Host`
+- [x] dedupe IPv4/IPv6 mirrors same as `extractPorts`
+- [x] skip malformed entries silently (do not error — text format is best-effort fallback)
+- [x] write tests: empty string; single entry; multi-entry comma-split; IPv4/IPv6 mirror dedup; bracketed IPv6; malformed entry skipped; all-malformed input → empty slice (no panic); UDP suffix preserved
+- [x] run `go test ./internal/compose/...` — must pass
 
 ### Task 4: Wire ports into `parseContainerStatus` aggregation
 
@@ -196,11 +196,11 @@ Captions row gains "Ports" label when any service has non-empty `Ports`.
 - Modify: `internal/compose/compose.go`
 - Modify: `internal/compose/compose_test.go`
 
-- [ ] extend `svcAgg` with `ports []runner.Port` field
-- [ ] in the aggregation loop, call `extractPorts(entry)` (fallback to `parsePortsString(entry.Ports)` when `Publishers` is empty/nil) and append to `a.ports`
-- [ ] after aggregation loop, dedupe `a.ports` by `(Host, HostPort, ContainerPort, Protocol)` tuple and sort ascending by `HostPort`, then assign to `status[svc].Ports`
-- [ ] write tests: single replica with one publisher; scaled service with 3 ephemeral host ports → 3 distinct Ports sorted; scaled service with identical publishers → deduped to 1; stopped container with no `Publishers` → empty Ports; stopped replica that still has non-empty `Publishers` → ports are still surfaced (Compose-driven, not filtered by state); older-Compose fallback (no `Publishers`, `Ports` text only) parses correctly
-- [ ] run `go test ./internal/compose/...` — must pass
+- [x] extend `svcAgg` with `ports []runner.Port` field
+- [x] in the aggregation loop, call `extractPorts(entry)` (fallback to `parsePortsString(entry.Ports)` when `Publishers` is empty/nil) and append to `a.ports`
+- [x] after aggregation loop, dedupe `a.ports` by `(Host, HostPort, ContainerPort, Protocol)` tuple and sort ascending by `HostPort`, then assign to `status[svc].Ports`
+- [x] write tests: single replica with one publisher; scaled service with 3 ephemeral host ports → 3 distinct Ports sorted; scaled service with identical publishers → deduped to 1; stopped container with no `Publishers` → empty Ports; stopped replica that still has non-empty `Publishers` → ports are still surfaced (Compose-driven, not filtered by state); older-Compose fallback (no `Publishers`, `Ports` text only) parses correctly
+- [x] run `go test ./internal/compose/...` — must pass
 
 ### Task 5: Add `FormatPort` / `FormatPorts` render helpers
 
@@ -208,10 +208,10 @@ Captions row gains "Ports" label when any service has non-empty `Ports`.
 - Create: `internal/compose/ports.go`
 - Create: `internal/compose/ports_test.go`
 
-- [ ] create `internal/compose/ports.go` with `FormatPort(p runner.Port) string` returning `host:hp→cp` plus `/proto` suffix when protocol is non-empty and not `tcp`
-- [ ] add `FormatPorts(ports []runner.Port) string` that returns `""` for empty slice and comma-joined `FormatPort` values otherwise
-- [ ] write tests: TCP omits suffix; UDP shows `/udp`; SCTP shows `/sctp`; empty protocol omits suffix; localhost bind preserved (`127.0.0.1:9000→9000`); arrow rune is exactly `→` (U+2192) — not `->`; empty slice → empty string; multi-port join
-- [ ] run `go test ./internal/compose/...` — must pass
+- [x] create `internal/compose/ports.go` with `FormatPort(p runner.Port) string` returning `host:hp→cp` plus `/proto` suffix when protocol is non-empty and not `tcp`
+- [x] add `FormatPorts(ports []runner.Port) string` that returns `""` for empty slice and comma-joined `FormatPort` values otherwise
+- [x] write tests: TCP omits suffix; UDP shows `/udp`; SCTP shows `/sctp`; empty protocol omits suffix; localhost bind preserved (`127.0.0.1:9000→9000`); arrow rune is exactly `→` (U+2192) — not `->`; empty slice → empty string; multi-port join
+- [x] run `go test ./internal/compose/...` — must pass
 
 ### Task 6: Surface ports in CLI `list` output
 
@@ -219,12 +219,12 @@ Captions row gains "Ports" label when any service has non-empty `Ports`.
 - Modify: `cmd/list.go`
 - Modify: `cmd/list_test.go`
 
-- [ ] extend `serviceStatus` struct with `Ports []runner.Port \`json:"ports,omitempty"\``
-- [ ] update `mergeStatus` to copy `st.Ports` through into `serviceStatus`
-- [ ] in `formatDots`, track `maxPorts` width (computed as `len(compose.FormatPorts(item.Ports))`), append column after Uptime gated on `maxPorts > 0`
-- [ ] in `formatDotsGrouped`, replicate the same `maxPorts` per-project tracking and rendering
-- [ ] write tests: `formatDots` with mixed services (some with ports, some without) — column padded; `formatDots` with no services having ports — no Ports column rendered; `formatDots` over a `flattenProjectServices`-style fixture (multiple projects in flat mode, mixed port presence) — column aligns correctly; `formatDotsGrouped` with per-project max width recalculated; `formatJSON` round-trip preserves structured Port array (assert ports field present + correct field names + omitempty when empty)
-- [ ] run `go test ./cmd/...` — must pass
+- [x] extend `serviceStatus` struct with `Ports []runner.Port \`json:"ports,omitempty"\``
+- [x] update `mergeStatus` to copy `st.Ports` through into `serviceStatus`
+- [x] in `formatDots`, track `maxPorts` width (computed as `len(compose.FormatPorts(item.Ports))`), append column after Uptime gated on `maxPorts > 0`
+- [x] in `formatDotsGrouped`, replicate the same `maxPorts` per-project tracking and rendering
+- [x] write tests: `formatDots` with mixed services (some with ports, some without) — column padded; `formatDots` with no services having ports — no Ports column rendered; `formatDots` over a `flattenProjectServices`-style fixture (multiple projects in flat mode, mixed port presence) — column aligns correctly; `formatDotsGrouped` with per-project max width recalculated; `formatJSON` round-trip preserves structured Port array (assert ports field present + correct field names + omitempty when empty)
+- [x] run `go test ./cmd/...` — must pass
 
 ### Task 7: Surface ports in TUI container-select screen
 
@@ -232,25 +232,25 @@ Captions row gains "Ports" label when any service has non-empty `Ports`.
 - Modify: `internal/tui/app.go`
 - Modify: `internal/tui/app_test.go`
 
-- [ ] extend `hasStatusColumns()` to return true also when any service has non-empty `Ports`
-- [ ] **no changes to `svcVisibleCount()`** — Ports column shares the same captions row that already triggers the existing `+1` to `headerLines`. Do not add a second bump.
-- [ ] in `viewSelectContainers` row rendering (around app.go:1900-1975), add `maxPorts` width tracking alongside `maxCreated`/`maxUptime`
-- [ ] append captions cell `"Ports"` after `"Uptime"` when `maxPorts > 0`
-- [ ] append per-row `compose.FormatPorts(st.Ports)` cell after Uptime gated on `maxPorts > 0`, padded with `%-*s` to `maxPorts` width — empty Ports cells still render as padded whitespace, matching the existing Created/Uptime pattern
-- [ ] write tests: row rendering with ports — formatted string appears in `View()` output; captions row includes "Ports" when any service has ports; `hasStatusColumns()` returns true with only Ports populated (existing test extended); row with empty Ports for a service in a list where another service has ports — alignment preserved (padded whitespace)
-- [ ] run `go test ./internal/tui/...` — must pass
+- [x] extend `hasStatusColumns()` to return true also when any service has non-empty `Ports`
+- [x] **no changes to `svcVisibleCount()`** — Ports column shares the same captions row that already triggers the existing `+1` to `headerLines`. Do not add a second bump.
+- [x] in `viewSelectContainers` row rendering (around app.go:1900-1975), add `maxPorts` width tracking alongside `maxCreated`/`maxUptime`
+- [x] append captions cell `"Ports"` after `"Uptime"` when `maxPorts > 0`
+- [x] append per-row `compose.FormatPorts(st.Ports)` cell after Uptime gated on `maxPorts > 0`, padded with `%-*s` to `maxPorts` width — empty Ports cells still render as padded whitespace, matching the existing Created/Uptime pattern
+- [x] write tests: row rendering with ports — formatted string appears in `View()` output; captions row includes "Ports" when any service has ports; `hasStatusColumns()` returns true with only Ports populated (existing test extended); row with empty Ports for a service in a list where another service has ports — alignment preserved (padded whitespace)
+- [x] run `go test ./internal/tui/...` — must pass
 
 ### Task 8: Verify acceptance criteria
 
-- [ ] verify `cdeploy list` shows Ports column for services with published mappings; blank cell for services without
-- [ ] verify `cdeploy list --json` includes structured `ports` array per service with correct field names
-- [ ] verify TUI container-select shows Ports column matching CLI format (visually align with Created/Uptime)
-- [ ] verify scaled services list all replica host ports comma-joined
-- [ ] verify IPv4/IPv6 dual-stack services show one row, not two
-- [ ] verify older Compose versions still render ports via text fallback (synthetic test fixture with `Ports` text only, `Publishers` nil)
-- [ ] run full test suite: `go test ./... -count=1` — all pass
-- [ ] run `go build -o cdeploy .` — builds without errors
-- [ ] run `go mod tidy` — no changes needed (no new deps)
+- [x] verify `cdeploy list` shows Ports column for services with published mappings; blank cell for services without — covered by `TestFormatDots_PortsColumn_Mixed`, `TestFormatDots_NoPorts_NoColumn`, `TestFormatDots_PortsColumn_FlattenedMultiProject`
+- [x] verify `cdeploy list --json` includes structured `ports` array per service with correct field names — covered by `TestFormatJSON_IncludesPorts`
+- [x] verify TUI container-select shows Ports column matching CLI format (visually align with Created/Uptime) — covered by `TestViewSelectContainers_Ports`, `TestViewSelectContainers_PortsAlignment`, `TestViewSelectContainers_NoPortsColumnWhenAllEmpty`
+- [x] verify scaled services list all replica host ports comma-joined — covered by `TestParseContainerStatus_PortsAggregation/scaled_service_with_3_ephemeral_host_ports_—_3_distinct_sorted`
+- [x] verify IPv4/IPv6 dual-stack services show one row, not two — covered by `TestExtractPorts/IPv4_IPv6_mirror_dedup`, `TestParsePortsString/comma_split_with_ipv4/ipv6_mirror_dedupes_to_ipv4`, `TestParseContainerStatus_PortsAggregation/scaled_service_ipv4_and_ipv6_mirrors_collapse_across_replicas`
+- [x] verify older Compose versions still render ports via text fallback (synthetic test fixture with `Ports` text only, `Publishers` nil) — covered by `TestParseContainerStatus_PortsAggregation/older_Compose_fallback_—_Ports_text_only,_Publishers_nil` and `older_Compose_fallback_with_multiple_ports_parses_correctly`
+- [x] run full test suite: `go test ./... -count=1` — all pass
+- [x] run `go build -o cdeploy .` — builds without errors
+- [x] run `go mod tidy` — no changes needed (no new deps)
 
 ### Task 9: Update documentation
 
@@ -258,9 +258,9 @@ Captions row gains "Ports" label when any service has non-empty `Ports`.
 - Modify: `CLAUDE.md`
 - Modify: `README.md` (if it documents `list` output format)
 
-- [ ] add a paragraph to CLAUDE.md under the existing "Health checks" / "Multi-project discovery" cluster describing the Ports column: data source (`Publishers` primary, `Ports` text fallback), format (`host:hp→cp`, `/tcp` omitted, `/udp` shown), aggregation (deduped, sorted by HostPort), and edge cases (stopped containers blank, internal-only skipped)
-- [ ] grep README.md for `cdeploy list` examples — if found, add ports to one example; if absent, skip (do not invent new sections)
-- [ ] move this plan to `docs/plans/completed/`
+- [x] add a paragraph to CLAUDE.md under the existing "Health checks" / "Multi-project discovery" cluster describing the Ports column: data source (`Publishers` primary, `Ports` text fallback), format (`host:hp→cp`, `/tcp` omitted, `/udp` shown), aggregation (deduped, sorted by HostPort), and edge cases (stopped containers blank, internal-only skipped)
+- [x] grep README.md for `cdeploy list` examples — if found, add ports to one example; if absent, skip (do not invent new sections) — README has `cdeploy list` invocation examples but no output samples; no edit made
+- [x] move this plan to `docs/plans/completed/`
 
 ## Post-Completion
 

@@ -9,11 +9,29 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
+	"strconv"
 	"strings"
 	"time"
 
 	"github.com/lexxzar/compose-deploy/internal/runner"
 )
+
+// maxPortRangeExpansion caps the number of ports a single "lo-hi" range may expand
+// into, so a malformed entry (e.g. "1-65535") cannot allocate an unbounded slice.
+const maxPortRangeExpansion = 1024
+
+// portKey identifies a unique published port mapping (Host, HostPort, ContainerPort,
+// Protocol). Including Host means two distinct bind interfaces on the same port
+// (e.g. 127.0.0.1:8080 and 192.168.1.10:8080) are NOT collapsed by primary dedup.
+// True IPv4/IPv6 mirrors of the same (HostPort, ContainerPort, Protocol) are
+// collapsed by a separate pass — see collapseIPv6Mirrors.
+type portKey struct {
+	host          string
+	hostPort      int
+	containerPort int
+	protocol      string
+}
 
 // Project represents a running Docker Compose project discovered via `docker compose ls`.
 type Project struct {
@@ -333,11 +351,323 @@ func (c *Compose) command(ctx context.Context, args ...string) *exec.Cmd {
 
 // psEntry matches the JSON schema of `docker compose ps --format json`.
 type psEntry struct {
-	Service   string `json:"Service"`
-	State     string `json:"State"`
-	Health    string `json:"Health"`
-	CreatedAt string `json:"CreatedAt"`
-	Status    string `json:"Status"`
+	Service    string        `json:"Service"`
+	State      string        `json:"State"`
+	Health     string        `json:"Health"`
+	CreatedAt  string        `json:"CreatedAt"`
+	Status     string        `json:"Status"`
+	Publishers []psPublisher `json:"Publishers"`
+	Ports      string        `json:"Ports"`
+}
+
+// psPublisher matches a single entry in the `Publishers` array of `docker compose ps --format json` (Compose v2).
+type psPublisher struct {
+	URL           string `json:"URL"`
+	TargetPort    int    `json:"TargetPort"`
+	PublishedPort int    `json:"PublishedPort"`
+	Protocol      string `json:"Protocol"`
+}
+
+// normalizeHost normalizes a bind-host string from a published port: an empty input is
+// rewritten to "0.0.0.0" (Compose's default for unspecified bind) and a bracketed-IPv6
+// form ("[::]", "[::1]") has its brackets stripped. All other inputs are returned as-is.
+// Used by extractPorts and splitHostPort to share a single normalization contract.
+func normalizeHost(s string) string {
+	if s == "" {
+		return "0.0.0.0"
+	}
+	if strings.HasPrefix(s, "[") && strings.HasSuffix(s, "]") && len(s) >= 2 {
+		return s[1 : len(s)-1]
+	}
+	return s
+}
+
+// extractPorts converts the Publishers array of a single ps entry to a slice of runner.Port.
+// Skips entries with PublishedPort == 0 (those are `expose:`-only, not actually published).
+// Distinct bind interfaces on the same (HostPort, ContainerPort, Protocol) are preserved
+// (e.g. 127.0.0.1:8080->80 and 192.168.1.10:8080->80 both survive). Only the IPv4/IPv6
+// wildcard pair "0.0.0.0" ↔ "::" on the same (HostPort, ContainerPort, Protocol) tuple
+// is collapsed (matching Compose's default dual-stack bind behavior); the "::" entry is
+// dropped in favor of "0.0.0.0". Non-wildcard IPv6 hosts (e.g. "::1", "2001:db8::1")
+// are distinct user-visible binds and survive intact.
+// An empty/missing URL is normalized to "0.0.0.0" (Compose's default for unspecified bind).
+func extractPorts(entry psEntry) []runner.Port {
+	if len(entry.Publishers) == 0 {
+		return nil
+	}
+	// preserve insertion order; map tracks index into ports slice for full-tuple dedup
+	idx := make(map[portKey]int)
+	var ports []runner.Port
+	for _, pub := range entry.Publishers {
+		if pub.PublishedPort == 0 {
+			continue
+		}
+		mergePort(&ports, idx, runner.Port{
+			Host:          normalizeHost(pub.URL),
+			HostPort:      pub.PublishedPort,
+			ContainerPort: pub.TargetPort,
+			Protocol:      pub.Protocol,
+		})
+	}
+	return collapseIPv6Mirrors(ports)
+}
+
+// mergePort appends p to ports unless an entry with the same (Host, HostPort,
+// ContainerPort, Protocol) tuple already exists, in which case it is dropped (exact
+// duplicate). idx tracks the index into ports for each full-tuple key. Both are
+// mutated in place. IPv4/IPv6 mirror collapse is handled separately by
+// collapseIPv6Mirrors after all entries have been merged.
+func mergePort(ports *[]runner.Port, idx map[portKey]int, p runner.Port) {
+	k := portKey{host: p.Host, hostPort: p.HostPort, containerPort: p.ContainerPort, protocol: p.Protocol}
+	if _, ok := idx[k]; ok {
+		return
+	}
+	idx[k] = len(*ports)
+	*ports = append(*ports, p)
+}
+
+// collapseIPv6Mirrors collapses the IPv4/IPv6 wildcard mirror pair that Compose
+// emits when a port is published to all interfaces on a dual-stack host: the IPv6
+// unspecified address "::" is dropped when an IPv4 unspecified address "0.0.0.0"
+// sibling exists on the same (HostPort, ContainerPort, Protocol) tuple. Only the
+// wildcard pair "0.0.0.0" ↔ "::" is treated as a mirror — all other host strings
+// (including IPv6 loopback "::1", link-local "fe80::1", or explicit IPv6 addresses
+// like "2001:db8::1") are distinct user-visible binds and must survive even when an
+// IPv4 entry exists on the same tuple. Likewise, multiple non-wildcard IPv6 entries
+// on the same tuple do not collapse against each other (full-tuple dedup in
+// mergePort already removes exact (Host, HostPort, ContainerPort, Protocol)
+// repeats). Stable order of survivors is preserved.
+func collapseIPv6Mirrors(ports []runner.Port) []runner.Port {
+	if len(ports) < 2 {
+		return ports
+	}
+	type tupleKey struct {
+		hostPort      int
+		containerPort int
+		protocol      string
+	}
+	hasIPv4Wildcard := make(map[tupleKey]bool)
+	for _, p := range ports {
+		if p.Host == "0.0.0.0" {
+			hasIPv4Wildcard[tupleKey{p.HostPort, p.ContainerPort, p.Protocol}] = true
+		}
+	}
+	out := make([]runner.Port, 0, len(ports))
+	for _, p := range ports {
+		if p.Host == "::" && hasIPv4Wildcard[tupleKey{p.HostPort, p.ContainerPort, p.Protocol}] {
+			// drop: IPv6 wildcard mirror of an IPv4 wildcard sibling
+			continue
+		}
+		out = append(out, p)
+	}
+	return out
+}
+
+// isIPv6Host reports whether host contains a colon — i.e., is an IPv6 address in any
+// form (wildcard "::", loopback "::1", link-local "fe80::1", etc.). Used for sort
+// ordering and bracket-wrapping in display formatting.
+func isIPv6Host(host string) bool {
+	return strings.Contains(host, ":")
+}
+
+// dedupAndSortPorts dedupes ports across replicas by the (Host, HostPort,
+// ContainerPort, Protocol) tuple and returns a slice sorted ascending by
+// HostPort, then by ContainerPort, then by Protocol, then by Host for stable
+// output. Distinct bind interfaces on the same port survive (e.g.
+// 127.0.0.1:8080 and 192.168.1.10:8080). Only the IPv4 unspecified address
+// "0.0.0.0" and the IPv6 unspecified address "::" are treated as mirrors —
+// when both wildcards appear on the same (HostPort, ContainerPort, Protocol)
+// tuple, the "::" entry is dropped. All other host strings are distinct
+// user-visible binds and survive (e.g. IPv6 loopback "::1" or explicit IPv6
+// addresses are NOT collapsed against an IPv4 sibling). This matches the
+// behavior of extractPorts and parsePortsString.
+func dedupAndSortPorts(ports []runner.Port) []runner.Port {
+	if len(ports) == 0 {
+		return nil
+	}
+	idx := make(map[portKey]int)
+	out := make([]runner.Port, 0, len(ports))
+	for _, p := range ports {
+		mergePort(&out, idx, p)
+	}
+	out = collapseIPv6Mirrors(out)
+	sort.SliceStable(out, func(i, j int) bool { return portLess(out[i], out[j]) })
+	return out
+}
+
+// portLess defines stable sort ordering for runner.Port: HostPort ascending,
+// then ContainerPort, then Protocol, then Host.
+func portLess(a, b runner.Port) bool {
+	if a.HostPort != b.HostPort {
+		return a.HostPort < b.HostPort
+	}
+	if a.ContainerPort != b.ContainerPort {
+		return a.ContainerPort < b.ContainerPort
+	}
+	if a.Protocol != b.Protocol {
+		return a.Protocol < b.Protocol
+	}
+	return a.Host < b.Host
+}
+
+// parsePortsString is a fallback parser for Compose's `Ports` text field, used when
+// the structured `Publishers` array is empty/missing (older Compose versions).
+//
+// It accepts a comma-separated list of entries shaped like:
+//
+//	0.0.0.0:8080->80/tcp
+//	:::8080->80/tcp
+//	[::]:8080->80/tcp
+//	[::1]:8443->443/tcp
+//	0.0.0.0:1812->1812/udp
+//	0.0.0.0:8080-8090->8080-8090/tcp     (port ranges, expanded 1:1)
+//
+// Entries without a `->` (e.g. plain "80/tcp" exposed-only) are skipped. Malformed
+// entries are skipped silently (best-effort). Port ranges (e.g. `8080-8090`) are
+// expanded to one runner.Port per (host_port, container_port) pair when the host and
+// container range widths match; mismatched widths cause the entry to be skipped.
+// Distinct bind interfaces on the same port survive (e.g. 127.0.0.1:8080 and
+// 192.168.1.10:8080). Only the IPv4/IPv6 wildcard pair ("0.0.0.0" ↔ "::") on the
+// same (HostPort, ContainerPort, Protocol) tuple is collapsed to the IPv4 form;
+// non-wildcard IPv6 hosts (e.g. "::1", "2001:db8::1") survive intact.
+func parsePortsString(text string) []runner.Port {
+	text = strings.TrimSpace(text)
+	if text == "" {
+		return nil
+	}
+	idx := make(map[portKey]int)
+	var ports []runner.Port
+	for _, raw := range strings.Split(text, ",") {
+		entry := strings.TrimSpace(raw)
+		if entry == "" {
+			continue
+		}
+		// Must contain "->"; otherwise it's an internal-only entry like "80/tcp".
+		arrowIdx := strings.Index(entry, "->")
+		if arrowIdx < 0 {
+			continue
+		}
+		left := entry[:arrowIdx]
+		right := entry[arrowIdx+2:]
+
+		// Parse host portion: either "host:port[-port]" or "[ipv6]:port[-port]" or
+		// "::port[-port]" (Compose's IPv6 unspecified shorthand).
+		host, hostPortStr, ok := splitHostPort(left)
+		if !ok {
+			continue
+		}
+		hostPorts, ok := parsePortOrRange(hostPortStr)
+		if !ok {
+			continue
+		}
+
+		// Parse container portion: "port[-port]/proto" or "port[-port]".
+		cpStr := right
+		proto := ""
+		if slash := strings.Index(right, "/"); slash >= 0 {
+			cpStr = right[:slash]
+			proto = right[slash+1:]
+		}
+		containerPorts, ok := parsePortOrRange(cpStr)
+		if !ok {
+			continue
+		}
+
+		// Range widths must match for a 1:1 mapping (e.g. 8080-8090 -> 8080-8090).
+		if len(hostPorts) != len(containerPorts) {
+			continue
+		}
+
+		host = normalizeHost(host)
+
+		for i := range hostPorts {
+			mergePort(&ports, idx, runner.Port{
+				Host:          host,
+				HostPort:      hostPorts[i],
+				ContainerPort: containerPorts[i],
+				Protocol:      proto,
+			})
+		}
+	}
+	return collapseIPv6Mirrors(ports)
+}
+
+// parsePortOrRange parses a port number or a "lo-hi" inclusive range and returns the
+// expanded slice of port numbers. Returns ok=false if the input is malformed, contains
+// non-positive ports, or the range is reversed (lo > hi). Ranges are capped at 1024
+// ports to avoid unbounded expansion from malformed input.
+func parsePortOrRange(s string) ([]int, bool) {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return nil, false
+	}
+	if dash := strings.Index(s, "-"); dash >= 0 {
+		lo, err := strconv.Atoi(s[:dash])
+		if err != nil || lo <= 0 {
+			return nil, false
+		}
+		hi, err := strconv.Atoi(s[dash+1:])
+		if err != nil || hi <= 0 || hi < lo {
+			return nil, false
+		}
+		if hi-lo+1 > maxPortRangeExpansion {
+			return nil, false
+		}
+		out := make([]int, 0, hi-lo+1)
+		for p := lo; p <= hi; p++ {
+			out = append(out, p)
+		}
+		return out, true
+	}
+	p, err := strconv.Atoi(s)
+	if err != nil || p <= 0 {
+		return nil, false
+	}
+	return []int{p}, true
+}
+
+// splitHostPort splits a "host:port" or "[ipv6]:port" string into (host, port).
+// Returns ok=false if the input has no port separator or is malformed.
+// IPv6 brackets are stripped from the returned host. Bare-IPv6 forms (e.g. "::8080",
+// "::1:8443", "2001:db8::1:8080") are recognized: when the input contains 2 or more
+// colons and is not bracketed, the last colon is treated as the host:port separator
+// and everything before it (e.g. "::", "::1", "2001:db8::1") is returned as the host.
+// The 2-colon "::port" form (Compose's IPv6 unspecified shorthand, e.g. "::8080") is
+// treated as host="::" / port="8080".
+func splitHostPort(s string) (host, port string, ok bool) {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return "", "", false
+	}
+	// Bracketed IPv6: "[..]:port"
+	if strings.HasPrefix(s, "[") {
+		closeIdx := strings.Index(s, "]")
+		if closeIdx < 0 || closeIdx+1 >= len(s) || s[closeIdx+1] != ':' {
+			return "", "", false
+		}
+		host = s[1:closeIdx]
+		port = s[closeIdx+2:]
+		if port == "" {
+			return "", "", false
+		}
+		return host, port, true
+	}
+	lastColon := strings.LastIndex(s, ":")
+	if lastColon < 0 {
+		return "", "", false
+	}
+	port = s[lastColon+1:]
+	if port == "" {
+		return "", "", false
+	}
+	// Special case: "::port" (e.g. "::8080") — bare IPv6 unspecified shorthand.
+	// LastIndex of ":" lands at index 1, leaving host=":". Detect this and rewrite
+	// to host="::" so the IPv6 wildcard form parses consistently with ":::port".
+	if lastColon == 1 && s[0] == ':' {
+		return "::", port, true
+	}
+	host = s[:lastColon]
+	return host, port, true
 }
 
 // ContainerStatus returns a map of service name to ServiceStatus.
@@ -423,6 +753,7 @@ func parseContainerStatus(data []byte) (map[string]runner.ServiceStatus, error) 
 		longestUpDur       time.Duration // longest actual uptime among running replicas
 		longestUpStr       string        // uptime string of the longest-running replica
 		longestFromRunning bool          // true if longestUpStr came from a running replica
+		ports              []runner.Port // accumulated published ports across all replicas (deduped/sorted later)
 	}
 	agg := make(map[string]*svcAgg)
 
@@ -470,16 +801,25 @@ func parseContainerStatus(data []byte) (map[string]runner.ServiceStatus, error) 
 			a.longestUpStr = entryUptime
 		}
 
+		// Accumulate ports for this replica. Prefer the structured Publishers field
+		// (Compose v2); fall back to the Ports text string when Publishers is empty.
+		if replicaPorts := extractPorts(entry); len(replicaPorts) > 0 {
+			a.ports = append(a.ports, replicaPorts...)
+		} else if entry.Ports != "" {
+			a.ports = append(a.ports, parsePortsString(entry.Ports)...)
+		}
+
 		status[entry.Service] = prev
 	}
 
-	// Apply aggregated Created and Uptime to final status.
+	// Apply aggregated Created, Uptime, and Ports to final status.
 	for svc, a := range agg {
 		st := status[svc]
 		if a.oldestCreatedValid {
 			st.Created = a.oldestCreated.Format("2006-01-02 15:04")
 		}
 		st.Uptime = a.longestUpStr
+		st.Ports = dedupAndSortPorts(a.ports)
 		status[svc] = st
 	}
 
