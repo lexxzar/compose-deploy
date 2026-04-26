@@ -5,12 +5,26 @@ import (
 	"io"
 )
 
+// Port describes a single published port mapping for a service.
+// Aggregated across replicas at the ServiceStatus level: deduped by
+// (Host, HostPort, ContainerPort, Protocol) and sorted ascending by HostPort.
+type Port struct {
+	Host          string `json:"host"`           // bind interface, e.g. "0.0.0.0", "127.0.0.1"
+	HostPort      int    `json:"host_port"`      // published host port
+	ContainerPort int    `json:"container_port"` // target container port
+	Protocol      string `json:"protocol"`       // "tcp", "udp", "sctp"
+}
+
 // ServiceStatus holds the running state and health check status of a service.
 type ServiceStatus struct {
 	Running bool
 	Health  string // "healthy", "unhealthy", "starting", or "" (no healthcheck)
 	Created string // formatted creation time, e.g. "2024-01-15 09:30"
 	Uptime  string // compact uptime, e.g. "3h", "2d", or "" if not running
+	// Ports lists published port mappings aggregated across replicas, deduped by
+	// (Host, HostPort, ContainerPort, Protocol) and sorted ascending by HostPort.
+	// Empty slice means no published ports (or stopped without recorded ports).
+	Ports []Port
 }
 
 // Composer is the interface consumed by the runner, implemented by compose.Compose.

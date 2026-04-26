@@ -159,11 +159,11 @@ Captions row gains "Ports" label when any service has non-empty `Ports`.
 **Files:**
 - Modify: `internal/runner/runner.go`
 
-- [ ] add `Port` struct with `Host`, `HostPort`, `ContainerPort`, `Protocol` fields and JSON tags (`host`, `host_port`, `container_port`, `protocol`)
-- [ ] append `Ports []Port` field to `ServiceStatus`
-- [ ] update `ServiceStatus` doc comment to describe `Ports` aggregation rule (deduped, sorted by HostPort)
-- [ ] verify `runner` package still compiles (no Composer interface change required)
-- [ ] run `go test ./internal/runner/...` — must pass
+- [x] add `Port` struct with `Host`, `HostPort`, `ContainerPort`, `Protocol` fields and JSON tags (`host`, `host_port`, `container_port`, `protocol`)
+- [x] append `Ports []Port` field to `ServiceStatus`
+- [x] update `ServiceStatus` doc comment to describe `Ports` aggregation rule (deduped, sorted by HostPort)
+- [x] verify `runner` package still compiles (no Composer interface change required)
+- [x] run `go test ./internal/runner/...` — must pass
 
 ### Task 2: Extend `psEntry` and add `extractPorts` helper
 
