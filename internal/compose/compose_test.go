@@ -1845,3 +1845,121 @@ func TestConfigResolved_ErrorIncludesStderr(t *testing.T) {
 		t.Errorf("error = %q, want stderr text included", err.Error())
 	}
 }
+
+func TestExtractPorts(t *testing.T) {
+	tests := []struct {
+		name  string
+		entry psEntry
+		want  []runner.Port
+	}{
+		{
+			name:  "no publishers returns nil",
+			entry: psEntry{Service: "web"},
+			want:  nil,
+		},
+		{
+			name: "single publisher",
+			entry: psEntry{Publishers: []psPublisher{
+				{URL: "0.0.0.0", TargetPort: 80, PublishedPort: 8080, Protocol: "tcp"},
+			}},
+			want: []runner.Port{
+				{Host: "0.0.0.0", HostPort: 8080, ContainerPort: 80, Protocol: "tcp"},
+			},
+		},
+		{
+			name: "PublishedPort zero is skipped",
+			entry: psEntry{Publishers: []psPublisher{
+				{URL: "", TargetPort: 5432, PublishedPort: 0, Protocol: "tcp"},
+				{URL: "0.0.0.0", TargetPort: 80, PublishedPort: 8080, Protocol: "tcp"},
+			}},
+			want: []runner.Port{
+				{Host: "0.0.0.0", HostPort: 8080, ContainerPort: 80, Protocol: "tcp"},
+			},
+		},
+		{
+			name: "IPv4/IPv6 mirror collapses preferring 0.0.0.0",
+			entry: psEntry{Publishers: []psPublisher{
+				{URL: "0.0.0.0", TargetPort: 80, PublishedPort: 8080, Protocol: "tcp"},
+				{URL: "::", TargetPort: 80, PublishedPort: 8080, Protocol: "tcp"},
+			}},
+			want: []runner.Port{
+				{Host: "0.0.0.0", HostPort: 8080, ContainerPort: 80, Protocol: "tcp"},
+			},
+		},
+		{
+			name: "IPv6-first then IPv4 still collapses to IPv4",
+			entry: psEntry{Publishers: []psPublisher{
+				{URL: "::", TargetPort: 80, PublishedPort: 8080, Protocol: "tcp"},
+				{URL: "0.0.0.0", TargetPort: 80, PublishedPort: 8080, Protocol: "tcp"},
+			}},
+			want: []runner.Port{
+				{Host: "0.0.0.0", HostPort: 8080, ContainerPort: 80, Protocol: "tcp"},
+			},
+		},
+		{
+			name: "empty URL normalized to 0.0.0.0",
+			entry: psEntry{Publishers: []psPublisher{
+				{URL: "", TargetPort: 80, PublishedPort: 8080, Protocol: "tcp"},
+			}},
+			want: []runner.Port{
+				{Host: "0.0.0.0", HostPort: 8080, ContainerPort: 80, Protocol: "tcp"},
+			},
+		},
+		{
+			name: "multiple distinct publishers preserved in order",
+			entry: psEntry{Publishers: []psPublisher{
+				{URL: "0.0.0.0", TargetPort: 80, PublishedPort: 8080, Protocol: "tcp"},
+				{URL: "0.0.0.0", TargetPort: 443, PublishedPort: 8443, Protocol: "tcp"},
+				{URL: "127.0.0.1", TargetPort: 9000, PublishedPort: 9000, Protocol: "tcp"},
+			}},
+			want: []runner.Port{
+				{Host: "0.0.0.0", HostPort: 8080, ContainerPort: 80, Protocol: "tcp"},
+				{Host: "0.0.0.0", HostPort: 8443, ContainerPort: 443, Protocol: "tcp"},
+				{Host: "127.0.0.1", HostPort: 9000, ContainerPort: 9000, Protocol: "tcp"},
+			},
+		},
+		{
+			name: "udp protocol preserved",
+			entry: psEntry{Publishers: []psPublisher{
+				{URL: "0.0.0.0", TargetPort: 1812, PublishedPort: 1812, Protocol: "udp"},
+			}},
+			want: []runner.Port{
+				{Host: "0.0.0.0", HostPort: 1812, ContainerPort: 1812, Protocol: "udp"},
+			},
+		},
+		{
+			name: "different protocols are not mirrors",
+			entry: psEntry{Publishers: []psPublisher{
+				{URL: "0.0.0.0", TargetPort: 53, PublishedPort: 53, Protocol: "tcp"},
+				{URL: "0.0.0.0", TargetPort: 53, PublishedPort: 53, Protocol: "udp"},
+			}},
+			want: []runner.Port{
+				{Host: "0.0.0.0", HostPort: 53, ContainerPort: 53, Protocol: "tcp"},
+				{Host: "0.0.0.0", HostPort: 53, ContainerPort: 53, Protocol: "udp"},
+			},
+		},
+		{
+			name: "bracketed IPv6 URL strips brackets",
+			entry: psEntry{Publishers: []psPublisher{
+				{URL: "[::]", TargetPort: 80, PublishedPort: 8080, Protocol: "tcp"},
+			}},
+			want: []runner.Port{
+				{Host: "::", HostPort: 8080, ContainerPort: 80, Protocol: "tcp"},
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := extractPorts(tt.entry)
+			if len(got) != len(tt.want) {
+				t.Fatalf("extractPorts() len = %d, want %d: got=%+v", len(got), len(tt.want), got)
+			}
+			for i, w := range tt.want {
+				if got[i] != w {
+					t.Errorf("extractPorts()[%d] = %+v, want %+v", i, got[i], w)
+				}
+			}
+		})
+	}
+}

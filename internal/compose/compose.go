@@ -333,11 +333,76 @@ func (c *Compose) command(ctx context.Context, args ...string) *exec.Cmd {
 
 // psEntry matches the JSON schema of `docker compose ps --format json`.
 type psEntry struct {
-	Service   string `json:"Service"`
-	State     string `json:"State"`
-	Health    string `json:"Health"`
-	CreatedAt string `json:"CreatedAt"`
-	Status    string `json:"Status"`
+	Service    string        `json:"Service"`
+	State      string        `json:"State"`
+	Health     string        `json:"Health"`
+	CreatedAt  string        `json:"CreatedAt"`
+	Status     string        `json:"Status"`
+	Publishers []psPublisher `json:"Publishers"`
+	Ports      string        `json:"Ports"`
+}
+
+// psPublisher matches a single entry in the `Publishers` array of `docker compose ps --format json` (Compose v2).
+type psPublisher struct {
+	URL           string `json:"URL"`
+	TargetPort    int    `json:"TargetPort"`
+	PublishedPort int    `json:"PublishedPort"`
+	Protocol      string `json:"Protocol"`
+}
+
+// extractPorts converts the Publishers array of a single ps entry to a slice of runner.Port.
+// Skips entries with PublishedPort == 0 (those are `expose:`-only, not actually published).
+// Dedupes IPv4/IPv6 mirrors of the same (HostPort, ContainerPort, Protocol) — when both a
+// "0.0.0.0" or empty-URL entry and a "::" entry exist, the IPv4 version wins.
+// An empty/missing URL is normalized to "0.0.0.0" (Compose's default for unspecified bind).
+func extractPorts(entry psEntry) []runner.Port {
+	if len(entry.Publishers) == 0 {
+		return nil
+	}
+	type key struct {
+		hostPort      int
+		containerPort int
+		protocol      string
+	}
+	// preserve insertion order; map tracks index into ports slice for dedup
+	idx := make(map[key]int)
+	var ports []runner.Port
+	for _, pub := range entry.Publishers {
+		if pub.PublishedPort == 0 {
+			continue
+		}
+		host := pub.URL
+		if host == "" {
+			host = "0.0.0.0"
+		}
+		// strip IPv6 brackets if present (e.g. "[::]")
+		if strings.HasPrefix(host, "[") && strings.HasSuffix(host, "]") {
+			host = host[1 : len(host)-1]
+		}
+		k := key{hostPort: pub.PublishedPort, containerPort: pub.TargetPort, protocol: pub.Protocol}
+		if existing, ok := idx[k]; ok {
+			// dedupe IPv4/IPv6 mirror: prefer 0.0.0.0 over ::
+			if isIPv6Wildcard(ports[existing].Host) && !isIPv6Wildcard(host) {
+				ports[existing].Host = host
+			}
+			continue
+		}
+		idx[k] = len(ports)
+		ports = append(ports, runner.Port{
+			Host:          host,
+			HostPort:      pub.PublishedPort,
+			ContainerPort: pub.TargetPort,
+			Protocol:      pub.Protocol,
+		})
+	}
+	return ports
+}
+
+// isIPv6Wildcard reports whether host is the IPv6 unspecified address ("::") or any
+// IPv6 form (contains ":"). For dedup purposes we treat any IPv6 form as a candidate
+// to be replaced by an IPv4 mirror of the same (HostPort, ContainerPort, Protocol).
+func isIPv6Wildcard(host string) bool {
+	return strings.Contains(host, ":")
 }
 
 // ContainerStatus returns a map of service name to ServiceStatus.

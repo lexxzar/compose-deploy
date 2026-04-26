@@ -171,11 +171,11 @@ Captions row gains "Ports" label when any service has non-empty `Ports`.
 - Modify: `internal/compose/compose.go`
 - Modify: `internal/compose/compose_test.go`
 
-- [ ] add `psPublisher` struct with `URL`, `TargetPort`, `PublishedPort`, `Protocol` JSON tags
-- [ ] extend `psEntry` with `Publishers []psPublisher` and `Ports string` fields
-- [ ] add `extractPorts(entry psEntry) []runner.Port` — converts `Publishers`, skips `PublishedPort == 0`, dedupes IPv4/IPv6 mirrors (collapse `::` mirror to its `0.0.0.0` sibling when `(HostPort, ContainerPort, Protocol)` matches), preserves order
-- [ ] write tests for `extractPorts`: single publisher; `PublishedPort == 0` skipped; IPv4/IPv6 mirror dedup; multiple distinct publishers preserved
-- [ ] run `go test ./internal/compose/...` — must pass
+- [x] add `psPublisher` struct with `URL`, `TargetPort`, `PublishedPort`, `Protocol` JSON tags
+- [x] extend `psEntry` with `Publishers []psPublisher` and `Ports string` fields
+- [x] add `extractPorts(entry psEntry) []runner.Port` — converts `Publishers`, skips `PublishedPort == 0`, dedupes IPv4/IPv6 mirrors (collapse `::` mirror to its `0.0.0.0` sibling when `(HostPort, ContainerPort, Protocol)` matches), preserves order
+- [x] write tests for `extractPorts`: single publisher; `PublishedPort == 0` skipped; IPv4/IPv6 mirror dedup; multiple distinct publishers preserved
+- [x] run `go test ./internal/compose/...` — must pass
 
 ### Task 3: Add `parsePortsString` fallback for older Compose
 
