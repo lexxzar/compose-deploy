@@ -219,12 +219,12 @@ Captions row gains "Ports" label when any service has non-empty `Ports`.
 - Modify: `cmd/list.go`
 - Modify: `cmd/list_test.go`
 
-- [ ] extend `serviceStatus` struct with `Ports []runner.Port \`json:"ports,omitempty"\``
-- [ ] update `mergeStatus` to copy `st.Ports` through into `serviceStatus`
-- [ ] in `formatDots`, track `maxPorts` width (computed as `len(compose.FormatPorts(item.Ports))`), append column after Uptime gated on `maxPorts > 0`
-- [ ] in `formatDotsGrouped`, replicate the same `maxPorts` per-project tracking and rendering
-- [ ] write tests: `formatDots` with mixed services (some with ports, some without) — column padded; `formatDots` with no services having ports — no Ports column rendered; `formatDots` over a `flattenProjectServices`-style fixture (multiple projects in flat mode, mixed port presence) — column aligns correctly; `formatDotsGrouped` with per-project max width recalculated; `formatJSON` round-trip preserves structured Port array (assert ports field present + correct field names + omitempty when empty)
-- [ ] run `go test ./cmd/...` — must pass
+- [x] extend `serviceStatus` struct with `Ports []runner.Port \`json:"ports,omitempty"\``
+- [x] update `mergeStatus` to copy `st.Ports` through into `serviceStatus`
+- [x] in `formatDots`, track `maxPorts` width (computed as `len(compose.FormatPorts(item.Ports))`), append column after Uptime gated on `maxPorts > 0`
+- [x] in `formatDotsGrouped`, replicate the same `maxPorts` per-project tracking and rendering
+- [x] write tests: `formatDots` with mixed services (some with ports, some without) — column padded; `formatDots` with no services having ports — no Ports column rendered; `formatDots` over a `flattenProjectServices`-style fixture (multiple projects in flat mode, mixed port presence) — column aligns correctly; `formatDotsGrouped` with per-project max width recalculated; `formatJSON` round-trip preserves structured Port array (assert ports field present + correct field names + omitempty when empty)
+- [x] run `go test ./cmd/...` — must pass
 
 ### Task 7: Surface ports in TUI container-select screen
 

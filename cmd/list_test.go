@@ -9,6 +9,7 @@ import (
 	"os/exec"
 	"strings"
 	"testing"
+	"unicode/utf8"
 
 	"github.com/lexxzar/compose-deploy/internal/compose"
 	"github.com/lexxzar/compose-deploy/internal/runner"
@@ -1564,6 +1565,196 @@ func TestRunList_SSHHappyPath(t *testing.T) {
 	}
 	if !strings.Contains(args, "'config'") {
 		t.Errorf("ssh argv = %v, want to contain 'config' subcommand", capturedConfigArgs)
+	}
+}
+
+func TestMergeStatus_CopiesPorts(t *testing.T) {
+	services := []string{"web", "db"}
+	ports := []runner.Port{
+		{Host: "0.0.0.0", HostPort: 8080, ContainerPort: 80, Protocol: "tcp"},
+	}
+	status := map[string]runner.ServiceStatus{
+		"web": {Running: true, Ports: ports},
+		"db":  {Running: true},
+	}
+
+	got := mergeStatus(services, status)
+
+	for _, s := range got {
+		switch s.Name {
+		case "web":
+			if len(s.Ports) != 1 {
+				t.Fatalf("web Ports len = %d, want 1", len(s.Ports))
+			}
+			if s.Ports[0] != ports[0] {
+				t.Errorf("web Ports[0] = %+v, want %+v", s.Ports[0], ports[0])
+			}
+		case "db":
+			if len(s.Ports) != 0 {
+				t.Errorf("db Ports = %+v, want empty", s.Ports)
+			}
+		}
+	}
+}
+
+func TestFormatDots_PortsColumn_Mixed(t *testing.T) {
+	items := []serviceStatus{
+		{Name: "web", Running: true, Ports: []runner.Port{
+			{Host: "0.0.0.0", HostPort: 8080, ContainerPort: 80, Protocol: "tcp"},
+		}},
+		{Name: "db", Running: true},
+	}
+
+	out := formatDots(items)
+	lines := strings.Split(out, "\n")
+	if len(lines) != 2 {
+		t.Fatalf("lines = %d, want 2", len(lines))
+	}
+
+	if !strings.Contains(lines[0], "0.0.0.0:8080→80") {
+		t.Errorf("web line missing ports: %q", lines[0])
+	}
+	// Both lines should have the same visible (rune) width: db should be padded
+	w0 := utf8.RuneCountInString(lines[0])
+	w1 := utf8.RuneCountInString(lines[1])
+	if w0 != w1 {
+		t.Errorf("ports column not aligned (rune width): web=%d, db=%d\nweb: %q\ndb:  %q",
+			w0, w1, lines[0], lines[1])
+	}
+}
+
+func TestFormatDots_NoPorts_NoColumn(t *testing.T) {
+	items := []serviceStatus{
+		{Name: "web", Running: true, Created: "2024-01-15 09:30", Uptime: "3h"},
+		{Name: "db", Running: false, Created: "2024-01-14 08:00"},
+	}
+
+	out := formatDots(items)
+	// No service has ports → arrow rune should not appear
+	if strings.Contains(out, "→") {
+		t.Errorf("output should not contain ports arrow when no service has ports, got: %q", out)
+	}
+}
+
+func TestFormatDots_PortsColumn_FlattenedMultiProject(t *testing.T) {
+	// Simulates a flat-mode listing across multiple projects, mixed port presence.
+	flat := flattenProjectServices([]projectServices{
+		{
+			Name: "app1",
+			Services: []serviceStatus{
+				{Name: "web", Running: true, Ports: []runner.Port{
+					{Host: "0.0.0.0", HostPort: 80, ContainerPort: 80, Protocol: "tcp"},
+				}},
+			},
+		},
+		{
+			Name: "app2",
+			Services: []serviceStatus{
+				{Name: "api", Running: true, Ports: []runner.Port{
+					{Host: "127.0.0.1", HostPort: 9000, ContainerPort: 9000, Protocol: "tcp"},
+				}},
+				{Name: "worker", Running: true},
+			},
+		},
+	})
+
+	out := formatDots(flat)
+	if !strings.Contains(out, "0.0.0.0:80→80") {
+		t.Errorf("missing web ports in output: %q", out)
+	}
+	if !strings.Contains(out, "127.0.0.1:9000→9000") {
+		t.Errorf("missing api ports in output: %q", out)
+	}
+
+	// All lines should have the same length (uniform alignment).
+	lines := strings.Split(out, "\n")
+	if len(lines) != 3 {
+		t.Fatalf("lines = %d, want 3", len(lines))
+	}
+	w0 := utf8.RuneCountInString(lines[0])
+	for i := 1; i < len(lines); i++ {
+		wi := utf8.RuneCountInString(lines[i])
+		if wi != w0 {
+			t.Errorf("alignment mismatch (rune width): line[0]=%d, line[%d]=%d\n[0]: %q\n[%d]: %q",
+				w0, i, wi, lines[0], i, lines[i])
+		}
+	}
+}
+
+func TestFormatDotsGrouped_PerProjectPortsWidth(t *testing.T) {
+	projects := []projectServices{
+		{
+			Name: "shortports",
+			Services: []serviceStatus{
+				{Name: "web", Running: true, Ports: []runner.Port{
+					{Host: "0.0.0.0", HostPort: 80, ContainerPort: 80, Protocol: "tcp"},
+				}},
+			},
+		},
+		{
+			Name: "noports",
+			Services: []serviceStatus{
+				{Name: "worker", Running: true},
+			},
+		},
+	}
+
+	out := formatDotsGrouped(projects)
+	if !strings.Contains(out, "0.0.0.0:80→80") {
+		t.Errorf("missing ports in shortports project: %q", out)
+	}
+	// noports project should not have an arrow rune
+	noPortsIdx := strings.Index(out, "noports")
+	if noPortsIdx == -1 {
+		t.Fatal("noports header missing")
+	}
+	noPortsBlock := out[noPortsIdx:]
+	if strings.Contains(noPortsBlock, "→") {
+		t.Errorf("noports project should not render ports column: %q", noPortsBlock)
+	}
+}
+
+func TestFormatJSON_IncludesPorts(t *testing.T) {
+	items := []serviceStatus{
+		{Name: "web", Running: true, Ports: []runner.Port{
+			{Host: "0.0.0.0", HostPort: 8080, ContainerPort: 80, Protocol: "tcp"},
+		}},
+		{Name: "db", Running: true},
+	}
+
+	out, err := formatJSON(items)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Field name verification on raw output
+	if !strings.Contains(out, `"ports"`) {
+		t.Errorf("ports field missing from JSON: %s", out)
+	}
+	if !strings.Contains(out, `"host"`) || !strings.Contains(out, `"host_port"`) ||
+		!strings.Contains(out, `"container_port"`) || !strings.Contains(out, `"protocol"`) {
+		t.Errorf("port field names missing or wrong-cased in JSON: %s", out)
+	}
+
+	// omitempty: only one occurrence of "ports" (for web, not db)
+	if strings.Count(out, `"ports"`) != 1 {
+		t.Errorf("expected ports field exactly once (for web only), got JSON: %s", out)
+	}
+
+	// Round-trip
+	var got []serviceStatus
+	if err := json.Unmarshal([]byte(out), &got); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if len(got[0].Ports) != 1 {
+		t.Fatalf("got[0].Ports len = %d, want 1", len(got[0].Ports))
+	}
+	if got[0].Ports[0].Host != "0.0.0.0" || got[0].Ports[0].HostPort != 8080 ||
+		got[0].Ports[0].ContainerPort != 80 || got[0].Ports[0].Protocol != "tcp" {
+		t.Errorf("got[0].Ports[0] = %+v, want full round-trip", got[0].Ports[0])
+	}
+	if len(got[1].Ports) != 0 {
+		t.Errorf("got[1].Ports = %+v, want empty (omitempty)", got[1].Ports)
 	}
 }
 
