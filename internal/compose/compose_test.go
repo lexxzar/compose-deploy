@@ -2091,3 +2091,225 @@ func TestParsePortsString(t *testing.T) {
 		})
 	}
 }
+
+func TestParseContainerStatus_PortsAggregation(t *testing.T) {
+	tests := []struct {
+		name  string
+		input string
+		want  map[string][]runner.Port
+	}{
+		{
+			name:  "single replica with one publisher",
+			input: `[{"Service":"nginx","State":"running","Publishers":[{"URL":"0.0.0.0","TargetPort":80,"PublishedPort":8080,"Protocol":"tcp"}]}]`,
+			want: map[string][]runner.Port{
+				"nginx": {{Host: "0.0.0.0", HostPort: 8080, ContainerPort: 80, Protocol: "tcp"}},
+			},
+		},
+		{
+			name: "scaled service with 3 ephemeral host ports — 3 distinct sorted",
+			input: `[` +
+				`{"Service":"web","State":"running","Publishers":[{"URL":"0.0.0.0","TargetPort":80,"PublishedPort":32770,"Protocol":"tcp"}]},` +
+				`{"Service":"web","State":"running","Publishers":[{"URL":"0.0.0.0","TargetPort":80,"PublishedPort":32768,"Protocol":"tcp"}]},` +
+				`{"Service":"web","State":"running","Publishers":[{"URL":"0.0.0.0","TargetPort":80,"PublishedPort":32769,"Protocol":"tcp"}]}` +
+				`]`,
+			want: map[string][]runner.Port{
+				"web": {
+					{Host: "0.0.0.0", HostPort: 32768, ContainerPort: 80, Protocol: "tcp"},
+					{Host: "0.0.0.0", HostPort: 32769, ContainerPort: 80, Protocol: "tcp"},
+					{Host: "0.0.0.0", HostPort: 32770, ContainerPort: 80, Protocol: "tcp"},
+				},
+			},
+		},
+		{
+			name: "scaled service with identical publishers deduped to 1",
+			input: `[` +
+				`{"Service":"web","State":"running","Publishers":[{"URL":"0.0.0.0","TargetPort":80,"PublishedPort":8080,"Protocol":"tcp"}]},` +
+				`{"Service":"web","State":"running","Publishers":[{"URL":"0.0.0.0","TargetPort":80,"PublishedPort":8080,"Protocol":"tcp"}]},` +
+				`{"Service":"web","State":"running","Publishers":[{"URL":"0.0.0.0","TargetPort":80,"PublishedPort":8080,"Protocol":"tcp"}]}` +
+				`]`,
+			want: map[string][]runner.Port{
+				"web": {{Host: "0.0.0.0", HostPort: 8080, ContainerPort: 80, Protocol: "tcp"}},
+			},
+		},
+		{
+			name:  "stopped container with no Publishers — empty Ports",
+			input: `[{"Service":"db","State":"exited"}]`,
+			want: map[string][]runner.Port{
+				"db": nil,
+			},
+		},
+		{
+			name:  "stopped replica with non-empty Publishers — ports still surfaced",
+			input: `[{"Service":"api","State":"exited","Publishers":[{"URL":"0.0.0.0","TargetPort":3000,"PublishedPort":3000,"Protocol":"tcp"}]}]`,
+			want: map[string][]runner.Port{
+				"api": {{Host: "0.0.0.0", HostPort: 3000, ContainerPort: 3000, Protocol: "tcp"}},
+			},
+		},
+		{
+			name:  "older Compose fallback — Ports text only, Publishers nil",
+			input: `[{"Service":"web","State":"running","Ports":"0.0.0.0:8080->80/tcp, :::8080->80/tcp"}]`,
+			want: map[string][]runner.Port{
+				"web": {{Host: "0.0.0.0", HostPort: 8080, ContainerPort: 80, Protocol: "tcp"}},
+			},
+		},
+		{
+			name:  "older Compose fallback with multiple ports parses correctly",
+			input: `[{"Service":"app","State":"running","Ports":"0.0.0.0:443->443/tcp, 0.0.0.0:80->80/tcp"}]`,
+			want: map[string][]runner.Port{
+				"app": {
+					{Host: "0.0.0.0", HostPort: 80, ContainerPort: 80, Protocol: "tcp"},
+					{Host: "0.0.0.0", HostPort: 443, ContainerPort: 443, Protocol: "tcp"},
+				},
+			},
+		},
+		{
+			name: "scaled service ipv4 and ipv6 mirrors collapse across replicas",
+			input: `[` +
+				`{"Service":"web","State":"running","Publishers":[{"URL":"0.0.0.0","TargetPort":80,"PublishedPort":8080,"Protocol":"tcp"},{"URL":"::","TargetPort":80,"PublishedPort":8080,"Protocol":"tcp"}]},` +
+				`{"Service":"web","State":"running","Publishers":[{"URL":"0.0.0.0","TargetPort":80,"PublishedPort":8080,"Protocol":"tcp"},{"URL":"::","TargetPort":80,"PublishedPort":8080,"Protocol":"tcp"}]}` +
+				`]`,
+			want: map[string][]runner.Port{
+				"web": {{Host: "0.0.0.0", HostPort: 8080, ContainerPort: 80, Protocol: "tcp"}},
+			},
+		},
+		{
+			name:  "publisher with PublishedPort=0 is skipped (expose-only)",
+			input: `[{"Service":"db","State":"running","Publishers":[{"URL":"","TargetPort":5432,"PublishedPort":0,"Protocol":"tcp"}]}]`,
+			want: map[string][]runner.Port{
+				"db": nil,
+			},
+		},
+		{
+			name:  "mixed UDP and TCP on same service sorted by HostPort",
+			input: `[{"Service":"net","State":"running","Publishers":[{"URL":"0.0.0.0","TargetPort":1812,"PublishedPort":1812,"Protocol":"udp"},{"URL":"0.0.0.0","TargetPort":80,"PublishedPort":80,"Protocol":"tcp"}]}]`,
+			want: map[string][]runner.Port{
+				"net": {
+					{Host: "0.0.0.0", HostPort: 80, ContainerPort: 80, Protocol: "tcp"},
+					{Host: "0.0.0.0", HostPort: 1812, ContainerPort: 1812, Protocol: "udp"},
+				},
+			},
+		},
+		{
+			name: "Publishers preferred over Ports text when both present",
+			input: `[{"Service":"web","State":"running",` +
+				`"Publishers":[{"URL":"0.0.0.0","TargetPort":80,"PublishedPort":8080,"Protocol":"tcp"}],` +
+				`"Ports":"127.0.0.1:9999->99/tcp"}]`,
+			want: map[string][]runner.Port{
+				"web": {{Host: "0.0.0.0", HostPort: 8080, ContainerPort: 80, Protocol: "tcp"}},
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := parseContainerStatus([]byte(tt.input))
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			for svc, wantPorts := range tt.want {
+				gotStatus, ok := got[svc]
+				if !ok {
+					t.Fatalf("service %q missing from result", svc)
+				}
+				if len(gotStatus.Ports) != len(wantPorts) {
+					t.Fatalf("service %q: got %d ports, want %d: got=%+v want=%+v",
+						svc, len(gotStatus.Ports), len(wantPorts), gotStatus.Ports, wantPorts)
+				}
+				for i, w := range wantPorts {
+					if gotStatus.Ports[i] != w {
+						t.Errorf("service %q: ports[%d] = %+v, want %+v", svc, i, gotStatus.Ports[i], w)
+					}
+				}
+			}
+		})
+	}
+}
+
+func TestDedupAndSortPorts(t *testing.T) {
+	tests := []struct {
+		name string
+		in   []runner.Port
+		want []runner.Port
+	}{
+		{
+			name: "empty input",
+			in:   nil,
+			want: nil,
+		},
+		{
+			name: "single port unchanged",
+			in:   []runner.Port{{Host: "0.0.0.0", HostPort: 80, ContainerPort: 80, Protocol: "tcp"}},
+			want: []runner.Port{{Host: "0.0.0.0", HostPort: 80, ContainerPort: 80, Protocol: "tcp"}},
+		},
+		{
+			name: "ipv4/ipv6 mirror collapsed to ipv4",
+			in: []runner.Port{
+				{Host: "::", HostPort: 8080, ContainerPort: 80, Protocol: "tcp"},
+				{Host: "0.0.0.0", HostPort: 8080, ContainerPort: 80, Protocol: "tcp"},
+			},
+			want: []runner.Port{
+				{Host: "0.0.0.0", HostPort: 8080, ContainerPort: 80, Protocol: "tcp"},
+			},
+		},
+		{
+			name: "duplicate identical entries deduped",
+			in: []runner.Port{
+				{Host: "127.0.0.1", HostPort: 9000, ContainerPort: 9000, Protocol: "tcp"},
+				{Host: "127.0.0.1", HostPort: 9000, ContainerPort: 9000, Protocol: "tcp"},
+				{Host: "127.0.0.1", HostPort: 9000, ContainerPort: 9000, Protocol: "tcp"},
+			},
+			want: []runner.Port{
+				{Host: "127.0.0.1", HostPort: 9000, ContainerPort: 9000, Protocol: "tcp"},
+			},
+		},
+		{
+			name: "sorted ascending by HostPort",
+			in: []runner.Port{
+				{Host: "0.0.0.0", HostPort: 443, ContainerPort: 443, Protocol: "tcp"},
+				{Host: "0.0.0.0", HostPort: 80, ContainerPort: 80, Protocol: "tcp"},
+				{Host: "0.0.0.0", HostPort: 8080, ContainerPort: 80, Protocol: "tcp"},
+			},
+			want: []runner.Port{
+				{Host: "0.0.0.0", HostPort: 80, ContainerPort: 80, Protocol: "tcp"},
+				{Host: "0.0.0.0", HostPort: 443, ContainerPort: 443, Protocol: "tcp"},
+				{Host: "0.0.0.0", HostPort: 8080, ContainerPort: 80, Protocol: "tcp"},
+			},
+		},
+		{
+			name: "different bind interfaces preserved (e.g. localhost vs 0.0.0.0)",
+			in: []runner.Port{
+				{Host: "127.0.0.1", HostPort: 9000, ContainerPort: 9000, Protocol: "tcp"},
+				{Host: "0.0.0.0", HostPort: 8080, ContainerPort: 80, Protocol: "tcp"},
+			},
+			want: []runner.Port{
+				{Host: "0.0.0.0", HostPort: 8080, ContainerPort: 80, Protocol: "tcp"},
+				{Host: "127.0.0.1", HostPort: 9000, ContainerPort: 9000, Protocol: "tcp"},
+			},
+		},
+		{
+			name: "tie on HostPort breaks on ContainerPort then Protocol",
+			in: []runner.Port{
+				{Host: "0.0.0.0", HostPort: 53, ContainerPort: 53, Protocol: "udp"},
+				{Host: "0.0.0.0", HostPort: 53, ContainerPort: 53, Protocol: "tcp"},
+			},
+			want: []runner.Port{
+				{Host: "0.0.0.0", HostPort: 53, ContainerPort: 53, Protocol: "tcp"},
+				{Host: "0.0.0.0", HostPort: 53, ContainerPort: 53, Protocol: "udp"},
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := dedupAndSortPorts(tt.in)
+			if len(got) != len(tt.want) {
+				t.Fatalf("dedupAndSortPorts() len = %d, want %d: got=%+v", len(got), len(tt.want), got)
+			}
+			for i, w := range tt.want {
+				if got[i] != w {
+					t.Errorf("dedupAndSortPorts()[%d] = %+v, want %+v", i, got[i], w)
+				}
+			}
+		})
+	}
+}

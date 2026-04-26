@@ -196,11 +196,11 @@ Captions row gains "Ports" label when any service has non-empty `Ports`.
 - Modify: `internal/compose/compose.go`
 - Modify: `internal/compose/compose_test.go`
 
-- [ ] extend `svcAgg` with `ports []runner.Port` field
-- [ ] in the aggregation loop, call `extractPorts(entry)` (fallback to `parsePortsString(entry.Ports)` when `Publishers` is empty/nil) and append to `a.ports`
-- [ ] after aggregation loop, dedupe `a.ports` by `(Host, HostPort, ContainerPort, Protocol)` tuple and sort ascending by `HostPort`, then assign to `status[svc].Ports`
-- [ ] write tests: single replica with one publisher; scaled service with 3 ephemeral host ports → 3 distinct Ports sorted; scaled service with identical publishers → deduped to 1; stopped container with no `Publishers` → empty Ports; stopped replica that still has non-empty `Publishers` → ports are still surfaced (Compose-driven, not filtered by state); older-Compose fallback (no `Publishers`, `Ports` text only) parses correctly
-- [ ] run `go test ./internal/compose/...` — must pass
+- [x] extend `svcAgg` with `ports []runner.Port` field
+- [x] in the aggregation loop, call `extractPorts(entry)` (fallback to `parsePortsString(entry.Ports)` when `Publishers` is empty/nil) and append to `a.ports`
+- [x] after aggregation loop, dedupe `a.ports` by `(Host, HostPort, ContainerPort, Protocol)` tuple and sort ascending by `HostPort`, then assign to `status[svc].Ports`
+- [x] write tests: single replica with one publisher; scaled service with 3 ephemeral host ports → 3 distinct Ports sorted; scaled service with identical publishers → deduped to 1; stopped container with no `Publishers` → empty Ports; stopped replica that still has non-empty `Publishers` → ports are still surfaced (Compose-driven, not filtered by state); older-Compose fallback (no `Publishers`, `Ports` text only) parses correctly
+- [x] run `go test ./internal/compose/...` — must pass
 
 ### Task 5: Add `FormatPort` / `FormatPorts` render helpers
 

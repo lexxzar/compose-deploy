@@ -406,6 +406,78 @@ func isIPv6Wildcard(host string) bool {
 	return strings.Contains(host, ":")
 }
 
+// dedupAndSortPorts dedupes ports across replicas by the full
+// (Host, HostPort, ContainerPort, Protocol) tuple and returns a slice sorted
+// ascending by HostPort, then by ContainerPort, then by Protocol, then by Host
+// for stable output. IPv4/IPv6 mirrors of the same (HostPort, ContainerPort,
+// Protocol) tuple are collapsed to the IPv4 form (preferring "0.0.0.0" or any
+// non-IPv6 host over an IPv6 host) — this matches the behavior of extractPorts
+// and parsePortsString, but applied across replicas.
+func dedupAndSortPorts(ports []runner.Port) []runner.Port {
+	if len(ports) == 0 {
+		return nil
+	}
+	// First pass: collapse IPv4/IPv6 mirrors of the same (HostPort, ContainerPort, Protocol).
+	type mirrorKey struct {
+		hostPort      int
+		containerPort int
+		protocol      string
+	}
+	mirrorIdx := make(map[mirrorKey]int)
+	merged := make([]runner.Port, 0, len(ports))
+	for _, p := range ports {
+		mk := mirrorKey{hostPort: p.HostPort, containerPort: p.ContainerPort, protocol: p.Protocol}
+		if existing, ok := mirrorIdx[mk]; ok {
+			// Prefer non-IPv6 host (e.g. "0.0.0.0") over IPv6 mirror.
+			if isIPv6Wildcard(merged[existing].Host) && !isIPv6Wildcard(p.Host) {
+				merged[existing].Host = p.Host
+			}
+			continue
+		}
+		mirrorIdx[mk] = len(merged)
+		merged = append(merged, p)
+	}
+	// Second pass: dedupe by full (Host, HostPort, ContainerPort, Protocol) tuple.
+	type fullKey struct {
+		host          string
+		hostPort      int
+		containerPort int
+		protocol      string
+	}
+	seen := make(map[fullKey]bool)
+	out := make([]runner.Port, 0, len(merged))
+	for _, p := range merged {
+		k := fullKey{host: p.Host, hostPort: p.HostPort, containerPort: p.ContainerPort, protocol: p.Protocol}
+		if seen[k] {
+			continue
+		}
+		seen[k] = true
+		out = append(out, p)
+	}
+	// Sort ascending by HostPort, then ContainerPort, then Protocol, then Host.
+	for i := 1; i < len(out); i++ {
+		for j := i; j > 0 && portLess(out[j], out[j-1]); j-- {
+			out[j], out[j-1] = out[j-1], out[j]
+		}
+	}
+	return out
+}
+
+// portLess defines stable sort ordering for runner.Port: HostPort ascending,
+// then ContainerPort, then Protocol, then Host.
+func portLess(a, b runner.Port) bool {
+	if a.HostPort != b.HostPort {
+		return a.HostPort < b.HostPort
+	}
+	if a.ContainerPort != b.ContainerPort {
+		return a.ContainerPort < b.ContainerPort
+	}
+	if a.Protocol != b.Protocol {
+		return a.Protocol < b.Protocol
+	}
+	return a.Host < b.Host
+}
+
 // parsePortsString is a fallback parser for Compose's `Ports` text field, used when
 // the structured `Publishers` array is empty/missing (older Compose versions).
 //
@@ -610,6 +682,7 @@ func parseContainerStatus(data []byte) (map[string]runner.ServiceStatus, error) 
 		longestUpDur       time.Duration // longest actual uptime among running replicas
 		longestUpStr       string        // uptime string of the longest-running replica
 		longestFromRunning bool          // true if longestUpStr came from a running replica
+		ports              []runner.Port // accumulated published ports across all replicas (deduped/sorted later)
 	}
 	agg := make(map[string]*svcAgg)
 
@@ -657,16 +730,25 @@ func parseContainerStatus(data []byte) (map[string]runner.ServiceStatus, error) 
 			a.longestUpStr = entryUptime
 		}
 
+		// Accumulate ports for this replica. Prefer the structured Publishers field
+		// (Compose v2); fall back to the Ports text string when Publishers is empty.
+		if replicaPorts := extractPorts(entry); len(replicaPorts) > 0 {
+			a.ports = append(a.ports, replicaPorts...)
+		} else if entry.Ports != "" {
+			a.ports = append(a.ports, parsePortsString(entry.Ports)...)
+		}
+
 		status[entry.Service] = prev
 	}
 
-	// Apply aggregated Created and Uptime to final status.
+	// Apply aggregated Created, Uptime, and Ports to final status.
 	for svc, a := range agg {
 		st := status[svc]
 		if a.oldestCreatedValid {
 			st.Created = a.oldestCreated.Format("2006-01-02 15:04")
 		}
 		st.Uptime = a.longestUpStr
+		st.Ports = dedupAndSortPorts(a.ports)
 		status[svc] = st
 	}
 
