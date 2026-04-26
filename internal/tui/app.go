@@ -1939,8 +1939,19 @@ func (m Model) viewSelectContainers() string {
 		b.WriteString("\n\n")
 	}
 
-	// Column captions row (only when status data exists)
+	// Column captions row (only when status data exists). Widen each active
+	// column to at least its caption width so the caption never overflows and
+	// shifts the following columns rightward.
 	if maxCreated > 0 || maxUptime > 0 || maxPorts > 0 {
+		if maxCreated > 0 && len("Created") > maxCreated {
+			maxCreated = len("Created")
+		}
+		if maxUptime > 0 && len("Uptime") > maxUptime {
+			maxUptime = len("Uptime")
+		}
+		if maxPorts > 0 && len("Ports") > maxPorts {
+			maxPorts = len("Ports")
+		}
 		// Left padding: cursor(2) + checkbox(3) + space(1) + health(1) + space(1) + dot(1) + space(1) + name
 		padding := strings.Repeat(" ", 10+maxName)
 		header := padding

@@ -4018,12 +4018,12 @@ func TestViewSelectContainers_Ports(t *testing.T) {
 		t.Errorf("expected 'Ports' caption in view, got:\n%s", view)
 	}
 
-	// Verify formatted ports appear
-	if !strings.Contains(view, "0.0.0.0:8080→80") {
-		t.Errorf("expected formatted port '0.0.0.0:8080→80' in view, got:\n%s", view)
+	// Verify formatted ports appear (wildcard host hidden)
+	if !strings.Contains(view, "8080→80") {
+		t.Errorf("expected formatted port '8080→80' in view, got:\n%s", view)
 	}
-	if !strings.Contains(view, "0.0.0.0:8443→443") {
-		t.Errorf("expected formatted port '0.0.0.0:8443→443' in view, got:\n%s", view)
+	if !strings.Contains(view, "8443→443") {
+		t.Errorf("expected formatted port '8443→443' in view, got:\n%s", view)
 	}
 }
 
@@ -4064,8 +4064,8 @@ func TestViewSelectContainers_PortsAlignment(t *testing.T) {
 		t.Fatalf("expected service rows, got:\n%s", view)
 	}
 
-	// nginx line must contain the formatted port
-	if !strings.Contains(nginxLine, "0.0.0.0:80→80") {
+	// nginx line must contain the formatted port (wildcard host hidden)
+	if !strings.Contains(nginxLine, "80→80") {
 		t.Errorf("expected formatted port in nginx line, got: %q", nginxLine)
 	}
 

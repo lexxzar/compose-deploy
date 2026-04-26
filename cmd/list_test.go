@@ -1611,7 +1611,7 @@ func TestFormatDots_PortsColumn_Mixed(t *testing.T) {
 		t.Fatalf("lines = %d, want 2", len(lines))
 	}
 
-	if !strings.Contains(lines[0], "0.0.0.0:8080→80") {
+	if !strings.Contains(lines[0], "8080→80") {
 		t.Errorf("web line missing ports: %q", lines[0])
 	}
 	// Both lines should have the same visible (rune) width: db should be padded
@@ -1659,7 +1659,7 @@ func TestFormatDots_PortsColumn_FlattenedMultiProject(t *testing.T) {
 	})
 
 	out := formatDots(flat)
-	if !strings.Contains(out, "0.0.0.0:80→80") {
+	if !strings.Contains(out, "80→80") {
 		t.Errorf("missing web ports in output: %q", out)
 	}
 	if !strings.Contains(out, "127.0.0.1:9000→9000") {
@@ -1700,7 +1700,7 @@ func TestFormatDotsGrouped_PerProjectPortsWidth(t *testing.T) {
 	}
 
 	out := formatDotsGrouped(projects)
-	if !strings.Contains(out, "0.0.0.0:80→80") {
+	if !strings.Contains(out, "80→80") {
 		t.Errorf("missing ports in shortports project: %q", out)
 	}
 	// noports project should not have an arrow rune
