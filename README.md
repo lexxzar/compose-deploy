@@ -6,6 +6,10 @@ Instead of SSH-ing into each machine and running `docker compose stop && docker 
 
 No daemon. No agents to install on your servers. No cluster orchestrator. Single binary. Plain SSH.
 
+Highlights:
+
+- Shows published port mappings (host:port→container) alongside service status in both the TUI list and `cdeploy list` CLI output.
+
 ## Install
 
 ```bash
@@ -62,7 +66,8 @@ cdeploy stop nginx
 # List services and their status
 cdeploy list
 
-# List services as JSON
+# List services as JSON (each service includes a `ports` array of
+# {host, host_port, container_port, protocol} entries when published)
 cdeploy list --json
 
 # Stream logs for a service

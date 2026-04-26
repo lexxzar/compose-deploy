@@ -1947,6 +1947,73 @@ func TestExtractPorts(t *testing.T) {
 				{Host: "::", HostPort: 8080, ContainerPort: 80, Protocol: "tcp"},
 			},
 		},
+		{
+			name: "two distinct IPv4 bind interfaces on same port both preserved",
+			entry: psEntry{Publishers: []psPublisher{
+				{URL: "127.0.0.1", TargetPort: 80, PublishedPort: 8080, Protocol: "tcp"},
+				{URL: "192.168.1.10", TargetPort: 80, PublishedPort: 8080, Protocol: "tcp"},
+			}},
+			want: []runner.Port{
+				{Host: "127.0.0.1", HostPort: 8080, ContainerPort: 80, Protocol: "tcp"},
+				{Host: "192.168.1.10", HostPort: 8080, ContainerPort: 80, Protocol: "tcp"},
+			},
+		},
+		{
+			name: "distinct IPv4 binds plus IPv6 wildcard without IPv4 wildcard: all survive",
+			entry: psEntry{Publishers: []psPublisher{
+				{URL: "127.0.0.1", TargetPort: 80, PublishedPort: 8080, Protocol: "tcp"},
+				{URL: "192.168.1.10", TargetPort: 80, PublishedPort: 8080, Protocol: "tcp"},
+				{URL: "::", TargetPort: 80, PublishedPort: 8080, Protocol: "tcp"},
+			}},
+			want: []runner.Port{
+				{Host: "127.0.0.1", HostPort: 8080, ContainerPort: 80, Protocol: "tcp"},
+				{Host: "192.168.1.10", HostPort: 8080, ContainerPort: 80, Protocol: "tcp"},
+				{Host: "::", HostPort: 8080, ContainerPort: 80, Protocol: "tcp"},
+			},
+		},
+		{
+			name: "IPv6 wildcard with IPv4 wildcard sibling: IPv6 wildcard collapses",
+			entry: psEntry{Publishers: []psPublisher{
+				{URL: "0.0.0.0", TargetPort: 80, PublishedPort: 8080, Protocol: "tcp"},
+				{URL: "::", TargetPort: 80, PublishedPort: 8080, Protocol: "tcp"},
+			}},
+			want: []runner.Port{
+				{Host: "0.0.0.0", HostPort: 8080, ContainerPort: 80, Protocol: "tcp"},
+			},
+		},
+		{
+			name: "IPv6 loopback plus IPv4 wildcard: both survive (loopback is not a mirror)",
+			entry: psEntry{Publishers: []psPublisher{
+				{URL: "0.0.0.0", TargetPort: 443, PublishedPort: 8443, Protocol: "tcp"},
+				{URL: "::1", TargetPort: 443, PublishedPort: 8443, Protocol: "tcp"},
+			}},
+			want: []runner.Port{
+				{Host: "0.0.0.0", HostPort: 8443, ContainerPort: 443, Protocol: "tcp"},
+				{Host: "::1", HostPort: 8443, ContainerPort: 443, Protocol: "tcp"},
+			},
+		},
+		{
+			name: "IPv6 wildcard plus IPv6 loopback (no IPv4): both survive",
+			entry: psEntry{Publishers: []psPublisher{
+				{URL: "::", TargetPort: 80, PublishedPort: 8080, Protocol: "tcp"},
+				{URL: "::1", TargetPort: 80, PublishedPort: 8080, Protocol: "tcp"},
+			}},
+			want: []runner.Port{
+				{Host: "::", HostPort: 8080, ContainerPort: 80, Protocol: "tcp"},
+				{Host: "::1", HostPort: 8080, ContainerPort: 80, Protocol: "tcp"},
+			},
+		},
+		{
+			name: "two distinct non-wildcard IPv6 binds on same tuple: both survive",
+			entry: psEntry{Publishers: []psPublisher{
+				{URL: "::1", TargetPort: 443, PublishedPort: 8443, Protocol: "tcp"},
+				{URL: "2001:db8::1", TargetPort: 443, PublishedPort: 8443, Protocol: "tcp"},
+			}},
+			want: []runner.Port{
+				{Host: "::1", HostPort: 8443, ContainerPort: 443, Protocol: "tcp"},
+				{Host: "2001:db8::1", HostPort: 8443, ContainerPort: 443, Protocol: "tcp"},
+			},
+		},
 	}
 
 	for _, tt := range tests {
@@ -2073,6 +2140,86 @@ func TestParsePortsString(t *testing.T) {
 			want: []runner.Port{
 				{Host: "0.0.0.0", HostPort: 53, ContainerPort: 53, Protocol: "tcp"},
 				{Host: "0.0.0.0", HostPort: 53, ContainerPort: 53, Protocol: "udp"},
+			},
+		},
+		{
+			name: "port range expanded 1:1",
+			in:   "0.0.0.0:8080-8082->8080-8082/tcp",
+			want: []runner.Port{
+				{Host: "0.0.0.0", HostPort: 8080, ContainerPort: 8080, Protocol: "tcp"},
+				{Host: "0.0.0.0", HostPort: 8081, ContainerPort: 8081, Protocol: "tcp"},
+				{Host: "0.0.0.0", HostPort: 8082, ContainerPort: 8082, Protocol: "tcp"},
+			},
+		},
+		{
+			name: "mismatched range widths skipped",
+			in:   "0.0.0.0:8080-8090->8080/tcp",
+			want: nil,
+		},
+		{
+			name: "reversed range skipped",
+			in:   "0.0.0.0:8090-8080->8090-8080/tcp",
+			want: nil,
+		},
+		{
+			name: "bare 2-colon ipv6 wildcard (::port) parses as ::",
+			in:   "::8080->80/tcp",
+			want: []runner.Port{
+				{Host: "::", HostPort: 8080, ContainerPort: 80, Protocol: "tcp"},
+			},
+		},
+		{
+			name: "ipv6 literal host (compact form) preserved",
+			in:   "2001:db8::1:8080->80/tcp",
+			want: []runner.Port{
+				{Host: "2001:db8::1", HostPort: 8080, ContainerPort: 80, Protocol: "tcp"},
+			},
+		},
+		{
+			name: "ipv6 loopback bare form preserved",
+			in:   "::1:8443->443/tcp",
+			want: []runner.Port{
+				{Host: "::1", HostPort: 8443, ContainerPort: 443, Protocol: "tcp"},
+			},
+		},
+		{
+			name: "bare 2-colon ipv6 dedupes with ipv4 mirror to ipv4",
+			in:   "::8080->80/tcp, 0.0.0.0:8080->80/tcp",
+			want: []runner.Port{
+				{Host: "0.0.0.0", HostPort: 8080, ContainerPort: 80, Protocol: "tcp"},
+			},
+		},
+		{
+			name: "two distinct IPv4 bind interfaces on same port both preserved",
+			in:   "127.0.0.1:8080->80/tcp, 192.168.1.10:8080->80/tcp",
+			want: []runner.Port{
+				{Host: "127.0.0.1", HostPort: 8080, ContainerPort: 80, Protocol: "tcp"},
+				{Host: "192.168.1.10", HostPort: 8080, ContainerPort: 80, Protocol: "tcp"},
+			},
+		},
+		{
+			name: "distinct IPv4 binds plus IPv6 wildcard without IPv4 wildcard: all survive",
+			in:   "127.0.0.1:8080->80/tcp, 192.168.1.10:8080->80/tcp, [::]:8080->80/tcp",
+			want: []runner.Port{
+				{Host: "127.0.0.1", HostPort: 8080, ContainerPort: 80, Protocol: "tcp"},
+				{Host: "192.168.1.10", HostPort: 8080, ContainerPort: 80, Protocol: "tcp"},
+				{Host: "::", HostPort: 8080, ContainerPort: 80, Protocol: "tcp"},
+			},
+		},
+		{
+			name: "IPv6 loopback plus IPv4 wildcard: both survive (loopback is not a mirror)",
+			in:   "0.0.0.0:8443->443/tcp, [::1]:8443->443/tcp",
+			want: []runner.Port{
+				{Host: "0.0.0.0", HostPort: 8443, ContainerPort: 443, Protocol: "tcp"},
+				{Host: "::1", HostPort: 8443, ContainerPort: 443, Protocol: "tcp"},
+			},
+		},
+		{
+			name: "IPv6 wildcard plus IPv6 loopback (no IPv4): both survive",
+			in:   "[::]:8080->80/tcp, [::1]:8080->80/tcp",
+			want: []runner.Port{
+				{Host: "::", HostPort: 8080, ContainerPort: 80, Protocol: "tcp"},
+				{Host: "::1", HostPort: 8080, ContainerPort: 80, Protocol: "tcp"},
 			},
 		},
 	}
@@ -2295,6 +2442,63 @@ func TestDedupAndSortPorts(t *testing.T) {
 			want: []runner.Port{
 				{Host: "0.0.0.0", HostPort: 53, ContainerPort: 53, Protocol: "tcp"},
 				{Host: "0.0.0.0", HostPort: 53, ContainerPort: 53, Protocol: "udp"},
+			},
+		},
+		{
+			name: "two distinct IPv4 binds on same port both preserved across replicas",
+			in: []runner.Port{
+				{Host: "127.0.0.1", HostPort: 8080, ContainerPort: 80, Protocol: "tcp"},
+				{Host: "192.168.1.10", HostPort: 8080, ContainerPort: 80, Protocol: "tcp"},
+			},
+			want: []runner.Port{
+				{Host: "127.0.0.1", HostPort: 8080, ContainerPort: 80, Protocol: "tcp"},
+				{Host: "192.168.1.10", HostPort: 8080, ContainerPort: 80, Protocol: "tcp"},
+			},
+		},
+		{
+			name: "distinct IPv4 binds plus IPv6 wildcard without IPv4 wildcard: all survive",
+			in: []runner.Port{
+				{Host: "::", HostPort: 8080, ContainerPort: 80, Protocol: "tcp"},
+				{Host: "127.0.0.1", HostPort: 8080, ContainerPort: 80, Protocol: "tcp"},
+				{Host: "192.168.1.10", HostPort: 8080, ContainerPort: 80, Protocol: "tcp"},
+			},
+			want: []runner.Port{
+				{Host: "127.0.0.1", HostPort: 8080, ContainerPort: 80, Protocol: "tcp"},
+				{Host: "192.168.1.10", HostPort: 8080, ContainerPort: 80, Protocol: "tcp"},
+				{Host: "::", HostPort: 8080, ContainerPort: 80, Protocol: "tcp"},
+			},
+		},
+		{
+			name: "IPv6 wildcard plus IPv6 loopback (no IPv4 wildcard): both survive",
+			in: []runner.Port{
+				{Host: "::", HostPort: 8080, ContainerPort: 80, Protocol: "tcp"},
+				{Host: "::1", HostPort: 8080, ContainerPort: 80, Protocol: "tcp"},
+			},
+			want: []runner.Port{
+				{Host: "::", HostPort: 8080, ContainerPort: 80, Protocol: "tcp"},
+				{Host: "::1", HostPort: 8080, ContainerPort: 80, Protocol: "tcp"},
+			},
+		},
+		{
+			name: "IPv6 loopback plus IPv4 wildcard: both survive (loopback is not a mirror)",
+			in: []runner.Port{
+				{Host: "::1", HostPort: 8443, ContainerPort: 443, Protocol: "tcp"},
+				{Host: "0.0.0.0", HostPort: 8443, ContainerPort: 443, Protocol: "tcp"},
+			},
+			want: []runner.Port{
+				{Host: "0.0.0.0", HostPort: 8443, ContainerPort: 443, Protocol: "tcp"},
+				{Host: "::1", HostPort: 8443, ContainerPort: 443, Protocol: "tcp"},
+			},
+		},
+		{
+			name: "two distinct non-wildcard IPv6 binds on same tuple: both survive",
+			in: []runner.Port{
+				{Host: "::1", HostPort: 8443, ContainerPort: 443, Protocol: "tcp"},
+				{Host: "2001:db8::1", HostPort: 8443, ContainerPort: 443, Protocol: "tcp"},
+			},
+			want: []runner.Port{
+				{Host: "2001:db8::1", HostPort: 8443, ContainerPort: 443, Protocol: "tcp"},
+				{Host: "::1", HostPort: 8443, ContainerPort: 443, Protocol: "tcp"},
 			},
 		},
 	}

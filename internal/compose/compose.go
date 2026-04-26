@@ -9,12 +9,29 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
 
 	"github.com/lexxzar/compose-deploy/internal/runner"
 )
+
+// maxPortRangeExpansion caps the number of ports a single "lo-hi" range may expand
+// into, so a malformed entry (e.g. "1-65535") cannot allocate an unbounded slice.
+const maxPortRangeExpansion = 1024
+
+// portKey identifies a unique published port mapping (Host, HostPort, ContainerPort,
+// Protocol). Including Host means two distinct bind interfaces on the same port
+// (e.g. 127.0.0.1:8080 and 192.168.1.10:8080) are NOT collapsed by primary dedup.
+// True IPv4/IPv6 mirrors of the same (HostPort, ContainerPort, Protocol) are
+// collapsed by a separate pass — see collapseIPv6Mirrors.
+type portKey struct {
+	host          string
+	hostPort      int
+	containerPort int
+	protocol      string
+}
 
 // Project represents a running Docker Compose project discovered via `docker compose ls`.
 type Project struct {
@@ -351,115 +368,130 @@ type psPublisher struct {
 	Protocol      string `json:"Protocol"`
 }
 
+// normalizeHost normalizes a bind-host string from a published port: an empty input is
+// rewritten to "0.0.0.0" (Compose's default for unspecified bind) and a bracketed-IPv6
+// form ("[::]", "[::1]") has its brackets stripped. All other inputs are returned as-is.
+// Used by extractPorts and splitHostPort to share a single normalization contract.
+func normalizeHost(s string) string {
+	if s == "" {
+		return "0.0.0.0"
+	}
+	if strings.HasPrefix(s, "[") && strings.HasSuffix(s, "]") && len(s) >= 2 {
+		return s[1 : len(s)-1]
+	}
+	return s
+}
+
 // extractPorts converts the Publishers array of a single ps entry to a slice of runner.Port.
 // Skips entries with PublishedPort == 0 (those are `expose:`-only, not actually published).
-// Dedupes IPv4/IPv6 mirrors of the same (HostPort, ContainerPort, Protocol) — when both a
-// "0.0.0.0" or empty-URL entry and a "::" entry exist, the IPv4 version wins.
+// Distinct bind interfaces on the same (HostPort, ContainerPort, Protocol) are preserved
+// (e.g. 127.0.0.1:8080->80 and 192.168.1.10:8080->80 both survive). Only the IPv4/IPv6
+// wildcard pair "0.0.0.0" ↔ "::" on the same (HostPort, ContainerPort, Protocol) tuple
+// is collapsed (matching Compose's default dual-stack bind behavior); the "::" entry is
+// dropped in favor of "0.0.0.0". Non-wildcard IPv6 hosts (e.g. "::1", "2001:db8::1")
+// are distinct user-visible binds and survive intact.
 // An empty/missing URL is normalized to "0.0.0.0" (Compose's default for unspecified bind).
 func extractPorts(entry psEntry) []runner.Port {
 	if len(entry.Publishers) == 0 {
 		return nil
 	}
-	type key struct {
-		hostPort      int
-		containerPort int
-		protocol      string
-	}
-	// preserve insertion order; map tracks index into ports slice for dedup
-	idx := make(map[key]int)
+	// preserve insertion order; map tracks index into ports slice for full-tuple dedup
+	idx := make(map[portKey]int)
 	var ports []runner.Port
 	for _, pub := range entry.Publishers {
 		if pub.PublishedPort == 0 {
 			continue
 		}
-		host := pub.URL
-		if host == "" {
-			host = "0.0.0.0"
-		}
-		// strip IPv6 brackets if present (e.g. "[::]")
-		if strings.HasPrefix(host, "[") && strings.HasSuffix(host, "]") {
-			host = host[1 : len(host)-1]
-		}
-		k := key{hostPort: pub.PublishedPort, containerPort: pub.TargetPort, protocol: pub.Protocol}
-		if existing, ok := idx[k]; ok {
-			// dedupe IPv4/IPv6 mirror: prefer 0.0.0.0 over ::
-			if isIPv6Wildcard(ports[existing].Host) && !isIPv6Wildcard(host) {
-				ports[existing].Host = host
-			}
-			continue
-		}
-		idx[k] = len(ports)
-		ports = append(ports, runner.Port{
-			Host:          host,
+		mergePort(&ports, idx, runner.Port{
+			Host:          normalizeHost(pub.URL),
 			HostPort:      pub.PublishedPort,
 			ContainerPort: pub.TargetPort,
 			Protocol:      pub.Protocol,
 		})
 	}
-	return ports
+	return collapseIPv6Mirrors(ports)
 }
 
-// isIPv6Wildcard reports whether host is the IPv6 unspecified address ("::") or any
-// IPv6 form (contains ":"). For dedup purposes we treat any IPv6 form as a candidate
-// to be replaced by an IPv4 mirror of the same (HostPort, ContainerPort, Protocol).
-func isIPv6Wildcard(host string) bool {
+// mergePort appends p to ports unless an entry with the same (Host, HostPort,
+// ContainerPort, Protocol) tuple already exists, in which case it is dropped (exact
+// duplicate). idx tracks the index into ports for each full-tuple key. Both are
+// mutated in place. IPv4/IPv6 mirror collapse is handled separately by
+// collapseIPv6Mirrors after all entries have been merged.
+func mergePort(ports *[]runner.Port, idx map[portKey]int, p runner.Port) {
+	k := portKey{host: p.Host, hostPort: p.HostPort, containerPort: p.ContainerPort, protocol: p.Protocol}
+	if _, ok := idx[k]; ok {
+		return
+	}
+	idx[k] = len(*ports)
+	*ports = append(*ports, p)
+}
+
+// collapseIPv6Mirrors collapses the IPv4/IPv6 wildcard mirror pair that Compose
+// emits when a port is published to all interfaces on a dual-stack host: the IPv6
+// unspecified address "::" is dropped when an IPv4 unspecified address "0.0.0.0"
+// sibling exists on the same (HostPort, ContainerPort, Protocol) tuple. Only the
+// wildcard pair "0.0.0.0" ↔ "::" is treated as a mirror — all other host strings
+// (including IPv6 loopback "::1", link-local "fe80::1", or explicit IPv6 addresses
+// like "2001:db8::1") are distinct user-visible binds and must survive even when an
+// IPv4 entry exists on the same tuple. Likewise, multiple non-wildcard IPv6 entries
+// on the same tuple do not collapse against each other (full-tuple dedup in
+// mergePort already removes exact (Host, HostPort, ContainerPort, Protocol)
+// repeats). Stable order of survivors is preserved.
+func collapseIPv6Mirrors(ports []runner.Port) []runner.Port {
+	if len(ports) < 2 {
+		return ports
+	}
+	type tupleKey struct {
+		hostPort      int
+		containerPort int
+		protocol      string
+	}
+	hasIPv4Wildcard := make(map[tupleKey]bool)
+	for _, p := range ports {
+		if p.Host == "0.0.0.0" {
+			hasIPv4Wildcard[tupleKey{p.HostPort, p.ContainerPort, p.Protocol}] = true
+		}
+	}
+	out := make([]runner.Port, 0, len(ports))
+	for _, p := range ports {
+		if p.Host == "::" && hasIPv4Wildcard[tupleKey{p.HostPort, p.ContainerPort, p.Protocol}] {
+			// drop: IPv6 wildcard mirror of an IPv4 wildcard sibling
+			continue
+		}
+		out = append(out, p)
+	}
+	return out
+}
+
+// isIPv6Host reports whether host contains a colon — i.e., is an IPv6 address in any
+// form (wildcard "::", loopback "::1", link-local "fe80::1", etc.). Used for sort
+// ordering and bracket-wrapping in display formatting.
+func isIPv6Host(host string) bool {
 	return strings.Contains(host, ":")
 }
 
-// dedupAndSortPorts dedupes ports across replicas by the full
-// (Host, HostPort, ContainerPort, Protocol) tuple and returns a slice sorted
-// ascending by HostPort, then by ContainerPort, then by Protocol, then by Host
-// for stable output. IPv4/IPv6 mirrors of the same (HostPort, ContainerPort,
-// Protocol) tuple are collapsed to the IPv4 form (preferring "0.0.0.0" or any
-// non-IPv6 host over an IPv6 host) — this matches the behavior of extractPorts
-// and parsePortsString, but applied across replicas.
+// dedupAndSortPorts dedupes ports across replicas by the (Host, HostPort,
+// ContainerPort, Protocol) tuple and returns a slice sorted ascending by
+// HostPort, then by ContainerPort, then by Protocol, then by Host for stable
+// output. Distinct bind interfaces on the same port survive (e.g.
+// 127.0.0.1:8080 and 192.168.1.10:8080). Only the IPv4 unspecified address
+// "0.0.0.0" and the IPv6 unspecified address "::" are treated as mirrors —
+// when both wildcards appear on the same (HostPort, ContainerPort, Protocol)
+// tuple, the "::" entry is dropped. All other host strings are distinct
+// user-visible binds and survive (e.g. IPv6 loopback "::1" or explicit IPv6
+// addresses are NOT collapsed against an IPv4 sibling). This matches the
+// behavior of extractPorts and parsePortsString.
 func dedupAndSortPorts(ports []runner.Port) []runner.Port {
 	if len(ports) == 0 {
 		return nil
 	}
-	// First pass: collapse IPv4/IPv6 mirrors of the same (HostPort, ContainerPort, Protocol).
-	type mirrorKey struct {
-		hostPort      int
-		containerPort int
-		protocol      string
-	}
-	mirrorIdx := make(map[mirrorKey]int)
-	merged := make([]runner.Port, 0, len(ports))
+	idx := make(map[portKey]int)
+	out := make([]runner.Port, 0, len(ports))
 	for _, p := range ports {
-		mk := mirrorKey{hostPort: p.HostPort, containerPort: p.ContainerPort, protocol: p.Protocol}
-		if existing, ok := mirrorIdx[mk]; ok {
-			// Prefer non-IPv6 host (e.g. "0.0.0.0") over IPv6 mirror.
-			if isIPv6Wildcard(merged[existing].Host) && !isIPv6Wildcard(p.Host) {
-				merged[existing].Host = p.Host
-			}
-			continue
-		}
-		mirrorIdx[mk] = len(merged)
-		merged = append(merged, p)
+		mergePort(&out, idx, p)
 	}
-	// Second pass: dedupe by full (Host, HostPort, ContainerPort, Protocol) tuple.
-	type fullKey struct {
-		host          string
-		hostPort      int
-		containerPort int
-		protocol      string
-	}
-	seen := make(map[fullKey]bool)
-	out := make([]runner.Port, 0, len(merged))
-	for _, p := range merged {
-		k := fullKey{host: p.Host, hostPort: p.HostPort, containerPort: p.ContainerPort, protocol: p.Protocol}
-		if seen[k] {
-			continue
-		}
-		seen[k] = true
-		out = append(out, p)
-	}
-	// Sort ascending by HostPort, then ContainerPort, then Protocol, then Host.
-	for i := 1; i < len(out); i++ {
-		for j := i; j > 0 && portLess(out[j], out[j-1]); j-- {
-			out[j], out[j-1] = out[j-1], out[j]
-		}
-	}
+	out = collapseIPv6Mirrors(out)
+	sort.SliceStable(out, func(i, j int) bool { return portLess(out[i], out[j]) })
 	return out
 }
 
@@ -488,21 +520,22 @@ func portLess(a, b runner.Port) bool {
 //	[::]:8080->80/tcp
 //	[::1]:8443->443/tcp
 //	0.0.0.0:1812->1812/udp
+//	0.0.0.0:8080-8090->8080-8090/tcp     (port ranges, expanded 1:1)
 //
 // Entries without a `->` (e.g. plain "80/tcp" exposed-only) are skipped. Malformed
-// entries are skipped silently (best-effort). IPv4/IPv6 mirrors of the same
-// (HostPort, ContainerPort, Protocol) tuple are deduped, preferring the IPv4 form.
+// entries are skipped silently (best-effort). Port ranges (e.g. `8080-8090`) are
+// expanded to one runner.Port per (host_port, container_port) pair when the host and
+// container range widths match; mismatched widths cause the entry to be skipped.
+// Distinct bind interfaces on the same port survive (e.g. 127.0.0.1:8080 and
+// 192.168.1.10:8080). Only the IPv4/IPv6 wildcard pair ("0.0.0.0" ↔ "::") on the
+// same (HostPort, ContainerPort, Protocol) tuple is collapsed to the IPv4 form;
+// non-wildcard IPv6 hosts (e.g. "::1", "2001:db8::1") survive intact.
 func parsePortsString(text string) []runner.Port {
 	text = strings.TrimSpace(text)
 	if text == "" {
 		return nil
 	}
-	type key struct {
-		hostPort      int
-		containerPort int
-		protocol      string
-	}
-	idx := make(map[key]int)
+	idx := make(map[portKey]int)
 	var ports []runner.Port
 	for _, raw := range strings.Split(text, ",") {
 		entry := strings.TrimSpace(raw)
@@ -517,55 +550,90 @@ func parsePortsString(text string) []runner.Port {
 		left := entry[:arrowIdx]
 		right := entry[arrowIdx+2:]
 
-		// Parse host portion: either "host:port" or "[ipv6]:port" or ":::port" (IPv6 unspecified).
+		// Parse host portion: either "host:port[-port]" or "[ipv6]:port[-port]" or
+		// "::port[-port]" (Compose's IPv6 unspecified shorthand).
 		host, hostPortStr, ok := splitHostPort(left)
 		if !ok {
 			continue
 		}
-		hp, err := strconv.Atoi(hostPortStr)
-		if err != nil || hp <= 0 {
+		hostPorts, ok := parsePortOrRange(hostPortStr)
+		if !ok {
 			continue
 		}
 
-		// Parse container portion: "port/proto" or "port".
+		// Parse container portion: "port[-port]/proto" or "port[-port]".
 		cpStr := right
 		proto := ""
 		if slash := strings.Index(right, "/"); slash >= 0 {
 			cpStr = right[:slash]
 			proto = right[slash+1:]
 		}
-		cp, err := strconv.Atoi(cpStr)
-		if err != nil || cp <= 0 {
+		containerPorts, ok := parsePortOrRange(cpStr)
+		if !ok {
 			continue
 		}
 
-		if host == "" {
-			host = "0.0.0.0"
-		}
-
-		k := key{hostPort: hp, containerPort: cp, protocol: proto}
-		if existing, ok := idx[k]; ok {
-			if isIPv6Wildcard(ports[existing].Host) && !isIPv6Wildcard(host) {
-				ports[existing].Host = host
-			}
+		// Range widths must match for a 1:1 mapping (e.g. 8080-8090 -> 8080-8090).
+		if len(hostPorts) != len(containerPorts) {
 			continue
 		}
-		idx[k] = len(ports)
-		ports = append(ports, runner.Port{
-			Host:          host,
-			HostPort:      hp,
-			ContainerPort: cp,
-			Protocol:      proto,
-		})
+
+		host = normalizeHost(host)
+
+		for i := range hostPorts {
+			mergePort(&ports, idx, runner.Port{
+				Host:          host,
+				HostPort:      hostPorts[i],
+				ContainerPort: containerPorts[i],
+				Protocol:      proto,
+			})
+		}
 	}
-	return ports
+	return collapseIPv6Mirrors(ports)
+}
+
+// parsePortOrRange parses a port number or a "lo-hi" inclusive range and returns the
+// expanded slice of port numbers. Returns ok=false if the input is malformed, contains
+// non-positive ports, or the range is reversed (lo > hi). Ranges are capped at 1024
+// ports to avoid unbounded expansion from malformed input.
+func parsePortOrRange(s string) ([]int, bool) {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return nil, false
+	}
+	if dash := strings.Index(s, "-"); dash >= 0 {
+		lo, err := strconv.Atoi(s[:dash])
+		if err != nil || lo <= 0 {
+			return nil, false
+		}
+		hi, err := strconv.Atoi(s[dash+1:])
+		if err != nil || hi <= 0 || hi < lo {
+			return nil, false
+		}
+		if hi-lo+1 > maxPortRangeExpansion {
+			return nil, false
+		}
+		out := make([]int, 0, hi-lo+1)
+		for p := lo; p <= hi; p++ {
+			out = append(out, p)
+		}
+		return out, true
+	}
+	p, err := strconv.Atoi(s)
+	if err != nil || p <= 0 {
+		return nil, false
+	}
+	return []int{p}, true
 }
 
 // splitHostPort splits a "host:port" or "[ipv6]:port" string into (host, port).
 // Returns ok=false if the input has no port separator or is malformed.
-// IPv6 brackets are stripped from the returned host. The bare "::port" form
-// (Compose's IPv6 unspecified shorthand, three colons total) is recognized:
-// host becomes "::" and port becomes whatever follows the third colon.
+// IPv6 brackets are stripped from the returned host. Bare-IPv6 forms (e.g. "::8080",
+// "::1:8443", "2001:db8::1:8080") are recognized: when the input contains 2 or more
+// colons and is not bracketed, the last colon is treated as the host:port separator
+// and everything before it (e.g. "::", "::1", "2001:db8::1") is returned as the host.
+// The 2-colon "::port" form (Compose's IPv6 unspecified shorthand, e.g. "::8080") is
+// treated as host="::" / port="8080".
 func splitHostPort(s string) (host, port string, ok bool) {
 	s = strings.TrimSpace(s)
 	if s == "" {
@@ -584,18 +652,21 @@ func splitHostPort(s string) (host, port string, ok bool) {
 		}
 		return host, port, true
 	}
-	// Find last colon — split host:port. Handles bare-IPv6 forms like "::8080"
-	// (which Compose emits for the unspecified IPv6 address); the last colon is
-	// the host:port separator, leaving "::" as the host.
 	lastColon := strings.LastIndex(s, ":")
 	if lastColon < 0 {
 		return "", "", false
 	}
-	host = s[:lastColon]
 	port = s[lastColon+1:]
 	if port == "" {
 		return "", "", false
 	}
+	// Special case: "::port" (e.g. "::8080") — bare IPv6 unspecified shorthand.
+	// LastIndex of ":" lands at index 1, leaving host=":". Detect this and rewrite
+	// to host="::" so the IPv6 wildcard form parses consistently with ":::port".
+	if lastColon == 1 && s[0] == ':' {
+		return "::", port, true
+	}
+	host = s[:lastColon]
 	return host, port, true
 }
 

@@ -1717,9 +1717,11 @@ func TestFormatDotsGrouped_PerProjectPortsWidth(t *testing.T) {
 func TestFormatJSON_IncludesPorts(t *testing.T) {
 	items := []serviceStatus{
 		{Name: "web", Running: true, Ports: []runner.Port{
-			{Host: "0.0.0.0", HostPort: 8080, ContainerPort: 80, Protocol: "tcp"},
+			{Host: "0.0.0.0", HostPort: 80, ContainerPort: 80, Protocol: "tcp"},
+			{Host: "0.0.0.0", HostPort: 443, ContainerPort: 443, Protocol: "tcp"},
 		}},
-		{Name: "db", Running: true},
+		{Name: "nilports", Running: true},                       // nil slice → omitempty
+		{Name: "emptyports", Running: true, Ports: []runner.Port{}}, // explicit empty slice → omitempty too
 	}
 
 	out, err := formatJSON(items)
@@ -1727,18 +1729,17 @@ func TestFormatJSON_IncludesPorts(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// Field name verification on raw output
-	if !strings.Contains(out, `"ports"`) {
-		t.Errorf("ports field missing from JSON: %s", out)
-	}
-	if !strings.Contains(out, `"host"`) || !strings.Contains(out, `"host_port"`) ||
-		!strings.Contains(out, `"container_port"`) || !strings.Contains(out, `"protocol"`) {
-		t.Errorf("port field names missing or wrong-cased in JSON: %s", out)
+	// Full field-name set (snake_case) verification on raw output
+	for _, want := range []string{`"ports"`, `"host"`, `"host_port"`, `"container_port"`, `"protocol"`} {
+		if !strings.Contains(out, want) {
+			t.Errorf("expected field %s in JSON, got: %s", want, out)
+		}
 	}
 
-	// omitempty: only one occurrence of "ports" (for web, not db)
+	// omitempty: only one occurrence of "ports" (for web), since both nil and explicit
+	// empty slice should be omitted by encoding/json with the omitempty tag.
 	if strings.Count(out, `"ports"`) != 1 {
-		t.Errorf("expected ports field exactly once (for web only), got JSON: %s", out)
+		t.Errorf("expected ports field exactly once (web only — nil and empty-slice both omitted), got JSON: %s", out)
 	}
 
 	// Round-trip
@@ -1746,15 +1747,22 @@ func TestFormatJSON_IncludesPorts(t *testing.T) {
 	if err := json.Unmarshal([]byte(out), &got); err != nil {
 		t.Fatalf("unmarshal: %v", err)
 	}
-	if len(got[0].Ports) != 1 {
-		t.Fatalf("got[0].Ports len = %d, want 1", len(got[0].Ports))
+	// Multi-port-per-service shape preserved.
+	if len(got[0].Ports) != 2 {
+		t.Fatalf("got[0].Ports len = %d, want 2 (multi-port per service)", len(got[0].Ports))
 	}
-	if got[0].Ports[0].Host != "0.0.0.0" || got[0].Ports[0].HostPort != 8080 ||
+	if got[0].Ports[0].Host != "0.0.0.0" || got[0].Ports[0].HostPort != 80 ||
 		got[0].Ports[0].ContainerPort != 80 || got[0].Ports[0].Protocol != "tcp" {
-		t.Errorf("got[0].Ports[0] = %+v, want full round-trip", got[0].Ports[0])
+		t.Errorf("got[0].Ports[0] = %+v, want first port round-trip", got[0].Ports[0])
+	}
+	if got[0].Ports[1].HostPort != 443 || got[0].Ports[1].ContainerPort != 443 {
+		t.Errorf("got[0].Ports[1] = %+v, want second port round-trip", got[0].Ports[1])
 	}
 	if len(got[1].Ports) != 0 {
-		t.Errorf("got[1].Ports = %+v, want empty (omitempty)", got[1].Ports)
+		t.Errorf("got[1].Ports = %+v, want empty (nil → omitempty)", got[1].Ports)
+	}
+	if len(got[2].Ports) != 0 {
+		t.Errorf("got[2].Ports = %+v, want empty (explicit empty slice → omitempty)", got[2].Ports)
 	}
 }
 

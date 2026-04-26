@@ -11,6 +11,7 @@ import (
 	"regexp"
 	"strings"
 	"testing"
+	"unicode/utf8"
 
 	"github.com/charmbracelet/bubbles/viewport"
 	tea "github.com/charmbracelet/bubbletea"
@@ -4043,16 +4044,21 @@ func TestViewSelectContainers_PortsAlignment(t *testing.T) {
 	view := m.viewSelectContainers()
 	lines := strings.Split(view, "\n")
 
-	// Find lines for both services
-	var nginxLine, apiLine string
+	// Find caption row and both service rows
+	var captionLine, nginxLine, apiLine string
 	for _, line := range lines {
-		// Avoid matching captions or headers
+		if strings.Contains(line, "Ports") && !strings.Contains(line, "●") {
+			captionLine = line
+		}
 		if strings.Contains(line, "● ") && strings.Contains(line, "nginx") {
 			nginxLine = line
 		}
 		if strings.Contains(line, "● ") && strings.Contains(line, "api") && !strings.Contains(line, "nginx") {
 			apiLine = line
 		}
+	}
+	if captionLine == "" {
+		t.Fatalf("expected captions row containing 'Ports', got:\n%s", view)
 	}
 	if nginxLine == "" || apiLine == "" {
 		t.Fatalf("expected service rows, got:\n%s", view)
@@ -4063,14 +4069,25 @@ func TestViewSelectContainers_PortsAlignment(t *testing.T) {
 		t.Errorf("expected formatted port in nginx line, got: %q", nginxLine)
 	}
 
-	// Both lines should be padded to similar lengths so columns align.
-	// api line should still have padding for the empty Ports cell to keep alignment.
-	// We check that api line ends with trailing spaces (padding) at least the width of the empty Ports cell.
-	trimmedAPI := strings.TrimRight(apiLine, " ")
-	padLen := len(apiLine) - len(trimmedAPI)
-	// nginx ports formatted is "0.0.0.0:80→80" — 13 runes; we just check api padding > 0
-	if padLen < 1 {
-		t.Errorf("expected api line to have padding for empty Ports cell, got: %q (padLen=%d)", apiLine, padLen)
+	// Strong alignment check: both rows must have the exact same visible (rune)
+	// width. The empty-ports row pads the Ports column with spaces to match the
+	// formatted-port row, so widths must be equal — mirrors the CLI's parallel
+	// assertion in TestFormatDots_PortsColumn_Mixed.
+	wNginx := utf8.RuneCountInString(nginxLine)
+	wAPI := utf8.RuneCountInString(apiLine)
+	if wNginx != wAPI {
+		t.Errorf("ports column not aligned (rune width): nginx=%d, api=%d\nnginx: %q\napi:   %q",
+			wNginx, wAPI, nginxLine, apiLine)
+	}
+
+	// Column-boundary check: locate the rune-index of "Ports" in the captions row,
+	// then assert that both data rows have a rune at that column position (padding
+	// or content) — i.e., both rows are at least as wide as the captions column starts.
+	captionRuneIdx := utf8.RuneCountInString(captionLine[:strings.Index(captionLine, "Ports")])
+	for _, line := range []string{nginxLine, apiLine} {
+		if utf8.RuneCountInString(line) < captionRuneIdx {
+			t.Errorf("data row shorter than 'Ports' caption start (%d runes): %q", captionRuneIdx, line)
+		}
 	}
 }
 

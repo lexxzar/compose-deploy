@@ -242,15 +242,15 @@ Captions row gains "Ports" label when any service has non-empty `Ports`.
 
 ### Task 8: Verify acceptance criteria
 
-- [ ] verify `cdeploy list` shows Ports column for services with published mappings; blank cell for services without
-- [ ] verify `cdeploy list --json` includes structured `ports` array per service with correct field names
-- [ ] verify TUI container-select shows Ports column matching CLI format (visually align with Created/Uptime)
-- [ ] verify scaled services list all replica host ports comma-joined
-- [ ] verify IPv4/IPv6 dual-stack services show one row, not two
-- [ ] verify older Compose versions still render ports via text fallback (synthetic test fixture with `Ports` text only, `Publishers` nil)
-- [ ] run full test suite: `go test ./... -count=1` — all pass
-- [ ] run `go build -o cdeploy .` — builds without errors
-- [ ] run `go mod tidy` — no changes needed (no new deps)
+- [x] verify `cdeploy list` shows Ports column for services with published mappings; blank cell for services without — covered by `TestFormatDots_PortsColumn_Mixed`, `TestFormatDots_NoPorts_NoColumn`, `TestFormatDots_PortsColumn_FlattenedMultiProject`
+- [x] verify `cdeploy list --json` includes structured `ports` array per service with correct field names — covered by `TestFormatJSON_IncludesPorts`
+- [x] verify TUI container-select shows Ports column matching CLI format (visually align with Created/Uptime) — covered by `TestViewSelectContainers_Ports`, `TestViewSelectContainers_PortsAlignment`, `TestViewSelectContainers_NoPortsColumnWhenAllEmpty`
+- [x] verify scaled services list all replica host ports comma-joined — covered by `TestParseContainerStatus_PortsAggregation/scaled_service_with_3_ephemeral_host_ports_—_3_distinct_sorted`
+- [x] verify IPv4/IPv6 dual-stack services show one row, not two — covered by `TestExtractPorts/IPv4_IPv6_mirror_dedup`, `TestParsePortsString/comma_split_with_ipv4/ipv6_mirror_dedupes_to_ipv4`, `TestParseContainerStatus_PortsAggregation/scaled_service_ipv4_and_ipv6_mirrors_collapse_across_replicas`
+- [x] verify older Compose versions still render ports via text fallback (synthetic test fixture with `Ports` text only, `Publishers` nil) — covered by `TestParseContainerStatus_PortsAggregation/older_Compose_fallback_—_Ports_text_only,_Publishers_nil` and `older_Compose_fallback_with_multiple_ports_parses_correctly`
+- [x] run full test suite: `go test ./... -count=1` — all pass
+- [x] run `go build -o cdeploy .` — builds without errors
+- [x] run `go mod tidy` — no changes needed (no new deps)
 
 ### Task 9: Update documentation
 
@@ -258,9 +258,9 @@ Captions row gains "Ports" label when any service has non-empty `Ports`.
 - Modify: `CLAUDE.md`
 - Modify: `README.md` (if it documents `list` output format)
 
-- [ ] add a paragraph to CLAUDE.md under the existing "Health checks" / "Multi-project discovery" cluster describing the Ports column: data source (`Publishers` primary, `Ports` text fallback), format (`host:hp→cp`, `/tcp` omitted, `/udp` shown), aggregation (deduped, sorted by HostPort), and edge cases (stopped containers blank, internal-only skipped)
-- [ ] grep README.md for `cdeploy list` examples — if found, add ports to one example; if absent, skip (do not invent new sections)
-- [ ] move this plan to `docs/plans/completed/`
+- [x] add a paragraph to CLAUDE.md under the existing "Health checks" / "Multi-project discovery" cluster describing the Ports column: data source (`Publishers` primary, `Ports` text fallback), format (`host:hp→cp`, `/tcp` omitted, `/udp` shown), aggregation (deduped, sorted by HostPort), and edge cases (stopped containers blank, internal-only skipped)
+- [x] grep README.md for `cdeploy list` examples — if found, add ports to one example; if absent, skip (do not invent new sections) — README has `cdeploy list` invocation examples but no output samples; no edit made
+- [x] move this plan to `docs/plans/completed/`
 
 ## Post-Completion
 

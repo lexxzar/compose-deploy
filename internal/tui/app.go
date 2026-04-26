@@ -1902,11 +1902,15 @@ func (m Model) viewSelectContainers() string {
 		end = len(m.services)
 	}
 
-	// Calculate max widths for alignment (across ALL services, not just visible)
+	// Calculate max widths for alignment (across ALL services, not just visible).
+	// portsStr caches FormatPorts(...) per service so the render loop below can
+	// reuse the formatted strings without re-calling FormatPorts (mirrors the
+	// pattern in cmd/list.go formatDots/formatDotsGrouped).
 	maxName := 0
 	maxCreated := 0
 	maxUptime := 0
 	maxPorts := 0
+	portsStr := make(map[string]string, len(m.services))
 	for _, svc := range m.services {
 		if len(svc) > maxName {
 			maxName = len(svc)
@@ -1918,7 +1922,9 @@ func (m Model) viewSelectContainers() string {
 			if len(st.Uptime) > maxUptime {
 				maxUptime = len(st.Uptime)
 			}
-			if w := utf8.RuneCountInString(compose.FormatPorts(st.Ports)); w > maxPorts {
+			s := compose.FormatPorts(st.Ports)
+			portsStr[svc] = s
+			if w := utf8.RuneCountInString(s); w > maxPorts {
 				maxPorts = w
 			}
 		}
@@ -1980,7 +1986,7 @@ func (m Model) viewSelectContainers() string {
 			line += fmt.Sprintf("  %-*s", maxUptime, st.Uptime)
 		}
 		if maxPorts > 0 {
-			line += fmt.Sprintf("  %-*s", maxPorts, compose.FormatPorts(st.Ports))
+			line += fmt.Sprintf("  %-*s", maxPorts, portsStr[svc])
 		}
 		b.WriteString(line)
 		b.WriteByte('\n')

@@ -7,15 +7,23 @@ import (
 	"github.com/lexxzar/compose-deploy/internal/runner"
 )
 
-// FormatPort renders a single Port as "host:hostPort→containerPort"
-// with an optional "/proto" suffix when Protocol is non-empty and not "tcp".
+// FormatPort renders a single Port as "host:hostPort→containerPort" (IPv4) or
+// "[host]:hostPort→containerPort" (IPv6) with an optional "/proto" suffix when
+// Protocol is non-empty and not "tcp". IPv6 hosts (any host containing a colon)
+// are wrapped in brackets to disambiguate the host:port boundary.
 // Examples:
 //
 //	{Host: "0.0.0.0", HostPort: 8080, ContainerPort: 80, Protocol: "tcp"}   -> "0.0.0.0:8080→80"
 //	{Host: "0.0.0.0", HostPort: 1812, ContainerPort: 1812, Protocol: "udp"} -> "0.0.0.0:1812→1812/udp"
 //	{Host: "127.0.0.1", HostPort: 9000, ContainerPort: 9000}                -> "127.0.0.1:9000→9000"
+//	{Host: "::", HostPort: 8080, ContainerPort: 80, Protocol: "tcp"}        -> "[::]:8080→80"
+//	{Host: "::1", HostPort: 8443, ContainerPort: 443, Protocol: "tcp"}      -> "[::1]:8443→443"
 func FormatPort(p runner.Port) string {
-	base := fmt.Sprintf("%s:%d→%d", p.Host, p.HostPort, p.ContainerPort)
+	host := p.Host
+	if isIPv6Host(host) {
+		host = "[" + host + "]"
+	}
+	base := fmt.Sprintf("%s:%d→%d", host, p.HostPort, p.ContainerPort)
 	if p.Protocol != "" && p.Protocol != "tcp" {
 		base += "/" + p.Protocol
 	}
