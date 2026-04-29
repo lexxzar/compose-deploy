@@ -35,6 +35,10 @@ func checkRemoteMutex(serverName, sshTarget, identityFile string) error {
 // its own injectable factory variable (e.g., opNewRemote, execNewRemote,
 // logsNewRemote, listNewRemote) — preserving existing test seams.
 //
+// When identityFile is non-empty, it is validated via config.ParseIdentity
+// and appended to SSHExtraArgs as `-i <cleanPath>`, alongside any port args
+// from the SSH target.
+//
 // The returned cleanup is always non-nil; on the error path it is a no-op so
 // callers can write `defer cleanup()` immediately after the call without
 // nil-checking. On Detect failure the helper closes the ControlMaster
@@ -42,7 +46,7 @@ func checkRemoteMutex(serverName, sshTarget, identityFile string) error {
 // when err is non-nil (it is a no-op anyway).
 func resolveSSHRemote(
 	ctx context.Context,
-	sshTarget, projectDir string,
+	sshTarget, projectDir, identityFile string,
 	newRemote func(host, projDir string) *compose.RemoteCompose,
 ) (*compose.RemoteCompose, func(), error) {
 	if projectDir == "" {
@@ -54,8 +58,17 @@ func resolveSSHRemote(
 		return nil, noopCleanup, fmt.Errorf("invalid --ssh value %q: %w", sshTarget, err)
 	}
 
+	extraArgs := target.PortArgs()
+	if identityFile != "" {
+		cleanPath, err := config.ParseIdentity(identityFile)
+		if err != nil {
+			return nil, noopCleanup, fmt.Errorf("invalid --identity value %q: %w", identityFile, err)
+		}
+		extraArgs = append(extraArgs, "-i", cleanPath)
+	}
+
 	rc := newRemote(target.SSHHost(), projectDir)
-	rc.SSHExtraArgs = target.PortArgs()
+	rc.SSHExtraArgs = extraArgs
 
 	if err := rc.Connect(ctx); err != nil {
 		return nil, noopCleanup, fmt.Errorf("connecting to %s: %w", target.SSHHost(), err)

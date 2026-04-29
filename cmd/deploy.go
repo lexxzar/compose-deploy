@@ -128,7 +128,7 @@ func runOperation(ctx context.Context, op runner.Operation, all bool, containers
 	var c runner.Composer
 	switch {
 	case sshTarget != "":
-		rc, cleanup, err := resolveSSHRemote(ctx, sshTarget, projectDir, opNewRemote)
+		rc, cleanup, err := resolveSSHRemote(ctx, sshTarget, projectDir, "", opNewRemote)
 		if err != nil {
 			return err
 		}

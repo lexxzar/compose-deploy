@@ -72,7 +72,7 @@ func runExec(ctx context.Context, service string, command []string) error {
 	var c execCommander
 	switch {
 	case sshTarget != "":
-		rc, cleanup, err := resolveSSHRemote(ctx, sshTarget, projectDir, execNewRemote)
+		rc, cleanup, err := resolveSSHRemote(ctx, sshTarget, projectDir, "", execNewRemote)
 		if err != nil {
 			return err
 		}

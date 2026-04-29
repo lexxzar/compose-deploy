@@ -157,24 +157,24 @@ Connect/Detect path unchanged.
 - Modify: `cmd/remote.go`
 - Modify: `cmd/remote_test.go`
 
-- [ ] change `resolveSSHRemote` signature to add `identityFile string` between
+- [x] change `resolveSSHRemote` signature to add `identityFile string` between
       `projectDir` and `newRemote`. Inside, after computing `target.PortArgs()`,
       branch on `identityFile != ""`: call `config.ParseIdentity`, on error wrap as
       `"invalid --identity value %q: %w"` and return with `noopCleanup`; on success
       append `"-i", cleanPath` to the local `extraArgs` slice. Assign
       `rc.SSHExtraArgs = extraArgs`.
-- [ ] update existing tests in `cmd/remote_test.go` to pass `""` as the new
+- [x] update existing tests in `cmd/remote_test.go` to pass `""` as the new
       `identityFile` argument (mechanical edit to all `resolveSSHRemote(...)` calls)
-- [ ] add `TestResolveSSHRemote_WithIdentity_HappyPath`: pass a real temp file path,
+- [x] add `TestResolveSSHRemote_WithIdentity_HappyPath`: pass a real temp file path,
       expect `rc.SSHExtraArgs == ["-p","2222","-i",<tempPath>]` (or `["-i",<tempPath>]`
       with no port). Use `t.TempDir()` and `os.WriteFile` to create the key file.
-- [ ] add `TestResolveSSHRemote_WithIdentity_InvalidPath`: pass `/nonexistent/key`,
+- [x] add `TestResolveSSHRemote_WithIdentity_InvalidPath`: pass `/nonexistent/key`,
       expect error wrapping `"invalid --identity value"` and the underlying `not found`
       message. Verify `cleanup` is the no-op (safe to call).
-- [ ] add `TestResolveSSHRemote_WithIdentity_TildeExpansion`: set `HOME` via
+- [x] add `TestResolveSSHRemote_WithIdentity_TildeExpansion`: set `HOME` via
       `t.Setenv`, create `$HOME/.ssh/id_test`, pass `~/.ssh/id_test`, expect
       `rc.SSHExtraArgs[len-1]` to be the absolute path under the temp HOME.
-- [ ] run tests: `go test ./cmd/ -run TestResolveSSHRemote -v` — must pass before task 4
+- [x] run tests: `go test ./cmd/ -run TestResolveSSHRemote -v` — must pass before task 4
 
 ### Task 4: Wire `-i/--identity` into root command + TUI rejection
 

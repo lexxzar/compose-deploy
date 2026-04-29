@@ -337,7 +337,7 @@ func runList(ctx context.Context, jsonOutput bool) error {
 
 	if sshTarget != "" {
 		// --ssh always implies a single project (resolveSSHRemote requires --project-dir).
-		rc, cleanup, err := resolveSSHRemote(ctx, sshTarget, projectDir, listNewRemote)
+		rc, cleanup, err := resolveSSHRemote(ctx, sshTarget, projectDir, "", listNewRemote)
 		if err != nil {
 			return err
 		}

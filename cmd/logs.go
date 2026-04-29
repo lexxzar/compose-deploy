@@ -57,7 +57,7 @@ func runLogs(ctx context.Context, service string, follow bool, tail int) error {
 	var c runner.Composer
 	switch {
 	case sshTarget != "":
-		rc, cleanup, err := resolveSSHRemote(ctx, sshTarget, projectDir, logsNewRemote)
+		rc, cleanup, err := resolveSSHRemote(ctx, sshTarget, projectDir, "", logsNewRemote)
 		if err != nil {
 			return err
 		}
