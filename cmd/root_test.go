@@ -1,6 +1,7 @@
 package cmd
 
 import (
+	"strings"
 	"testing"
 )
 
@@ -16,6 +17,7 @@ func TestRootCmd_FlagRegistration(t *testing.T) {
 		{"project-dir flag exists", "project-dir", "C"},
 		{"server flag exists", "server", "s"},
 		{"ssh flag exists", "ssh", "S"},
+		{"identity flag exists", "identity", "i"},
 	}
 
 	for _, tt := range tests {
@@ -28,6 +30,49 @@ func TestRootCmd_FlagRegistration(t *testing.T) {
 				t.Errorf("flag %q shorthand = %q, want %q", tt.flagName, flag.Shorthand, tt.shorthand)
 			}
 		})
+	}
+}
+
+func TestRootCmd_IdentityFlagDetails(t *testing.T) {
+	cmd := NewRootCmd()
+	flag := cmd.PersistentFlags().Lookup("identity")
+	if flag == nil {
+		t.Fatal("identity flag not found")
+	}
+	if flag.Shorthand != "i" {
+		t.Errorf("identity shorthand = %q, want %q", flag.Shorthand, "i")
+	}
+	if flag.DefValue != "" {
+		t.Errorf("identity default = %q, want empty", flag.DefValue)
+	}
+	if flag.Value.Type() != "string" {
+		t.Errorf("identity flag type = %q, want %q", flag.Value.Type(), "string")
+	}
+	if !strings.Contains(flag.Usage, "SSH private key") {
+		t.Errorf("identity usage missing 'SSH private key': %q", flag.Usage)
+	}
+	if !strings.Contains(flag.Usage, "--ssh") {
+		t.Errorf("identity usage missing '--ssh' reference: %q", flag.Usage)
+	}
+}
+
+func TestRootCmd_IdentityRejectedInTUI(t *testing.T) {
+	// reset globals on exit to avoid state leakage between tests
+	t.Cleanup(func() {
+		identityFile = ""
+		sshTarget = ""
+		serverName = ""
+		projectDir = ""
+		logDir = ""
+	})
+	cmd := NewRootCmd()
+	cmd.SetArgs([]string{"--identity", "/tmp/x"})
+	err := cmd.Execute()
+	if err == nil {
+		t.Fatal("expected error when --identity is used without a subcommand")
+	}
+	if !strings.Contains(err.Error(), "--identity is not valid for the interactive TUI") {
+		t.Errorf("error = %q, want substring %q", err.Error(), "--identity is not valid for the interactive TUI")
 	}
 }
 

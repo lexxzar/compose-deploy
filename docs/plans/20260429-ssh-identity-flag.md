@@ -182,17 +182,18 @@ Connect/Detect path unchanged.
 - Modify: `cmd/root.go`
 - Modify: `cmd/root_test.go`
 
-- [ ] add `var identityFile string` next to the existing `sshTarget` var
-- [ ] register the persistent flag immediately after the `--ssh` registration:
+- [x] add `var identityFile string` next to the existing `sshTarget` var
+- [x] register the persistent flag immediately after the `--ssh` registration:
       `rootCmd.PersistentFlags().StringVarP(&identityFile, "identity", "i", "", "path to SSH private key (requires --ssh)")`
-- [ ] in the root `RunE` (right after the existing `--ssh` rejection at line 46-48),
+- [x] in the root `RunE` (right after the existing `--ssh` rejection at line 46-48),
       add an analogous rejection: `if identityFile != "" { return fmt.Errorf("--identity is not valid for the interactive TUI; use it with a subcommand") }`
-- [ ] extend `cmd/root_test.go` flag-registration assertions to verify `-i`/`--identity`
+- [x] extend `cmd/root_test.go` flag-registration assertions to verify `-i`/`--identity`
       is registered as a persistent string flag with the correct help text. Follow
       the existing pattern used for `-S`/`--ssh`.
-- [ ] add a test asserting that running root with `--identity /tmp/x` (without a
+- [x] add a test asserting that running root with `--identity /tmp/x` (without a
       subcommand) returns the TUI rejection error. Mirror the existing `--ssh` TUI test.
-- [ ] run tests: `go test ./cmd/ -run TestRoot -v` — must pass before task 5
+      Note: there was no existing `--ssh` TUI rejection test; created `TestRootCmd_IdentityRejectedInTUI` from scratch.
+- [x] run tests: `go test ./cmd/ -run TestRoot -v` — must pass before task 5
 
 ### Task 5: Thread `identityFile` through four subcommand call sites
 

@@ -15,10 +15,11 @@ import (
 )
 
 var (
-	logDir     string
-	projectDir string
-	serverName string
-	sshTarget  string
+	logDir       string
+	projectDir   string
+	serverName   string
+	sshTarget    string
+	identityFile string
 )
 
 func NewRootCmd() *cobra.Command {
@@ -45,6 +46,11 @@ Remote server configuration (~/.cdeploy/servers.yml):
 			// flag here rather than silently ignoring it.
 			if sshTarget != "" {
 				return fmt.Errorf("--ssh is not valid for the interactive TUI; use it with a subcommand")
+			}
+			// `--identity` is also CLI-only; it only makes sense paired with
+			// `--ssh`. Reject early in the TUI path.
+			if identityFile != "" {
+				return fmt.Errorf("--identity is not valid for the interactive TUI; use it with a subcommand")
 			}
 
 			dir := projectDir
@@ -178,6 +184,7 @@ Remote server configuration (~/.cdeploy/servers.yml):
 	rootCmd.PersistentFlags().StringVarP(&projectDir, "project-dir", "C", "", "docker compose project directory (default: current directory)")
 	rootCmd.PersistentFlags().StringVarP(&serverName, "server", "s", "", "remote server name from ~/.cdeploy/servers.yml")
 	rootCmd.PersistentFlags().StringVarP(&sshTarget, "ssh", "S", "", "ad-hoc SSH connection string [user@]host[:port] (mutually exclusive with --server)")
+	rootCmd.PersistentFlags().StringVarP(&identityFile, "identity", "i", "", "path to SSH private key (requires --ssh)")
 
 	rootCmd.AddCommand(newDeployCmd(), newRestartCmd(), newStopCmd(), newListCmd(), newLogsCmd(), newExecCmd())
 
