@@ -12,12 +12,18 @@ import (
 // `defer cleanup()` unconditionally without nil-checking.
 func noopCleanup() {}
 
-// checkRemoteMutex returns an error when both --server and --ssh are set.
-// The two flags are mutually exclusive: --server reads a named entry from
-// ~/.cdeploy/servers.yml, while --ssh provides an ad-hoc connection string.
-func checkRemoteMutex(serverName, sshTarget string) error {
+// checkRemoteMutex returns an error when remote-selection flags conflict.
+// Rules:
+//   - --server and --ssh are mutually exclusive (--server reads a named entry
+//     from ~/.cdeploy/servers.yml; --ssh provides an ad-hoc connection string).
+//   - --identity is only valid alongside --ssh: named-server users belong in
+//     ~/.ssh/config via IdentityFile.
+func checkRemoteMutex(serverName, sshTarget, identityFile string) error {
 	if serverName != "" && sshTarget != "" {
 		return fmt.Errorf("--ssh (%q) and --server (%q) are mutually exclusive", sshTarget, serverName)
+	}
+	if identityFile != "" && sshTarget == "" {
+		return fmt.Errorf("--identity requires --ssh")
 	}
 	return nil
 }

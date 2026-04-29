@@ -65,7 +65,7 @@ type execCommander interface {
 }
 
 func runExec(ctx context.Context, service string, command []string) error {
-	if err := checkRemoteMutex(serverName, sshTarget); err != nil {
+	if err := checkRemoteMutex(serverName, sshTarget, ""); err != nil {
 		return err
 	}
 

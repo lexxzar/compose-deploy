@@ -138,10 +138,10 @@ Connect/Detect path unchanged.
 - Modify: `cmd/remote.go`
 - Modify: `cmd/remote_test.go`
 
-- [ ] change `checkRemoteMutex` signature to `(serverName, sshTarget, identityFile string) error`
+- [x] change `checkRemoteMutex` signature to `(serverName, sshTarget, identityFile string) error`
       and add the new rule: `identityFile != "" && sshTarget == ""` →
       `fmt.Errorf("--identity requires --ssh")`. Update the doc comment.
-- [ ] extend `TestCheckRemoteMutex` table with: `("","","/k")` errors with
+- [x] extend `TestCheckRemoteMutex` table with: `("","","/k")` errors with
       `"--identity requires --ssh"`; `("prod","","/k")` also errors with
       `"--identity requires --ssh"` (the existing `--server`/`--ssh` mutex requires
       both non-empty, so it does not fire when `sshTarget` is empty — the new
@@ -149,7 +149,7 @@ Connect/Detect path unchanged.
       strict-narrow scoping we want); `("","host","/k")` is ok; `("prod","host","/k")`
       still errors via the existing `--server`/`--ssh` mutex. Update all existing
       cases to pass the new third argument as `""`.
-- [ ] run tests: `go test ./cmd/ -run TestCheckRemoteMutex -v` — must pass before task 3
+- [x] run tests: `go test ./cmd/ -run TestCheckRemoteMutex -v` — must pass before task 3
 
 ### Task 3: Extend `resolveSSHRemote` to thread identity into `SSHExtraArgs`
 

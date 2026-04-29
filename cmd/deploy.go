@@ -105,7 +105,7 @@ func runOperation(ctx context.Context, op runner.Operation, all bool, containers
 	// `--ssh` together with `--server` reports the mutex error consistently
 	// across subcommands (matching exec/logs/list ordering), regardless of
 	// whether `-a` or container names were also supplied.
-	if err := checkRemoteMutex(serverName, sshTarget); err != nil {
+	if err := checkRemoteMutex(serverName, sshTarget, ""); err != nil {
 		return err
 	}
 

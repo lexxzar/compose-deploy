@@ -328,7 +328,7 @@ func printMultiProject(grouped []projectServices, jsonOutput bool) error {
 }
 
 func runList(ctx context.Context, jsonOutput bool) error {
-	if err := checkRemoteMutex(serverName, sshTarget); err != nil {
+	if err := checkRemoteMutex(serverName, sshTarget, ""); err != nil {
 		return err
 	}
 

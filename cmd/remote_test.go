@@ -12,20 +12,31 @@ import (
 
 func TestCheckRemoteMutex(t *testing.T) {
 	tests := []struct {
-		name       string
-		serverName string
-		sshTarget  string
-		wantErr    string // substring in error; empty means no error
+		name         string
+		serverName   string
+		sshTarget    string
+		identityFile string
+		wantErr      string // substring in error; empty means no error
 	}{
-		{name: "both empty", serverName: "", sshTarget: "", wantErr: ""},
-		{name: "only server", serverName: "prod", sshTarget: "", wantErr: ""},
-		{name: "only ssh", serverName: "", sshTarget: "user@host", wantErr: ""},
-		{name: "both set", serverName: "prod", sshTarget: "user@host", wantErr: `--ssh ("user@host") and --server ("prod") are mutually exclusive`},
+		{name: "all empty", serverName: "", sshTarget: "", identityFile: "", wantErr: ""},
+		{name: "only server", serverName: "prod", sshTarget: "", identityFile: "", wantErr: ""},
+		{name: "only ssh", serverName: "", sshTarget: "user@host", identityFile: "", wantErr: ""},
+		{name: "server and ssh", serverName: "prod", sshTarget: "user@host", identityFile: "", wantErr: `--ssh ("user@host") and --server ("prod") are mutually exclusive`},
+		{name: "ssh and identity", serverName: "", sshTarget: "user@host", identityFile: "/k", wantErr: ""},
+		{name: "identity without ssh", serverName: "", sshTarget: "", identityFile: "/k", wantErr: "--identity requires --ssh"},
+		// --server + --identity (no --ssh): the --server/--ssh mutex needs both
+		// non-empty to fire, so this misuse falls through to the new
+		// `--identity requires --ssh` rule, which is the strict-narrow scoping
+		// we want.
+		{name: "server and identity without ssh", serverName: "prod", sshTarget: "", identityFile: "/k", wantErr: "--identity requires --ssh"},
+		// --server + --ssh + --identity: the --server/--ssh mutex still fires
+		// first (and reports first), regardless of identity.
+		{name: "server, ssh, and identity", serverName: "prod", sshTarget: "user@host", identityFile: "/k", wantErr: "mutually exclusive"},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			err := checkRemoteMutex(tt.serverName, tt.sshTarget)
+			err := checkRemoteMutex(tt.serverName, tt.sshTarget, tt.identityFile)
 			if tt.wantErr == "" {
 				if err != nil {
 					t.Errorf("expected no error, got %v", err)
