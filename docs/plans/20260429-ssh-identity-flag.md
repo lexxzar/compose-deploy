@@ -121,16 +121,16 @@ Connect/Detect path unchanged.
 - Create: `internal/config/identity.go`
 - Create: `internal/config/identity_test.go`
 
-- [ ] create `internal/config/identity.go` with `ParseIdentity(s string) (string, error)`:
+- [x] create `internal/config/identity.go` with `ParseIdentity(s string) (string, error)`:
       trim → reject empty → `~/` and bare `~` expansion via `os.UserHomeDir()` →
       reject `~user` → `os.Stat` (regular file check) → `os.Open` + immediate close
       (readability check) → return `filepath.Clean` of the resolved path
-- [ ] write tests covering: empty input, `~/foo` expansion (use `t.Setenv("HOME", t.TempDir())`),
+- [x] write tests covering: empty input, `~/foo` expansion (use `t.Setenv("HOME", t.TempDir())`),
       bare `~` expansion, `~user` rejected with clear message, non-existent path,
       directory (not a regular file), valid regular file (returns cleaned path),
       relative path passes through unchanged, unreadable file via `chmod 0000`
       (skip on `runtime.GOOS == "windows"`)
-- [ ] run tests: `go test ./internal/config/ -run TestParseIdentity -v` — must pass before task 2
+- [x] run tests: `go test ./internal/config/ -run TestParseIdentity -v` — must pass before task 2
 
 ### Task 2: Extend `checkRemoteMutex` for `--identity` rule
 
