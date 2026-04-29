@@ -328,7 +328,7 @@ func printMultiProject(grouped []projectServices, jsonOutput bool) error {
 }
 
 func runList(ctx context.Context, jsonOutput bool) error {
-	if err := checkRemoteMutex(serverName, sshTarget, ""); err != nil {
+	if err := checkRemoteMutex(serverName, sshTarget, identityFile); err != nil {
 		return err
 	}
 
@@ -337,7 +337,7 @@ func runList(ctx context.Context, jsonOutput bool) error {
 
 	if sshTarget != "" {
 		// --ssh always implies a single project (resolveSSHRemote requires --project-dir).
-		rc, cleanup, err := resolveSSHRemote(ctx, sshTarget, projectDir, "", listNewRemote)
+		rc, cleanup, err := resolveSSHRemote(ctx, sshTarget, projectDir, identityFile, listNewRemote)
 		if err != nil {
 			return err
 		}

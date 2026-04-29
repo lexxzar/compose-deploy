@@ -613,6 +613,32 @@ func TestRunExec_SSHHappyPath(t *testing.T) {
 	}
 }
 
+func TestExec_IdentityWithoutSSH(t *testing.T) {
+	oldServer := serverName
+	oldSSH := sshTarget
+	oldProj := projectDir
+	oldIdentity := identityFile
+	t.Cleanup(func() {
+		serverName = oldServer
+		sshTarget = oldSSH
+		projectDir = oldProj
+		identityFile = oldIdentity
+	})
+
+	serverName = ""
+	sshTarget = ""
+	projectDir = ""
+	identityFile = "/tmp/k"
+
+	err := runExec(context.Background(), "nginx", nil)
+	if err == nil {
+		t.Fatal("expected error when --identity is set without --ssh")
+	}
+	if !strings.Contains(err.Error(), "--identity requires --ssh") {
+		t.Errorf("error = %q, want it to contain '--identity requires --ssh'", err.Error())
+	}
+}
+
 func TestExecCmd_SSHFlagInherited(t *testing.T) {
 	root := NewRootCmd()
 

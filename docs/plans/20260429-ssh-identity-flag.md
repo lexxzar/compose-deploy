@@ -207,13 +207,13 @@ Connect/Detect path unchanged.
 - Modify: `cmd/logs_test.go`
 - Modify: `cmd/exec_test.go`
 
-- [ ] in each of `cmd/deploy.go`, `cmd/list.go`, `cmd/logs.go`, `cmd/exec.go`:
+- [x] in each of `cmd/deploy.go`, `cmd/list.go`, `cmd/logs.go`, `cmd/exec.go`:
       update `checkRemoteMutex(serverName, sshTarget)` →
       `checkRemoteMutex(serverName, sshTarget, identityFile)`, and
       `resolveSSHRemote(ctx, sshTarget, projectDir, factory)` →
       `resolveSSHRemote(ctx, sshTarget, projectDir, identityFile, factory)`.
       Mechanical edits — the global `identityFile` var from `cmd/root.go` is in scope.
-- [ ] add `TestRunOperation_IdentityWithoutSSH` in `cmd/deploy_test.go` (covers
+- [x] add `TestRunOperation_IdentityWithoutSSH` in `cmd/deploy_test.go` (covers
       deploy/restart/stop because they all flow through `runOperation()`; follow the
       existing `runOperation(...)` test pattern around lines 350/385/417). Add
       analogous `TestList_IdentityWithoutSSH`, `TestLogs_IdentityWithoutSSH`,
@@ -222,7 +222,7 @@ Connect/Detect path unchanged.
       `RunE` (or `runOperation` for deploy_test), assert the error contains
       `"--identity requires --ssh"`. Reset globals (`identityFile = ""`,
       `sshTarget = ""`) in `t.Cleanup` to avoid state leakage between tests.
-- [ ] run tests: `go test ./cmd/ -v` — must pass before task 6
+- [x] run tests: `go test ./cmd/ -v` — must pass before task 6
 
 ### Task 6: Verify acceptance criteria
 

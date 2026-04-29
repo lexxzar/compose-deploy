@@ -865,6 +865,35 @@ func TestDeployCmd_SSHFlagInherited(t *testing.T) {
 	}
 }
 
+// TestRunOperation_IdentityWithoutSSH verifies that --identity without --ssh
+// is rejected by the mutex check. Covers deploy/restart/stop because they all
+// flow through runOperation().
+func TestRunOperation_IdentityWithoutSSH(t *testing.T) {
+	oldServer := serverName
+	oldSSH := sshTarget
+	oldProj := projectDir
+	oldIdentity := identityFile
+	t.Cleanup(func() {
+		serverName = oldServer
+		sshTarget = oldSSH
+		projectDir = oldProj
+		identityFile = oldIdentity
+	})
+
+	serverName = ""
+	sshTarget = ""
+	projectDir = ""
+	identityFile = "/tmp/k"
+
+	err := runOperation(context.Background(), runner.Deploy, true, nil)
+	if err == nil {
+		t.Fatal("expected error when --identity is set without --ssh")
+	}
+	if !strings.Contains(err.Error(), "--identity requires --ssh") {
+		t.Errorf("error = %q, want it to contain '--identity requires --ssh'", err.Error())
+	}
+}
+
 func TestRunOperation_LocalDetectFailure(t *testing.T) {
 	oldNew := opNewLocal
 	oldProj := projectDir
