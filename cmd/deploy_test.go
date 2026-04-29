@@ -733,12 +733,14 @@ func TestRunOperation_SSHHappyPath(t *testing.T) {
 	oldServer := serverName
 	oldSSH := sshTarget
 	oldProj := projectDir
+	oldIdentity := identityFile
 	oldNewRemote := opNewRemote
 	oldNewLogger := opNewLogger
 	t.Cleanup(func() {
 		serverName = oldServer
 		sshTarget = oldSSH
 		projectDir = oldProj
+		identityFile = oldIdentity
 		opNewRemote = oldNewRemote
 		opNewLogger = oldNewLogger
 	})
@@ -746,6 +748,7 @@ func TestRunOperation_SSHHappyPath(t *testing.T) {
 	serverName = ""
 	sshTarget = "deploy@host:2222"
 	projectDir = "/srv/app"
+	identityFile = ""
 
 	var stopArgs []string
 	var pullCalled, startCalled bool
@@ -798,6 +801,77 @@ func TestRunOperation_SSHHappyPath(t *testing.T) {
 	}
 	if !strings.Contains(args, "'stop'") {
 		t.Errorf("ssh argv = %v, want to contain 'stop' subcommand", stopArgs)
+	}
+}
+
+// TestRunOperation_SSHHappyPathWithIdentity verifies that when both --ssh and
+// --identity are set, -i <keyPath> is spliced into the SSH argv via
+// SSHExtraArgs alongside any port args. Catches a regression where the
+// identityFile global is dropped from the deploy/restart/stop wiring.
+func TestRunOperation_SSHHappyPathWithIdentity(t *testing.T) {
+	oldServer := serverName
+	oldSSH := sshTarget
+	oldProj := projectDir
+	oldIdentity := identityFile
+	oldNewRemote := opNewRemote
+	oldNewLogger := opNewLogger
+	t.Cleanup(func() {
+		serverName = oldServer
+		sshTarget = oldSSH
+		projectDir = oldProj
+		identityFile = oldIdentity
+		opNewRemote = oldNewRemote
+		opNewLogger = oldNewLogger
+	})
+
+	tmpDir := t.TempDir()
+	keyPath := tmpDir + "/id_test"
+	if err := os.WriteFile(keyPath, []byte("dummy"), 0o600); err != nil {
+		t.Fatalf("write key: %v", err)
+	}
+
+	serverName = ""
+	sshTarget = "deploy@host:2222"
+	projectDir = "/srv/app"
+	identityFile = keyPath
+
+	var capturedArgs []string
+	opNewRemote = func(host, projDir string) *compose.RemoteCompose {
+		rc := compose.NewRemote(host, projDir)
+		rc.SetTestHooks(
+			func(cmd *exec.Cmd) error {
+				args := strings.Join(cmd.Args, " ")
+				if strings.Contains(args, "'stop'") && capturedArgs == nil {
+					capturedArgs = append([]string(nil), cmd.Args...)
+				}
+				return nil
+			},
+			func(cmd *exec.Cmd) ([]byte, error) {
+				remoteCmd := cmd.Args[len(cmd.Args)-1]
+				if strings.Contains(remoteCmd, "version") {
+					return []byte("Docker Compose version v2.24.0\n"), nil
+				}
+				return nil, nil
+			},
+		)
+		return rc
+	}
+	opNewLogger = func(dir string) (*logging.Logger, error) {
+		return logging.NewLogger(t.TempDir())
+	}
+
+	if err := runOperation(context.Background(), runner.Deploy, true, nil); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if capturedArgs == nil {
+		t.Fatal("stop not called on remote")
+	}
+	args := strings.Join(capturedArgs, " ")
+	if !strings.Contains(args, "-p 2222") {
+		t.Errorf("ssh argv = %v, want to contain '-p 2222'", capturedArgs)
+	}
+	if !strings.Contains(args, "-i "+keyPath) {
+		t.Errorf("ssh argv = %v, want to contain '-i %s'", capturedArgs, keyPath)
 	}
 }
 

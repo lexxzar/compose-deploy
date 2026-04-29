@@ -8,8 +8,10 @@ import (
 )
 
 // ParseIdentity validates and resolves a path to an SSH private key file
-// supplied via `-i/--identity`. It supports `~/` and bare `~` expansion via
-// `os.UserHomeDir()`; the `~user` form is rejected (no `getpwnam` lookup).
+// supplied via `-i/--identity`. It supports `~/` expansion via
+// `os.UserHomeDir()`; bare `~` and the `~user` form are rejected (a bare
+// home directory is not a key file, and `~user` would require a `getpwnam`
+// lookup).
 //
 // Validation: the resolved path must exist, be a regular file, and be readable
 // (an immediate `os.Open` confirms ACL/perm readability beyond mode bits).
@@ -28,17 +30,15 @@ func ParseIdentity(s string) (string, error) {
 		return "", fmt.Errorf("path is empty")
 	}
 
-	// Tilde expansion: `~/foo` and bare `~` are supported. `~user` is not.
-	if s == "~" || strings.HasPrefix(s, "~/") {
+	// Tilde expansion: `~/foo` is supported. Bare `~` and `~user` are rejected
+	// (a bare home directory is not a key file, and `~user` would require a
+	// `getpwnam` lookup).
+	if strings.HasPrefix(s, "~/") {
 		home, err := os.UserHomeDir()
 		if err != nil {
 			return "", fmt.Errorf("cannot resolve home directory: %w", err)
 		}
-		if s == "~" {
-			s = home
-		} else {
-			s = filepath.Join(home, s[2:])
-		}
+		s = filepath.Join(home, s[2:])
 	} else if strings.HasPrefix(s, "~") {
 		return "", fmt.Errorf("only ~/ is supported (no ~user)")
 	}

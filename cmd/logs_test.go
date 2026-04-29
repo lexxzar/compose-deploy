@@ -367,17 +367,20 @@ func TestRunLogs_SSHHappyPath(t *testing.T) {
 	oldServer := serverName
 	oldSSH := sshTarget
 	oldProj := projectDir
+	oldIdentity := identityFile
 	oldNewRemote := logsNewRemote
 	t.Cleanup(func() {
 		serverName = oldServer
 		sshTarget = oldSSH
 		projectDir = oldProj
+		identityFile = oldIdentity
 		logsNewRemote = oldNewRemote
 	})
 
 	serverName = ""
 	sshTarget = "deploy@host:2222"
 	projectDir = "/srv/app"
+	identityFile = ""
 
 	var capturedSSHArgs []string
 	var logsCalled bool
@@ -420,6 +423,66 @@ func TestRunLogs_SSHHappyPath(t *testing.T) {
 	}
 	if !strings.Contains(joined, "'logs'") {
 		t.Errorf("ssh argv = %v, want to contain 'logs' subcommand", capturedSSHArgs)
+	}
+}
+
+// TestRunLogs_SSHHappyPathWithIdentity verifies the logs subcommand splices
+// -i <keyPath> into SSHExtraArgs when both --ssh and --identity are set.
+func TestRunLogs_SSHHappyPathWithIdentity(t *testing.T) {
+	oldServer := serverName
+	oldSSH := sshTarget
+	oldProj := projectDir
+	oldIdentity := identityFile
+	oldNewRemote := logsNewRemote
+	t.Cleanup(func() {
+		serverName = oldServer
+		sshTarget = oldSSH
+		projectDir = oldProj
+		identityFile = oldIdentity
+		logsNewRemote = oldNewRemote
+	})
+
+	tmpDir := t.TempDir()
+	keyPath := tmpDir + "/id_test"
+	if err := os.WriteFile(keyPath, []byte("dummy"), 0o600); err != nil {
+		t.Fatalf("write key: %v", err)
+	}
+
+	serverName = ""
+	sshTarget = "deploy@host:2222"
+	projectDir = "/srv/app"
+	identityFile = keyPath
+
+	var capturedSSHArgs []string
+	logsNewRemote = func(host, projDir string) *compose.RemoteCompose {
+		rc := compose.NewRemote(host, projDir)
+		rc.SetTestHooks(
+			func(cmd *exec.Cmd) error {
+				args := strings.Join(cmd.Args, " ")
+				if strings.Contains(args, "'logs'") {
+					capturedSSHArgs = append([]string(nil), cmd.Args...)
+				}
+				return nil
+			},
+			func(cmd *exec.Cmd) ([]byte, error) {
+				return []byte("Docker Compose version v2.24.0\n"), nil
+			},
+		)
+		return rc
+	}
+
+	if err := runLogs(context.Background(), "nginx", true, 50); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if capturedSSHArgs == nil {
+		t.Fatal("logs subcommand was not invoked on remote")
+	}
+	joined := strings.Join(capturedSSHArgs, " ")
+	if !strings.Contains(joined, "-p 2222") {
+		t.Errorf("ssh argv = %v, want to contain '-p 2222'", capturedSSHArgs)
+	}
+	if !strings.Contains(joined, "-i "+keyPath) {
+		t.Errorf("ssh argv = %v, want to contain '-i %s'", capturedSSHArgs, keyPath)
 	}
 }
 

@@ -12,6 +12,12 @@ import (
 	"github.com/lexxzar/compose-deploy/internal/compose"
 )
 
+// TestCheckRemoteMutex verifies the two-rule mutex:
+//   - "server and identity without ssh": the --server/--ssh mutex needs both
+//     non-empty to fire, so this misuse falls through to the new
+//     `--identity requires --ssh` rule (the strict-narrow scoping we want).
+//   - "server, ssh, and identity": the --server/--ssh mutex still fires first
+//     (and reports first), regardless of identity.
 func TestCheckRemoteMutex(t *testing.T) {
 	tests := []struct {
 		name         string
@@ -26,13 +32,7 @@ func TestCheckRemoteMutex(t *testing.T) {
 		{name: "server and ssh", serverName: "prod", sshTarget: "user@host", identityFile: "", wantErr: `--ssh ("user@host") and --server ("prod") are mutually exclusive`},
 		{name: "ssh and identity", serverName: "", sshTarget: "user@host", identityFile: "/k", wantErr: ""},
 		{name: "identity without ssh", serverName: "", sshTarget: "", identityFile: "/k", wantErr: "--identity requires --ssh"},
-		// --server + --identity (no --ssh): the --server/--ssh mutex needs both
-		// non-empty to fire, so this misuse falls through to the new
-		// `--identity requires --ssh` rule, which is the strict-narrow scoping
-		// we want.
 		{name: "server and identity without ssh", serverName: "prod", sshTarget: "", identityFile: "/k", wantErr: "--identity requires --ssh"},
-		// --server + --ssh + --identity: the --server/--ssh mutex still fires
-		// first (and reports first), regardless of identity.
 		{name: "server, ssh, and identity", serverName: "prod", sshTarget: "user@host", identityFile: "/k", wantErr: "mutually exclusive"},
 	}
 
@@ -322,7 +322,7 @@ func TestResolveSSHRemote_WithIdentity_NoPort(t *testing.T) {
 func TestResolveSSHRemote_WithIdentity_InvalidPath(t *testing.T) {
 	factory, _ := stubRemoteFactory(nil, nil)
 
-	rc, cleanup, err := resolveSSHRemote(
+	_, cleanup, err := resolveSSHRemote(
 		context.Background(),
 		"user@host",
 		"/srv/app",
@@ -332,14 +332,7 @@ func TestResolveSSHRemote_WithIdentity_InvalidPath(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected error, got nil")
 	}
-	if rc != nil {
-		t.Error("expected nil RemoteCompose on identity validation failure")
-	}
-	if cleanup == nil {
-		t.Error("expected non-nil (no-op) cleanup on identity validation failure")
-	} else {
-		cleanup() // must be safe to call (no-op)
-	}
+	cleanup() // must be the no-op (safe to call)
 	if !strings.Contains(err.Error(), "invalid --identity value") {
 		t.Errorf("error = %q, want it to contain 'invalid --identity value'", err.Error())
 	}
@@ -375,11 +368,13 @@ func TestResolveSSHRemote_WithIdentity_TildeExpansion(t *testing.T) {
 	}
 	defer cleanup()
 
-	if n := len(rc.SSHExtraArgs); n == 0 {
-		t.Fatalf("SSHExtraArgs is empty, want last entry to be expanded path")
+	wantArgs := []string{"-i", keyPath}
+	if len(rc.SSHExtraArgs) != len(wantArgs) {
+		t.Fatalf("SSHExtraArgs = %v, want %v (~/ expanded to %q)", rc.SSHExtraArgs, wantArgs, homeDir)
 	}
-	got := rc.SSHExtraArgs[len(rc.SSHExtraArgs)-1]
-	if got != keyPath {
-		t.Errorf("SSHExtraArgs last = %q, want %q (expanded ~/ to %q)", got, keyPath, homeDir)
+	for i, want := range wantArgs {
+		if rc.SSHExtraArgs[i] != want {
+			t.Errorf("SSHExtraArgs[%d] = %q, want %q", i, rc.SSHExtraArgs[i], want)
+		}
 	}
 }

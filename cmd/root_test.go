@@ -56,23 +56,51 @@ func TestRootCmd_IdentityFlagDetails(t *testing.T) {
 	}
 }
 
-func TestRootCmd_IdentityRejectedInTUI(t *testing.T) {
-	// reset globals on exit to avoid state leakage between tests
+func TestRootCmd_FlagRejectedInTUI(t *testing.T) {
+	// snapshot/restore globals (cobra binds flags to them) so subsequent
+	// tests don't see leaked values when -count >1 or -shuffle is used.
+	oldIdentity := identityFile
+	oldSSH := sshTarget
+	oldServer := serverName
+	oldProj := projectDir
+	oldLogDir := logDir
 	t.Cleanup(func() {
-		identityFile = ""
-		sshTarget = ""
-		serverName = ""
-		projectDir = ""
-		logDir = ""
+		identityFile = oldIdentity
+		sshTarget = oldSSH
+		serverName = oldServer
+		projectDir = oldProj
+		logDir = oldLogDir
 	})
-	cmd := NewRootCmd()
-	cmd.SetArgs([]string{"--identity", "/tmp/x"})
-	err := cmd.Execute()
-	if err == nil {
-		t.Fatal("expected error when --identity is used without a subcommand")
+
+	tests := []struct {
+		name       string
+		args       []string
+		wantSubstr string
+	}{
+		{
+			name:       "identity rejected",
+			args:       []string{"--identity", "/tmp/x"},
+			wantSubstr: "--identity is not valid for the interactive TUI",
+		},
+		{
+			name:       "ssh rejected",
+			args:       []string{"--ssh", "user@host"},
+			wantSubstr: "--ssh is not valid for the interactive TUI",
+		},
 	}
-	if !strings.Contains(err.Error(), "--identity is not valid for the interactive TUI") {
-		t.Errorf("error = %q, want substring %q", err.Error(), "--identity is not valid for the interactive TUI")
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cmd := NewRootCmd()
+			cmd.SetArgs(tt.args)
+			err := cmd.Execute()
+			if err == nil {
+				t.Fatalf("expected error for args %v", tt.args)
+			}
+			if !strings.Contains(err.Error(), tt.wantSubstr) {
+				t.Errorf("error = %q, want substring %q", err.Error(), tt.wantSubstr)
+			}
+		})
 	}
 }
 

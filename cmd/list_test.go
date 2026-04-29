@@ -1518,17 +1518,20 @@ func TestRunList_SSHHappyPath(t *testing.T) {
 	oldServer := serverName
 	oldSSH := sshTarget
 	oldProj := projectDir
+	oldIdentity := identityFile
 	oldNewRemote := listNewRemote
 	t.Cleanup(func() {
 		serverName = oldServer
 		sshTarget = oldSSH
 		projectDir = oldProj
+		identityFile = oldIdentity
 		listNewRemote = oldNewRemote
 	})
 
 	serverName = ""
 	sshTarget = "deploy@host:2222"
 	projectDir = "/srv/app"
+	identityFile = ""
 
 	var capturedConfigArgs []string
 	listNewRemote = func(host, projDir string) *compose.RemoteCompose {
@@ -1763,6 +1766,70 @@ func TestFormatJSON_IncludesPorts(t *testing.T) {
 	}
 	if len(got[2].Ports) != 0 {
 		t.Errorf("got[2].Ports = %+v, want empty (explicit empty slice → omitempty)", got[2].Ports)
+	}
+}
+
+// TestRunList_SSHHappyPathWithIdentity verifies the list subcommand splices
+// -i <keyPath> into SSHExtraArgs when both --ssh and --identity are set.
+func TestRunList_SSHHappyPathWithIdentity(t *testing.T) {
+	oldServer := serverName
+	oldSSH := sshTarget
+	oldProj := projectDir
+	oldIdentity := identityFile
+	oldNewRemote := listNewRemote
+	t.Cleanup(func() {
+		serverName = oldServer
+		sshTarget = oldSSH
+		projectDir = oldProj
+		identityFile = oldIdentity
+		listNewRemote = oldNewRemote
+	})
+
+	tmpDir := t.TempDir()
+	keyPath := tmpDir + "/id_test"
+	if err := os.WriteFile(keyPath, []byte("dummy"), 0o600); err != nil {
+		t.Fatalf("write key: %v", err)
+	}
+
+	serverName = ""
+	sshTarget = "deploy@host:2222"
+	projectDir = "/srv/app"
+	identityFile = keyPath
+
+	var capturedConfigArgs []string
+	listNewRemote = func(host, projDir string) *compose.RemoteCompose {
+		rc := compose.NewRemote(host, projDir)
+		rc.SetTestHooks(
+			func(cmd *exec.Cmd) error { return nil },
+			func(cmd *exec.Cmd) ([]byte, error) {
+				args := strings.Join(cmd.Args, " ")
+				switch {
+				case strings.Contains(args, "version"):
+					return []byte("Docker Compose version v2.24.0\n"), nil
+				case strings.Contains(args, "'config'") && strings.Contains(args, "'--services'"):
+					capturedConfigArgs = append([]string(nil), cmd.Args...)
+					return []byte("nginx\nweb\n"), nil
+				case strings.Contains(args, "'ps'"):
+					return []byte("[]"), nil
+				}
+				return nil, nil
+			},
+		)
+		return rc
+	}
+
+	if err := runList(context.Background(), false); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if capturedConfigArgs == nil {
+		t.Fatal("config --services was not invoked on remote")
+	}
+	args := strings.Join(capturedConfigArgs, " ")
+	if !strings.Contains(args, "-p 2222") {
+		t.Errorf("ssh argv = %v, want to contain '-p 2222'", capturedConfigArgs)
+	}
+	if !strings.Contains(args, "-i "+keyPath) {
+		t.Errorf("ssh argv = %v, want to contain '-i %s'", capturedConfigArgs, keyPath)
 	}
 }
 

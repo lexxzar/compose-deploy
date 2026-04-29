@@ -59,7 +59,7 @@ Dependencies identified:
 
 ## Solution Overview
 
-**One new public function** (`config.ParseIdentity`) handles all path validation and `~/` expansion. Returns the cleaned absolute path on success, bare-worded errors on failure.
+**One new public function** (`config.ParseIdentity`) handles all path validation and `~/` expansion. Returns the cleaned path on success (relative paths preserved to match `ssh -i` semantics), bare-worded errors on failure.
 
 **Two helper signature extensions** in `cmd/remote.go`:
 - `checkRemoteMutex` gains an `identityFile` parameter and a second rule: `--identity` requires `--ssh`. Existing `--server`/`--ssh` mutex unchanged.
@@ -75,10 +75,11 @@ The implementation **does not touch** `internal/compose/remote.go` — the splic
 
 **`ParseIdentity(s string) (string, error)`** — `internal/config/identity.go`:
 1. `s = strings.TrimSpace(s)` — reject empty with `"path is empty"`.
-2. If `strings.HasPrefix(s, "~/")` or `s == "~"`: expand via `os.UserHomeDir()`. Replace `~` with home; preserve trailing path.
-3. If `strings.HasPrefix(s, "~")` (any non-`~/` form like `~root`): reject with `"only ~/ is supported (no ~user)"`.
+2. If `strings.HasPrefix(s, "~/")`: expand via `os.UserHomeDir()`, replacing `~/` with `<home>/`.
+3. Else if `strings.HasPrefix(s, "~")` (bare `~` or any `~user` form like `~root`): reject with `"only ~/ is supported (no ~user)"`.
 4. `os.Stat(path)`:
-   - error → wrap as `"not found: <err>"` (or pass through if the OS message is already clear).
+   - `os.IsNotExist(err)` → reject with `"not found: <clean path>"`.
+   - other stat errors → wrap as `"cannot stat: %w"`.
    - `info.Mode().IsRegular() == false` → reject with `"not a regular file"`.
 5. `f, err := os.Open(path); if err != nil { return "", fmt.Errorf("not readable: %w", err) }; f.Close()` — confirms ACL/perm readability beyond mode bits.
 6. Return cleaned path. Use `filepath.Clean` after expansion. Don't absolutize relative paths — let `ssh(1)` resolve them against cwd, matching `ssh -i` behavior.
@@ -122,11 +123,12 @@ Connect/Detect path unchanged.
 - Create: `internal/config/identity_test.go`
 
 - [x] create `internal/config/identity.go` with `ParseIdentity(s string) (string, error)`:
-      trim → reject empty → `~/` and bare `~` expansion via `os.UserHomeDir()` →
-      reject `~user` → `os.Stat` (regular file check) → `os.Open` + immediate close
+      trim → reject empty → `~/foo` expansion via `os.UserHomeDir()` →
+      reject bare `~` and `~user` with `only ~/ is supported (no ~user)` →
+      `os.Stat` (regular file check) → `os.Open` + immediate close
       (readability check) → return `filepath.Clean` of the resolved path
 - [x] write tests covering: empty input, `~/foo` expansion (use `t.Setenv("HOME", t.TempDir())`),
-      bare `~` expansion, `~user` rejected with clear message, non-existent path,
+      bare `~` rejected, `~user` rejected with clear message, non-existent path,
       directory (not a regular file), valid regular file (returns cleaned path),
       relative path passes through unchanged, unreadable file via `chmod 0000`
       (skip on `runtime.GOOS == "windows"`)
@@ -229,17 +231,18 @@ Connect/Detect path unchanged.
 **Files:**
 - (no file edits — verification only)
 
-- [ ] verify all requirements from Overview are implemented:
+- [x] verify all requirements from Overview are implemented:
       `-i` flag exists, requires `--ssh`, mutex with `--server`, CLI-only,
       `~/` expansion works, validates existence/regular-file/readability,
       reuses `SSHExtraArgs`, no changes to `internal/compose/remote.go`
-- [ ] verify edge cases: empty `--identity`, `~user` rejected, directory rejected,
+- [x] verify edge cases: empty `--identity`, `~user` rejected, directory rejected,
       unreadable file rejected, valid path with non-default port works
-- [ ] run full test suite: `go test ./... -count=1`
-- [ ] run `go vet ./...`
-- [ ] run `go build -o cdeploy .` — must succeed with no warnings
-- [ ] verify test coverage of `ParseIdentity` (the only new public function):
+- [x] run full test suite: `go test ./... -count=1`
+- [x] run `go vet ./...`
+- [x] run `go build -o cdeploy .` — must succeed with no warnings
+- [x] verify test coverage of `ParseIdentity` (the only new public function):
       `go test ./internal/config/ -cover`. Expect ≥ 90% line coverage.
+      Result: 92.0% line coverage on `ParseIdentity`.
 
 ### Task 7: Update documentation
 
@@ -248,15 +251,15 @@ Connect/Detect path unchanged.
 - Modify: `CLAUDE.md`
 - Move: this plan file → `docs/plans/completed/`
 
-- [ ] in `README.md`, locate the `--ssh` section/example and add an `-i` example:
+- [x] in `README.md`, locate the `--ssh` section/example and add an `-i` example:
       `cdeploy -S deploy@1.2.3.4 -i ~/.ssh/ci.pem -C /opt/app deploy`. Add a one-line
       note: `-i` is only valid with `-S` and is intended for CI/ephemeral use; for
       configured servers, use `IdentityFile` in `~/.ssh/config`.
-- [ ] in `CLAUDE.md`, update the "**Ad-hoc SSH (`-S`/`--ssh`)**" paragraph: note
+- [x] in `CLAUDE.md`, update the "**Ad-hoc SSH (`-S`/`--ssh`)**" paragraph: note
       that `SSHExtraArgs` content is now port + optional identity. Amend the sentence
       "SSH-specific options (keys, jump hosts, tunnels) belong in `~/.ssh/config`"
       with the carve-out: *except `-i` for ad-hoc CI/automation use via `--ssh`*.
-- [ ] move plan: `mkdir -p docs/plans/completed && mv docs/plans/20260429-ssh-identity-flag.md docs/plans/completed/`
+- [x] move plan: `mkdir -p docs/plans/completed && mv docs/plans/20260429-ssh-identity-flag.md docs/plans/completed/`
 
 ## Post-Completion
 
