@@ -22,10 +22,19 @@ var (
 	identityFile string
 )
 
+// Build-time metadata. Overridden via -ldflags by GoReleaser; the defaults
+// here are what `go build` from a working tree produces.
+var (
+	version = "dev"
+	commit  = "none"
+	date    = "unknown"
+)
+
 func NewRootCmd() *cobra.Command {
 	rootCmd := &cobra.Command{
-		Use:   "cdeploy",
-		Short: "Docker Compose deploy and restart tool",
+		Use:     "cdeploy",
+		Version: fmt.Sprintf("%s (commit %s, built %s)", version, commit, date),
+		Short:   "Docker Compose deploy and restart tool",
 		Long: `A TUI/CLI tool for managing Docker Compose container deployments and restarts.
 
 Run without arguments to launch the interactive TUI.

@@ -1,0 +1,59 @@
+version: 2
+
+before:
+  hooks:
+    - go mod tidy
+
+builds:
+  - id: cdeploy
+    main: .
+    binary: cdeploy
+    env:
+      - CGO_ENABLED=0
+    goos:
+      - linux
+      - darwin
+    goarch:
+      - amd64
+      - arm64
+    ldflags:
+      - -s -w
+      - -X github.com/lexxzar/compose-deploy/cmd.version={{.Version}}
+      - -X github.com/lexxzar/compose-deploy/cmd.commit={{.ShortCommit}}
+      - -X github.com/lexxzar/compose-deploy/cmd.date={{.Date}}
+
+archives:
+  - id: cdeploy
+    ids:
+      - cdeploy
+    name_template: >-
+      {{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}
+
+nfpms:
+  - id: cdeploy
+    package_name: cdeploy
+    ids:
+      - cdeploy
+    vendor: lexxzar
+    homepage: https://github.com/lexxzar/compose-deploy
+    maintainer: Oleksii Podkolzin <lexxzar@gmail.com>
+    description: Deploy and manage Docker Compose stacks — locally or over SSH — from a TUI or CLI.
+    license: MIT
+    formats:
+      - deb
+      - rpm
+    file_name_template: "{{ .ConventionalFileName }}"
+
+checksum:
+  name_template: checksums.txt
+
+snapshot:
+  version_template: "{{ incpatch .Version }}-next"
+
+changelog:
+  sort: asc
+  filters:
+    exclude:
+      - "^docs:"
+      - "^test:"
+      - "^chore:"
