@@ -124,17 +124,23 @@ cdeploy logs nginx -S deploy@host -C /srv/app
 
 # Exec into a container on an ad-hoc host
 cdeploy exec nginx -S deploy@host -C /srv/app
+
+# Use an ad-hoc SSH key (CI/automation workflows that write keys from secrets)
+cdeploy -S deploy@1.2.3.4 -i ~/.ssh/ci.pem -C /opt/app deploy
 ```
 
 The connection string format is `[user@]host[:port]`. The `-S`/`--ssh` flag is **mutually exclusive** with `-s`/`--server` and **requires** `-C`/`--project-dir` (no config lookup is performed).
 
-**CI usage:** `--ssh` requires passwordless SSH authentication on the target host — configure keys via `~/.ssh/config` or `ssh-agent` before running. Host-key verification still applies; either pre-populate `~/.ssh/known_hosts` or use the standard `StrictHostKeyChecking` settings in your SSH config.
+**SSH identity (`-i`/`--identity`):** pass an SSH private key path inline. Only valid alongside `-S`/`--ssh`; intended for CI/ephemeral use where writing a `~/.ssh/config` entry is impractical. For configured servers, use `IdentityFile` in `~/.ssh/config` instead. The path supports `~/` expansion and is validated at parse time (must exist, be a regular file, and be readable).
+
+**CI usage:** `--ssh` requires passwordless SSH authentication on the target host — configure keys via `~/.ssh/config`, `ssh-agent`, or `-i`/`--identity` before running. Host-key verification still applies; either pre-populate `~/.ssh/known_hosts` or use the standard `StrictHostKeyChecking` settings in your SSH config.
 
 ### Global Flags
 
 ```
 -s, --server string        Remote server name from ~/.cdeploy/servers.yml
 -S, --ssh string           Ad-hoc SSH connection string [user@]host[:port] (mutually exclusive with --server)
+-i, --identity string      Path to SSH private key (requires --ssh)
 -C, --project-dir string   Docker compose project directory (default: current directory)
     --log-dir string       Log directory (default ~/.cdeploy/logs/)
 ```
@@ -176,7 +182,7 @@ servers:
 
 Allowed `color` values: `red`, `green`, `yellow`, `blue`, `magenta`, `cyan`, `white`, `gray`. A common pattern is to mark production servers red so they stand out before you run an operation.
 
-SSH-specific options (keys, jump hosts, tunnels, ports) belong in `~/.ssh/config` — cdeploy uses the system `ssh` binary and inherits its configuration.
+SSH-specific options (keys, jump hosts, tunnels, ports) belong in `~/.ssh/config` — cdeploy uses the system `ssh` binary and inherits its configuration. Exception: for ad-hoc CI/automation use, `-i/--identity` may be passed alongside `-S/--ssh` to supply a key path inline without a `~/.ssh/config` entry.
 
 ### How it works
 

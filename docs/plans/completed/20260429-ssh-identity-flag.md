@@ -59,7 +59,7 @@ Dependencies identified:
 
 ## Solution Overview
 
-**One new public function** (`config.ParseIdentity`) handles all path validation and `~/` expansion. Returns the cleaned absolute path on success, bare-worded errors on failure.
+**One new public function** (`config.ParseIdentity`) handles all path validation and `~/` expansion. Returns the cleaned path on success (relative paths preserved to match `ssh -i` semantics), bare-worded errors on failure.
 
 **Two helper signature extensions** in `cmd/remote.go`:
 - `checkRemoteMutex` gains an `identityFile` parameter and a second rule: `--identity` requires `--ssh`. Existing `--server`/`--ssh` mutex unchanged.
@@ -75,10 +75,11 @@ The implementation **does not touch** `internal/compose/remote.go` — the splic
 
 **`ParseIdentity(s string) (string, error)`** — `internal/config/identity.go`:
 1. `s = strings.TrimSpace(s)` — reject empty with `"path is empty"`.
-2. If `strings.HasPrefix(s, "~/")` or `s == "~"`: expand via `os.UserHomeDir()`. Replace `~` with home; preserve trailing path.
-3. If `strings.HasPrefix(s, "~")` (any non-`~/` form like `~root`): reject with `"only ~/ is supported (no ~user)"`.
+2. If `strings.HasPrefix(s, "~/")`: expand via `os.UserHomeDir()`, replacing `~/` with `<home>/`.
+3. Else if `strings.HasPrefix(s, "~")` (bare `~` or any `~user` form like `~root`): reject with `"only ~/ is supported (no ~user)"`.
 4. `os.Stat(path)`:
-   - error → wrap as `"not found: <err>"` (or pass through if the OS message is already clear).
+   - `os.IsNotExist(err)` → reject with `"not found: <clean path>"`.
+   - other stat errors → wrap as `"cannot stat: %w"`.
    - `info.Mode().IsRegular() == false` → reject with `"not a regular file"`.
 5. `f, err := os.Open(path); if err != nil { return "", fmt.Errorf("not readable: %w", err) }; f.Close()` — confirms ACL/perm readability beyond mode bits.
 6. Return cleaned path. Use `filepath.Clean` after expansion. Don't absolutize relative paths — let `ssh(1)` resolve them against cwd, matching `ssh -i` behavior.
@@ -121,16 +122,17 @@ Connect/Detect path unchanged.
 - Create: `internal/config/identity.go`
 - Create: `internal/config/identity_test.go`
 
-- [ ] create `internal/config/identity.go` with `ParseIdentity(s string) (string, error)`:
-      trim → reject empty → `~/` and bare `~` expansion via `os.UserHomeDir()` →
-      reject `~user` → `os.Stat` (regular file check) → `os.Open` + immediate close
+- [x] create `internal/config/identity.go` with `ParseIdentity(s string) (string, error)`:
+      trim → reject empty → `~/foo` expansion via `os.UserHomeDir()` →
+      reject bare `~` and `~user` with `only ~/ is supported (no ~user)` →
+      `os.Stat` (regular file check) → `os.Open` + immediate close
       (readability check) → return `filepath.Clean` of the resolved path
-- [ ] write tests covering: empty input, `~/foo` expansion (use `t.Setenv("HOME", t.TempDir())`),
-      bare `~` expansion, `~user` rejected with clear message, non-existent path,
+- [x] write tests covering: empty input, `~/foo` expansion (use `t.Setenv("HOME", t.TempDir())`),
+      bare `~` rejected, `~user` rejected with clear message, non-existent path,
       directory (not a regular file), valid regular file (returns cleaned path),
       relative path passes through unchanged, unreadable file via `chmod 0000`
       (skip on `runtime.GOOS == "windows"`)
-- [ ] run tests: `go test ./internal/config/ -run TestParseIdentity -v` — must pass before task 2
+- [x] run tests: `go test ./internal/config/ -run TestParseIdentity -v` — must pass before task 2
 
 ### Task 2: Extend `checkRemoteMutex` for `--identity` rule
 
@@ -138,10 +140,10 @@ Connect/Detect path unchanged.
 - Modify: `cmd/remote.go`
 - Modify: `cmd/remote_test.go`
 
-- [ ] change `checkRemoteMutex` signature to `(serverName, sshTarget, identityFile string) error`
+- [x] change `checkRemoteMutex` signature to `(serverName, sshTarget, identityFile string) error`
       and add the new rule: `identityFile != "" && sshTarget == ""` →
       `fmt.Errorf("--identity requires --ssh")`. Update the doc comment.
-- [ ] extend `TestCheckRemoteMutex` table with: `("","","/k")` errors with
+- [x] extend `TestCheckRemoteMutex` table with: `("","","/k")` errors with
       `"--identity requires --ssh"`; `("prod","","/k")` also errors with
       `"--identity requires --ssh"` (the existing `--server`/`--ssh` mutex requires
       both non-empty, so it does not fire when `sshTarget` is empty — the new
@@ -149,7 +151,7 @@ Connect/Detect path unchanged.
       strict-narrow scoping we want); `("","host","/k")` is ok; `("prod","host","/k")`
       still errors via the existing `--server`/`--ssh` mutex. Update all existing
       cases to pass the new third argument as `""`.
-- [ ] run tests: `go test ./cmd/ -run TestCheckRemoteMutex -v` — must pass before task 3
+- [x] run tests: `go test ./cmd/ -run TestCheckRemoteMutex -v` — must pass before task 3
 
 ### Task 3: Extend `resolveSSHRemote` to thread identity into `SSHExtraArgs`
 
@@ -157,24 +159,24 @@ Connect/Detect path unchanged.
 - Modify: `cmd/remote.go`
 - Modify: `cmd/remote_test.go`
 
-- [ ] change `resolveSSHRemote` signature to add `identityFile string` between
+- [x] change `resolveSSHRemote` signature to add `identityFile string` between
       `projectDir` and `newRemote`. Inside, after computing `target.PortArgs()`,
       branch on `identityFile != ""`: call `config.ParseIdentity`, on error wrap as
       `"invalid --identity value %q: %w"` and return with `noopCleanup`; on success
       append `"-i", cleanPath` to the local `extraArgs` slice. Assign
       `rc.SSHExtraArgs = extraArgs`.
-- [ ] update existing tests in `cmd/remote_test.go` to pass `""` as the new
+- [x] update existing tests in `cmd/remote_test.go` to pass `""` as the new
       `identityFile` argument (mechanical edit to all `resolveSSHRemote(...)` calls)
-- [ ] add `TestResolveSSHRemote_WithIdentity_HappyPath`: pass a real temp file path,
+- [x] add `TestResolveSSHRemote_WithIdentity_HappyPath`: pass a real temp file path,
       expect `rc.SSHExtraArgs == ["-p","2222","-i",<tempPath>]` (or `["-i",<tempPath>]`
       with no port). Use `t.TempDir()` and `os.WriteFile` to create the key file.
-- [ ] add `TestResolveSSHRemote_WithIdentity_InvalidPath`: pass `/nonexistent/key`,
+- [x] add `TestResolveSSHRemote_WithIdentity_InvalidPath`: pass `/nonexistent/key`,
       expect error wrapping `"invalid --identity value"` and the underlying `not found`
       message. Verify `cleanup` is the no-op (safe to call).
-- [ ] add `TestResolveSSHRemote_WithIdentity_TildeExpansion`: set `HOME` via
+- [x] add `TestResolveSSHRemote_WithIdentity_TildeExpansion`: set `HOME` via
       `t.Setenv`, create `$HOME/.ssh/id_test`, pass `~/.ssh/id_test`, expect
       `rc.SSHExtraArgs[len-1]` to be the absolute path under the temp HOME.
-- [ ] run tests: `go test ./cmd/ -run TestResolveSSHRemote -v` — must pass before task 4
+- [x] run tests: `go test ./cmd/ -run TestResolveSSHRemote -v` — must pass before task 4
 
 ### Task 4: Wire `-i/--identity` into root command + TUI rejection
 
@@ -182,17 +184,18 @@ Connect/Detect path unchanged.
 - Modify: `cmd/root.go`
 - Modify: `cmd/root_test.go`
 
-- [ ] add `var identityFile string` next to the existing `sshTarget` var
-- [ ] register the persistent flag immediately after the `--ssh` registration:
+- [x] add `var identityFile string` next to the existing `sshTarget` var
+- [x] register the persistent flag immediately after the `--ssh` registration:
       `rootCmd.PersistentFlags().StringVarP(&identityFile, "identity", "i", "", "path to SSH private key (requires --ssh)")`
-- [ ] in the root `RunE` (right after the existing `--ssh` rejection at line 46-48),
+- [x] in the root `RunE` (right after the existing `--ssh` rejection at line 46-48),
       add an analogous rejection: `if identityFile != "" { return fmt.Errorf("--identity is not valid for the interactive TUI; use it with a subcommand") }`
-- [ ] extend `cmd/root_test.go` flag-registration assertions to verify `-i`/`--identity`
+- [x] extend `cmd/root_test.go` flag-registration assertions to verify `-i`/`--identity`
       is registered as a persistent string flag with the correct help text. Follow
       the existing pattern used for `-S`/`--ssh`.
-- [ ] add a test asserting that running root with `--identity /tmp/x` (without a
+- [x] add a test asserting that running root with `--identity /tmp/x` (without a
       subcommand) returns the TUI rejection error. Mirror the existing `--ssh` TUI test.
-- [ ] run tests: `go test ./cmd/ -run TestRoot -v` — must pass before task 5
+      Note: there was no existing `--ssh` TUI rejection test; created `TestRootCmd_IdentityRejectedInTUI` from scratch.
+- [x] run tests: `go test ./cmd/ -run TestRoot -v` — must pass before task 5
 
 ### Task 5: Thread `identityFile` through four subcommand call sites
 
@@ -206,13 +209,13 @@ Connect/Detect path unchanged.
 - Modify: `cmd/logs_test.go`
 - Modify: `cmd/exec_test.go`
 
-- [ ] in each of `cmd/deploy.go`, `cmd/list.go`, `cmd/logs.go`, `cmd/exec.go`:
+- [x] in each of `cmd/deploy.go`, `cmd/list.go`, `cmd/logs.go`, `cmd/exec.go`:
       update `checkRemoteMutex(serverName, sshTarget)` →
       `checkRemoteMutex(serverName, sshTarget, identityFile)`, and
       `resolveSSHRemote(ctx, sshTarget, projectDir, factory)` →
       `resolveSSHRemote(ctx, sshTarget, projectDir, identityFile, factory)`.
       Mechanical edits — the global `identityFile` var from `cmd/root.go` is in scope.
-- [ ] add `TestRunOperation_IdentityWithoutSSH` in `cmd/deploy_test.go` (covers
+- [x] add `TestRunOperation_IdentityWithoutSSH` in `cmd/deploy_test.go` (covers
       deploy/restart/stop because they all flow through `runOperation()`; follow the
       existing `runOperation(...)` test pattern around lines 350/385/417). Add
       analogous `TestList_IdentityWithoutSSH`, `TestLogs_IdentityWithoutSSH`,
@@ -221,24 +224,25 @@ Connect/Detect path unchanged.
       `RunE` (or `runOperation` for deploy_test), assert the error contains
       `"--identity requires --ssh"`. Reset globals (`identityFile = ""`,
       `sshTarget = ""`) in `t.Cleanup` to avoid state leakage between tests.
-- [ ] run tests: `go test ./cmd/ -v` — must pass before task 6
+- [x] run tests: `go test ./cmd/ -v` — must pass before task 6
 
 ### Task 6: Verify acceptance criteria
 
 **Files:**
 - (no file edits — verification only)
 
-- [ ] verify all requirements from Overview are implemented:
+- [x] verify all requirements from Overview are implemented:
       `-i` flag exists, requires `--ssh`, mutex with `--server`, CLI-only,
       `~/` expansion works, validates existence/regular-file/readability,
       reuses `SSHExtraArgs`, no changes to `internal/compose/remote.go`
-- [ ] verify edge cases: empty `--identity`, `~user` rejected, directory rejected,
+- [x] verify edge cases: empty `--identity`, `~user` rejected, directory rejected,
       unreadable file rejected, valid path with non-default port works
-- [ ] run full test suite: `go test ./... -count=1`
-- [ ] run `go vet ./...`
-- [ ] run `go build -o cdeploy .` — must succeed with no warnings
-- [ ] verify test coverage of `ParseIdentity` (the only new public function):
+- [x] run full test suite: `go test ./... -count=1`
+- [x] run `go vet ./...`
+- [x] run `go build -o cdeploy .` — must succeed with no warnings
+- [x] verify test coverage of `ParseIdentity` (the only new public function):
       `go test ./internal/config/ -cover`. Expect ≥ 90% line coverage.
+      Result: 92.0% line coverage on `ParseIdentity`.
 
 ### Task 7: Update documentation
 
@@ -247,15 +251,15 @@ Connect/Detect path unchanged.
 - Modify: `CLAUDE.md`
 - Move: this plan file → `docs/plans/completed/`
 
-- [ ] in `README.md`, locate the `--ssh` section/example and add an `-i` example:
+- [x] in `README.md`, locate the `--ssh` section/example and add an `-i` example:
       `cdeploy -S deploy@1.2.3.4 -i ~/.ssh/ci.pem -C /opt/app deploy`. Add a one-line
       note: `-i` is only valid with `-S` and is intended for CI/ephemeral use; for
       configured servers, use `IdentityFile` in `~/.ssh/config`.
-- [ ] in `CLAUDE.md`, update the "**Ad-hoc SSH (`-S`/`--ssh`)**" paragraph: note
+- [x] in `CLAUDE.md`, update the "**Ad-hoc SSH (`-S`/`--ssh`)**" paragraph: note
       that `SSHExtraArgs` content is now port + optional identity. Amend the sentence
       "SSH-specific options (keys, jump hosts, tunnels) belong in `~/.ssh/config`"
       with the carve-out: *except `-i` for ad-hoc CI/automation use via `--ssh`*.
-- [ ] move plan: `mkdir -p docs/plans/completed && mv docs/plans/20260429-ssh-identity-flag.md docs/plans/completed/`
+- [x] move plan: `mkdir -p docs/plans/completed && mv docs/plans/20260429-ssh-identity-flag.md docs/plans/completed/`
 
 ## Post-Completion
 

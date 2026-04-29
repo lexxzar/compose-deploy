@@ -565,12 +565,14 @@ func TestRunExec_SSHHappyPath(t *testing.T) {
 	oldServer := serverName
 	oldSSH := sshTarget
 	oldProj := projectDir
+	oldIdentity := identityFile
 	oldNewRemote := execNewRemote
 	oldRun := execRunCmd
 	t.Cleanup(func() {
 		serverName = oldServer
 		sshTarget = oldSSH
 		projectDir = oldProj
+		identityFile = oldIdentity
 		execNewRemote = oldNewRemote
 		execRunCmd = oldRun
 	})
@@ -578,6 +580,7 @@ func TestRunExec_SSHHappyPath(t *testing.T) {
 	serverName = ""
 	sshTarget = "deploy@host:2222"
 	projectDir = "/srv/app"
+	identityFile = ""
 
 	var capturedArgs []string
 	execRunCmd = func(cmd *exec.Cmd) error {
@@ -610,6 +613,91 @@ func TestRunExec_SSHHappyPath(t *testing.T) {
 	}
 	if !strings.Contains(args, "'nginx'") {
 		t.Errorf("args = %q, want it to contain 'nginx'", args)
+	}
+}
+
+// TestRunExec_SSHHappyPathWithIdentity verifies the exec subcommand splices
+// -i <keyPath> into the SSH argv when both --ssh and --identity are set.
+func TestRunExec_SSHHappyPathWithIdentity(t *testing.T) {
+	oldServer := serverName
+	oldSSH := sshTarget
+	oldProj := projectDir
+	oldIdentity := identityFile
+	oldNewRemote := execNewRemote
+	oldRun := execRunCmd
+	t.Cleanup(func() {
+		serverName = oldServer
+		sshTarget = oldSSH
+		projectDir = oldProj
+		identityFile = oldIdentity
+		execNewRemote = oldNewRemote
+		execRunCmd = oldRun
+	})
+
+	tmpDir := t.TempDir()
+	keyPath := tmpDir + "/id_test"
+	if err := os.WriteFile(keyPath, []byte("dummy"), 0o600); err != nil {
+		t.Fatalf("write key: %v", err)
+	}
+
+	serverName = ""
+	sshTarget = "deploy@host:2222"
+	projectDir = "/srv/app"
+	identityFile = keyPath
+
+	var capturedArgs []string
+	execRunCmd = func(cmd *exec.Cmd) error {
+		capturedArgs = append([]string(nil), cmd.Args...)
+		return nil
+	}
+
+	execNewRemote = func(host, projDir string) *compose.RemoteCompose {
+		rc := compose.NewRemote(host, projDir)
+		rc.SetTestHooks(
+			func(cmd *exec.Cmd) error { return nil },
+			func(cmd *exec.Cmd) ([]byte, error) {
+				return []byte("Docker Compose version v2.24.0\n"), nil
+			},
+		)
+		return rc
+	}
+
+	if err := runExec(context.Background(), "nginx", nil); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	args := strings.Join(capturedArgs, " ")
+	if !strings.Contains(args, "-p 2222") {
+		t.Errorf("args = %q, want it to contain '-p 2222'", args)
+	}
+	if !strings.Contains(args, "-i "+keyPath) {
+		t.Errorf("args = %q, want it to contain '-i %s'", args, keyPath)
+	}
+}
+
+func TestExec_IdentityWithoutSSH(t *testing.T) {
+	oldServer := serverName
+	oldSSH := sshTarget
+	oldProj := projectDir
+	oldIdentity := identityFile
+	t.Cleanup(func() {
+		serverName = oldServer
+		sshTarget = oldSSH
+		projectDir = oldProj
+		identityFile = oldIdentity
+	})
+
+	serverName = ""
+	sshTarget = ""
+	projectDir = ""
+	identityFile = "/tmp/k"
+
+	err := runExec(context.Background(), "nginx", nil)
+	if err == nil {
+		t.Fatal("expected error when --identity is set without --ssh")
+	}
+	if !strings.Contains(err.Error(), "--identity requires --ssh") {
+		t.Errorf("error = %q, want it to contain '--identity requires --ssh'", err.Error())
 	}
 }
 

@@ -65,14 +65,14 @@ type execCommander interface {
 }
 
 func runExec(ctx context.Context, service string, command []string) error {
-	if err := checkRemoteMutex(serverName, sshTarget); err != nil {
+	if err := checkRemoteMutex(serverName, sshTarget, identityFile); err != nil {
 		return err
 	}
 
 	var c execCommander
 	switch {
 	case sshTarget != "":
-		rc, cleanup, err := resolveSSHRemote(ctx, sshTarget, projectDir, execNewRemote)
+		rc, cleanup, err := resolveSSHRemote(ctx, sshTarget, projectDir, identityFile, execNewRemote)
 		if err != nil {
 			return err
 		}

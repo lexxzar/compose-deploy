@@ -50,14 +50,14 @@ func newLogsCmd() *cobra.Command {
 }
 
 func runLogs(ctx context.Context, service string, follow bool, tail int) error {
-	if err := checkRemoteMutex(serverName, sshTarget); err != nil {
+	if err := checkRemoteMutex(serverName, sshTarget, identityFile); err != nil {
 		return err
 	}
 
 	var c runner.Composer
 	switch {
 	case sshTarget != "":
-		rc, cleanup, err := resolveSSHRemote(ctx, sshTarget, projectDir, logsNewRemote)
+		rc, cleanup, err := resolveSSHRemote(ctx, sshTarget, projectDir, identityFile, logsNewRemote)
 		if err != nil {
 			return err
 		}
