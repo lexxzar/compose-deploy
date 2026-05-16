@@ -290,6 +290,43 @@ func (r *RemoteCompose) ContainerStatus(ctx context.Context) (map[string]runner.
 	return parseContainerStatus(out)
 }
 
+// ContainerStats returns CPU and memory usage for each running service in this
+// remote project. It fetches the project's container IDs via `docker compose ps`,
+// calls AllContainerStatsRemote to retrieve host-wide stats over the same SSH
+// ControlMaster connection, then joins by container ID and sum-aggregates per
+// service. See Compose.ContainerStats for the full contract.
+func (r *RemoteCompose) ContainerStats(ctx context.Context) (map[string]runner.ServiceStats, error) {
+	all, err := AllContainerStatsRemote(ctx, r)
+	if err != nil {
+		return nil, err
+	}
+	return r.ContainerStatsFromBulk(ctx, all)
+}
+
+// ContainerStatsFromBulk joins a pre-fetched host-wide stats map (from
+// AllContainerStatsRemote) against this remote project's container IDs and
+// returns per-service aggregated stats. See Compose.ContainerStatsFromBulk
+// for the full contract — this is the SSH counterpart that shares one
+// host-wide `docker stats` call across every project on the remote host.
+func (r *RemoteCompose) ContainerStatsFromBulk(ctx context.Context, bulk map[string]runner.ServiceStats) (map[string]runner.ServiceStats, error) {
+	cmd := r.remoteCommand(ctx, "ps", "-a", "--format", "json")
+	var out []byte
+	var err error
+	if r.outputCmd != nil {
+		out, err = r.outputCmd(cmd)
+	} else {
+		out, err = cmd.Output()
+	}
+	if err != nil {
+		return nil, fmt.Errorf("listing remote project containers for stats: %w", withStderr(err))
+	}
+	idToService, err := parsePsIDToService(out)
+	if err != nil {
+		return nil, err
+	}
+	return aggregateStatsByService(idToService, bulk), nil
+}
+
 // findRemoteComposeFile runs a single SSH command that probes all compose file
 // candidates and returns the first match. Avoids multiple SSH round-trips.
 func (r *RemoteCompose) findRemoteComposeFile(ctx context.Context) (string, error) {

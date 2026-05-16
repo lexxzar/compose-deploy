@@ -28,6 +28,22 @@ type ServiceStatus struct {
 	Ports   []Port // aggregated/deduped/sorted across replicas; see Port doc
 }
 
+// ServiceStats holds CPU and memory usage for a service, sourced from
+// `docker stats --no-stream --format json`.
+//
+// Aggregation contract for scaled services (multiple replicas of the same
+// service name): all three fields are summed across replicas. A 3-replica
+// service each using 50% CPU and 100MiB of a 512MiB limit reports
+// CPUPercent=150.0, MemoryUsed=300MiB, MemoryLimit=1536MiB. This matches
+// the "how much is this service costing me" intuition that users budget
+// against. Only running containers are included; stopped services are
+// absent from the result map of ContainerStats.
+type ServiceStats struct {
+	CPUPercent  float64 // 100.0 = 1 full core; can exceed 100 for scaled or multi-core saturated services
+	MemoryUsed  int64   // bytes
+	MemoryLimit int64   // bytes; whatever Docker reports (often host memory if no explicit limit)
+}
+
 // Composer is the interface consumed by the runner, implemented by compose.Compose.
 type Composer interface {
 	Stop(ctx context.Context, containers []string, w io.Writer) error
@@ -44,6 +60,12 @@ type Composer interface {
 	// Ports are deduped across replicas by (Host, HostPort, ContainerPort,
 	// Protocol) and sorted ascending by HostPort.
 	ContainerStatus(ctx context.Context) (map[string]ServiceStatus, error)
+	// ContainerStats returns a map of service name to ServiceStats.
+	// Only running containers are included; stopped services are absent.
+	// For scaled services (multiple replicas of the same service name),
+	// CPUPercent, MemoryUsed, and MemoryLimit are all summed across
+	// replicas — see the ServiceStats type doc for the full contract.
+	ContainerStats(ctx context.Context) (map[string]ServiceStats, error)
 	// Logs streams docker compose logs for a single service to w.
 	// When follow is true, it streams until ctx is cancelled.
 	// tail controls how many historical lines to show (0 = all).

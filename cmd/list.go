@@ -30,6 +30,13 @@ type serviceStatus struct {
 	Created string        `json:"created,omitempty"`
 	Uptime  string        `json:"uptime,omitempty"`
 	Ports   []runner.Port `json:"ports,omitempty"`
+	// Stats fields: populated only when --stats is set. Pointer types ensure
+	// zero values (e.g. an idle container at 0% CPU) are still emitted in JSON
+	// when stats were requested, while nil pointers are omitted entirely when
+	// --stats was absent — preserving wire-shape compatibility.
+	CPUPercent  *float64 `json:"cpu_percent,omitempty"`
+	MemoryUsed  *int64   `json:"memory_used,omitempty"`
+	MemoryLimit *int64   `json:"memory_limit,omitempty"`
 }
 
 // projectServices groups service statuses under a project name for grouped display.
@@ -41,6 +48,15 @@ type projectServices struct {
 // mergeStatus combines the canonical service list with container status.
 // Services missing from the status map are treated as stopped.
 func mergeStatus(services []string, status map[string]runner.ServiceStatus) []serviceStatus {
+	return mergeStatusStats(services, status, nil, false)
+}
+
+// mergeStatusStats is the stats-aware variant of mergeStatus. When statsRequested
+// is true, stats fields are populated for every service (with zero values for
+// services absent from the stats map — typically stopped containers, which
+// renders as blank cells). When statsRequested is false, stats fields stay nil
+// and are omitted from JSON output (wire-shape compatible).
+func mergeStatusStats(services []string, status map[string]runner.ServiceStatus, stats map[string]runner.ServiceStats, statsRequested bool) []serviceStatus {
 	result := make([]serviceStatus, len(services))
 	for i, svc := range services {
 		st := status[svc]
@@ -51,6 +67,21 @@ func mergeStatus(services []string, status map[string]runner.ServiceStatus) []se
 			Created: st.Created,
 			Uptime:  st.Uptime,
 			Ports:   st.Ports,
+		}
+		if statsRequested && stats != nil {
+			if s, ok := stats[svc]; ok {
+				cpu := s.CPUPercent
+				used := s.MemoryUsed
+				limit := s.MemoryLimit
+				result[i].CPUPercent = &cpu
+				result[i].MemoryUsed = &used
+				result[i].MemoryLimit = &limit
+			}
+			// Service absent from stats (stopped, or ps/stats race): pointers
+			// stay nil so tabular cells render blank and JSON omits the fields.
+			// A legitimate zero from docker (idle container at 0% CPU) arrives
+			// as an entry in the stats map with zero-valued fields — that case
+			// still emits &0 pointers and renders "0.0%" / "0B/0B".
 		}
 	}
 	sort.Slice(result, func(i, j int) bool {
@@ -73,6 +104,27 @@ func healthIcon(health string) string {
 	}
 }
 
+// formatCPUCell renders a service's CPU% cell. Running services with stats get
+// "<x.y>%" (one decimal); other services (stopped, or stats fetch failed) get
+// an empty string. The caller pads to the column width — empty strings render
+// as blank cells.
+func formatCPUCell(s serviceStatus) string {
+	if s.CPUPercent == nil || !s.Running {
+		return ""
+	}
+	return fmt.Sprintf("%.1f%%", *s.CPUPercent)
+}
+
+// formatMemCell renders a service's memory cell as "<used>/<limit>" using
+// compose.FormatBytes. Stopped services or services without stats render as an
+// empty string for blank-cell alignment.
+func formatMemCell(s serviceStatus) string {
+	if s.MemoryUsed == nil || s.MemoryLimit == nil || !s.Running {
+		return ""
+	}
+	return compose.FormatBytes(*s.MemoryUsed) + "/" + compose.FormatBytes(*s.MemoryLimit)
+}
+
 // formatDots renders service statuses as colored dot lines with aligned names.
 func formatDots(items []serviceStatus) string {
 	if len(items) == 0 {
@@ -82,8 +134,12 @@ func formatDots(items []serviceStatus) string {
 	maxName := 0
 	maxCreated := 0
 	maxUptime := 0
+	maxCPU := 0
+	maxMem := 0
 	maxPorts := 0
 	portsStr := make([]string, len(items))
+	cpuStr := make([]string, len(items))
+	memStr := make([]string, len(items))
 	for i, item := range items {
 		if len(item.Name) > maxName {
 			maxName = len(item.Name)
@@ -93,6 +149,14 @@ func formatDots(items []serviceStatus) string {
 		}
 		if len(item.Uptime) > maxUptime {
 			maxUptime = len(item.Uptime)
+		}
+		cpuStr[i] = formatCPUCell(item)
+		if w := utf8.RuneCountInString(cpuStr[i]); w > maxCPU {
+			maxCPU = w
+		}
+		memStr[i] = formatMemCell(item)
+		if w := utf8.RuneCountInString(memStr[i]); w > maxMem {
+			maxMem = w
 		}
 		portsStr[i] = compose.FormatPorts(item.Ports)
 		if w := utf8.RuneCountInString(portsStr[i]); w > maxPorts {
@@ -122,6 +186,14 @@ func formatDots(items []serviceStatus) string {
 			b.WriteString("  ")
 			b.WriteString(fmt.Sprintf("%-*s", maxUptime, item.Uptime))
 		}
+		if maxCPU > 0 {
+			b.WriteString("  ")
+			b.WriteString(fmt.Sprintf("%-*s", maxCPU, cpuStr[i]))
+		}
+		if maxMem > 0 {
+			b.WriteString("  ")
+			b.WriteString(fmt.Sprintf("%-*s", maxMem, memStr[i]))
+		}
 		if maxPorts > 0 {
 			b.WriteString("  ")
 			b.WriteString(fmt.Sprintf("%-*s", maxPorts, portsStr[i]))
@@ -147,8 +219,12 @@ func formatDotsGrouped(projects []projectServices) string {
 		maxName := 0
 		maxCreated := 0
 		maxUptime := 0
+		maxCPU := 0
+		maxMem := 0
 		maxPorts := 0
 		portsStr := make([]string, len(proj.Services))
+		cpuStr := make([]string, len(proj.Services))
+		memStr := make([]string, len(proj.Services))
 		for i, item := range proj.Services {
 			if len(item.Name) > maxName {
 				maxName = len(item.Name)
@@ -158,6 +234,14 @@ func formatDotsGrouped(projects []projectServices) string {
 			}
 			if len(item.Uptime) > maxUptime {
 				maxUptime = len(item.Uptime)
+			}
+			cpuStr[i] = formatCPUCell(item)
+			if w := utf8.RuneCountInString(cpuStr[i]); w > maxCPU {
+				maxCPU = w
+			}
+			memStr[i] = formatMemCell(item)
+			if w := utf8.RuneCountInString(memStr[i]); w > maxMem {
+				maxMem = w
 			}
 			portsStr[i] = compose.FormatPorts(item.Ports)
 			if w := utf8.RuneCountInString(portsStr[i]); w > maxPorts {
@@ -185,6 +269,14 @@ func formatDotsGrouped(projects []projectServices) string {
 				b.WriteString("  ")
 				b.WriteString(fmt.Sprintf("%-*s", maxUptime, item.Uptime))
 			}
+			if maxCPU > 0 {
+				b.WriteString("  ")
+				b.WriteString(fmt.Sprintf("%-*s", maxCPU, cpuStr[i]))
+			}
+			if maxMem > 0 {
+				b.WriteString("  ")
+				b.WriteString(fmt.Sprintf("%-*s", maxMem, memStr[i]))
+			}
 			if maxPorts > 0 {
 				b.WriteString("  ")
 				b.WriteString(fmt.Sprintf("%-*s", maxPorts, portsStr[i]))
@@ -205,6 +297,7 @@ func formatJSON(items []serviceStatus) (string, error) {
 
 func newListCmd() *cobra.Command {
 	var jsonOutput bool
+	var showStats bool
 
 	cmd := &cobra.Command{
 		Use:   "list",
@@ -213,7 +306,12 @@ func newListCmd() *cobra.Command {
 
 When no -C (project directory) is specified, discovers all compose projects and
 displays services grouped by project. Works both locally and with -s (remote server).
-When -C is specified, shows only that project's services in a flat list.`,
+When -C is specified, shows only that project's services in a flat list.
+
+With --stats, includes per-service CPU and memory usage columns. The bulk
+docker stats call adds ~1.5s of latency, so --stats is off by default; scripts
+and CI pay nothing unless they ask for it. On stats fetch failure the rest of
+the listing still renders and a warning is printed to stderr.`,
 		Example: `  # List services in current directory (if compose file exists)
   cdeploy list
 
@@ -227,23 +325,31 @@ When -C is specified, shows only that project's services in a flat list.`,
   cdeploy list -C /opt/myapp
   cdeploy list -s prod -C /opt/myapp
 
+  # Include CPU and memory usage
+  cdeploy list --stats
+  cdeploy list -s prod --stats --json
+
   # Output as JSON for scripting
   cdeploy list --json
   cdeploy list -s prod --json | jq '.[] | select(.running)'`,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			return runList(cmd.Context(), jsonOutput)
+			return runList(cmd.Context(), jsonOutput, showStats)
 		},
 		SilenceUsage:  true,
 		SilenceErrors: true,
 	}
 
 	cmd.Flags().BoolVar(&jsonOutput, "json", false, "output as JSON")
+	cmd.Flags().BoolVar(&showStats, "stats", false, "include CPU and memory usage columns (adds ~1.5s latency)")
 
 	return cmd
 }
 
 // listSingleProject lists services for a single composer and prints the result.
-func listSingleProject(ctx context.Context, c runner.Composer, jsonOutput bool) error {
+// When showStats is true, fetches per-service CPU/memory via ContainerStats.
+// Stats fetch failures are soft: a warning is printed to stderr, stats cells
+// render blank, and the listing succeeds (stats are a secondary view).
+func listSingleProject(ctx context.Context, c runner.Composer, jsonOutput, showStats bool) error {
 	services, err := c.ListServices(ctx)
 	if err != nil {
 		return fmt.Errorf("listing services: %w", err)
@@ -254,7 +360,16 @@ func listSingleProject(ctx context.Context, c runner.Composer, jsonOutput bool) 
 		return fmt.Errorf("getting container status: %w", err)
 	}
 
-	items := mergeStatus(services, status)
+	var stats map[string]runner.ServiceStats
+	if showStats {
+		stats, err = c.ContainerStats(ctx)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "cdeploy: stats unavailable: %v\n", err)
+			stats = nil // mergeStatusStats leaves pointers nil → blank cells, fields omitted from JSON
+		}
+	}
+
+	items := mergeStatusStats(services, status, stats, showStats)
 
 	if jsonOutput {
 		out, err := formatJSON(items)
@@ -275,6 +390,37 @@ func listSingleProject(ctx context.Context, c runner.Composer, jsonOutput bool) 
 // collectMultiProject gathers service statuses for each project using the factory to create composers.
 // Per-project errors are non-fatal: a warning is printed to stderr and the project is skipped.
 func collectMultiProject(ctx context.Context, projects []compose.Project, factory func(dir string) runner.Composer) []projectServices {
+	return collectMultiProjectStats(ctx, projects, factory, false, nil)
+}
+
+// bulkStatsAggregator is the optional capability that a composer can implement
+// to consume a pre-fetched host-wide `docker stats` map and join only its own
+// `docker compose ps` output against it. Both *compose.Compose and
+// *compose.RemoteCompose satisfy this; test mocks that don't implement it fall
+// back to the per-project ContainerStats() path.
+type bulkStatsAggregator interface {
+	ContainerStatsFromBulk(ctx context.Context, bulk map[string]runner.ServiceStats) (map[string]runner.ServiceStats, error)
+}
+
+// collectMultiProjectStats is the stats-aware variant of collectMultiProject.
+// When showStats is true, it populates per-service CPU/Mem cells for every
+// project. Per-project stats failures degrade gracefully: a warning is logged
+// to stderr, stats cells render blank for that project, and the rest of the
+// listing continues. Per-project status (ListServices/ContainerStatus)
+// failures remain fatal-to-the-project (the project is skipped entirely),
+// matching the existing convention — stats is strictly additive and never
+// causes a project to drop.
+//
+// Bulk-call sharing: when bulkStats is non-nil and the per-project composer
+// implements bulkStatsAggregator, ContainerStatsFromBulk runs against the
+// pre-fetched map — only `docker compose ps` runs per project, so the host
+// pays one ~1.5s `docker stats` cost regardless of project count. Callers
+// that fail to pre-fetch should still pass a non-nil empty map so this path
+// is preserved (no N×retry of the host-wide stats call). When bulkStats is
+// nil, the composer's ContainerStats() runs per project as a fallback —
+// reserved for callers that didn't request bulk sharing at all (e.g. test
+// mocks that don't implement bulkStatsAggregator).
+func collectMultiProjectStats(ctx context.Context, projects []compose.Project, factory func(dir string) runner.Composer, showStats bool, bulkStats map[string]runner.ServiceStats) []projectServices {
 	var result []projectServices
 	for _, proj := range projects {
 		c := factory(proj.ConfigDir)
@@ -291,7 +437,20 @@ func collectMultiProject(ctx context.Context, projects []compose.Project, factor
 			continue
 		}
 
-		items := mergeStatus(services, status)
+		var stats map[string]runner.ServiceStats
+		if showStats {
+			if bsa, ok := c.(bulkStatsAggregator); ok && bulkStats != nil {
+				stats, err = bsa.ContainerStatsFromBulk(ctx, bulkStats)
+			} else {
+				stats, err = c.ContainerStats(ctx)
+			}
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "cdeploy: stats unavailable for %q: %v\n", proj.Name, err)
+				stats = nil
+			}
+		}
+
+		items := mergeStatusStats(services, status, stats, showStats)
 		result = append(result, projectServices{Name: proj.Name, Services: items})
 	}
 	return result
@@ -327,7 +486,7 @@ func printMultiProject(grouped []projectServices, jsonOutput bool) error {
 	return nil
 }
 
-func runList(ctx context.Context, jsonOutput bool) error {
+func runList(ctx context.Context, jsonOutput, showStats bool) error {
 	if err := checkRemoteMutex(serverName, sshTarget, identityFile); err != nil {
 		return err
 	}
@@ -342,7 +501,7 @@ func runList(ctx context.Context, jsonOutput bool) error {
 			return err
 		}
 		defer cleanup()
-		return listSingleProject(ctx, rc, jsonOutput)
+		return listSingleProject(ctx, rc, jsonOutput, showStats)
 	}
 
 	if serverName != "" {
@@ -373,7 +532,7 @@ func runList(ctx context.Context, jsonOutput bool) error {
 
 		// Single-project mode: -C explicitly specified
 		if projDir != "" {
-			return listSingleProject(ctx, rc, jsonOutput)
+			return listSingleProject(ctx, rc, jsonOutput, showStats)
 		}
 
 		// Multi-project mode: discover all projects on the server
@@ -391,7 +550,19 @@ func runList(ctx context.Context, jsonOutput bool) error {
 			rc2.SetStandalone(rc.Standalone)
 			return rc2
 		}
-		grouped := collectMultiProject(ctx, projects, factory)
+		// One host-wide `docker stats` call shared across every project. When
+		// the bulk fetch fails, warn once and pass a non-nil empty map so the
+		// per-project loop still uses the bulk path (just `docker compose ps`)
+		// instead of retrying the host-wide stats call N more times.
+		var bulkStats map[string]runner.ServiceStats
+		if showStats {
+			bulkStats, err = compose.AllContainerStatsRemote(ctx, rc)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "cdeploy: stats unavailable: %v\n", err)
+				bulkStats = map[string]runner.ServiceStats{}
+			}
+		}
+		grouped := collectMultiProjectStats(ctx, projects, factory, showStats, bulkStats)
 		return printMultiProject(grouped, jsonOutput)
 	}
 
@@ -413,7 +584,7 @@ func runList(ctx context.Context, jsonOutput bool) error {
 		if err := c.Detect(ctx); err != nil {
 			return err
 		}
-		return listSingleProject(ctx, c, jsonOutput)
+		return listSingleProject(ctx, c, jsonOutput, showStats)
 	}
 
 	// Local multi-project: discover all projects on the system
@@ -433,6 +604,18 @@ func runList(ctx context.Context, jsonOutput bool) error {
 		lc.SetStandalone(c.Standalone)
 		return lc
 	}
-	grouped := collectMultiProject(ctx, projects, factory)
+	// Single host-wide stats fetch shared across all local projects. On
+	// failure pass a non-nil empty map so per-project loop uses the bulk
+	// path (just `docker compose ps`) instead of retrying `docker stats`
+	// N more times.
+	var bulkStats map[string]runner.ServiceStats
+	if showStats {
+		bulkStats, err = compose.AllContainerStats(ctx, c)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "cdeploy: stats unavailable: %v\n", err)
+			bulkStats = map[string]runner.ServiceStats{}
+		}
+	}
+	grouped := collectMultiProjectStats(ctx, projects, factory, showStats, bulkStats)
 	return printMultiProject(grouped, jsonOutput)
 }

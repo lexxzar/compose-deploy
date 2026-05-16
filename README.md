@@ -60,7 +60,7 @@ The TUI has six main screens, plus an inline settings editor reachable from scre
 
 1. **Server select** — choose a remote server or "Local" (only shown when servers are configured); press `s` to open the settings editor for managing servers
 2. **Project select** — pick a Docker Compose project (auto-skipped if the current directory has a compose file)
-3. **Service select** — pick services and choose an action (`r` restart, `d` deploy, `s` stop, `l` logs, `c` config, `x` exec)
+3. **Service select** — pick services and choose an action (`r` restart, `d` deploy, `s` stop, `l` logs, `c` config, `x` exec); also shows CPU% and Mem (used/limit) columns for running services, refreshed on screen entry and after every operation
 4. **Progress** — watch step-by-step execution with status indicators
 5. **Logs** — live-stream logs for the selected service
 6. **Config** — inspect or edit the compose file, toggle between raw and resolved config, and see validation status
@@ -96,8 +96,14 @@ cdeploy stop nginx
 # List services and their status
 cdeploy list
 
+# List services with CPU and memory usage (~1.5s per discovered project)
+cdeploy list --stats
+
 # List services as JSON (for scripts and CI)
 cdeploy list --json
+
+# Combine stats with JSON output
+cdeploy list --stats --json
 
 # Stream logs for a service
 cdeploy logs nginx
@@ -131,6 +137,8 @@ cdeploy exec web -- rails console
 ```
 
 `health`, `created`, `uptime`, and `ports` are omitted when not applicable (no healthcheck, stopped container, no published ports).
+
+With `--stats`, three additional fields are populated per running service: `cpu_percent` (`100.0` = one full core; sums across replicas for scaled services), `memory_used` (bytes), `memory_limit` (bytes; equals host memory when no explicit limit is set). The fields are omitted entirely when `--stats` is not passed, so existing scripts see byte-identical output. On stats fetch failure the CLI prints `cdeploy: stats unavailable: <err>` to stderr (single-project mode) or `cdeploy: stats unavailable for "<project>": <err>` (multi-project mode), exits 0, and renders blank cells — status is the load-bearing primary view.
 
 **Exit codes**: `0` on success, non-zero on failure (config errors, SSH/Docker failures, validation errors). Suitable for CI gating.
 

@@ -351,6 +351,7 @@ func (c *Compose) command(ctx context.Context, args ...string) *exec.Cmd {
 
 // psEntry matches the JSON schema of `docker compose ps --format json`.
 type psEntry struct {
+	ID         string        `json:"ID"`
 	Service    string        `json:"Service"`
 	State      string        `json:"State"`
 	Health     string        `json:"Health"`
@@ -684,6 +685,52 @@ func (c *Compose) ContainerStatus(ctx context.Context) (map[string]runner.Servic
 		return nil, fmt.Errorf("listing container status: %w", withStderr(err))
 	}
 	return parseContainerStatus(out)
+}
+
+// ContainerStats returns CPU and memory usage for each running service in this
+// project. It fetches the project's container IDs via `docker compose ps`, calls
+// AllContainerStats to retrieve host-wide stats, then joins by container ID and
+// sum-aggregates CPU%, MemoryUsed, and MemoryLimit across replicas of each
+// service. Stopped containers (absent from `docker stats`) are not included in
+// the result. Services whose containers appear in `ps` but are missing from the
+// stats map (e.g. stopped between the two calls) are silently skipped — this is
+// not an error, since the goal is to surface live usage.
+func (c *Compose) ContainerStats(ctx context.Context) (map[string]runner.ServiceStats, error) {
+	all, err := AllContainerStats(ctx, c)
+	if err != nil {
+		return nil, err
+	}
+	return c.ContainerStatsFromBulk(ctx, all)
+}
+
+// ContainerStatsFromBulk joins a pre-fetched host-wide stats map (from
+// AllContainerStats) against this project's container IDs and returns
+// per-service aggregated stats. Lets the multi-project CLI path pay the
+// ~1.5s `docker stats` cost once for the whole host instead of once per
+// project, fulfilling the plan's "one cost regardless of project count" goal.
+//
+// Skips the host-wide `docker stats` call entirely — only `docker compose ps`
+// runs here. Pass nil bulk to model a failed-but-soft host-wide stats fetch:
+// the per-project ps call still succeeds, all services land in the result map
+// with zero values, and the caller can surface a single "stats unavailable"
+// warning rather than one per project.
+func (c *Compose) ContainerStatsFromBulk(ctx context.Context, bulk map[string]runner.ServiceStats) (map[string]runner.ServiceStats, error) {
+	cmd := c.command(ctx, "ps", "-a", "--format", "json")
+	var out []byte
+	var err error
+	if c.outputCmd != nil {
+		out, err = c.outputCmd(cmd)
+	} else {
+		out, err = cmd.Output()
+	}
+	if err != nil {
+		return nil, fmt.Errorf("listing project containers for stats: %w", withStderr(err))
+	}
+	idToService, err := parsePsIDToService(out)
+	if err != nil {
+		return nil, err
+	}
+	return aggregateStatsByService(idToService, bulk), nil
 }
 
 // healthPriority returns a numeric priority for health values.
