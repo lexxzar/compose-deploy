@@ -78,6 +78,91 @@ func AllContainerStatsRemote(ctx context.Context, rc *RemoteCompose) (map[string
 	return parseStatsOutput(out)
 }
 
+// shortContainerID returns the first 12 characters of a Docker container ID
+// (the short form). `docker stats` emits short IDs while `docker compose ps`
+// emits full IDs, so we normalize on the short form for joining the two.
+// If the input is already 12 chars or shorter it is returned unchanged.
+func shortContainerID(id string) string {
+	if len(id) > 12 {
+		return id[:12]
+	}
+	return id
+}
+
+// parsePsIDToService parses the JSON output of `docker compose ps --format json`
+// and returns a slice of (shortID, serviceName) pairs in source order. Pairs
+// with an empty container ID or empty service name are skipped.
+//
+// The result is a slice (not a map) so that scaled services with multiple
+// replicas all contribute to aggregation in ContainerStats. Slice avoids
+// silently dropping duplicate-keyed entries that a map would lose.
+func parsePsIDToService(data []byte) ([]psIDService, error) {
+	s := strings.TrimSpace(string(data))
+	if s == "" || s == "[]" {
+		return nil, nil
+	}
+
+	var entries []psEntry
+	if strings.HasPrefix(s, "[") {
+		if err := json.Unmarshal([]byte(s), &entries); err != nil {
+			return nil, fmt.Errorf("parsing ps for stats: %w", err)
+		}
+	} else {
+		for _, line := range strings.Split(s, "\n") {
+			line = strings.TrimSpace(line)
+			if line == "" {
+				continue
+			}
+			var entry psEntry
+			if err := json.Unmarshal([]byte(line), &entry); err != nil {
+				return nil, fmt.Errorf("parsing ps for stats: %w", err)
+			}
+			entries = append(entries, entry)
+		}
+	}
+
+	pairs := make([]psIDService, 0, len(entries))
+	for _, e := range entries {
+		if e.ID == "" || e.Service == "" {
+			continue
+		}
+		pairs = append(pairs, psIDService{ID: shortContainerID(e.ID), Service: e.Service})
+	}
+	return pairs, nil
+}
+
+// psIDService pairs a (short) container ID with its compose service name. Used
+// internally by ContainerStats to join the project's `ps` output against the
+// host-wide stats map.
+type psIDService struct {
+	ID      string
+	Service string
+}
+
+// aggregateStatsByService joins a slice of (containerID, service) pairs (from
+// `docker compose ps`) against a host-wide stats map (from `docker stats`) and
+// returns per-service aggregated stats. CPU%, MemoryUsed, and MemoryLimit are
+// SUMMED across replicas, matching the "total resource use" intuition that
+// users budget against. Pairs whose ID is missing from the stats map are
+// silently skipped — this models the natural race window where a container
+// stops between the two calls, and also the expected case where a service is
+// stopped (absent from `docker stats` entirely).
+func aggregateStatsByService(pairs []psIDService, all map[string]runner.ServiceStats) map[string]runner.ServiceStats {
+	out := make(map[string]runner.ServiceStats)
+	for _, p := range pairs {
+		s, ok := all[p.ID]
+		if !ok {
+			continue
+		}
+		cur := out[p.Service]
+		cur.CPUPercent += s.CPUPercent
+		cur.MemoryUsed += s.MemoryUsed
+		cur.MemoryLimit += s.MemoryLimit
+		out[p.Service] = cur
+	}
+	return out
+}
+
 // statsEntry matches the JSON schema of `docker stats --no-stream --format json`.
 // Fields are camel-cased exactly as Docker emits them; only the fields we consume
 // are declared. `ID` is the short container ID (12 chars); used as the join key

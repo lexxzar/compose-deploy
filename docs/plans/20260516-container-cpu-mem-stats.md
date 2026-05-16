@@ -231,17 +231,18 @@ In `cmd/list.go`, when `--stats` is set and no `-C` is given, the bulk `AllConta
 - Modify: `internal/compose/remote.go`
 - Modify: `internal/compose/stats_test.go`
 
-- [ ] add `(c *Compose) ContainerStats(ctx context.Context) (map[string]runner.ServiceStats, error)` — calls `docker compose ps --format json` for this project's container IDs, calls `AllContainerStats(ctx, c)`, joins by container ID, sum-aggregates per service name, returns the result
-- [ ] add identical-shape `(rc *RemoteCompose) ContainerStats(...)` method using `AllContainerStatsRemote`
-- [ ] aggregation logic: build `map[serviceName]ServiceStats` by iterating compose `ps` entries; for each entry, look up by container ID in the stats map; if present, add CPU%/MemoryUsed/MemoryLimit to that service's running totals
-- [ ] write `TestContainerStats_local_singleReplica` — one service, one container, verify pass-through values
-- [ ] write `TestContainerStats_local_scaledService` — one service, 3 containers, verify all three fields summed (e.g. 3× 50% CPU, 100MiB/512MiB → 150% CPU, 300MiB/1536MiB)
-- [ ] write `TestContainerStats_local_stoppedServicesAbsent` — service in `ps` but absent from stats (stopped) → not in returned map
-- [ ] write `TestContainerStats_local_psFailureReturnsError` — `ps` fails → method returns error (do not silently swallow)
-- [ ] write `TestContainerStats_local_statsFailureReturnsError` — `ps` succeeds but stats fails → method returns error (caller decides soft-fail)
-- [ ] write `TestContainerStats_local_psIDAbsentFromStats` — `ps` returns a container ID that does not appear in the stats map (race window: container stopped between calls) → that service is simply absent from the result map, no error
-- [ ] write `TestContainerStats_remote_passthrough` — verify remote variant joins the same way (one test sufficient; SSH argv already covered in Task 4)
-- [ ] run `go test ./internal/compose/...` — must pass before next task
+- [x] add `(c *Compose) ContainerStats(ctx context.Context) (map[string]runner.ServiceStats, error)` — calls `docker compose ps --format json` for this project's container IDs, calls `AllContainerStats(ctx, c)`, joins by container ID, sum-aggregates per service name, returns the result
+- [x] add identical-shape `(rc *RemoteCompose) ContainerStats(...)` method using `AllContainerStatsRemote`
+- [x] aggregation logic: build `map[serviceName]ServiceStats` by iterating compose `ps` entries; for each entry, look up by container ID in the stats map; if present, add CPU%/MemoryUsed/MemoryLimit to that service's running totals
+- [x] write `TestContainerStats_local_singleReplica` — one service, one container, verify pass-through values
+- [x] write `TestContainerStats_local_scaledService` — one service, 3 containers, verify all three fields summed (e.g. 3× 50% CPU, 100MiB/512MiB → 150% CPU, 300MiB/1536MiB)
+- [x] write `TestContainerStats_local_stoppedServicesAbsent` — service in `ps` but absent from stats (stopped) → not in returned map
+- [x] write `TestContainerStats_local_psFailureReturnsError` — `ps` fails → method returns error (do not silently swallow)
+- [x] write `TestContainerStats_local_statsFailureReturnsError` — `ps` succeeds but stats fails → method returns error (caller decides soft-fail)
+- [x] write `TestContainerStats_local_psIDAbsentFromStats` — `ps` returns a container ID that does not appear in the stats map (race window: container stopped between calls) → that service is simply absent from the result map, no error
+- [x] write `TestContainerStats_remote_passthrough` — verify remote variant joins the same way (one test sufficient; SSH argv already covered in Task 4)
+- [x] run `go test ./internal/compose/...` — must pass before next task
+- ➕ added `ID` field to `psEntry` struct (required for container-ID join against `docker stats`); added helpers `parsePsIDToService`, `aggregateStatsByService`, and `shortContainerID` in `internal/compose/stats.go`; added bonus `TestContainerStats_local_shortIDJoin` to verify 64-char full IDs from `ps` correctly truncate for join against 12-char short IDs from `docker stats`. The pre-existing `mockComposer` build failures in `internal/tui` and `cmd` packages (introduced by the interface-method addition in Task 1, deferred to Task 6) remain unchanged — `go test ./internal/compose/...` passes (Task 5's required gate); the wider `go test ./...` continues to fail until Task 6 stubs the mocks.
 
 ### Task 6: Add no-op `ContainerStats` to all other mock `Composer` implementations
 

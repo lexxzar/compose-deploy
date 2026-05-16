@@ -541,3 +541,290 @@ func TestAllContainerStatsRemote_error(t *testing.T) {
 		t.Errorf("error = %q, want it to mention remote container stats", err.Error())
 	}
 }
+
+// isPsCmd reports whether cmd.Args looks like a `docker compose ps` invocation
+// (either plugin or standalone form). Used by ContainerStats tests to
+// discriminate between the two outputCmd hook calls (ps vs stats).
+func isPsCmd(args []string) bool {
+	for _, a := range args {
+		if a == "ps" {
+			return true
+		}
+	}
+	return false
+}
+
+// isStatsCmd reports whether cmd.Args looks like a `docker stats` invocation.
+func isStatsCmd(args []string) bool {
+	for _, a := range args {
+		if a == "stats" {
+			return true
+		}
+	}
+	return false
+}
+
+func TestContainerStats_local_singleReplica(t *testing.T) {
+	psOut := `[{"ID":"abc123def456","Service":"api","State":"running"}]`
+	statsOut := `{"ID":"abc123def456","Name":"proj-api-1","CPUPerc":"4.20%","MemUsage":"124MiB / 512MiB"}`
+	c := &Compose{
+		ProjectDir: "/proj",
+		UID:        "1000:1000",
+		outputCmd: func(cmd *exec.Cmd) ([]byte, error) {
+			switch {
+			case isPsCmd(cmd.Args):
+				return []byte(psOut), nil
+			case isStatsCmd(cmd.Args):
+				return []byte(statsOut), nil
+			default:
+				return nil, fmt.Errorf("unexpected cmd: %v", cmd.Args)
+			}
+		},
+	}
+	got, err := c.ContainerStats(context.Background())
+	if err != nil {
+		t.Fatalf("ContainerStats error: %v", err)
+	}
+	api, ok := got["api"]
+	if !ok {
+		t.Fatalf("missing api in result: %v", got)
+	}
+	if api.CPUPercent != 4.2 {
+		t.Errorf("api CPU = %v, want 4.2", api.CPUPercent)
+	}
+	if api.MemoryUsed != 130023424 {
+		t.Errorf("api MemoryUsed = %d, want 130023424", api.MemoryUsed)
+	}
+	if api.MemoryLimit != 536870912 {
+		t.Errorf("api MemoryLimit = %d, want 536870912", api.MemoryLimit)
+	}
+}
+
+func TestContainerStats_local_scaledService(t *testing.T) {
+	psOut := strings.Join([]string{
+		`[`,
+		`{"ID":"aaa111111111","Service":"web","State":"running"},`,
+		`{"ID":"bbb222222222","Service":"web","State":"running"},`,
+		`{"ID":"ccc333333333","Service":"web","State":"running"}`,
+		`]`,
+	}, "\n")
+	statsOut := strings.Join([]string{
+		`{"ID":"aaa111111111","Name":"proj-web-1","CPUPerc":"50.00%","MemUsage":"100MiB / 512MiB"}`,
+		`{"ID":"bbb222222222","Name":"proj-web-2","CPUPerc":"50.00%","MemUsage":"100MiB / 512MiB"}`,
+		`{"ID":"ccc333333333","Name":"proj-web-3","CPUPerc":"50.00%","MemUsage":"100MiB / 512MiB"}`,
+	}, "\n")
+	c := &Compose{
+		ProjectDir: "/proj",
+		UID:        "1000:1000",
+		outputCmd: func(cmd *exec.Cmd) ([]byte, error) {
+			switch {
+			case isPsCmd(cmd.Args):
+				return []byte(psOut), nil
+			case isStatsCmd(cmd.Args):
+				return []byte(statsOut), nil
+			default:
+				return nil, fmt.Errorf("unexpected cmd: %v", cmd.Args)
+			}
+		},
+	}
+	got, err := c.ContainerStats(context.Background())
+	if err != nil {
+		t.Fatalf("ContainerStats error: %v", err)
+	}
+	web, ok := got["web"]
+	if !ok {
+		t.Fatalf("missing web in result: %v", got)
+	}
+	if web.CPUPercent != 150 {
+		t.Errorf("web CPU = %v, want 150 (3 * 50)", web.CPUPercent)
+	}
+	if web.MemoryUsed != 3*100*1024*1024 {
+		t.Errorf("web MemoryUsed = %d, want %d (3 * 100MiB)", web.MemoryUsed, 3*100*1024*1024)
+	}
+	if web.MemoryLimit != 3*512*1024*1024 {
+		t.Errorf("web MemoryLimit = %d, want %d (3 * 512MiB)", web.MemoryLimit, 3*512*1024*1024)
+	}
+}
+
+func TestContainerStats_local_stoppedServicesAbsent(t *testing.T) {
+	// ps reports two services; stats only has data for one (the other is stopped).
+	psOut := `[{"ID":"aaa111111111","Service":"api","State":"running"},{"ID":"bbb222222222","Service":"db","State":"exited"}]`
+	statsOut := `{"ID":"aaa111111111","Name":"proj-api-1","CPUPerc":"4.20%","MemUsage":"124MiB / 512MiB"}`
+	c := &Compose{
+		ProjectDir: "/proj",
+		UID:        "1000:1000",
+		outputCmd: func(cmd *exec.Cmd) ([]byte, error) {
+			switch {
+			case isPsCmd(cmd.Args):
+				return []byte(psOut), nil
+			case isStatsCmd(cmd.Args):
+				return []byte(statsOut), nil
+			default:
+				return nil, fmt.Errorf("unexpected cmd: %v", cmd.Args)
+			}
+		},
+	}
+	got, err := c.ContainerStats(context.Background())
+	if err != nil {
+		t.Fatalf("ContainerStats error: %v", err)
+	}
+	if _, ok := got["api"]; !ok {
+		t.Errorf("missing api in result: %v", got)
+	}
+	if _, ok := got["db"]; ok {
+		t.Errorf("db should be absent (stopped, not in stats): %v", got)
+	}
+}
+
+func TestContainerStats_local_psFailureReturnsError(t *testing.T) {
+	c := &Compose{
+		ProjectDir: "/proj",
+		UID:        "1000:1000",
+		outputCmd: func(cmd *exec.Cmd) ([]byte, error) {
+			if isPsCmd(cmd.Args) {
+				return nil, fmt.Errorf("docker daemon down")
+			}
+			return []byte(""), nil
+		},
+	}
+	_, err := c.ContainerStats(context.Background())
+	if err == nil {
+		t.Fatal("expected error from ps failure, got nil")
+	}
+	if !strings.Contains(err.Error(), "project containers for stats") {
+		t.Errorf("error = %q, want it to mention project containers", err.Error())
+	}
+}
+
+func TestContainerStats_local_statsFailureReturnsError(t *testing.T) {
+	psOut := `[{"ID":"abc123def456","Service":"api","State":"running"}]`
+	c := &Compose{
+		ProjectDir: "/proj",
+		UID:        "1000:1000",
+		outputCmd: func(cmd *exec.Cmd) ([]byte, error) {
+			switch {
+			case isPsCmd(cmd.Args):
+				return []byte(psOut), nil
+			case isStatsCmd(cmd.Args):
+				return nil, fmt.Errorf("docker stats timeout")
+			default:
+				return nil, fmt.Errorf("unexpected cmd: %v", cmd.Args)
+			}
+		},
+	}
+	_, err := c.ContainerStats(context.Background())
+	if err == nil {
+		t.Fatal("expected error from stats failure, got nil")
+	}
+	if !strings.Contains(err.Error(), "container stats") {
+		t.Errorf("error = %q, want it to mention container stats", err.Error())
+	}
+}
+
+func TestContainerStats_local_psIDAbsentFromStats(t *testing.T) {
+	// ps returns an ID that does not appear in stats (race: container stopped
+	// between the two calls). The service should be absent from the result map,
+	// not an error.
+	psOut := `[{"ID":"aaa111111111","Service":"api","State":"running"},{"ID":"bbb222222222","Service":"ghost","State":"running"}]`
+	statsOut := `{"ID":"aaa111111111","Name":"proj-api-1","CPUPerc":"4.20%","MemUsage":"124MiB / 512MiB"}`
+	c := &Compose{
+		ProjectDir: "/proj",
+		UID:        "1000:1000",
+		outputCmd: func(cmd *exec.Cmd) ([]byte, error) {
+			switch {
+			case isPsCmd(cmd.Args):
+				return []byte(psOut), nil
+			case isStatsCmd(cmd.Args):
+				return []byte(statsOut), nil
+			default:
+				return nil, fmt.Errorf("unexpected cmd: %v", cmd.Args)
+			}
+		},
+	}
+	got, err := c.ContainerStats(context.Background())
+	if err != nil {
+		t.Fatalf("ContainerStats error: %v", err)
+	}
+	if _, ok := got["api"]; !ok {
+		t.Errorf("missing api in result: %v", got)
+	}
+	if _, ok := got["ghost"]; ok {
+		t.Errorf("ghost should be absent (not in stats map): %v", got)
+	}
+}
+
+func TestContainerStats_local_shortIDJoin(t *testing.T) {
+	// ps emits a full 64-char container ID; stats emits only the first 12 chars.
+	// ContainerStats must truncate the ps ID to the short form for joining.
+	fullID := "abc123def4567890abcdef0123456789abcdef0123456789abcdef0123456789"
+	psOut := fmt.Sprintf(`[{"ID":%q,"Service":"api","State":"running"}]`, fullID)
+	statsOut := fmt.Sprintf(`{"ID":%q,"Name":"proj-api-1","CPUPerc":"4.20%%","MemUsage":"124MiB / 512MiB"}`, fullID[:12])
+	c := &Compose{
+		ProjectDir: "/proj",
+		UID:        "1000:1000",
+		outputCmd: func(cmd *exec.Cmd) ([]byte, error) {
+			switch {
+			case isPsCmd(cmd.Args):
+				return []byte(psOut), nil
+			case isStatsCmd(cmd.Args):
+				return []byte(statsOut), nil
+			default:
+				return nil, fmt.Errorf("unexpected cmd: %v", cmd.Args)
+			}
+		},
+	}
+	got, err := c.ContainerStats(context.Background())
+	if err != nil {
+		t.Fatalf("ContainerStats error: %v", err)
+	}
+	api, ok := got["api"]
+	if !ok {
+		t.Fatalf("missing api in result (short-ID join failed): %v", got)
+	}
+	if api.CPUPercent != 4.2 {
+		t.Errorf("api CPU = %v, want 4.2", api.CPUPercent)
+	}
+}
+
+func TestContainerStats_remote_passthrough(t *testing.T) {
+	// Verify the remote variant joins the same way as local.
+	psOut := `[{"ID":"abc123def456","Service":"api","State":"running"}]`
+	statsOut := `{"ID":"abc123def456","Name":"proj-api-1","CPUPerc":"4.20%","MemUsage":"124MiB / 512MiB"}`
+	rc := &RemoteCompose{
+		Host:       "user@example.com",
+		ProjectDir: "/app",
+		SocketPath: "/tmp/cdeploy-ctrl-abc-99",
+		outputCmd: func(cmd *exec.Cmd) ([]byte, error) {
+			// Remote: outputCmd is invoked twice — once for ps (via remoteCommand)
+			// and once for stats (via direct sshArgs). The remote argv embeds the
+			// docker command as a single shell string (last arg), so check for "ps"
+			// vs "stats" substring in that string.
+			if len(cmd.Args) == 0 {
+				return nil, fmt.Errorf("empty argv")
+			}
+			last := cmd.Args[len(cmd.Args)-1]
+			switch {
+			case strings.Contains(last, "stats"):
+				return []byte(statsOut), nil
+			case strings.Contains(last, "ps"):
+				return []byte(psOut), nil
+			default:
+				return nil, fmt.Errorf("unexpected remote cmd last arg: %q", last)
+			}
+		},
+	}
+	got, err := rc.ContainerStats(context.Background())
+	if err != nil {
+		t.Fatalf("ContainerStats error: %v", err)
+	}
+	api, ok := got["api"]
+	if !ok {
+		t.Fatalf("missing api in result: %v", got)
+	}
+	if api.CPUPercent != 4.2 {
+		t.Errorf("api CPU = %v, want 4.2", api.CPUPercent)
+	}
+	if api.MemoryUsed != 130023424 {
+		t.Errorf("api MemoryUsed = %d, want 130023424", api.MemoryUsed)
+	}
+}

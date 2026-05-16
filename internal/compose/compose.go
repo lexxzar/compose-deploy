@@ -351,6 +351,7 @@ func (c *Compose) command(ctx context.Context, args ...string) *exec.Cmd {
 
 // psEntry matches the JSON schema of `docker compose ps --format json`.
 type psEntry struct {
+	ID         string        `json:"ID"`
 	Service    string        `json:"Service"`
 	State      string        `json:"State"`
 	Health     string        `json:"Health"`
@@ -686,12 +687,35 @@ func (c *Compose) ContainerStatus(ctx context.Context) (map[string]runner.Servic
 	return parseContainerStatus(out)
 }
 
-// ContainerStats returns CPU and memory usage for each running service.
-// Stub implementation — replaced in Task 5 of the container-cpu-mem-stats plan.
-// Returns an empty map until then so the runner.Composer compile-time check passes.
+// ContainerStats returns CPU and memory usage for each running service in this
+// project. It fetches the project's container IDs via `docker compose ps`, calls
+// AllContainerStats to retrieve host-wide stats, then joins by container ID and
+// sum-aggregates CPU%, MemoryUsed, and MemoryLimit across replicas of each
+// service. Stopped containers (absent from `docker stats`) are not included in
+// the result. Services whose containers appear in `ps` but are missing from the
+// stats map (e.g. stopped between the two calls) are silently skipped — this is
+// not an error, since the goal is to surface live usage.
 func (c *Compose) ContainerStats(ctx context.Context) (map[string]runner.ServiceStats, error) {
-	_ = ctx
-	return map[string]runner.ServiceStats{}, nil
+	cmd := c.command(ctx, "ps", "-a", "--format", "json")
+	var out []byte
+	var err error
+	if c.outputCmd != nil {
+		out, err = c.outputCmd(cmd)
+	} else {
+		out, err = cmd.Output()
+	}
+	if err != nil {
+		return nil, fmt.Errorf("listing project containers for stats: %w", withStderr(err))
+	}
+	idToService, err := parsePsIDToService(out)
+	if err != nil {
+		return nil, err
+	}
+	all, err := AllContainerStats(ctx, c)
+	if err != nil {
+		return nil, err
+	}
+	return aggregateStatsByService(idToService, all), nil
 }
 
 // healthPriority returns a numeric priority for health values.

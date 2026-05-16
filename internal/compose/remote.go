@@ -290,12 +290,32 @@ func (r *RemoteCompose) ContainerStatus(ctx context.Context) (map[string]runner.
 	return parseContainerStatus(out)
 }
 
-// ContainerStats returns CPU and memory usage for each running service.
-// Stub implementation — replaced in Task 5 of the container-cpu-mem-stats plan.
-// Returns an empty map until then so the runner.Composer compile-time check passes.
+// ContainerStats returns CPU and memory usage for each running service in this
+// remote project. It fetches the project's container IDs via `docker compose ps`,
+// calls AllContainerStatsRemote to retrieve host-wide stats over the same SSH
+// ControlMaster connection, then joins by container ID and sum-aggregates per
+// service. See Compose.ContainerStats for the full contract.
 func (r *RemoteCompose) ContainerStats(ctx context.Context) (map[string]runner.ServiceStats, error) {
-	_ = ctx
-	return map[string]runner.ServiceStats{}, nil
+	cmd := r.remoteCommand(ctx, "ps", "-a", "--format", "json")
+	var out []byte
+	var err error
+	if r.outputCmd != nil {
+		out, err = r.outputCmd(cmd)
+	} else {
+		out, err = cmd.Output()
+	}
+	if err != nil {
+		return nil, fmt.Errorf("listing remote project containers for stats: %w", withStderr(err))
+	}
+	idToService, err := parsePsIDToService(out)
+	if err != nil {
+		return nil, err
+	}
+	all, err := AllContainerStatsRemote(ctx, r)
+	if err != nil {
+		return nil, err
+	}
+	return aggregateStatsByService(idToService, all), nil
 }
 
 // findRemoteComposeFile runs a single SSH command that probes all compose file
