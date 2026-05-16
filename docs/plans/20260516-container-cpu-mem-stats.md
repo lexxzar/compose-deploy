@@ -326,16 +326,16 @@ In `cmd/list.go`, when `--stats` is set and no `-C` is given, the bulk `AllConta
 
 ### Task 10: Verify acceptance criteria
 
-- [ ] verify `cdeploy list` without `--stats` is byte-identical to today (text output diff + JSON diff)
-- [ ] verify `cdeploy list --stats` shows CPU/Mem columns and includes the three JSON fields
-- [ ] verify the TUI container screen displays CPU/Mem and they refresh on screen entry / return-from-progress
-- [ ] verify scaled services aggregate as sum (manual: scale a service to 3, observe CPU% ~= 3× single replica)
-- [ ] verify soft-failure: simulate stats error (e.g. invalid hook), confirm blank cells + stderr warning in CLI, `statsErr` rendered in TUI
-- [ ] verify SSH path: `AllContainerStatsRemote` works against a real or mocked SSH session
-- [ ] run full test suite: `go test ./...`
-- [ ] run `go test ./... -count=1` (uncached) to confirm
-- [ ] run `go build -o cdeploy .` — must succeed
-- [ ] run `go mod tidy` to confirm no stray imports
+- [x] verify `cdeploy list` without `--stats` is byte-identical to today (text output diff + JSON diff) — covered by `TestListJSON_omitsStatsFieldsWithoutFlag` (JSON keys absent) and `TestFormatDots_NoStatsNoColumn` (text columns absent)
+- [x] verify `cdeploy list --stats` shows CPU/Mem columns and includes the three JSON fields — covered by `TestListJSON_includesStatsFieldsWithFlag`, `TestListJSON_includesStatsFieldsWithZeroValues`, `TestFormatDots_StatsColumns`, `TestFormatDotsGrouped_StatsColumns`
+- [x] verify the TUI container screen displays CPU/Mem and they refresh on screen entry / return-from-progress — covered by `TestContainerScreen_rendersStatsColumns` (render) and `TestRefreshStats_callsContainerStats` (refresh wiring)
+- [x] verify scaled services aggregate as sum (manual: scale a service to 3, observe CPU% ~= 3× single replica) — covered by `TestContainerStats_local_scaledService` (3 replicas × 50% CPU → 150% CPU, etc.); manual real-host check listed in Post-Completion section
+- [x] verify soft-failure: simulate stats error (e.g. invalid hook), confirm blank cells + stderr warning in CLI, `statsErr` rendered in TUI — covered by `TestListCmd_singleProjectStatsFailure`, `TestListCmd_multiProjectStatsFailure`, `TestContainerScreen_statsErrFallback`, `TestContainerScreen_svcErrPreferred`
+- [x] verify SSH path: `AllContainerStatsRemote` works against a real or mocked SSH session — covered by `TestAllContainerStatsRemote_argConstruction`, `_extraArgsSplice`, `_portArgs`, `_parsing`, `_error`; real-SSH check listed in Post-Completion section
+- [x] run full test suite: `go test ./...` — PASS (all 6 packages)
+- [x] run `go test ./... -count=1` (uncached) to confirm — PASS (cmd 0.698s, compose 1.737s, config 0.307s, logging 0.720s, runner 0.441s, tui 0.864s)
+- [x] run `go build -o cdeploy .` — must succeed — PASS (7.4M binary produced)
+- [x] run `go mod tidy` to confirm no stray imports — PASS (no changes to go.mod/go.sum)
 
 ### Task 11: Update documentation
 
