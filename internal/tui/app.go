@@ -659,7 +659,7 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		case screenSelectServer:
 			return m, tea.Quit
 		case screenSelectProject:
-			if len(m.servers) == 0 {
+			if len(m.servers) == 0 && m.config == nil {
 				return m, tea.Quit
 			}
 			key = "esc"
@@ -741,7 +741,7 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		case "ctrl+c":
 			return m.tryQuit()
 		case "esc":
-			if len(m.servers) > 0 {
+			if len(m.servers) > 0 || m.config != nil {
 				// Back to server screen — disconnect if remote
 				disconnectFn := m.disconnectFunc
 				m.screen = screenSelectServer
@@ -1844,7 +1844,7 @@ func (m Model) viewSelectProject() string {
 	if m.projErr != nil {
 		b.WriteString(stepFailed.Render(fmt.Sprintf("  Error: %v\n", m.projErr)))
 		help := "  q quit"
-		if len(m.servers) > 0 {
+		if len(m.servers) > 0 || m.config != nil {
 			help = "  q back"
 		}
 		b.WriteString(helpStyle.Render("\n" + help))
@@ -1854,7 +1854,7 @@ func (m Model) viewSelectProject() string {
 	if len(m.projects) == 0 {
 		b.WriteString("  No Docker Compose projects found\n")
 		help := "  q quit"
-		if len(m.servers) > 0 {
+		if len(m.servers) > 0 || m.config != nil {
 			help = "  q back"
 		}
 		b.WriteString(helpStyle.Render("\n" + help))
@@ -1883,7 +1883,7 @@ func (m Model) viewSelectProject() string {
 	}
 
 	helpText := "\n  up/down navigate  •  enter select  •  q quit"
-	if len(m.servers) > 0 {
+	if len(m.servers) > 0 || m.config != nil {
 		helpText = "\n  up/down navigate  •  enter select  •  q back"
 	}
 	b.WriteString(helpStyle.Render(helpText))

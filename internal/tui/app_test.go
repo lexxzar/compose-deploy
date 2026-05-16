@@ -5860,6 +5860,48 @@ func TestQQuitsAtRoot_ProjectScreenNoServers(t *testing.T) {
 	}
 }
 
+func TestQBackNavigation_ProjectScreenWithEmptyConfig(t *testing.T) {
+	// When the config file exists but has no servers, NewModel starts on
+	// screenSelectServer (showing just the Local entry). Selecting Local
+	// transitions to screenSelectProject. Pressing q there must navigate
+	// back to server-select, not quit — because there IS a parent screen.
+	mc := &mockComposer{}
+	emptyCfg := &config.Config{}
+	m := NewModel(nil, io.Discard, mockFactory(mc), nil, nil, WithConfig(emptyCfg))
+	m.screen = screenSelectProject
+
+	updated, cmd := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'q'}})
+	um := updated.(Model)
+
+	if um.screen != screenSelectServer {
+		t.Errorf("screen = %d, want screenSelectServer", um.screen)
+	}
+	// No tea.Quit should be returned.
+	if cmd != nil {
+		if msg := cmd(); msg != nil {
+			if _, isQuit := msg.(tea.QuitMsg); isQuit {
+				t.Errorf("got tea.QuitMsg, expected back navigation")
+			}
+		}
+	}
+}
+
+func TestEscBackNavigation_ProjectScreenWithEmptyConfig(t *testing.T) {
+	// Same parent-exists condition for esc: when m.config != nil and
+	// len(servers) == 0, esc must still navigate back to server-select.
+	mc := &mockComposer{}
+	emptyCfg := &config.Config{}
+	m := NewModel(nil, io.Discard, mockFactory(mc), nil, nil, WithConfig(emptyCfg))
+	m.screen = screenSelectProject
+
+	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyEsc})
+	um := updated.(Model)
+
+	if um.screen != screenSelectServer {
+		t.Errorf("screen = %d, want screenSelectServer", um.screen)
+	}
+}
+
 func TestQQuitsAtRoot_ContainerScreenStandalone(t *testing.T) {
 	mc := &mockComposer{services: []string{"nginx"}}
 	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
