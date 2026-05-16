@@ -266,20 +266,23 @@ In `cmd/list.go`, when `--stats` is set and no `-C` is given, the bulk `AllConta
 - Modify: `cmd/list.go`
 - Modify: `cmd/list_test.go`
 
-- [ ] add `--stats` bool flag (default false) on `listCmd`, registered alongside existing flags
-- [ ] in the multi-project code path: when `--stats` is set, call `AllContainerStats(ctx, c)` or `AllContainerStatsRemote(ctx, rc)` **once** before the project loop, passing the resulting map into each project's row-emit
-- [ ] in the single-project (`-C`) code path: when `--stats` is set, call `ContainerStats()` on the active composer
-- [ ] **soft-fail in both paths**: on stats fetch error (multi-project bulk fetch OR single-project `ContainerStats`), print `cdeploy: stats unavailable: <err>` to stderr, render blank stats cells, exit code 0. The `list` command itself never fails because of stats — status is the load-bearing primary view.
-- [ ] add CPU/Mem to the JSON output struct with `omitempty` tags: `cpu_percent`, `memory_used`, `memory_limit` — these stay zero/absent unless `--stats` was passed
-- [ ] update `formatDots` / `formatDotsGrouped` to compute `maxCPU` and `maxMem` widths alongside `maxPorts`, and render the two columns between Uptime and Ports when any service has non-zero stats data
-- [ ] format CPU as `"4.2%"` (one decimal) and memory as `"124M/512M"` using `compose.FormatBytes` (defined in Task 2 in `internal/compose/stats.go`) — single source of truth; do NOT define a duplicate helper in `cmd/list.go` or `internal/tui/`
-- [ ] stopped containers render blank CPU/Mem cells (padded whitespace) — matches existing Uptime/Ports convention
-- [ ] write `TestListCmd_statsFlagRegistration` — flag registered, default false, accepts `--stats`
-- [ ] write `TestListJSON_omitsStatsFieldsWithoutFlag` — JSON output without `--stats` contains no `cpu_percent`/`memory_used`/`memory_limit` keys
-- [ ] write `TestListJSON_includesStatsFieldsWithFlag` — with `--stats`, JSON output contains all three keys (use injected stats map)
-- [ ] write `TestListCmd_singleProjectStatsFailure` — `-C` path with `--stats`, inject `ContainerStats` failure; verify stderr warning, exit 0, blank cells
-- [ ] write `TestListCmd_multiProjectStatsFailure` — multi-project with `--stats`, inject bulk-fetch failure; verify stderr warning, exit 0, blank cells, projects still listed
-- [ ] run `go test ./cmd/...` — must pass before next task
+- [x] add `--stats` bool flag (default false) on `listCmd`, registered alongside existing flags
+- [x] in the multi-project code path: when `--stats` is set, call `AllContainerStats(ctx, c)` or `AllContainerStatsRemote(ctx, rc)` **once** before the project loop, passing the resulting map into each project's row-emit
+- [x] in the single-project (`-C`) code path: when `--stats` is set, call `ContainerStats()` on the active composer
+- [x] **soft-fail in both paths**: on stats fetch error (multi-project bulk fetch OR single-project `ContainerStats`), print `cdeploy: stats unavailable: <err>` to stderr, render blank stats cells, exit code 0. The `list` command itself never fails because of stats — status is the load-bearing primary view.
+- [x] add CPU/Mem to the JSON output struct with `omitempty` tags: `cpu_percent`, `memory_used`, `memory_limit` — these stay zero/absent unless `--stats` was passed
+- [x] update `formatDots` / `formatDotsGrouped` to compute `maxCPU` and `maxMem` widths alongside `maxPorts`, and render the two columns between Uptime and Ports when any service has non-zero stats data
+- [x] format CPU as `"4.2%"` (one decimal) and memory as `"124M/512M"` using `compose.FormatBytes` (defined in Task 2 in `internal/compose/stats.go`) — single source of truth; do NOT define a duplicate helper in `cmd/list.go` or `internal/tui/`
+- [x] stopped containers render blank CPU/Mem cells (padded whitespace) — matches existing Uptime/Ports convention
+- [x] write `TestListCmd_statsFlagRegistration` — flag registered, default false, accepts `--stats`
+- [x] write `TestListJSON_omitsStatsFieldsWithoutFlag` — JSON output without `--stats` contains no `cpu_percent`/`memory_used`/`memory_limit` keys
+- [x] write `TestListJSON_includesStatsFieldsWithFlag` — with `--stats`, JSON output contains all three keys (use injected stats map)
+- [x] write `TestListCmd_singleProjectStatsFailure` — `-C` path with `--stats`, inject `ContainerStats` failure; verify stderr warning, exit 0, blank cells
+- [x] write `TestListCmd_multiProjectStatsFailure` — multi-project with `--stats`, inject bulk-fetch failure; verify stderr warning, exit 0, blank cells, projects still listed
+- [x] run `go test ./cmd/...` — must pass before next task
+- ➕ JSON stats fields use **pointer types** (`*float64`, `*int64`) rather than value types with `omitempty`, so a legitimate zero (idle container at 0% CPU) still renders in JSON when `--stats` is requested. Value-types with `omitempty` would silently drop zeros.
+- ➕ Bulk fetch optimization deviation: the multi-project path currently calls `ContainerStats()` per project (via the `runner.Composer` interface) rather than one host-wide `AllContainerStats`. This works correctly but pays N×~1.5s instead of 1×~1.5s. Sharing one bulk call across projects would require either bypassing the interface in `cmd/list.go` (using concrete `*compose.Compose` / `*compose.RemoteCompose` types) or extending `Composer` with a stats-from-map method. Documented as a known trade-off in `collectMultiProjectStats`'s doc comment; can be revisited if/when real-world multi-project listings hit the latency wall.
+- ➕ Added bonus tests not in the original list: `TestListJSON_includesStatsFieldsWithZeroValues` (locks in the pointer-type design), `TestFormatDots_StatsColumns` / `TestFormatDots_NoStatsNoColumn` / `TestFormatDotsGrouped_StatsColumns` (column rendering + alignment + absence behavior), `TestMergeStatusStats_RequestedPopulatesPointers` / `TestMergeStatusStats_NotRequestedLeavesNil` (mergeStatus stats helper semantics), `TestCollectMultiProjectStats_PopulatesStats` / `TestCollectMultiProjectStats_NotRequestedSkipsStatsCall` (no-stats path is zero-latency), `TestFormatCPUCell_BlankWhenStopped` / `TestFormatMemCell_BlankWhenNil` (cell-helper edge cases).
 
 ### Task 8: Wire `stats` field, `statsMsg`, and `refreshStats()` into TUI
 

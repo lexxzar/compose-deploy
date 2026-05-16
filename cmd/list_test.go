@@ -588,6 +588,8 @@ func TestMergeStatus_CopiesCreatedAndUptime(t *testing.T) {
 type mockComposer struct {
 	services []string
 	status   map[string]runner.ServiceStatus
+	stats    map[string]runner.ServiceStats
+	statsErr error
 	err      error
 }
 
@@ -606,7 +608,10 @@ func (m *mockComposer) ContainerStatus(_ context.Context) (map[string]runner.Ser
 }
 
 func (m *mockComposer) ContainerStats(_ context.Context) (map[string]runner.ServiceStats, error) {
-	return nil, nil
+	if m.statsErr != nil {
+		return nil, m.statsErr
+	}
+	return m.stats, nil
 }
 
 func (m *mockComposer) Stop(_ context.Context, _ []string, _ io.Writer) error   { return nil }
@@ -775,7 +780,7 @@ func TestListCmd_ExplicitProjectDir_NoComposeFile(t *testing.T) {
 	projectDir = dir
 	t.Cleanup(func() { projectDir = old })
 
-	err := runList(context.Background(), false)
+	err := runList(context.Background(), false, false)
 	if err == nil {
 		t.Fatal("expected error when -C points to directory without compose file")
 	}
@@ -816,7 +821,7 @@ func TestListSingleProject_Dots(t *testing.T) {
 	}
 
 	out := captureStdout(t, func() {
-		err := listSingleProject(context.Background(), mock, false)
+		err := listSingleProject(context.Background(), mock, false, false)
 		if err != nil {
 			t.Errorf("unexpected error: %v", err)
 		}
@@ -840,7 +845,7 @@ func TestListSingleProject_JSON(t *testing.T) {
 	}
 
 	out := captureStdout(t, func() {
-		err := listSingleProject(context.Background(), mock, true)
+		err := listSingleProject(context.Background(), mock, true, false)
 		if err != nil {
 			t.Errorf("unexpected error: %v", err)
 		}
@@ -858,7 +863,7 @@ func TestListSingleProject_JSON(t *testing.T) {
 func TestListSingleProject_ListServicesError(t *testing.T) {
 	mock := &mockComposer{err: fmt.Errorf("docker down")}
 
-	err := listSingleProject(context.Background(), mock, false)
+	err := listSingleProject(context.Background(), mock, false, false)
 	if err == nil {
 		t.Fatal("expected error, got nil")
 	}
@@ -874,7 +879,7 @@ func TestListSingleProject_ContainerStatusError(t *testing.T) {
 		statusErr: fmt.Errorf("connection lost"),
 	}
 
-	err := listSingleProject(context.Background(), statusErr, false)
+	err := listSingleProject(context.Background(), statusErr, false, false)
 	if err == nil {
 		t.Fatal("expected error, got nil")
 	}
@@ -995,7 +1000,7 @@ func TestRunList_LocalSingleProject(t *testing.T) {
 	projectDir = "/explicit/dir"
 
 	out := captureStdout(t, func() {
-		err := runList(context.Background(), false)
+		err := runList(context.Background(), false, false)
 		if err != nil {
 			t.Errorf("unexpected error: %v", err)
 		}
@@ -1044,7 +1049,7 @@ func TestRunList_LocalDiscoveryFromComposeDir(t *testing.T) {
 	projectDir = ""
 
 	out := captureStdout(t, func() {
-		err := runList(context.Background(), false)
+		err := runList(context.Background(), false, false)
 		if err != nil {
 			t.Errorf("unexpected error: %v", err)
 		}
@@ -1105,7 +1110,7 @@ func TestRunList_LocalMultiProject(t *testing.T) {
 	projectDir = ""
 
 	out := captureStdout(t, func() {
-		err := runList(context.Background(), false)
+		err := runList(context.Background(), false, false)
 		if err != nil {
 			t.Errorf("unexpected error: %v", err)
 		}
@@ -1153,7 +1158,7 @@ func TestRunList_LocalMultiProject_JSON(t *testing.T) {
 	projectDir = ""
 
 	out := captureStdout(t, func() {
-		err := runList(context.Background(), true)
+		err := runList(context.Background(), true, false)
 		if err != nil {
 			t.Errorf("unexpected error: %v", err)
 		}
@@ -1195,7 +1200,7 @@ func TestRunList_LocalListProjectsError(t *testing.T) {
 	}
 	projectDir = ""
 
-	err := runList(context.Background(), false)
+	err := runList(context.Background(), false, false)
 	if err == nil {
 		t.Fatal("expected error, got nil")
 	}
@@ -1231,7 +1236,7 @@ func TestRunList_LocalNoProjects(t *testing.T) {
 	}
 	projectDir = ""
 
-	err := runList(context.Background(), false)
+	err := runList(context.Background(), false, false)
 	if err == nil {
 		t.Fatal("expected error, got nil")
 	}
@@ -1266,7 +1271,7 @@ func TestRunList_LocalDetectFailure(t *testing.T) {
 	projectDir = "/explicit/dir"
 	serverName = ""
 
-	err := runList(context.Background(), false)
+	err := runList(context.Background(), false, false)
 	if err == nil {
 		t.Fatal("expected error when Detect fails")
 	}
@@ -1301,7 +1306,7 @@ func TestRunList_LocalMultiProjectDetectFailure(t *testing.T) {
 	projectDir = ""
 	serverName = ""
 
-	err := runList(context.Background(), false)
+	err := runList(context.Background(), false, false)
 	if err == nil {
 		t.Fatal("expected error when Detect fails")
 	}
@@ -1362,7 +1367,7 @@ func TestRunList_ServerSingleProject(t *testing.T) {
 	}
 
 	out := captureStdout(t, func() {
-		err := runList(context.Background(), false)
+		err := runList(context.Background(), false, false)
 		if err != nil {
 			t.Errorf("unexpected error: %v", err)
 		}
@@ -1426,7 +1431,7 @@ func TestRunList_ServerMultiProject(t *testing.T) {
 	}
 
 	out := captureStdout(t, func() {
-		err := runList(context.Background(), false)
+		err := runList(context.Background(), false, false)
 		if err != nil {
 			t.Errorf("unexpected error: %v", err)
 		}
@@ -1468,7 +1473,7 @@ func TestListCmd_RemoteIgnoresServerProjectDir(t *testing.T) {
 	}
 	t.Cleanup(func() { listNewRemote = oldNewRemote })
 
-	_ = runList(context.Background(), false)
+	_ = runList(context.Background(), false, false)
 
 	if capturedProjDir != "" {
 		t.Errorf("listNewRemote received projDir = %q, want empty (server.ProjectDir should be ignored)", capturedProjDir)
@@ -1489,7 +1494,7 @@ func TestRunList_SSHAndServerMutex(t *testing.T) {
 	sshTarget = "user@host"
 	projectDir = "/srv/app"
 
-	err := runList(context.Background(), false)
+	err := runList(context.Background(), false, false)
 	if err == nil {
 		t.Fatal("expected mutex error, got nil")
 	}
@@ -1512,7 +1517,7 @@ func TestRunList_SSHRequiresProjectDir(t *testing.T) {
 	sshTarget = "user@host"
 	projectDir = ""
 
-	err := runList(context.Background(), false)
+	err := runList(context.Background(), false, false)
 	if err == nil {
 		t.Fatal("expected error, got nil")
 	}
@@ -1562,7 +1567,7 @@ func TestRunList_SSHHappyPath(t *testing.T) {
 		return rc
 	}
 
-	if err := runList(context.Background(), false); err != nil {
+	if err := runList(context.Background(), false, false); err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 
@@ -1825,7 +1830,7 @@ func TestRunList_SSHHappyPathWithIdentity(t *testing.T) {
 		return rc
 	}
 
-	if err := runList(context.Background(), false); err != nil {
+	if err := runList(context.Background(), false, false); err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 	if capturedConfigArgs == nil {
@@ -1857,7 +1862,7 @@ func TestList_IdentityWithoutSSH(t *testing.T) {
 	projectDir = ""
 	identityFile = "/tmp/k"
 
-	err := runList(context.Background(), false)
+	err := runList(context.Background(), false, false)
 	if err == nil {
 		t.Fatal("expected error when --identity is set without --ssh")
 	}
@@ -1879,5 +1884,455 @@ func TestListCmd_SSHFlagInherited(t *testing.T) {
 	}
 	if sshFlag != nil && sshFlag.Shorthand != "S" {
 		t.Errorf("--ssh shorthand = %q, want %q", sshFlag.Shorthand, "S")
+	}
+}
+
+// TestListCmd_statsFlagRegistration verifies the --stats flag is registered
+// on `list` with a `false` default.
+func TestListCmd_statsFlagRegistration(t *testing.T) {
+	cmd := NewRootCmd()
+
+	var listCmd *cobra.Command
+	for _, sub := range cmd.Commands() {
+		if sub.Name() == "list" {
+			listCmd = sub
+			break
+		}
+	}
+	if listCmd == nil {
+		t.Fatal("list subcommand not found")
+	}
+
+	flag := listCmd.Flags().Lookup("stats")
+	if flag == nil {
+		t.Fatal("--stats flag not registered on list")
+	}
+	if flag.DefValue != "false" {
+		t.Errorf("--stats default = %q, want %q", flag.DefValue, "false")
+	}
+	// Verify the flag actually accepts being set via Set() — sanity check it's a Bool flag.
+	if err := flag.Value.Set("true"); err != nil {
+		t.Errorf("setting --stats=true failed: %v", err)
+	}
+	if flag.Value.String() != "true" {
+		t.Errorf("--stats after Set('true') = %q, want %q", flag.Value.String(), "true")
+	}
+}
+
+// TestListJSON_omitsStatsFieldsWithoutFlag verifies that without --stats the
+// JSON output contains none of the cpu_percent / memory_used / memory_limit
+// keys, preserving wire-shape compatibility.
+func TestListJSON_omitsStatsFieldsWithoutFlag(t *testing.T) {
+	mock := &mockComposer{
+		services: []string{"web"},
+		status:   map[string]runner.ServiceStatus{"web": {Running: true}},
+		// stats deliberately populated, but showStats=false should ignore them.
+		stats: map[string]runner.ServiceStats{
+			"web": {CPUPercent: 12.5, MemoryUsed: 100, MemoryLimit: 1000},
+		},
+	}
+
+	out := captureStdout(t, func() {
+		if err := listSingleProject(context.Background(), mock, true, false); err != nil {
+			t.Errorf("unexpected error: %v", err)
+		}
+	})
+
+	for _, key := range []string{`"cpu_percent"`, `"memory_used"`, `"memory_limit"`} {
+		if strings.Contains(out, key) {
+			t.Errorf("JSON without --stats must not contain %s, got: %s", key, out)
+		}
+	}
+}
+
+// TestListJSON_includesStatsFieldsWithFlag verifies that with --stats the
+// JSON output contains the three stats keys with values from the stats map.
+func TestListJSON_includesStatsFieldsWithFlag(t *testing.T) {
+	mock := &mockComposer{
+		services: []string{"web"},
+		status:   map[string]runner.ServiceStatus{"web": {Running: true}},
+		stats: map[string]runner.ServiceStats{
+			"web": {CPUPercent: 12.5, MemoryUsed: 130023424, MemoryLimit: 536870912},
+		},
+	}
+
+	out := captureStdout(t, func() {
+		if err := listSingleProject(context.Background(), mock, true, true); err != nil {
+			t.Errorf("unexpected error: %v", err)
+		}
+	})
+
+	for _, key := range []string{`"cpu_percent"`, `"memory_used"`, `"memory_limit"`} {
+		if !strings.Contains(out, key) {
+			t.Errorf("JSON with --stats must contain %s, got: %s", key, out)
+		}
+	}
+
+	// Round-trip the JSON and confirm the values match.
+	var got []serviceStatus
+	if err := json.Unmarshal([]byte(strings.TrimSpace(out)), &got); err != nil {
+		t.Fatalf("invalid JSON output: %v\nraw: %q", err, out)
+	}
+	if len(got) != 1 {
+		t.Fatalf("got %d items, want 1", len(got))
+	}
+	if got[0].CPUPercent == nil || *got[0].CPUPercent != 12.5 {
+		t.Errorf("CPUPercent = %v, want 12.5", got[0].CPUPercent)
+	}
+	if got[0].MemoryUsed == nil || *got[0].MemoryUsed != 130023424 {
+		t.Errorf("MemoryUsed = %v, want 130023424", got[0].MemoryUsed)
+	}
+	if got[0].MemoryLimit == nil || *got[0].MemoryLimit != 536870912 {
+		t.Errorf("MemoryLimit = %v, want 536870912", got[0].MemoryLimit)
+	}
+}
+
+// TestListJSON_includesStatsFieldsWithZeroValues verifies that --stats emits
+// stats fields even when the values are zero (idle container at 0% CPU). This
+// is the key reason pointer types are used on the JSON struct — value-types
+// with omitempty would silently drop legitimate zeros.
+func TestListJSON_includesStatsFieldsWithZeroValues(t *testing.T) {
+	mock := &mockComposer{
+		services: []string{"idle"},
+		status:   map[string]runner.ServiceStatus{"idle": {Running: true}},
+		stats: map[string]runner.ServiceStats{
+			"idle": {CPUPercent: 0, MemoryUsed: 0, MemoryLimit: 0},
+		},
+	}
+
+	out := captureStdout(t, func() {
+		if err := listSingleProject(context.Background(), mock, true, true); err != nil {
+			t.Errorf("unexpected error: %v", err)
+		}
+	})
+
+	for _, key := range []string{`"cpu_percent"`, `"memory_used"`, `"memory_limit"`} {
+		if !strings.Contains(out, key) {
+			t.Errorf("zero-valued stats with --stats must still appear in JSON: missing %s, got: %s", key, out)
+		}
+	}
+}
+
+// TestListCmd_singleProjectStatsFailure verifies that on stats failure in
+// single-project mode, the command exits 0 with a stderr warning and the
+// listing still renders without stats values.
+func TestListCmd_singleProjectStatsFailure(t *testing.T) {
+	mock := &mockComposer{
+		services: []string{"web"},
+		status:   map[string]runner.ServiceStatus{"web": {Running: true}},
+		statsErr: fmt.Errorf("docker stats failed: connection refused"),
+	}
+
+	// Capture stderr to verify the warning is emitted.
+	oldStderr := os.Stderr
+	rErr, wErr, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	os.Stderr = wErr
+	t.Cleanup(func() { os.Stderr = oldStderr })
+
+	stdout := captureStdout(t, func() {
+		if err := listSingleProject(context.Background(), mock, false, true); err != nil {
+			t.Errorf("listSingleProject must not return error on stats fail, got: %v", err)
+		}
+	})
+	wErr.Close()
+	os.Stderr = oldStderr
+
+	var stderrBuf strings.Builder
+	if _, err := io.Copy(&stderrBuf, rErr); err != nil {
+		t.Fatal(err)
+	}
+	stderr := stderrBuf.String()
+
+	if !strings.Contains(stderr, "stats unavailable") {
+		t.Errorf("stderr missing stats warning, got: %q", stderr)
+	}
+	if !strings.Contains(stderr, "connection refused") {
+		t.Errorf("stderr missing underlying error, got: %q", stderr)
+	}
+	// Service line is still rendered.
+	if !strings.Contains(stdout, "web") {
+		t.Errorf("stdout missing service name on stats fail, got: %q", stdout)
+	}
+}
+
+// TestListCmd_multiProjectStatsFailure verifies a per-project stats failure
+// is non-fatal: the warning is emitted and other projects still render.
+func TestListCmd_multiProjectStatsFailure(t *testing.T) {
+	mocks := map[string]*mockComposer{
+		"/app1": {
+			services: []string{"web"},
+			status:   map[string]runner.ServiceStatus{"web": {Running: true}},
+			statsErr: fmt.Errorf("stats fetch failed"),
+		},
+		"/app2": {
+			services: []string{"api"},
+			status:   map[string]runner.ServiceStatus{"api": {Running: true}},
+			stats: map[string]runner.ServiceStats{
+				"api": {CPUPercent: 5.5, MemoryUsed: 1024, MemoryLimit: 4096},
+			},
+		},
+	}
+
+	projects := []compose.Project{
+		{Name: "app1", ConfigDir: "/app1"},
+		{Name: "app2", ConfigDir: "/app2"},
+	}
+	factory := func(dir string) runner.Composer { return mocks[dir] }
+
+	oldStderr := os.Stderr
+	rErr, wErr, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	os.Stderr = wErr
+	t.Cleanup(func() { os.Stderr = oldStderr })
+
+	result := collectMultiProjectStats(context.Background(), projects, factory, true)
+	wErr.Close()
+	os.Stderr = oldStderr
+
+	var stderrBuf strings.Builder
+	if _, err := io.Copy(&stderrBuf, rErr); err != nil {
+		t.Fatal(err)
+	}
+	stderr := stderrBuf.String()
+
+	if !strings.Contains(stderr, "stats unavailable") {
+		t.Errorf("stderr missing stats warning for app1, got: %q", stderr)
+	}
+	if !strings.Contains(stderr, "app1") {
+		t.Errorf("stderr warning should name failing project app1, got: %q", stderr)
+	}
+	// Both projects still in the result (app1's status fetch succeeded; only stats failed).
+	if len(result) != 2 {
+		t.Fatalf("got %d projects, want 2 (stats failure must not drop a project)", len(result))
+	}
+	// app2's stats came through.
+	for _, p := range result {
+		if p.Name == "app2" && len(p.Services) == 1 {
+			s := p.Services[0]
+			if s.CPUPercent == nil || *s.CPUPercent != 5.5 {
+				t.Errorf("app2/api CPUPercent = %v, want 5.5", s.CPUPercent)
+			}
+		}
+		if p.Name == "app1" && len(p.Services) == 1 {
+			s := p.Services[0]
+			// On stats failure, pointers are still set (to zero values) so the
+			// service renders blank cells without crashing the JSON consumer.
+			if s.CPUPercent == nil {
+				t.Errorf("app1/web CPUPercent should be non-nil zero (stats failure → blank cell), got nil")
+			} else if *s.CPUPercent != 0 {
+				t.Errorf("app1/web CPUPercent = %v, want 0 (stats failure → zero)", *s.CPUPercent)
+			}
+		}
+	}
+}
+
+// TestFormatDots_StatsColumns verifies CPU and Mem columns are rendered when
+// any service has stats data, with proper alignment.
+func TestFormatDots_StatsColumns(t *testing.T) {
+	cpu1 := 4.2
+	mem1 := int64(130023424) // 124M
+	lim1 := int64(536870912) // 512M
+	items := []serviceStatus{
+		{
+			Name: "web", Running: true,
+			CPUPercent: &cpu1, MemoryUsed: &mem1, MemoryLimit: &lim1,
+		},
+		{Name: "db", Running: false}, // stopped: stats fields nil → blank cells
+	}
+
+	out := formatDots(items)
+	lines := strings.Split(out, "\n")
+	if len(lines) != 2 {
+		t.Fatalf("lines = %d, want 2", len(lines))
+	}
+
+	if !strings.Contains(lines[0], "4.2%") {
+		t.Errorf("web line missing CPU%%, got: %q", lines[0])
+	}
+	if !strings.Contains(lines[0], "124M/512M") {
+		t.Errorf("web line missing memory cell, got: %q", lines[0])
+	}
+	// Stopped db must not display web's stats.
+	if strings.Contains(lines[1], "4.2%") || strings.Contains(lines[1], "124M") {
+		t.Errorf("stopped db must not show running stats, got: %q", lines[1])
+	}
+	// Lines must align (rune width equal).
+	w0 := utf8.RuneCountInString(lines[0])
+	w1 := utf8.RuneCountInString(lines[1])
+	if w0 != w1 {
+		t.Errorf("stats columns not aligned: w0=%d, w1=%d\n[0]: %q\n[1]: %q", w0, w1, lines[0], lines[1])
+	}
+}
+
+// TestFormatDots_NoStatsNoColumn verifies that when no service has stats
+// data (nil pointers), no CPU/Mem column is rendered.
+func TestFormatDots_NoStatsNoColumn(t *testing.T) {
+	items := []serviceStatus{
+		{Name: "web", Running: true, Created: "2024-01-15 09:30", Uptime: "3h"},
+		{Name: "db", Running: false, Created: "2024-01-14 08:00"},
+	}
+
+	out := formatDots(items)
+	if strings.Contains(out, "%") {
+		t.Errorf("output should not contain '%%' when no stats, got: %q", out)
+	}
+}
+
+// TestFormatDotsGrouped_StatsColumns verifies grouped (multi-project) output
+// renders CPU/Mem columns per project, with proper alignment.
+func TestFormatDotsGrouped_StatsColumns(t *testing.T) {
+	cpu := 7.5
+	mem := int64(1024 * 1024 * 50)  // 50M
+	lim := int64(1024 * 1024 * 256) // 256M
+	projects := []projectServices{
+		{
+			Name: "app",
+			Services: []serviceStatus{
+				{
+					Name: "web", Running: true,
+					CPUPercent: &cpu, MemoryUsed: &mem, MemoryLimit: &lim,
+				},
+				{Name: "db", Running: false},
+			},
+		},
+	}
+
+	out := formatDotsGrouped(projects)
+	if !strings.Contains(out, "7.5%") {
+		t.Errorf("grouped output missing CPU%%, got: %q", out)
+	}
+	if !strings.Contains(out, "50M/256M") {
+		t.Errorf("grouped output missing memory cell, got: %q", out)
+	}
+}
+
+// TestMergeStatusStats_RequestedPopulatesPointers verifies that when
+// statsRequested is true, every service gets non-nil pointers — even those
+// absent from the stats map (mapped to zero values so JSON consumers see
+// the fields consistently).
+func TestMergeStatusStats_RequestedPopulatesPointers(t *testing.T) {
+	services := []string{"web", "missing"}
+	status := map[string]runner.ServiceStatus{
+		"web":     {Running: true},
+		"missing": {Running: false},
+	}
+	stats := map[string]runner.ServiceStats{
+		"web": {CPUPercent: 1.5, MemoryUsed: 100, MemoryLimit: 1000},
+	}
+
+	got := mergeStatusStats(services, status, stats, true)
+
+	// alphabetical sort: "missing" < "web"
+	if got[0].Name != "missing" || got[1].Name != "web" {
+		t.Fatalf("order = [%s, %s], want [missing, web]", got[0].Name, got[1].Name)
+	}
+
+	// "missing" should have non-nil pointers (zero values) — fields appear in JSON.
+	if got[0].CPUPercent == nil || got[0].MemoryUsed == nil || got[0].MemoryLimit == nil {
+		t.Errorf("absent-from-stats service must have non-nil pointers, got %+v", got[0])
+	}
+	if got[0].CPUPercent != nil && *got[0].CPUPercent != 0 {
+		t.Errorf("absent service CPU = %v, want 0", *got[0].CPUPercent)
+	}
+
+	// "web" should have the actual values.
+	if got[1].CPUPercent == nil || *got[1].CPUPercent != 1.5 {
+		t.Errorf("web CPU = %v, want 1.5", got[1].CPUPercent)
+	}
+	if got[1].MemoryUsed == nil || *got[1].MemoryUsed != 100 {
+		t.Errorf("web MemoryUsed = %v, want 100", got[1].MemoryUsed)
+	}
+}
+
+// TestMergeStatusStats_NotRequestedLeavesNil verifies that when statsRequested
+// is false, stats pointers stay nil — preserving wire-shape compatibility for
+// callers that did not opt into --stats.
+func TestMergeStatusStats_NotRequestedLeavesNil(t *testing.T) {
+	services := []string{"web"}
+	status := map[string]runner.ServiceStatus{"web": {Running: true}}
+	stats := map[string]runner.ServiceStats{
+		"web": {CPUPercent: 99.9, MemoryUsed: 1, MemoryLimit: 1},
+	}
+
+	got := mergeStatusStats(services, status, stats, false)
+	if got[0].CPUPercent != nil || got[0].MemoryUsed != nil || got[0].MemoryLimit != nil {
+		t.Errorf("stats pointers must remain nil when not requested, got %+v", got[0])
+	}
+}
+
+// TestCollectMultiProjectStats_PopulatesStats verifies the multi-project
+// path threads stats through to each project's services.
+func TestCollectMultiProjectStats_PopulatesStats(t *testing.T) {
+	mocks := map[string]*mockComposer{
+		"/a": {
+			services: []string{"web"},
+			status:   map[string]runner.ServiceStatus{"web": {Running: true}},
+			stats:    map[string]runner.ServiceStats{"web": {CPUPercent: 3.3, MemoryUsed: 100, MemoryLimit: 1000}},
+		},
+	}
+	projects := []compose.Project{{Name: "a", ConfigDir: "/a"}}
+	factory := func(dir string) runner.Composer { return mocks[dir] }
+
+	result := collectMultiProjectStats(context.Background(), projects, factory, true)
+	if len(result) != 1 || len(result[0].Services) != 1 {
+		t.Fatalf("unexpected result shape: %+v", result)
+	}
+	s := result[0].Services[0]
+	if s.CPUPercent == nil || *s.CPUPercent != 3.3 {
+		t.Errorf("CPUPercent = %v, want 3.3", s.CPUPercent)
+	}
+}
+
+// TestCollectMultiProjectStats_NotRequestedSkipsStatsCall verifies that when
+// showStats is false, ContainerStats is not called (saves the host-wide stats
+// latency on the no-stats path).
+func TestCollectMultiProjectStats_NotRequestedSkipsStatsCall(t *testing.T) {
+	mock := &mockComposer{
+		services: []string{"web"},
+		status:   map[string]runner.ServiceStatus{"web": {Running: true}},
+		statsErr: fmt.Errorf("stats should not have been called"),
+	}
+	projects := []compose.Project{{Name: "a", ConfigDir: "/a"}}
+	factory := func(_ string) runner.Composer { return mock }
+
+	// With showStats=false, statsErr must not surface — ContainerStats() not invoked.
+	result := collectMultiProjectStats(context.Background(), projects, factory, false)
+	if len(result) != 1 || len(result[0].Services) != 1 {
+		t.Fatalf("unexpected result shape: %+v", result)
+	}
+	if result[0].Services[0].CPUPercent != nil {
+		t.Errorf("CPUPercent must be nil without --stats, got %v", result[0].Services[0].CPUPercent)
+	}
+}
+
+// TestFormatCPUCell_BlankWhenStopped verifies the CPU cell helper returns "" for
+// stopped services even if a CPU pointer is set (defensive: prevents stale
+// stats from leaking into a stopped row).
+func TestFormatCPUCell_BlankWhenStopped(t *testing.T) {
+	cpu := 5.5
+	s := serviceStatus{Name: "x", Running: false, CPUPercent: &cpu}
+	if got := formatCPUCell(s); got != "" {
+		t.Errorf("formatCPUCell stopped = %q, want empty", got)
+	}
+}
+
+// TestFormatMemCell_BlankWhenNil verifies the Mem cell helper returns "" when
+// either MemoryUsed or MemoryLimit is nil.
+func TestFormatMemCell_BlankWhenNil(t *testing.T) {
+	used := int64(100)
+	cases := []serviceStatus{
+		{Name: "a", Running: true},                                          // both nil
+		{Name: "b", Running: true, MemoryUsed: &used},                       // limit nil
+		{Name: "c", Running: false, MemoryUsed: &used, MemoryLimit: &used},  // not running
+	}
+	for _, c := range cases {
+		if got := formatMemCell(c); got != "" {
+			t.Errorf("%s: formatMemCell = %q, want empty", c.Name, got)
+		}
 	}
 }
