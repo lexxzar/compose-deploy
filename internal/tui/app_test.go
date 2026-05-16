@@ -5663,6 +5663,35 @@ func TestQBackNavigation_ContainerScreenCancelsConfirming(t *testing.T) {
 	}
 }
 
+func TestQBackNavigation_ContainerScreenCancelsPendingExec(t *testing.T) {
+	// q during the exec confirmation prompt should cancel both confirming
+	// and pendingExec, mirroring the esc handler at app.go:799-803.
+	mc := &mockComposer{}
+	m := NewModel(nil, io.Discard, mockFactory(mc), testServers, mockConnectCb(mc))
+	m.screen = screenSelectContainers
+	m.showPicker = true
+	m.services = []string{"nginx"}
+	m.selected = map[int]bool{0: true}
+	m.confirming = true
+	m.pendingExec = true
+
+	updated, cmd := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'q'}})
+	um := updated.(Model)
+
+	if um.confirming {
+		t.Error("confirming should be cancelled after q")
+	}
+	if um.pendingExec {
+		t.Error("pendingExec should be cancelled after q")
+	}
+	if um.screen != screenSelectContainers {
+		t.Errorf("screen = %d, want screenSelectContainers", um.screen)
+	}
+	if cmd != nil {
+		t.Errorf("expected nil command, got non-nil")
+	}
+}
+
 func TestQBackNavigation_LogsScreen(t *testing.T) {
 	mc := &mockComposer{}
 	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
@@ -5762,18 +5791,31 @@ func TestQBackNavigation_ProjectScreen(t *testing.T) {
 }
 
 func TestQBackNavigation_ProgressDoneReturnsToContainers(t *testing.T) {
-	mc := &mockComposer{services: []string{"nginx"}}
-	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
-	m.screen = screenProgress
-	m.done = true
-	m.services = []string{"nginx"}
-	m.selected = make(map[int]bool)
+	tests := []struct {
+		name string
+		done bool
+		fail bool
+	}{
+		{"done", true, false},
+		{"failed", false, true},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			mc := &mockComposer{services: []string{"nginx"}}
+			m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
+			m.screen = screenProgress
+			m.done = tc.done
+			m.failed = tc.fail
+			m.services = []string{"nginx"}
+			m.selected = make(map[int]bool)
 
-	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'q'}})
-	um := updated.(Model)
+			updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'q'}})
+			um := updated.(Model)
 
-	if um.screen != screenSelectContainers {
-		t.Errorf("screen = %d, want screenSelectContainers", um.screen)
+			if um.screen != screenSelectContainers {
+				t.Errorf("screen = %d, want screenSelectContainers", um.screen)
+			}
+		})
 	}
 }
 

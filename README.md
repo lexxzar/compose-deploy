@@ -46,7 +46,7 @@ The TUI walks through up to six screens:
 | Key | Action |
 |-----|--------|
 | `esc` | Back to the previous screen (cancels confirmation prompts; cancels in-flight operations on the progress screen) |
-| `q` | Back inside the app (alias for `esc` on nested screens); quits at root screens (server picker, or standalone containers/project when no servers are configured). Typeable inside settings form text inputs. |
+| `q` | Back inside the app (alias for `esc` on nested screens) — also cancels confirmation prompts. Quits at root screens (server picker, or standalone containers/project when no servers are configured). Typeable inside settings form text inputs. No-op on the progress screen while an operation is in flight (use `esc` to cancel). |
 | `ctrl+c` | Quit the app. When connected to a remote server, prompts to confirm the disconnect (`y` to quit, `n`/`esc` to cancel). |
 
 ### CLI Mode
