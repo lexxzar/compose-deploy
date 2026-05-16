@@ -178,10 +178,11 @@ type Model struct {
 	composerFactory ComposerFactory
 
 	// Screen 1: service select
-	services  []string
-	svcStatus map[string]runner.ServiceStatus // service name → status
-	stats     map[string]runner.ServiceStats  // service name → resource usage; populated asynchronously by refreshStats
-	statsErr  error                           // last error from ContainerStats; rendered in the same slot as svcErr (svcErr wins)
+	services     []string
+	svcStatus    map[string]runner.ServiceStatus // service name → status
+	stats        map[string]runner.ServiceStats  // service name → resource usage; populated asynchronously by refreshStats
+	statsErr     error                           // last error from ContainerStats; rendered in the same slot as svcErr (svcErr wins)
+	statsSession uint64                          // bumped on context change (project/server) so stale in-flight responses get filtered
 	selected  map[int]bool
 	svcCursor int
 	svcOffset int // index of first visible service in scroll window
@@ -271,8 +272,9 @@ type statusMsg struct {
 	err    error
 }
 type statsMsg struct {
-	stats map[string]runner.ServiceStats
-	err   error
+	stats   map[string]runner.ServiceStats
+	err     error
+	session uint64
 }
 type pipelineDoneMsg struct{}
 type logChunkMsg struct {
@@ -474,7 +476,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case statsMsg:
-		if m.screen != screenSelectContainers {
+		if m.screen != screenSelectContainers || msg.session != m.statsSession {
 			return m, nil
 		}
 		if msg.err != nil {
@@ -725,6 +727,7 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 				m.quitting = false
 				if m.localComposer != nil {
 					m.composer = m.localComposer
+					m.statsSession++
 					m.showPicker = true
 					m.screen = screenSelectContainers
 					return m, tea.Batch(m.loadServices(), m.refreshStats())
@@ -773,6 +776,7 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 				m.projectLoader = m.localProjectLoader
 				m.composerFactory = m.localFactory
 				m.composer = nil
+				m.statsSession++
 				m.projName = ""
 				m.projects = nil
 				m.projCursor = 0
@@ -801,6 +805,7 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			proj := m.projects[m.projCursor]
 			m.projName = proj.Name
 			m.composer = m.composerFactory(proj.ConfigDir)
+			m.statsSession++
 			m.screen = screenSelectContainers
 			return m, tea.Batch(m.loadServices(), m.refreshStats())
 		}
@@ -834,6 +839,7 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			if m.showPicker {
 				m.screen = screenSelectProject
 				m.composer = nil
+				m.statsSession++
 				m.projName = ""
 				m.services = nil
 				m.svcStatus = nil
@@ -1510,9 +1516,10 @@ func (m Model) refreshStatus() tea.Cmd {
 func (m Model) refreshStats() tea.Cmd {
 	ctx := m.ctx
 	c := m.composer
+	session := m.statsSession
 	return func() tea.Msg {
 		stats, err := c.ContainerStats(ctx)
-		return statsMsg{stats: stats, err: err}
+		return statsMsg{stats: stats, err: err, session: session}
 	}
 }
 

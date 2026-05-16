@@ -60,7 +60,7 @@ The TUI has six main screens, plus an inline settings editor reachable from scre
 
 1. **Server select** — choose a remote server or "Local" (only shown when servers are configured); press `s` to open the settings editor for managing servers
 2. **Project select** — pick a Docker Compose project (auto-skipped if the current directory has a compose file)
-3. **Service select** — pick services and choose an action (`r` restart, `d` deploy, `s` stop, `l` logs, `c` config, `x` exec)
+3. **Service select** — pick services and choose an action (`r` restart, `d` deploy, `s` stop, `l` logs, `c` config, `x` exec); also shows CPU% and Mem (used/limit) columns for running services, refreshed on screen entry and after every operation
 4. **Progress** — watch step-by-step execution with status indicators
 5. **Logs** — live-stream logs for the selected service
 6. **Config** — inspect or edit the compose file, toggle between raw and resolved config, and see validation status

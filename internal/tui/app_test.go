@@ -6545,6 +6545,89 @@ func TestEsc_clearsStats(t *testing.T) {
 	}
 }
 
+func TestStatsMsg_staleSessionIgnored(t *testing.T) {
+	mc := &mockComposer{}
+	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
+	m.screen = screenSelectContainers
+	m.statsSession = 5
+
+	result, _ := m.Update(statsMsg{
+		stats:   map[string]runner.ServiceStats{"web": {CPUPercent: 99}},
+		session: 3,
+	})
+	model := result.(Model)
+
+	if model.stats != nil {
+		t.Errorf("stats mutated for old-session msg: got %+v", model.stats)
+	}
+	if model.statsErr != nil {
+		t.Errorf("statsErr mutated for old-session msg: got %v", model.statsErr)
+	}
+}
+
+func TestStatsMsg_currentSessionAccepted(t *testing.T) {
+	mc := &mockComposer{}
+	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
+	m.screen = screenSelectContainers
+	m.statsSession = 7
+
+	result, _ := m.Update(statsMsg{
+		stats:   map[string]runner.ServiceStats{"web": {CPUPercent: 1.0}},
+		session: 7,
+	})
+	model := result.(Model)
+
+	if got := model.stats["web"].CPUPercent; got != 1.0 {
+		t.Errorf("stats[web].CPUPercent = %v, want 1.0", got)
+	}
+}
+
+func TestRefreshStats_capturesCurrentSession(t *testing.T) {
+	mc := &mockComposer{stats: map[string]runner.ServiceStats{"web": {CPUPercent: 1}}}
+	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
+	m.statsSession = 42
+
+	msg, ok := m.refreshStats()().(statsMsg)
+	if !ok {
+		t.Fatalf("expected statsMsg, got %T", m.refreshStats()())
+	}
+	if msg.session != 42 {
+		t.Errorf("captured session = %d, want 42", msg.session)
+	}
+}
+
+func TestProjectEnter_bumpsStatsSession(t *testing.T) {
+	mc := &mockComposer{}
+	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
+	m.screen = screenSelectProject
+	m.projects = []compose.Project{{Name: "proj", ConfigDir: "/tmp"}}
+	m.projCursor = 0
+	m.statsSession = 1
+
+	result, _ := m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	model := result.(Model)
+
+	if model.statsSession <= 1 {
+		t.Errorf("statsSession = %d, want > 1 after project enter", model.statsSession)
+	}
+}
+
+func TestEsc_bumpsStatsSession(t *testing.T) {
+	mc := &mockComposer{services: []string{"web"}}
+	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
+	m.screen = screenSelectContainers
+	m.showPicker = true
+	m.projects = []compose.Project{{Name: "proj"}}
+	m.statsSession = 10
+
+	result, _ := m.Update(tea.KeyMsg{Type: tea.KeyEsc})
+	model := result.(Model)
+
+	if model.statsSession <= 10 {
+		t.Errorf("statsSession = %d, want > 10 after esc back-nav", model.statsSession)
+	}
+}
+
 func TestRefreshStats_callsContainerStats(t *testing.T) {
 	want := map[string]runner.ServiceStats{
 		"web": {CPUPercent: 7.5, MemoryUsed: 1024 * 1024 * 100, MemoryLimit: 1024 * 1024 * 512},
