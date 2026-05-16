@@ -479,10 +479,12 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		if msg.err != nil {
 			m.statsErr = msg.err
+			m.fixSvcOffset()
 			return m, nil
 		}
 		m.statsErr = nil
 		m.stats = msg.stats
+		m.fixSvcOffset()
 		return m, nil
 
 	case stepEventMsg:

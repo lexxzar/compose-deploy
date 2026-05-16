@@ -2056,6 +2056,13 @@ func TestListCmd_singleProjectStatsFailure(t *testing.T) {
 	if !strings.Contains(stdout, "web") {
 		t.Errorf("stdout missing service name on stats fail, got: %q", stdout)
 	}
+	// Cells must be blank — not fake "0.0%" / "0B/0B" indistinguishable from a real idle reading.
+	if strings.Contains(stdout, "0.0%") {
+		t.Errorf("stats-fail output must not contain fake 0.0%% CPU value, got: %q", stdout)
+	}
+	if strings.Contains(stdout, "0B/0B") {
+		t.Errorf("stats-fail output must not contain fake 0B/0B mem value, got: %q", stdout)
+	}
 }
 
 // TestListCmd_multiProjectStatsFailure verifies a per-project stats failure
@@ -2120,12 +2127,18 @@ func TestListCmd_multiProjectStatsFailure(t *testing.T) {
 		}
 		if p.Name == "app1" && len(p.Services) == 1 {
 			s := p.Services[0]
-			// On stats failure, pointers are still set (to zero values) so the
-			// service renders blank cells without crashing the JSON consumer.
-			if s.CPUPercent == nil {
-				t.Errorf("app1/web CPUPercent should be non-nil zero (stats failure → blank cell), got nil")
-			} else if *s.CPUPercent != 0 {
-				t.Errorf("app1/web CPUPercent = %v, want 0 (stats failure → zero)", *s.CPUPercent)
+			// On stats failure (stats map is nil), pointers stay nil so:
+			//   - tabular cells render blank (formatCPUCell/formatMemCell short-circuit on nil)
+			//   - JSON consumers see fields omitted (omitempty on nil pointer)
+			// rather than fake "0.0%" / "0B/0B" indistinguishable from a real idle reading.
+			if s.CPUPercent != nil {
+				t.Errorf("app1/web CPUPercent should be nil on stats failure (blank cell), got %v", *s.CPUPercent)
+			}
+			if s.MemoryUsed != nil {
+				t.Errorf("app1/web MemoryUsed should be nil on stats failure (blank cell), got %v", *s.MemoryUsed)
+			}
+			if s.MemoryLimit != nil {
+				t.Errorf("app1/web MemoryLimit should be nil on stats failure (blank cell), got %v", *s.MemoryLimit)
 			}
 		}
 	}

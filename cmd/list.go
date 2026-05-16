@@ -68,7 +68,7 @@ func mergeStatusStats(services []string, status map[string]runner.ServiceStatus,
 			Uptime:  st.Uptime,
 			Ports:   st.Ports,
 		}
-		if statsRequested {
+		if statsRequested && stats != nil {
 			if s, ok := stats[svc]; ok {
 				cpu := s.CPUPercent
 				used := s.MemoryUsed
@@ -79,8 +79,11 @@ func mergeStatusStats(services []string, status map[string]runner.ServiceStatus,
 			} else {
 				// Service is absent from stats (stopped, or race window between
 				// ps and stats). Emit zero values so JSON consumers see the
-				// fields and tabular output shows blank cells consistently.
-				// Each pointer gets its own backing variable to avoid aliasing.
+				// fields and stopped services render blank via !Running in the
+				// cell formatters. Each pointer gets its own backing variable
+				// to avoid aliasing. When stats fetch failed entirely (stats
+				// is nil), this whole block is skipped so pointers stay nil
+				// — blank tabular cells, omitted JSON fields.
 				zeroF := 0.0
 				zeroUsed := int64(0)
 				zeroLimit := int64(0)
@@ -371,7 +374,7 @@ func listSingleProject(ctx context.Context, c runner.Composer, jsonOutput, showS
 		stats, err = c.ContainerStats(ctx)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "cdeploy: stats unavailable: %v\n", err)
-			stats = nil // fall through with empty stats map → blank cells
+			stats = nil // mergeStatusStats leaves pointers nil → blank cells, fields omitted from JSON
 		}
 	}
 
