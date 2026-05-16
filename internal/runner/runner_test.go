@@ -65,6 +65,10 @@ func (m *mockComposer) ContainerStatus(ctx context.Context) (map[string]ServiceS
 	}, nil
 }
 
+func (m *mockComposer) ContainerStats(ctx context.Context) (map[string]ServiceStats, error) {
+	return nil, nil
+}
+
 func (m *mockComposer) Logs(ctx context.Context, service string, follow bool, tail int, w io.Writer) error {
 	return nil
 }
@@ -256,6 +260,23 @@ func TestSteps_StopOnly(t *testing.T) {
 	want := []string{StepStopping}
 	if len(steps) != len(want) {
 		t.Fatalf("steps = %v, want %v", steps, want)
+	}
+}
+
+func TestMockComposer_ContainerStatsNilNil(t *testing.T) {
+	// Sanity check: the mock satisfies the Composer interface (compile-time
+	// via the var assignment below) and its no-op ContainerStats returns
+	// (nil, nil) so tests that don't care about stats can still drive the
+	// pipeline without injecting a stats fixture.
+	var _ Composer = (*mockComposer)(nil)
+
+	mc := &mockComposer{}
+	stats, err := mc.ContainerStats(context.Background())
+	if err != nil {
+		t.Errorf("ContainerStats err = %v, want nil", err)
+	}
+	if stats != nil {
+		t.Errorf("ContainerStats stats = %v, want nil", stats)
 	}
 }
 

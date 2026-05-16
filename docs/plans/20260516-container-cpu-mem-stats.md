@@ -159,11 +159,11 @@ In `cmd/list.go`, when `--stats` is set and no `-C` is given, the bulk `AllConta
 - Modify: `internal/runner/runner.go`
 - Modify: `internal/runner/runner_test.go`
 
-- [ ] add `ServiceStats` struct to `internal/runner/runner.go` (fields: `CPUPercent float64`, `MemoryUsed int64`, `MemoryLimit int64`) with doc comment covering scaled-service summation contract
-- [ ] add `ContainerStats(ctx context.Context) (map[string]ServiceStats, error)` to `Composer` interface with doc comment
-- [ ] update the test mock `Composer` in `internal/runner/runner_test.go` to include a no-op `ContainerStats` returning `(nil, nil)`
-- [ ] write a test asserting the mock's `ContainerStats` returns nil-nil (sanity check the interface is satisfied)
-- [ ] run `go test ./internal/runner/...` — must pass before next task
+- [x] add `ServiceStats` struct to `internal/runner/runner.go` (fields: `CPUPercent float64`, `MemoryUsed int64`, `MemoryLimit int64`) with doc comment covering scaled-service summation contract
+- [x] add `ContainerStats(ctx context.Context) (map[string]ServiceStats, error)` to `Composer` interface with doc comment
+- [x] update the test mock `Composer` in `internal/runner/runner_test.go` to include a no-op `ContainerStats` returning `(nil, nil)`
+- [x] write a test asserting the mock's `ContainerStats` returns nil-nil (sanity check the interface is satisfied)
+- [x] run `go test ./internal/runner/...` — must pass before next task
 
 ### Task 2: Implement `parseStatsOutput`, `parseSize`, `parseCPUPercent`, `formatBytes`
 
