@@ -2004,8 +2004,8 @@ func TestViewLogs_RendersBreadcrumb(t *testing.T) {
 	if !strings.Contains(v, "nginx") {
 		t.Error("view should contain service name 'nginx'")
 	}
-	if !strings.Contains(v, "esc back") {
-		t.Error("view should contain 'esc back' in help")
+	if !strings.Contains(v, "q back") {
+		t.Error("view should contain 'q back' in help")
 	}
 	if !strings.Contains(v, "G bottom") {
 		t.Error("view should contain 'G bottom' in help")
@@ -5855,6 +5855,26 @@ func TestQTypedIntoSettingsFormInput(t *testing.T) {
 	}
 	if !strings.Contains(um.settingsInputs[0].Value(), "q") {
 		t.Errorf("settingsInputs[0] = %q, want to contain %q", um.settingsInputs[0].Value(), "q")
+	}
+}
+
+func TestQBackNavigation_SettingsFormColorPicker(t *testing.T) {
+	// When the color picker is focused (settingsField == 4) no text input
+	// has focus, so q acts as back-nav to the settings list rather than
+	// being silently swallowed.
+	mc := &mockComposer{}
+	m := NewModel(nil, io.Discard, mockFactory(mc), testServers, mockConnectCb(mc))
+	m.screen = screenSettingsForm
+	m.config = &config.Config{Servers: testServers}
+	m.settingsInputs = initSettingsInputs()
+	m.settingsField = 4
+	m.settingsColor = "red"
+
+	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'q'}})
+	um := updated.(Model)
+
+	if um.screen != screenSettingsList {
+		t.Errorf("screen = %d, want screenSettingsList", um.screen)
 	}
 }
 

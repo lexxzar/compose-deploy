@@ -649,9 +649,11 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 
 	// q acts as a back key inside the app. It quits only when there is
 	// no parent screen to navigate to (server-select, or the project /
-	// containers screens when standalone). The settings form is excluded
-	// so q can be typed into text inputs. screenProgress while running is
-	// also excluded so q cannot cancel an in-flight operation.
+	// containers screens when standalone). On the settings form, q falls
+	// through to the focused textinput so server names like "qa-prod" are
+	// typeable — except when the color picker (field 4) is focused, where
+	// q acts as back. screenProgress while running is also excluded so q
+	// cannot cancel an in-flight operation.
 	if key == "q" {
 		switch m.screen {
 		case screenSelectServer:
@@ -672,7 +674,10 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			}
 			key = "esc"
 		case screenSettingsForm:
-			// fall through — textinput consumes it
+			if m.settingsField == 4 {
+				key = "esc"
+			}
+			// else fall through — textinput consumes it
 		default:
 			key = "esc"
 		}
@@ -2095,7 +2100,7 @@ func (m Model) viewLogs() string {
 	b.WriteString(m.logsViewport.View())
 	b.WriteString("\n")
 
-	help := "  esc back  •  up/down scroll"
+	help := "  up/down scroll"
 	if !m.logsWrap {
 		help += "  •  <-/-> scroll"
 	}
@@ -2141,7 +2146,7 @@ func (m Model) viewConfig() string {
 	}
 
 	// Help bar
-	help := "  esc back  •  "
+	help := "  "
 	if m.configShowRes {
 		help += "r raw"
 	} else {
@@ -2261,7 +2266,7 @@ func (m Model) viewSettingsList() string {
 		b.WriteString(warningStyle.Render(fmt.Sprintf("  Delete server %q? (y/n)", name)))
 	}
 
-	b.WriteString(helpStyle.Render("\n  a add  •  enter edit  •  d delete  •  esc back"))
+	b.WriteString(helpStyle.Render("\n  a add  •  enter edit  •  d delete  •  q back"))
 	return b.String()
 }
 
