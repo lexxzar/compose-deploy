@@ -180,6 +180,8 @@ type Model struct {
 	// Screen 1: service select
 	services  []string
 	svcStatus map[string]runner.ServiceStatus // service name → status
+	stats     map[string]runner.ServiceStats  // service name → resource usage; populated asynchronously by refreshStats
+	statsErr  error                           // last error from ContainerStats; rendered in the same slot as svcErr (svcErr wins)
 	selected  map[int]bool
 	svcCursor int
 	svcOffset int // index of first visible service in scroll window
@@ -267,6 +269,10 @@ type servicesMsg struct {
 type statusMsg struct {
 	status map[string]runner.ServiceStatus
 	err    error
+}
+type statsMsg struct {
+	stats map[string]runner.ServiceStats
+	err   error
 }
 type pipelineDoneMsg struct{}
 type logChunkMsg struct {
@@ -393,7 +399,7 @@ func (m Model) Init() tea.Cmd {
 	if m.showPicker {
 		return m.loadProjects()
 	}
-	return m.loadServices()
+	return tea.Batch(m.loadServices(), m.refreshStats())
 }
 
 func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
@@ -465,6 +471,18 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.svcErr = nil
 		m.svcStatus = msg.status
 		m.fixSvcOffset()
+		return m, nil
+
+	case statsMsg:
+		if m.screen != screenSelectContainers {
+			return m, nil
+		}
+		if msg.err != nil {
+			m.statsErr = msg.err
+			return m, nil
+		}
+		m.statsErr = nil
+		m.stats = msg.stats
 		return m, nil
 
 	case stepEventMsg:
@@ -600,7 +618,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if msg.err != nil {
 			m.warning = fmt.Sprintf("exec failed: %v", msg.err)
 		}
-		return m, m.refreshStatus()
+		return m, tea.Batch(m.refreshStatus(), m.refreshStats())
 
 	case pipelineDoneMsg:
 		if !m.failed {
@@ -707,7 +725,7 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 					m.composer = m.localComposer
 					m.showPicker = true
 					m.screen = screenSelectContainers
-					return m, m.loadServices()
+					return m, tea.Batch(m.loadServices(), m.refreshStats())
 				}
 				m.showPicker = true
 				m.screen = screenSelectProject
@@ -782,7 +800,7 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.projName = proj.Name
 			m.composer = m.composerFactory(proj.ConfigDir)
 			m.screen = screenSelectContainers
-			return m, m.loadServices()
+			return m, tea.Batch(m.loadServices(), m.refreshStats())
 		}
 
 	case screenSelectContainers:
@@ -817,6 +835,8 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 				m.projName = ""
 				m.services = nil
 				m.svcStatus = nil
+				m.stats = nil
+				m.statsErr = nil
 				m.selected = make(map[int]bool)
 				m.svcCursor = 0
 				m.svcOffset = 0
@@ -916,7 +936,7 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.logsFormatted = ""
 			m.logsRawOff = 0
 			m.screen = screenSelectContainers
-			return m, m.refreshStatus()
+			return m, tea.Batch(m.refreshStatus(), m.refreshStats())
 		case "w":
 			m.logsWrap = !m.logsWrap
 			if m.logsWrap {
@@ -1196,7 +1216,7 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 				m.eventCh = nil
 				m.cancel = nil
 				m.logContent = ""
-				return m, m.refreshStatus()
+				return m, tea.Batch(m.refreshStatus(), m.refreshStats())
 			}
 			if m.cancel != nil {
 				m.cancel()
@@ -1482,6 +1502,15 @@ func (m Model) refreshStatus() tea.Cmd {
 	return func() tea.Msg {
 		status, err := c.ContainerStatus(ctx)
 		return statusMsg{status: status, err: err}
+	}
+}
+
+func (m Model) refreshStats() tea.Cmd {
+	ctx := m.ctx
+	c := m.composer
+	return func() tea.Msg {
+		stats, err := c.ContainerStats(ctx)
+		return statsMsg{stats: stats, err: err}
 	}
 }
 

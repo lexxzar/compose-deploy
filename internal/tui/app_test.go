@@ -29,6 +29,8 @@ type mockComposer struct {
 	status    map[string]runner.ServiceStatus
 	err       error
 	statusErr error
+	stats     map[string]runner.ServiceStats
+	statsErr  error
 }
 
 func (m *mockComposer) Stop(ctx context.Context, containers []string, w io.Writer) error {
@@ -54,7 +56,7 @@ func (m *mockComposer) ContainerStatus(ctx context.Context) (map[string]runner.S
 }
 
 func (m *mockComposer) ContainerStats(ctx context.Context) (map[string]runner.ServiceStats, error) {
-	return nil, nil
+	return m.stats, m.statsErr
 }
 
 func (m *mockComposer) Logs(ctx context.Context, service string, follow bool, tail int, w io.Writer) error {
@@ -6421,5 +6423,162 @@ func TestExec_XKeyOnServiceWithNoStatus(t *testing.T) {
 	}
 	if model.warning != "Container is not running" {
 		t.Errorf("warning = %q, want %q", model.warning, "Container is not running")
+	}
+}
+
+func TestStatsMsg_populates(t *testing.T) {
+	mc := &mockComposer{}
+	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
+	m.screen = screenSelectContainers
+
+	stats := map[string]runner.ServiceStats{
+		"web": {CPUPercent: 4.2, MemoryUsed: 130023424, MemoryLimit: 536870912},
+		"db":  {CPUPercent: 1.1, MemoryUsed: 200000000, MemoryLimit: 1073741824},
+	}
+	result, _ := m.Update(statsMsg{stats: stats})
+	model := result.(Model)
+
+	if model.statsErr != nil {
+		t.Errorf("statsErr = %v, want nil", model.statsErr)
+	}
+	if len(model.stats) != 2 {
+		t.Fatalf("len(stats) = %d, want 2", len(model.stats))
+	}
+	if got := model.stats["web"].CPUPercent; got != 4.2 {
+		t.Errorf("stats[web].CPUPercent = %v, want 4.2", got)
+	}
+	if got := model.stats["db"].MemoryUsed; got != 200000000 {
+		t.Errorf("stats[db].MemoryUsed = %v, want 200000000", got)
+	}
+}
+
+func TestStatsMsg_storesError(t *testing.T) {
+	mc := &mockComposer{}
+	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
+	m.screen = screenSelectContainers
+	prior := map[string]runner.ServiceStats{"web": {CPUPercent: 4.2}}
+	m.stats = prior
+
+	wantErr := errors.New("docker stats failed")
+	result, _ := m.Update(statsMsg{err: wantErr})
+	model := result.(Model)
+
+	if model.statsErr == nil || model.statsErr.Error() != wantErr.Error() {
+		t.Errorf("statsErr = %v, want %v", model.statsErr, wantErr)
+	}
+	if len(model.stats) != 1 || model.stats["web"].CPUPercent != 4.2 {
+		t.Errorf("stats mutated on error: got %+v", model.stats)
+	}
+}
+
+func TestStatsMsg_staleIgnored(t *testing.T) {
+	mc := &mockComposer{}
+	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
+	m.screen = screenSelectServer
+
+	result, _ := m.Update(statsMsg{stats: map[string]runner.ServiceStats{"web": {CPUPercent: 99}}})
+	model := result.(Model)
+
+	if model.stats != nil {
+		t.Errorf("stats mutated for stale msg: got %+v", model.stats)
+	}
+	if model.statsErr != nil {
+		t.Errorf("statsErr mutated for stale msg: got %v", model.statsErr)
+	}
+}
+
+func TestStatsMsg_staleErrorIgnored(t *testing.T) {
+	mc := &mockComposer{}
+	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
+	m.screen = screenSelectProject
+
+	result, _ := m.Update(statsMsg{err: errors.New("boom")})
+	model := result.(Model)
+
+	if model.statsErr != nil {
+		t.Errorf("statsErr set for stale msg: got %v", model.statsErr)
+	}
+}
+
+func TestStatsMsg_clearsPriorError(t *testing.T) {
+	mc := &mockComposer{}
+	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
+	m.screen = screenSelectContainers
+	m.statsErr = errors.New("previous failure")
+
+	result, _ := m.Update(statsMsg{stats: map[string]runner.ServiceStats{"web": {CPUPercent: 1.5}}})
+	model := result.(Model)
+
+	if model.statsErr != nil {
+		t.Errorf("statsErr not cleared on success: got %v", model.statsErr)
+	}
+	if got := model.stats["web"].CPUPercent; got != 1.5 {
+		t.Errorf("stats[web].CPUPercent = %v, want 1.5", got)
+	}
+}
+
+func TestEsc_clearsStats(t *testing.T) {
+	mc := &mockComposer{services: []string{"web"}}
+	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
+	m.screen = screenSelectContainers
+	m.showPicker = true
+	m.projects = []compose.Project{{Name: "proj"}}
+	m.services = []string{"web"}
+	m.svcStatus = map[string]runner.ServiceStatus{"web": {Running: true}}
+	m.stats = map[string]runner.ServiceStats{"web": {CPUPercent: 4.2}}
+	m.statsErr = errors.New("stale stats error")
+
+	result, _ := m.Update(tea.KeyMsg{Type: tea.KeyEsc})
+	model := result.(Model)
+
+	if model.screen != screenSelectProject {
+		t.Fatalf("screen = %d, want %d", model.screen, screenSelectProject)
+	}
+	if model.stats != nil {
+		t.Errorf("stats not cleared on esc: got %+v", model.stats)
+	}
+	if model.statsErr != nil {
+		t.Errorf("statsErr not cleared on esc: got %v", model.statsErr)
+	}
+	if model.svcStatus != nil {
+		t.Errorf("svcStatus not cleared on esc: got %+v", model.svcStatus)
+	}
+}
+
+func TestRefreshStats_callsContainerStats(t *testing.T) {
+	want := map[string]runner.ServiceStats{
+		"web": {CPUPercent: 7.5, MemoryUsed: 1024 * 1024 * 100, MemoryLimit: 1024 * 1024 * 512},
+	}
+	mc := &mockComposer{stats: want}
+	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
+
+	cmd := m.refreshStats()
+	if cmd == nil {
+		t.Fatal("refreshStats returned nil cmd")
+	}
+	msg, ok := cmd().(statsMsg)
+	if !ok {
+		t.Fatalf("cmd() type = %T, want statsMsg", cmd())
+	}
+	if msg.err != nil {
+		t.Errorf("err = %v, want nil", msg.err)
+	}
+	if got := msg.stats["web"].CPUPercent; got != 7.5 {
+		t.Errorf("stats[web].CPUPercent = %v, want 7.5", got)
+	}
+}
+
+func TestRefreshStats_propagatesError(t *testing.T) {
+	wantErr := errors.New("stats fetch failed")
+	mc := &mockComposer{statsErr: wantErr}
+	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
+
+	cmd := m.refreshStats()
+	msg, ok := cmd().(statsMsg)
+	if !ok {
+		t.Fatalf("cmd() type = %T, want statsMsg", cmd())
+	}
+	if msg.err == nil || msg.err.Error() != wantErr.Error() {
+		t.Errorf("err = %v, want %v", msg.err, wantErr)
 	}
 }

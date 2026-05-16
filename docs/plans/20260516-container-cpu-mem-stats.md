@@ -290,17 +290,19 @@ In `cmd/list.go`, when `--stats` is set and no `-C` is given, the bulk `AllConta
 - Modify: `internal/tui/app.go`
 - Modify: `internal/tui/app_test.go`
 
-- [ ] add `stats map[string]runner.ServiceStats` and `statsErr error` fields to `Model`
-- [ ] add `statsMsg{stats map[string]runner.ServiceStats; err error}` type
-- [ ] add `refreshStats() tea.Cmd` that calls the active composer's `ContainerStats(ctx)` and returns a `statsMsg`
-- [ ] update every site that currently invokes `refreshStatus()` to invoke `tea.Batch(refreshStatus(), refreshStats())` — entry to `screenSelectContainers`, return from progress/logs/config/exec screens
-- [ ] handle `statsMsg` in `Update`: if `m.screen != screenSelectContainers`, ignore (stale guard); on error, store `statsErr`, keep `m.stats` as-is; on success, replace `m.stats` and clear `m.statsErr`
-- [ ] clear `m.stats` and `m.statsErr` in the `esc` cleanup paths that already clear `servicesStatus` (matches existing cleanup discipline)
-- [ ] write `TestStatsMsg_populates` — send `statsMsg` with a map, assert `m.stats` populated, `m.statsErr` nil
-- [ ] write `TestStatsMsg_storesError` — send `statsMsg` with error, assert `m.statsErr` set, `m.stats` unchanged
-- [ ] write `TestStatsMsg_staleIgnored` — set `m.screen = screenSelectServer`, send `statsMsg`, assert no state mutation
-- [ ] write `TestEsc_clearsStats` — populate `m.stats`, send `esc`, assert cleared alongside other state
-- [ ] run `go test ./internal/tui/...` — must pass before next task
+- [x] add `stats map[string]runner.ServiceStats` and `statsErr error` fields to `Model`
+- [x] add `statsMsg{stats map[string]runner.ServiceStats; err error}` type
+- [x] add `refreshStats() tea.Cmd` that calls the active composer's `ContainerStats(ctx)` and returns a `statsMsg`
+- [x] update every site that currently invokes `refreshStatus()` to invoke `tea.Batch(refreshStatus(), refreshStats())` — entry to `screenSelectContainers`, return from progress/logs/config/exec screens
+- [x] handle `statsMsg` in `Update`: if `m.screen != screenSelectContainers`, ignore (stale guard); on error, store `statsErr`, keep `m.stats` as-is; on success, replace `m.stats` and clear `m.statsErr`
+- [x] clear `m.stats` and `m.statsErr` in the `esc` cleanup paths that already clear `servicesStatus` (matches existing cleanup discipline)
+- [x] write `TestStatsMsg_populates` — send `statsMsg` with a map, assert `m.stats` populated, `m.statsErr` nil
+- [x] write `TestStatsMsg_storesError` — send `statsMsg` with error, assert `m.statsErr` set, `m.stats` unchanged
+- [x] write `TestStatsMsg_staleIgnored` — set `m.screen = screenSelectServer`, send `statsMsg`, assert no state mutation
+- [x] write `TestEsc_clearsStats` — populate `m.stats`, send `esc`, assert cleared alongside other state
+- [x] run `go test ./internal/tui/...` — must pass before next task
+- ➕ Entry-to-screen sites (`Init()` when not showing picker, entryLocal, project enter) currently invoke `m.loadServices()` (not `refreshStatus()`), so these were updated to `tea.Batch(m.loadServices(), m.refreshStats())` to satisfy the "entry to screenSelectContainers" requirement. The screenConfig esc path does not currently call `refreshStatus()` (read-only screen), so per the rule "update every site that currently invokes `refreshStatus()`" it was left untouched.
+- ➕ Added bonus tests not in the original list: `TestStatsMsg_staleErrorIgnored` (stale guard for error path), `TestStatsMsg_clearsPriorError` (success clears previous statsErr), `TestRefreshStats_callsContainerStats` (refreshStats actually invokes composer), `TestRefreshStats_propagatesError` (error round-trip).
 
 ### Task 9: Render CPU/Mem columns on the TUI container screen
 
