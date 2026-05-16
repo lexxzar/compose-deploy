@@ -80,11 +80,13 @@ func mergeStatusStats(services []string, status map[string]runner.ServiceStatus,
 				// Service is absent from stats (stopped, or race window between
 				// ps and stats). Emit zero values so JSON consumers see the
 				// fields and tabular output shows blank cells consistently.
+				// Each pointer gets its own backing variable to avoid aliasing.
 				zeroF := 0.0
-				zeroI := int64(0)
+				zeroUsed := int64(0)
+				zeroLimit := int64(0)
 				result[i].CPUPercent = &zeroF
-				result[i].MemoryUsed = &zeroI
-				result[i].MemoryLimit = &zeroI
+				result[i].MemoryUsed = &zeroUsed
+				result[i].MemoryLimit = &zeroLimit
 			}
 		}
 	}

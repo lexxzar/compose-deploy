@@ -1564,6 +1564,8 @@ func (m Model) selectedCount() int {
 
 // hasStatusColumns returns true if any service in m.services has non-empty Created, Uptime,
 // Ports, or stats data, indicating that column captions should be displayed.
+// The stats branch must match the render predicate in viewSelectContainers
+// (map-presence + running) so svcVisibleCount and the captions row stay in sync.
 func (m Model) hasStatusColumns() bool {
 	for _, svc := range m.services {
 		if st, ok := m.svcStatus[svc]; ok {
@@ -1571,8 +1573,8 @@ func (m Model) hasStatusColumns() bool {
 				return true
 			}
 		}
-		if st, ok := m.stats[svc]; ok {
-			if st.CPUPercent != 0 || st.MemoryUsed != 0 || st.MemoryLimit != 0 {
+		if _, ok := m.stats[svc]; ok {
+			if m.svcStatus[svc].Running {
 				return true
 			}
 		}
