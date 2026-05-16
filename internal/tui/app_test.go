@@ -666,8 +666,8 @@ func TestViewSelectProject_ErrorWithPicker(t *testing.T) {
 	m.projErr = fmt.Errorf("connection refused")
 
 	v := m.View()
-	if !strings.Contains(v, "esc back") {
-		t.Error("error state should show 'esc back' when server picker is available")
+	if !strings.Contains(v, "q back") {
+		t.Error("error state should show 'q back' when server picker is available")
 	}
 }
 
@@ -693,8 +693,8 @@ func TestViewSelectProject_EmptyWithPicker(t *testing.T) {
 	m.projects = []compose.Project{}
 
 	v := m.View()
-	if !strings.Contains(v, "esc back") {
-		t.Error("empty state should show 'esc back' when server picker is available")
+	if !strings.Contains(v, "q back") {
+		t.Error("empty state should show 'q back' when server picker is available")
 	}
 }
 
@@ -997,7 +997,10 @@ func TestConfirmation_NavigationLocked(t *testing.T) {
 	}
 }
 
-func TestConfirmation_QuitStillWorks(t *testing.T) {
+func TestConfirmation_QCancelsConfirming(t *testing.T) {
+	// q during a confirmation prompt cancels the prompt (matches esc),
+	// rather than quitting the app. Intentional behavior change so q is
+	// never destructive mid-action.
 	mc := &mockComposer{services: []string{"nginx"}}
 	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
 	m.screen = screenSelectContainers
@@ -1006,9 +1009,28 @@ func TestConfirmation_QuitStillWorks(t *testing.T) {
 	m.confirming = true
 	m.pendingOp = runner.Deploy
 
-	_, cmd := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'q'}})
+	updated, cmd := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'q'}})
+	um := updated.(Model)
+	if um.confirming {
+		t.Error("confirming should be cancelled by q")
+	}
+	if cmd != nil {
+		t.Errorf("expected nil command, got non-nil")
+	}
+}
+
+func TestConfirmation_CtrlCStillQuits(t *testing.T) {
+	mc := &mockComposer{services: []string{"nginx"}}
+	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
+	m.screen = screenSelectContainers
+	m.services = mc.services
+	m.selected[0] = true
+	m.confirming = true
+	m.pendingOp = runner.Deploy
+
+	_, cmd := m.Update(tea.KeyMsg{Type: tea.KeyCtrlC})
 	if cmd == nil {
-		t.Fatal("expected quit command during confirmation, got nil")
+		t.Fatal("expected quit command from ctrl+c during confirmation, got nil")
 	}
 }
 
@@ -1982,8 +2004,8 @@ func TestViewLogs_RendersBreadcrumb(t *testing.T) {
 	if !strings.Contains(v, "nginx") {
 		t.Error("view should contain service name 'nginx'")
 	}
-	if !strings.Contains(v, "esc back") {
-		t.Error("view should contain 'esc back' in help")
+	if !strings.Contains(v, "q back") {
+		t.Error("view should contain 'q back' in help")
 	}
 	if !strings.Contains(v, "G bottom") {
 		t.Error("view should contain 'G bottom' in help")
@@ -2575,8 +2597,8 @@ func TestViewProgress_AllDone(t *testing.T) {
 	}
 
 	view := m.viewProgress()
-	if !strings.Contains(view, "esc") {
-		t.Errorf("done progress should show esc hint, got: %q", view)
+	if !strings.Contains(view, "q back") {
+		t.Errorf("done progress should show 'q back' hint, got: %q", view)
 	}
 }
 
@@ -5255,23 +5277,26 @@ func TestSettingsForm_ColorAccessibleWhenGrouped(t *testing.T) {
 
 func TestQuitConfirmation_RemoteConnection_ShowsPrompt(t *testing.T) {
 	// When connected to a remote server (disconnectFunc != nil),
-	// pressing q should set quitting = true and NOT return tea.Quit.
+	// pressing ctrl+c should set quitting = true and NOT return tea.Quit.
+	// (q on nested screens is now back-navigation — covered by
+	// TestQBackNavigation_*.)
 	mc := &mockComposer{services: []string{"nginx"}}
-	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
+	m := NewModel(nil, io.Discard, mockFactory(mc), testServers, mockConnectCb(mc))
 	m.screen = screenSelectContainers
+	m.showPicker = true
 	m.services = mc.services
 	m.selected = make(map[int]bool)
 	m.disconnectFunc = func() error { return nil }
 	m.serverName = "prod"
 
-	updated, cmd := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'q'}})
+	updated, cmd := m.Update(tea.KeyMsg{Type: tea.KeyCtrlC})
 	um := updated.(Model)
 
 	if cmd != nil {
 		t.Fatal("expected nil command (no quit), got non-nil")
 	}
 	if !um.quitting {
-		t.Error("quitting should be true after pressing q on remote connection")
+		t.Error("quitting should be true after pressing ctrl+c on remote connection")
 	}
 	if um.screen != screenSelectContainers {
 		t.Errorf("screen should remain unchanged, got %d", um.screen)
@@ -5390,50 +5415,47 @@ func TestQuitConfirmation_ServerSelectAlwaysQuitsDirectly(t *testing.T) {
 	}
 }
 
-func TestQuitConfirmation_AllRemoteScreens(t *testing.T) {
-	// Verify that tryQuit is used across all non-server-select screens
-	// by testing q on each screen with a remote connection.
+func TestCtrlCConfirmation_AllRemoteScreens(t *testing.T) {
+	// Verify that ctrl+c is intercepted by tryQuit across all non-server-select
+	// screens with a remote connection. q is no longer tested here — it now
+	// performs back-navigation on nested screens (covered by TestQBackNavigation_*).
 	tests := []struct {
 		name   string
 		screen screen
 		key    string
 		setup  func(m *Model)
 	}{
-		{"project select", screenSelectProject, "q", func(m *Model) {
+		{"project select", screenSelectProject, "ctrl+c", func(m *Model) {
 			m.projects = []compose.Project{{Name: "app", ConfigDir: "/app"}}
 		}},
-		{"containers normal", screenSelectContainers, "q", func(m *Model) {
+		{"containers normal", screenSelectContainers, "ctrl+c", func(m *Model) {
 			m.services = []string{"nginx"}
 			m.selected = make(map[int]bool)
 		}},
-		{"containers confirming", screenSelectContainers, "q", func(m *Model) {
+		{"containers confirming", screenSelectContainers, "ctrl+c", func(m *Model) {
 			m.services = []string{"nginx"}
 			m.selected = map[int]bool{0: true}
 			m.confirming = true
 			m.pendingOp = runner.Deploy
 		}},
-		{"logs", screenLogs, "q", func(m *Model) {
+		{"logs", screenLogs, "ctrl+c", func(m *Model) {
 			m.logsService = "nginx"
 		}},
-		{"config", screenConfig, "q", func(m *Model) {
+		{"config", screenConfig, "ctrl+c", func(m *Model) {
 			m.configContent = []byte("version: '3'")
 		}},
-		{"settings list", screenSettingsList, "q", func(m *Model) {
+		{"settings list", screenSettingsList, "ctrl+c", func(m *Model) {
 			m.config = &config.Config{Servers: testServers}
 		}},
 		{"settings form ctrl+c", screenSettingsForm, "ctrl+c", func(m *Model) {
 			m.config = &config.Config{Servers: testServers}
 			m.settingsInputs = initSettingsInputs()
 		}},
-		{"progress done", screenProgress, "q", func(m *Model) {
+		{"progress done", screenProgress, "ctrl+c", func(m *Model) {
 			m.done = true
 		}},
-		{"progress failed", screenProgress, "q", func(m *Model) {
+		{"progress failed", screenProgress, "ctrl+c", func(m *Model) {
 			m.failed = true
-		}},
-		{"containers ctrl+c", screenSelectContainers, "ctrl+c", func(m *Model) {
-			m.services = []string{"nginx"}
-			m.selected = make(map[int]bool)
 		}},
 	}
 
@@ -5589,6 +5611,397 @@ func TestQuitConfirmation_ProgressInProgressIgnoresQ(t *testing.T) {
 	}
 	if cmd != nil {
 		t.Error("pressing q during in-progress operation should not return a command")
+	}
+}
+
+// --- q back-navigation tests ---
+
+func TestQBackNavigation_ContainerScreen(t *testing.T) {
+	mc := &mockComposer{}
+	m := NewModel(nil, io.Discard, mockFactory(mc), testServers, mockConnectCb(mc))
+	m.screen = screenSelectContainers
+	m.showPicker = true
+	m.services = []string{"nginx"}
+	m.selected = make(map[int]bool)
+	m.composer = mc
+
+	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'q'}})
+	um := updated.(Model)
+
+	if um.screen != screenSelectProject {
+		t.Errorf("screen = %d, want screenSelectProject", um.screen)
+	}
+	if um.composer != nil {
+		t.Error("composer should be cleared after back nav")
+	}
+	if um.services != nil {
+		t.Error("services should be cleared after back nav")
+	}
+}
+
+func TestQBackNavigation_ContainerScreenCancelsConfirming(t *testing.T) {
+	mc := &mockComposer{}
+	m := NewModel(nil, io.Discard, mockFactory(mc), testServers, mockConnectCb(mc))
+	m.screen = screenSelectContainers
+	m.showPicker = true
+	m.services = []string{"nginx"}
+	m.selected = map[int]bool{0: true}
+	m.confirming = true
+	m.pendingOp = runner.Deploy
+
+	updated, cmd := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'q'}})
+	um := updated.(Model)
+
+	if um.confirming {
+		t.Error("confirming should be cancelled after q")
+	}
+	if um.screen != screenSelectContainers {
+		t.Errorf("screen = %d, want screenSelectContainers", um.screen)
+	}
+	if cmd != nil {
+		t.Errorf("expected nil command, got non-nil")
+	}
+}
+
+func TestQBackNavigation_ContainerScreenCancelsPendingExec(t *testing.T) {
+	// q during the exec confirmation prompt should cancel both confirming
+	// and pendingExec, mirroring the esc handler at app.go:799-803.
+	mc := &mockComposer{}
+	m := NewModel(nil, io.Discard, mockFactory(mc), testServers, mockConnectCb(mc))
+	m.screen = screenSelectContainers
+	m.showPicker = true
+	m.services = []string{"nginx"}
+	m.selected = map[int]bool{0: true}
+	m.confirming = true
+	m.pendingExec = true
+
+	updated, cmd := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'q'}})
+	um := updated.(Model)
+
+	if um.confirming {
+		t.Error("confirming should be cancelled after q")
+	}
+	if um.pendingExec {
+		t.Error("pendingExec should be cancelled after q")
+	}
+	if um.screen != screenSelectContainers {
+		t.Errorf("screen = %d, want screenSelectContainers", um.screen)
+	}
+	if cmd != nil {
+		t.Errorf("expected nil command, got non-nil")
+	}
+}
+
+func TestQBackNavigation_LogsScreen(t *testing.T) {
+	mc := &mockComposer{}
+	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
+	m.screen = screenLogs
+	m.logsService = "nginx"
+
+	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'q'}})
+	um := updated.(Model)
+
+	if um.screen != screenSelectContainers {
+		t.Errorf("screen = %d, want screenSelectContainers", um.screen)
+	}
+	if um.logsService != "" {
+		t.Errorf("logsService = %q, want empty", um.logsService)
+	}
+}
+
+func TestQBackNavigation_ConfigScreen(t *testing.T) {
+	mc := &mockComposer{}
+	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
+	m.screen = screenConfig
+	m.configContent = []byte("version: '3'")
+
+	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'q'}})
+	um := updated.(Model)
+
+	if um.screen != screenSelectContainers {
+		t.Errorf("screen = %d, want screenSelectContainers", um.screen)
+	}
+	if um.configContent != nil {
+		t.Errorf("configContent should be cleared, got %v", um.configContent)
+	}
+}
+
+func TestQBackNavigation_SettingsList(t *testing.T) {
+	mc := &mockComposer{}
+	m := NewModel(nil, io.Discard, mockFactory(mc), testServers, mockConnectCb(mc))
+	m.screen = screenSettingsList
+	m.config = &config.Config{Servers: testServers}
+
+	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'q'}})
+	um := updated.(Model)
+
+	if um.screen != screenSelectServer {
+		t.Errorf("screen = %d, want screenSelectServer", um.screen)
+	}
+}
+
+func TestQBackNavigation_SettingsListCancelsDelete(t *testing.T) {
+	mc := &mockComposer{}
+	m := NewModel(nil, io.Discard, mockFactory(mc), testServers, mockConnectCb(mc))
+	m.screen = screenSettingsList
+	m.config = &config.Config{Servers: testServers}
+	m.settingsDelete = true
+
+	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'q'}})
+	um := updated.(Model)
+
+	if um.settingsDelete {
+		t.Error("settingsDelete should be false after q")
+	}
+	if um.screen != screenSettingsList {
+		t.Errorf("screen = %d, want screenSettingsList", um.screen)
+	}
+}
+
+func TestQBackNavigation_ProjectScreen(t *testing.T) {
+	mc := &mockComposer{}
+	m := NewModel(nil, io.Discard, mockFactory(mc), testServers, mockConnectCb(mc))
+	m.screen = screenSelectProject
+	m.serverName = "prod"
+	disconnectCalls := 0
+	m.disconnectFunc = func() error {
+		disconnectCalls++
+		return nil
+	}
+
+	updated, cmd := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'q'}})
+	um := updated.(Model)
+
+	if um.screen != screenSelectServer {
+		t.Errorf("screen = %d, want screenSelectServer", um.screen)
+	}
+	if um.disconnectFunc != nil {
+		t.Error("disconnectFunc should be nil after back nav")
+	}
+	if cmd == nil {
+		t.Fatal("expected a tea.Cmd to run disconnect, got nil")
+	}
+	msg := cmd()
+	if _, ok := msg.(disconnectDoneMsg); !ok {
+		t.Errorf("expected disconnectDoneMsg, got %T", msg)
+	}
+	if disconnectCalls != 1 {
+		t.Errorf("disconnect called %d times, want 1", disconnectCalls)
+	}
+}
+
+func TestQBackNavigation_ProgressDoneReturnsToContainers(t *testing.T) {
+	tests := []struct {
+		name string
+		done bool
+		fail bool
+	}{
+		{"done", true, false},
+		{"failed", false, true},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			mc := &mockComposer{services: []string{"nginx"}}
+			m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
+			m.screen = screenProgress
+			m.done = tc.done
+			m.failed = tc.fail
+			m.services = []string{"nginx"}
+			m.selected = make(map[int]bool)
+
+			updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'q'}})
+			um := updated.(Model)
+
+			if um.screen != screenSelectContainers {
+				t.Errorf("screen = %d, want screenSelectContainers", um.screen)
+			}
+		})
+	}
+}
+
+func TestQOnProgressWhileRunningIsNoop(t *testing.T) {
+	mc := &mockComposer{services: []string{"nginx"}}
+	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
+	m.screen = screenProgress
+	m.done = false
+	m.failed = false
+	cancelCalls := 0
+	m.cancel = func() {
+		cancelCalls++
+	}
+
+	updated, cmd := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'q'}})
+	um := updated.(Model)
+
+	if um.screen != screenProgress {
+		t.Errorf("screen = %d, want screenProgress (unchanged)", um.screen)
+	}
+	if cancelCalls != 0 {
+		t.Errorf("cancel called %d times, want 0", cancelCalls)
+	}
+	if cmd != nil {
+		t.Error("expected nil cmd, got non-nil")
+	}
+}
+
+func TestQQuitsAtRoot_ProjectScreenNoServers(t *testing.T) {
+	mc := &mockComposer{}
+	m := NewModel(nil, io.Discard, mockFactory(mc), nil, nil)
+	m.screen = screenSelectProject
+
+	_, cmd := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'q'}})
+
+	if cmd == nil {
+		t.Fatal("expected quit cmd, got nil")
+	}
+	msg := cmd()
+	if _, ok := msg.(tea.QuitMsg); !ok {
+		t.Errorf("expected tea.QuitMsg, got %T", msg)
+	}
+}
+
+func TestQBackNavigation_ProjectScreenWithEmptyConfig(t *testing.T) {
+	// When the config file exists but has no servers, NewModel starts on
+	// screenSelectServer (showing just the Local entry). Selecting Local
+	// transitions to screenSelectProject. Pressing q there must navigate
+	// back to server-select, not quit — because there IS a parent screen.
+	mc := &mockComposer{}
+	emptyCfg := &config.Config{}
+	m := NewModel(nil, io.Discard, mockFactory(mc), nil, nil, WithConfig(emptyCfg))
+	m.screen = screenSelectProject
+
+	updated, cmd := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'q'}})
+	um := updated.(Model)
+
+	if um.screen != screenSelectServer {
+		t.Errorf("screen = %d, want screenSelectServer", um.screen)
+	}
+	// No tea.Quit should be returned.
+	if cmd != nil {
+		if msg := cmd(); msg != nil {
+			if _, isQuit := msg.(tea.QuitMsg); isQuit {
+				t.Errorf("got tea.QuitMsg, expected back navigation")
+			}
+		}
+	}
+}
+
+func TestEscBackNavigation_ProjectScreenWithEmptyConfig(t *testing.T) {
+	// Same parent-exists condition for esc: when m.config != nil and
+	// len(servers) == 0, esc must still navigate back to server-select.
+	mc := &mockComposer{}
+	emptyCfg := &config.Config{}
+	m := NewModel(nil, io.Discard, mockFactory(mc), nil, nil, WithConfig(emptyCfg))
+	m.screen = screenSelectProject
+
+	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyEsc})
+	um := updated.(Model)
+
+	if um.screen != screenSelectServer {
+		t.Errorf("screen = %d, want screenSelectServer", um.screen)
+	}
+}
+
+func TestQQuitsAtRoot_ContainerScreenStandalone(t *testing.T) {
+	mc := &mockComposer{services: []string{"nginx"}}
+	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
+	m.screen = screenSelectContainers
+	m.showPicker = false
+	m.confirming = false
+	m.services = mc.services
+	m.selected = make(map[int]bool)
+
+	_, cmd := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'q'}})
+
+	if cmd == nil {
+		t.Fatal("expected quit cmd, got nil")
+	}
+	msg := cmd()
+	if _, ok := msg.(tea.QuitMsg); !ok {
+		t.Errorf("expected tea.QuitMsg, got %T", msg)
+	}
+}
+
+func TestQTypedIntoSettingsFormInput(t *testing.T) {
+	mc := &mockComposer{}
+	m := NewModel(nil, io.Discard, mockFactory(mc), testServers, mockConnectCb(mc))
+	m.screen = screenSettingsForm
+	m.config = &config.Config{Servers: testServers}
+	m.settingsInputs = initSettingsInputs()
+	m.settingsField = 0
+	m.settingsInputs[0].Focus()
+
+	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'q'}})
+	um := updated.(Model)
+
+	if um.screen != screenSettingsForm {
+		t.Errorf("screen = %d, want screenSettingsForm", um.screen)
+	}
+	if !strings.Contains(um.settingsInputs[0].Value(), "q") {
+		t.Errorf("settingsInputs[0] = %q, want to contain %q", um.settingsInputs[0].Value(), "q")
+	}
+}
+
+func TestQBackNavigation_SettingsFormColorPicker(t *testing.T) {
+	// When the color picker is focused (settingsField == 4) no text input
+	// has focus, so q acts as back-nav to the settings list rather than
+	// being silently swallowed.
+	mc := &mockComposer{}
+	m := NewModel(nil, io.Discard, mockFactory(mc), testServers, mockConnectCb(mc))
+	m.screen = screenSettingsForm
+	m.config = &config.Config{Servers: testServers}
+	m.settingsInputs = initSettingsInputs()
+	m.settingsField = 4
+	m.settingsColor = "red"
+
+	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'q'}})
+	um := updated.(Model)
+
+	if um.screen != screenSettingsList {
+		t.Errorf("screen = %d, want screenSettingsList", um.screen)
+	}
+}
+
+func TestCtrlCStillTriggersDisconnectPrompt(t *testing.T) {
+	mc := &mockComposer{}
+	m := NewModel(nil, io.Discard, mockFactory(mc), testServers, mockConnectCb(mc))
+	m.screen = screenSelectContainers
+	m.showPicker = true
+	m.services = []string{"nginx"}
+	m.selected = make(map[int]bool)
+	m.disconnectFunc = func() error { return nil }
+	m.serverName = "prod"
+
+	updated, cmd := m.Update(tea.KeyMsg{Type: tea.KeyCtrlC})
+	um := updated.(Model)
+
+	if !um.quitting {
+		t.Error("quitting should be true after ctrl+c on remote connection")
+	}
+	if cmd != nil {
+		t.Error("expected nil cmd (quit intercepted), got non-nil")
+	}
+}
+
+func TestQDuringQuittingPromptStillSwallowed(t *testing.T) {
+	mc := &mockComposer{}
+	m := NewModel(nil, io.Discard, mockFactory(mc), testServers, mockConnectCb(mc))
+	m.screen = screenSelectContainers
+	m.showPicker = true
+	m.services = []string{"nginx"}
+	m.selected = make(map[int]bool)
+	m.disconnectFunc = func() error { return nil }
+	m.serverName = "prod"
+	m.quitting = true
+
+	updated, cmd := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'q'}})
+	um := updated.(Model)
+
+	if !um.quitting {
+		t.Error("quitting should remain true (q is swallowed by the prompt intercept)")
+	}
+	if cmd != nil {
+		t.Error("expected nil cmd, got non-nil")
 	}
 }
 

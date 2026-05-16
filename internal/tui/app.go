@@ -647,6 +647,42 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m, nil
 	}
 
+	// q acts as a back key inside the app. It quits only when there is
+	// no parent screen to navigate to (server-select, or the project /
+	// containers screens when standalone). On the settings form, q falls
+	// through to the focused textinput so server names like "qa-prod" are
+	// typeable — except when the color picker (field 4) is focused, where
+	// q acts as back. screenProgress while running is also excluded so q
+	// cannot cancel an in-flight operation.
+	if key == "q" {
+		switch m.screen {
+		case screenSelectServer:
+			return m, tea.Quit
+		case screenSelectProject:
+			if len(m.servers) == 0 && m.config == nil {
+				return m, tea.Quit
+			}
+			key = "esc"
+		case screenSelectContainers:
+			if !m.showPicker && !m.confirming {
+				return m, tea.Quit
+			}
+			key = "esc"
+		case screenProgress:
+			if !m.done && !m.failed {
+				return m, nil
+			}
+			key = "esc"
+		case screenSettingsForm:
+			if m.settingsField == 4 {
+				key = "esc"
+			}
+			// else fall through — textinput consumes it
+		default:
+			key = "esc"
+		}
+	}
+
 	switch m.screen {
 	case screenSelectServer:
 		switch key {
@@ -702,10 +738,10 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 
 	case screenSelectProject:
 		switch key {
-		case "q", "ctrl+c":
+		case "ctrl+c":
 			return m.tryQuit()
 		case "esc":
-			if len(m.servers) > 0 {
+			if len(m.servers) > 0 || m.config != nil {
 				// Back to server screen — disconnect if remote
 				disconnectFn := m.disconnectFunc
 				m.screen = screenSelectServer
@@ -752,7 +788,7 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case screenSelectContainers:
 		if m.confirming {
 			switch key {
-			case "q", "ctrl+c":
+			case "ctrl+c":
 				return m.tryQuit()
 			case "enter":
 				if m.pendingExec {
@@ -772,7 +808,7 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.warning = ""
 
 		switch key {
-		case "q", "ctrl+c":
+		case "ctrl+c":
 			return m.tryQuit()
 		case "esc":
 			if m.showPicker {
@@ -862,7 +898,7 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 
 	case screenLogs:
 		switch key {
-		case "q", "ctrl+c":
+		case "ctrl+c":
 			return m.tryQuit()
 		case "esc":
 			if m.logsCancel != nil {
@@ -905,7 +941,7 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 
 	case screenConfig:
 		switch key {
-		case "q", "ctrl+c":
+		case "ctrl+c":
 			return m.tryQuit()
 		case "esc":
 			m.configContent = nil
@@ -985,7 +1021,7 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 
 		switch key {
-		case "q", "ctrl+c":
+		case "ctrl+c":
 			return m.tryQuit()
 		case "esc":
 			m.screen = screenSelectServer
@@ -1146,7 +1182,7 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 
 	case screenProgress:
 		switch key {
-		case "q", "ctrl+c":
+		case "ctrl+c":
 			if m.done || m.failed {
 				return m.tryQuit()
 			}
@@ -1535,7 +1571,7 @@ func (m Model) svcVisibleCount() int {
 		// Compute whether help fits on one line (same logic as viewSelectContainers)
 		back := "q quit"
 		if m.showPicker {
-			back = "esc back"
+			back = "q back"
 		}
 		line1 := fmt.Sprintf("  space toggle  •  a all  •  %s", back)
 		line2 := "  r restart  •  d deploy  •  s stop  •  l logs  •  c config  •  x exec"
@@ -1808,8 +1844,8 @@ func (m Model) viewSelectProject() string {
 	if m.projErr != nil {
 		b.WriteString(stepFailed.Render(fmt.Sprintf("  Error: %v\n", m.projErr)))
 		help := "  q quit"
-		if len(m.servers) > 0 {
-			help = "  esc back  q quit"
+		if len(m.servers) > 0 || m.config != nil {
+			help = "  q back"
 		}
 		b.WriteString(helpStyle.Render("\n" + help))
 		return b.String()
@@ -1818,8 +1854,8 @@ func (m Model) viewSelectProject() string {
 	if len(m.projects) == 0 {
 		b.WriteString("  No Docker Compose projects found\n")
 		help := "  q quit"
-		if len(m.servers) > 0 {
-			help = "  esc back  q quit"
+		if len(m.servers) > 0 || m.config != nil {
+			help = "  q back"
 		}
 		b.WriteString(helpStyle.Render("\n" + help))
 		return b.String()
@@ -1847,8 +1883,8 @@ func (m Model) viewSelectProject() string {
 	}
 
 	helpText := "\n  up/down navigate  •  enter select  •  q quit"
-	if len(m.servers) > 0 {
-		helpText = "\n  up/down navigate  •  enter select  •  esc back  •  q quit"
+	if len(m.servers) > 0 || m.config != nil {
+		helpText = "\n  up/down navigate  •  enter select  •  q back"
 	}
 	b.WriteString(helpStyle.Render(helpText))
 	return b.String()
@@ -1887,7 +1923,7 @@ func (m Model) viewSelectContainers() string {
 		b.WriteString("\n\n")
 		b.WriteString(stepFailed.Render(fmt.Sprintf("  Error: %v\n", m.svcErr)))
 		if m.showPicker {
-			b.WriteString(helpStyle.Render("\n  esc back  •  q quit"))
+			b.WriteString(helpStyle.Render("\n  q back"))
 		} else {
 			b.WriteString(helpStyle.Render("\n  q quit"))
 		}
@@ -2038,7 +2074,7 @@ func (m Model) viewSelectContainers() string {
 		}
 		back := "q quit"
 		if m.showPicker {
-			back = "esc back"
+			back = "q back"
 		}
 		line1 := fmt.Sprintf("  space toggle  •  a all  •  %s", back)
 		line2 := "  r restart  •  d deploy  •  s stop  •  l logs  •  c config  •  x exec"
@@ -2064,7 +2100,7 @@ func (m Model) viewLogs() string {
 	b.WriteString(m.logsViewport.View())
 	b.WriteString("\n")
 
-	help := "  esc back  •  up/down scroll"
+	help := "  up/down scroll"
 	if !m.logsWrap {
 		help += "  •  <-/-> scroll"
 	}
@@ -2079,7 +2115,7 @@ func (m Model) viewLogs() string {
 	} else {
 		help += "  •  p pretty"
 	}
-	help += "  •  q quit"
+	help += "  •  q back"
 	b.WriteString(helpStyle.Render(help))
 	return b.String()
 }
@@ -2110,13 +2146,13 @@ func (m Model) viewConfig() string {
 	}
 
 	// Help bar
-	help := "  esc back  •  "
+	help := "  "
 	if m.configShowRes {
 		help += "r raw"
 	} else {
 		help += "r resolved"
 	}
-	help += "  •  e edit  •  up/down scroll  •  q quit"
+	help += "  •  e edit  •  up/down scroll  •  q back"
 	b.WriteString(helpStyle.Render(help))
 	return b.String()
 }
@@ -2148,7 +2184,7 @@ func (m Model) viewProgress() string {
 	}
 
 	if m.done || m.failed {
-		b.WriteString(helpStyle.Render("\n  esc back  •  q quit"))
+		b.WriteString(helpStyle.Render("\n  q back"))
 	} else {
 		b.WriteString(helpStyle.Render("\n  esc cancel"))
 	}
@@ -2230,7 +2266,7 @@ func (m Model) viewSettingsList() string {
 		b.WriteString(warningStyle.Render(fmt.Sprintf("  Delete server %q? (y/n)", name)))
 	}
 
-	b.WriteString(helpStyle.Render("\n  a add  •  enter edit  •  d delete  •  esc back"))
+	b.WriteString(helpStyle.Render("\n  a add  •  enter edit  •  d delete  •  q back"))
 	return b.String()
 }
 
