@@ -249,6 +249,9 @@ func (m *opMockComposer) ListServices(_ context.Context) ([]string, error) { ret
 func (m *opMockComposer) ContainerStatus(_ context.Context) (map[string]runner.ServiceStatus, error) {
 	return nil, nil
 }
+func (m *opMockComposer) ContainerStats(_ context.Context) (map[string]runner.ServiceStats, error) {
+	return nil, nil
+}
 func (m *opMockComposer) Logs(_ context.Context, _ string, _ bool, _ int, _ io.Writer) error {
 	return nil
 }

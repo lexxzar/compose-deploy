@@ -249,11 +249,16 @@ In `cmd/list.go`, when `--stats` is set and no `-C` is given, the bulk `AllConta
 **Files:**
 - Modify: every file containing a `Composer` mock (enumerated below)
 
-- [ ] grep the repo for `Composer` implementers: `grep -rn "ListServices(ctx" --include="*_test.go"` and `grep -rn "ContainerStatus(ctx" --include="*_test.go"`
-- [ ] **enumerate every mock site discovered as a `➕` discovered item appended to this task** before editing — this makes completeness auditable in the diff. Example: `➕ Mock found at internal/tui/app_test.go:42 (mockComposer)`. List all sites this way before adding any code.
-- [ ] add a no-op `ContainerStats(ctx context.Context) (map[string]runner.ServiceStats, error) { return nil, nil }` method to each enumerated mock
-- [ ] ensure `go build ./...` succeeds — every implementer must satisfy the interface
-- [ ] run `go test ./...` — full suite must pass before next task (this confirms no existing test breaks from the interface addition)
+- [x] grep the repo for `Composer` implementers: `grep -rn "ListServices(ctx" --include="*_test.go"` and `grep -rn "ContainerStatus(ctx" --include="*_test.go"`
+- [x] **enumerate every mock site discovered as a `➕` discovered item appended to this task** before editing — this makes completeness auditable in the diff. Example: `➕ Mock found at internal/tui/app_test.go:42 (mockComposer)`. List all sites this way before adding any code.
+- [x] add a no-op `ContainerStats(ctx context.Context) (map[string]runner.ServiceStats, error) { return nil, nil }` method to each enumerated mock
+- [x] ensure `go build ./...` succeeds — every implementer must satisfy the interface
+- [x] run `go test ./...` — full suite must pass before next task (this confirms no existing test breaks from the interface addition)
+- ➕ Mock found at `internal/tui/app_test.go:27` (`mockComposer`) — `mockConfigComposer` and `mockExecComposer` in the same file embed it, so the method is inherited
+- ➕ Mock found at `cmd/deploy_test.go:239` (`opMockComposer`)
+- ➕ Mock found at `cmd/list_test.go:588` (`mockComposer`) — `mockLogsComposer` in `cmd/logs_test.go:39` embeds it, so the method is inherited
+- ➕ Mock found at `cmd/list_test.go:883` (`mockComposerStatusErr`)
+- ➕ Mock at `internal/runner/runner_test.go:11` (`mockComposer`) already had `ContainerStats` added in Task 1 — no change required
 
 ### Task 7: Wire `--stats` flag and JSON fields into CLI `list`
 

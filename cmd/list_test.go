@@ -605,6 +605,10 @@ func (m *mockComposer) ContainerStatus(_ context.Context) (map[string]runner.Ser
 	return m.status, nil
 }
 
+func (m *mockComposer) ContainerStats(_ context.Context) (map[string]runner.ServiceStats, error) {
+	return nil, nil
+}
+
 func (m *mockComposer) Stop(_ context.Context, _ []string, _ io.Writer) error   { return nil }
 func (m *mockComposer) Remove(_ context.Context, _ []string, _ io.Writer) error { return nil }
 func (m *mockComposer) Pull(_ context.Context, _ []string, _ io.Writer) error   { return nil }
@@ -890,6 +894,9 @@ func (m *mockComposerStatusErr) ListServices(_ context.Context) ([]string, error
 }
 func (m *mockComposerStatusErr) ContainerStatus(_ context.Context) (map[string]runner.ServiceStatus, error) {
 	return nil, m.statusErr
+}
+func (m *mockComposerStatusErr) ContainerStats(_ context.Context) (map[string]runner.ServiceStats, error) {
+	return nil, nil
 }
 func (m *mockComposerStatusErr) Stop(_ context.Context, _ []string, _ io.Writer) error   { return nil }
 func (m *mockComposerStatusErr) Remove(_ context.Context, _ []string, _ io.Writer) error { return nil }
