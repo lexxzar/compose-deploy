@@ -41,6 +41,14 @@ The TUI walks through up to six screens:
 5. **Logs** — live-stream logs for the selected service
 6. **Config** — inspect or edit the compose file, toggle between raw and resolved config, and see validation status
 
+#### Navigation
+
+| Key | Action |
+|-----|--------|
+| `esc` | Back to the previous screen (cancels confirmation prompts; cancels in-flight operations on the progress screen) |
+| `q` | Back inside the app (alias for `esc` on nested screens); quits at root screens (server picker, or standalone containers/project when no servers are configured). Typeable inside settings form text inputs. |
+| `ctrl+c` | Quit the app. When connected to a remote server, prompts to confirm the disconnect (`y` to quit, `n`/`esc` to cancel). |
+
 ### CLI Mode
 
 ```bash

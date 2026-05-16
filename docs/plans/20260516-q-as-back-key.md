@@ -184,10 +184,10 @@ Exact text choices to be finalised when reading the surrounding code in Task 2 �
 - Modify: `CLAUDE.md`
 - Modify: `README.md`
 
-- [ ] in `CLAUDE.md`, update the "Exit confirmation for remote connections" section: clarify that only `ctrl+c` (not `q`) shows the disconnect prompt on nested screens, because `q` now does back-navigation. Note the new pre-dispatch rule and the two root carve-outs.
-- [ ] in `CLAUDE.md`, optionally add a one-line note in the "TUI state machine" section: `q` is a back key on nested screens (alias for `esc`); quits only on root screens.
-- [ ] in `README.md`, update the key-bindings reference: change the description of `q` from "quit" to "back inside the app; quit at root screens (server picker / standalone)"; add an explicit `ctrl+c` line for "quit the app (prompts to confirm disconnect when connected to a remote server)" if the README doesn't already mention `ctrl+c`
-- [ ] no test changes — documentation only
+- [x] in `CLAUDE.md`, update the "Exit confirmation for remote connections" section: clarify that only `ctrl+c` (not `q`) shows the disconnect prompt on nested screens, because `q` now does back-navigation. Note the new pre-dispatch rule and the two root carve-outs.
+- [x] in `CLAUDE.md`, optionally add a one-line note in the "TUI state machine" section: `q` is a back key on nested screens (alias for `esc`); quits only on root screens.
+- [x] in `README.md`, update the key-bindings reference: change the description of `q` from "quit" to "back inside the app; quit at root screens (server picker / standalone)"; add an explicit `ctrl+c` line for "quit the app (prompts to confirm disconnect when connected to a remote server)" if the README doesn't already mention `ctrl+c`
+- [x] no test changes — documentation only
 
 ### Task 3: Verify acceptance criteria
 
