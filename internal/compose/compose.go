@@ -686,6 +686,14 @@ func (c *Compose) ContainerStatus(ctx context.Context) (map[string]runner.Servic
 	return parseContainerStatus(out)
 }
 
+// ContainerStats returns CPU and memory usage for each running service.
+// Stub implementation — replaced in Task 5 of the container-cpu-mem-stats plan.
+// Returns an empty map until then so the runner.Composer compile-time check passes.
+func (c *Compose) ContainerStats(ctx context.Context) (map[string]runner.ServiceStats, error) {
+	_ = ctx
+	return map[string]runner.ServiceStats{}, nil
+}
+
 // healthPriority returns a numeric priority for health values.
 // Higher = worse. Used to pick worst-case health for scaled services.
 func healthPriority(h string) int {

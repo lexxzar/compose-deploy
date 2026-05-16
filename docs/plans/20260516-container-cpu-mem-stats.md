@@ -171,18 +171,19 @@ In `cmd/list.go`, when `--stats` is set and no `-C` is given, the bulk `AllConta
 - Create: `internal/compose/stats.go`
 - Create: `internal/compose/stats_test.go`
 
-- [ ] create `internal/compose/stats.go` with `parseStatsOutput([]byte) (map[string]runner.ServiceStats, error)` — keyed by container ID (short form); tolerant of both NDJSON and JSON array
-- [ ] implement `parseSize(string) (int64, error)` handling `B`, `KiB`/`KB`/`kB`, `MiB`/`MB`, `GiB`/`GB`, `TiB`/`TB` (binary + decimal suffixes); case-insensitive on the unit letter
-- [ ] implement `parseCPUPercent(string) (float64, error)` — strip `%`, parse float, empty → 0, malformed → error
-- [ ] implement `formatBytes(int64) string` — inverse of `parseSize`, produces compact `"124M"` / `"1.5G"` / `"512K"` / `"0B"` (single-letter suffix, no `i`, rounded). Exported because both `cmd/list.go` and `internal/tui/app.go` import it; placing it here (next to `parseSize`) prevents duplicate helpers in both packages.
-- [ ] write `TestParseSize` table-driven: `"124MiB"`→130023424, `"1.5GiB"`→1610612736, `"512B"`→512, `"0B"`→0, `"1.5GB"`→1500000000, `"100kB"`→100000, `"100KB"`→100000, malformed → error
-- [ ] write `TestParseCPUPercent` table-driven: `"4.20%"`→4.2, `"0.00%"`→0, `""`→0, garbage → error
-- [ ] write `TestFormatBytes` table-driven: 0→`"0B"`, 512→`"512B"`, 130023424→`"124M"`, 1610612736→`"1.5G"`, boundary checks at 1024 and 1024² and 1024³
-- [ ] write `TestParseStatsOutput` with canned NDJSON containing 3 containers (mixed units, varied CPU%) — verify map shape, ID keys, and parsed values
-- [ ] write `TestParseStatsOutput_JSONArray` with array-form input — verify same result as NDJSON form
-- [ ] write `TestParseStatsOutput_Empty` — empty input returns empty map, no error
-- [ ] write `TestParseStatsOutput_Malformed` — malformed line in NDJSON returns error
-- [ ] run `go test ./internal/compose/...` — must pass before next task
+- [x] create `internal/compose/stats.go` with `parseStatsOutput([]byte) (map[string]runner.ServiceStats, error)` — keyed by container ID (short form); tolerant of both NDJSON and JSON array
+- [x] implement `parseSize(string) (int64, error)` handling `B`, `KiB`/`KB`/`kB`, `MiB`/`MB`, `GiB`/`GB`, `TiB`/`TB` (binary + decimal suffixes); case-insensitive on the unit letter
+- [x] implement `parseCPUPercent(string) (float64, error)` — strip `%`, parse float, empty → 0, malformed → error
+- [x] implement `formatBytes(int64) string` — inverse of `parseSize`, produces compact `"124M"` / `"1.5G"` / `"512K"` / `"0B"` (single-letter suffix, no `i`, rounded). Exported because both `cmd/list.go` and `internal/tui/app.go` import it; placing it here (next to `parseSize`) prevents duplicate helpers in both packages.
+- [x] write `TestParseSize` table-driven: `"124MiB"`→130023424, `"1.5GiB"`→1610612736, `"512B"`→512, `"0B"`→0, `"1.5GB"`→1500000000, `"100kB"`→100000, `"100KB"`→100000, malformed → error
+- [x] write `TestParseCPUPercent` table-driven: `"4.20%"`→4.2, `"0.00%"`→0, `""`→0, garbage → error
+- [x] write `TestFormatBytes` table-driven: 0→`"0B"`, 512→`"512B"`, 130023424→`"124M"`, 1610612736→`"1.5G"`, boundary checks at 1024 and 1024² and 1024³
+- [x] write `TestParseStatsOutput` with canned NDJSON containing 3 containers (mixed units, varied CPU%) — verify map shape, ID keys, and parsed values
+- [x] write `TestParseStatsOutput_JSONArray` with array-form input — verify same result as NDJSON form
+- [x] write `TestParseStatsOutput_Empty` — empty input returns empty map, no error
+- [x] write `TestParseStatsOutput_Malformed` — malformed line in NDJSON returns error
+- [x] run `go test ./internal/compose/...` — must pass before next task
+- ➕ added stub `ContainerStats` methods on `Compose` and `RemoteCompose` (returning empty map) to keep the `runner.Composer` compile-time check passing; replaced with full implementation in Task 5
 
 ### Task 3: Implement `AllContainerStats` (local) — bypassing `command()`
 

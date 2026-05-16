@@ -290,6 +290,14 @@ func (r *RemoteCompose) ContainerStatus(ctx context.Context) (map[string]runner.
 	return parseContainerStatus(out)
 }
 
+// ContainerStats returns CPU and memory usage for each running service.
+// Stub implementation — replaced in Task 5 of the container-cpu-mem-stats plan.
+// Returns an empty map until then so the runner.Composer compile-time check passes.
+func (r *RemoteCompose) ContainerStats(ctx context.Context) (map[string]runner.ServiceStats, error) {
+	_ = ctx
+	return map[string]runner.ServiceStats{}, nil
+}
+
 // findRemoteComposeFile runs a single SSH command that probes all compose file
 // candidates and returns the first match. Avoids multiple SSH round-trips.
 func (r *RemoteCompose) findRemoteComposeFile(ctx context.Context) (string, error) {
