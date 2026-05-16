@@ -191,10 +191,10 @@ Exact text choices to be finalised when reading the surrounding code in Task 2 â
 
 ### Task 3: Verify acceptance criteria
 
-- [ ] verify the new behavior table from the plan Overview matches actual behaviour: `q` is back on all nested screens, `q` quits on root screens, `q` is typed in settings form, `ctrl+c` still prompts to disconnect
-- [ ] run full test suite: `go test ./... -count=1`
-- [ ] verify no regressions in non-TUI packages (cmd, compose, runner, config)
-- [ ] manually inspect `git diff internal/tui/app.go` to confirm no stray `case "q"` remains where it shouldn't, and no `tryQuit()` call was missed
+- [x] verify the new behavior table from the plan Overview matches actual behaviour: `q` is back on all nested screens, `q` quits on root screens, `q` is typed in settings form, `ctrl+c` still prompts to disconnect
+- [x] run full test suite: `go test ./... -count=1`
+- [x] verify no regressions in non-TUI packages (cmd, compose, runner, config)
+- [x] manually inspect `git diff internal/tui/app.go` to confirm no stray `case "q"` remains where it shouldn't, and no `tryQuit()` call was missed
 
 ### Task 4: Final â€” move plan to completed
 
