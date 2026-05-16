@@ -2,17 +2,41 @@
 
 cdeploy is a TUI/CLI app for teams and solo developers who deploy and manage Docker Compose stacks — locally or on a few servers over SSH.
 
-Instead of SSH-ing into each machine and running `docker compose stop && docker compose rm -f && docker compose pull && docker compose up --no-start && docker compose start` by hand, cdeploy wraps that rollout into a single command or terminal UI.
+Instead of SSH-ing into each machine and running this rollout by hand:
+
+```bash
+docker compose stop
+docker compose rm -f
+docker compose pull
+docker compose up --no-start
+docker compose start
+```
+
+cdeploy wraps it into a single command or terminal UI.
 
 No daemon. No agents to install on your servers. No cluster orchestrator. Single binary. Plain SSH.
 
+## Why cdeploy?
+
+cdeploy is not a replacement for Kubernetes, Docker Swarm, or full deployment platforms like Kamal. It's for teams and solo developers who deploy to a handful of servers with plain `docker compose` and just want a faster, less error-prone way to do it — without installing anything on the servers themselves.
+
+## Requirements
+
+- Go 1.26+ (for `go install` or building from source)
+- Docker Compose v2 plugin (`docker compose`) or v1 standalone (`docker-compose`) — auto-detected
+- SSH client (for remote server support)
+
 ## Install
+
+**Prebuilt binaries** (recommended): grab the latest `.tar.gz`, `.deb`, or `.rpm` for your platform from the [Releases page](https://github.com/lexxzar/compose-deploy/releases). Linux and macOS, amd64 and arm64.
+
+**From source**:
 
 ```bash
 go install github.com/lexxzar/compose-deploy@latest
 ```
 
-Or build from source:
+Or clone and build:
 
 ```bash
 git clone https://github.com/lexxzar/compose-deploy.git
@@ -32,9 +56,9 @@ cdeploy
 
 After you select a remote server, the server name is shown in the breadcrumb on subsequent screens. If that server has a `color` set in `~/.cdeploy/servers.yml`, the breadcrumb renders it as a colored badge; if `color` is omitted, the breadcrumb stays plain text.
 
-The TUI walks through up to six screens:
+The TUI has six main screens, plus an inline settings editor reachable from screen 1:
 
-1. **Server select** — choose a remote server or "Local" (only shown when servers are configured); press `s` to open the inline settings editor for managing servers
+1. **Server select** — choose a remote server or "Local" (only shown when servers are configured); press `s` to open the settings editor for managing servers
 2. **Project select** — pick a Docker Compose project (auto-skipped if the current directory has a compose file)
 3. **Service select** — pick services and choose an action (`r` restart, `d` deploy, `s` stop, `l` logs, `c` config, `x` exec)
 4. **Progress** — watch step-by-step execution with status indicators
@@ -45,9 +69,11 @@ The TUI walks through up to six screens:
 
 | Key | Action |
 |-----|--------|
-| `esc` | Back to the previous screen (cancels confirmation prompts; cancels in-flight operations on the progress screen) |
-| `q` | Back inside the app (alias for `esc` on nested screens) — also cancels confirmation prompts. Quits at root screens (server picker, or standalone containers/project when no servers are configured). Typeable inside settings form text inputs. No-op on the progress screen while an operation is in flight (use `esc` to cancel). |
-| `ctrl+c` | Quit the app. When connected to a remote server, prompts to confirm the disconnect (`y` to quit, `n`/`esc` to cancel). |
+| `esc` | Back to the previous screen; cancels confirmation prompts and in-flight operations |
+| `q` | Back on nested screens (alias for `esc`); quits on root screens |
+| `ctrl+c` | Quit. On remote sessions, prompts to confirm the disconnect (`y` to quit, `n`/`esc` to cancel) |
+
+`q` is typeable inside settings-form text inputs and is a no-op on the progress screen while an operation is in flight — use `esc` to cancel.
 
 ### CLI Mode
 
@@ -70,8 +96,7 @@ cdeploy stop nginx
 # List services and their status
 cdeploy list
 
-# List services as JSON (each service includes a `ports` array of
-# {host, host_port, container_port, protocol} entries when published)
+# List services as JSON (for scripts and CI)
 cdeploy list --json
 
 # Stream logs for a service
@@ -86,6 +111,28 @@ cdeploy exec nginx
 # Run a specific command inside a container
 cdeploy exec web -- rails console
 ```
+
+**`list --json` output** (one entry per service, grouped by project):
+
+```json
+[
+  {
+    "project": "myapp",
+    "service": "nginx",
+    "running": true,
+    "health": "healthy",
+    "created": "2026-05-14 10:22",
+    "uptime": "2d",
+    "ports": [
+      { "host": "0.0.0.0", "host_port": 8080, "container_port": 80, "protocol": "tcp" }
+    ]
+  }
+]
+```
+
+`health`, `created`, `uptime`, and `ports` are omitted when not applicable (no healthcheck, stopped container, no published ports).
+
+**Exit codes**: `0` on success, non-zero on failure (config errors, SSH/Docker failures, validation errors). Suitable for CI gating.
 
 #### Remote servers (CLI)
 
@@ -153,36 +200,50 @@ The connection string format is `[user@]host[:port]`. The `-S`/`--ssh` flag is *
 
 > Need a one-off connection without editing the config file? See [Ad-hoc SSH connection (`-S`/`--ssh`)](#ad-hoc-ssh-connection--s--ssh) above for a CLI-only alternative aimed at scripts and CI.
 
-Define remote servers in `~/.cdeploy/servers.yml`:
+Define remote servers in `~/.cdeploy/servers.yml`. Colors are defined once per group and inherited by every server in that group:
 
 ```yaml
+groups:
+  - name: Dev
+    color: green
+  - name: Production
+    color: red
+
 servers:
   - name: app.dev
     host: deploy@app.dev
     group: Dev
-    color: green
   - name: discovery.dev
     host: deploy@discovery.dev
     group: Dev
-    color: cyan
   - name: app.prod
     host: deploy@app.prod
     group: Production
-    color: red
   - name: discovery.prod
     host: deploy@discovery.prod
     project_dir: /opt/apps/web
     group: Production
-    color: red
 ```
+
+Ungrouped servers may set `color` directly on the server entry. Older configs with per-server colors on grouped servers are auto-migrated on load (first-server-wins per group); rewriting them in the format above is recommended.
+
+**Top-level fields**
+
+| Field | Description |
+|-------|-------------|
+| `groups[].name` | Group identifier referenced by `servers[].group` |
+| `groups[].color` | Breadcrumb badge color shared by every server in the group |
+| `servers[]` | List of server entries (see below) |
+
+**Server fields**
 
 | Field | Required | Description |
 |-------|----------|-------------|
 | `name` | yes | Identifier used in TUI and `--server` flag |
 | `host` | yes | SSH destination (`user@hostname`) |
 | `project_dir` | no | Default project directory on the remote host |
-| `group` | no | Visual group label in the TUI server picker — servers with the same group are displayed together under a shared header |
-| `color` | no | Breadcrumb badge color for the selected server on post-selection TUI screens; when omitted, the breadcrumb uses plain text |
+| `group` | no | Name of a group defined in `groups:` — servers with the same group are displayed together and share the group's color |
+| `color` | no | Breadcrumb badge color. Only meaningful for ungrouped servers; ignored when `group` is set (the group's color wins) |
 
 Allowed `color` values: `red`, `green`, `yellow`, `blue`, `magenta`, `cyan`, `white`, `gray`. A common pattern is to mark production servers red so they stand out before you run an operation.
 
@@ -214,7 +275,7 @@ If your services define Docker health checks, cdeploy displays their status alon
 - **✗** unhealthy
 - **~** starting (health check hasn't passed yet)
 
-For scaled services, the worst-case health is shown (unhealthy > starting > healthy). Services without a health check show only the running/stopped dot.
+For scaled services, the worst-case health is shown (unhealthy > starting > healthy). Services without a health check show only the running/stopped dot. The same icons appear in `cdeploy list` output.
 
 ## Logging
 
@@ -228,16 +289,6 @@ From the service screen, press `c` to open the compose config viewer/editor. Thi
 - `e` opens the compose file in your editor. Local mode uses `$EDITOR`, then `$VISUAL`, then `vi`; values like `code --wait` are supported. Remote mode runs `${EDITOR:-vi}` over SSH on the target host.
 - After the editor exits, cdeploy reloads the raw file, switches back to raw view, and validates it with `docker compose config --quiet`. Validation errors are shown inline in the TUI.
 
-## Why cdeploy?
-
-cdeploy is not a replacement for Kubernetes, Docker Swarm, or full deployment platforms like Kamal. It's for teams and solo developers who deploy to a handful of servers with plain `docker compose` and just want a faster, less error-prone way to do it — without installing anything on the servers themselves.
-
 ## License
 
 [MIT](LICENSE)
-
-## Requirements
-
-- Go 1.26+
-- Docker with Compose v2 plugin (`docker compose`)
-- SSH client (for remote server support)
