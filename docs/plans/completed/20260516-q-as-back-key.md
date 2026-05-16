@@ -198,8 +198,8 @@ Exact text choices to be finalised when reading the surrounding code in Task 2 â
 
 ### Task 4: Final â€” move plan to completed
 
-- [ ] `mkdir -p docs/plans/completed`
-- [ ] `mv docs/plans/20260516-q-as-back-key.md docs/plans/completed/`
+- [x] `mkdir -p docs/plans/completed`
+- [x] `mv docs/plans/20260516-q-as-back-key.md docs/plans/completed/`
 
 ## Post-Completion
 
