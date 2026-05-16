@@ -7320,6 +7320,145 @@ func TestContainerScreen_rendersStatsColumns(t *testing.T) {
 	}
 }
 
+// TestContainerScreen_serviceColumnHasCaption verifies that the "Service"
+// caption is rendered above the service-name column when any status columns
+// are present, and that it aligns with the service names underneath.
+func TestContainerScreen_serviceColumnHasCaption(t *testing.T) {
+	mc := &mockComposer{services: []string{"web", "db"}}
+	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
+	m.screen = screenSelectContainers
+	m.services = mc.services
+	m.svcStatus = map[string]runner.ServiceStatus{
+		"web": {Running: true, Created: "2024-01-15 09:30"},
+		"db":  {Running: true, Created: "2024-01-15 09:30"},
+	}
+	m.width = 200
+	m.height = 24
+
+	view := m.viewSelectContainers()
+
+	// Caption must appear.
+	serviceIdx := strings.Index(view, "Service")
+	if serviceIdx < 0 {
+		t.Fatalf("expected 'Service' caption in view, got:\n%s", view)
+	}
+	// Caption must precede the data rows (the rows contain the service names).
+	webIdx := strings.Index(view, "web")
+	if serviceIdx >= webIdx {
+		t.Errorf("'Service' caption at %d should precede 'web' row at %d", serviceIdx, webIdx)
+	}
+	// Caption must precede other column headers.
+	if createdIdx := strings.Index(view, "Created"); createdIdx > 0 && serviceIdx >= createdIdx {
+		t.Errorf("'Service' caption at %d should precede 'Created' at %d", serviceIdx, createdIdx)
+	}
+}
+
+// TestContainerScreen_serviceCaptionWidensShortNames verifies that when every
+// service name is shorter than "Service" (7 chars), the column widens to fit
+// the caption — keeping the following column headers aligned with the data
+// rows underneath. Lipgloss embeds ANSI codes inline in styled segments
+// (checkbox / health / dot), so we strip those before comparing column
+// positions across rows.
+func TestContainerScreen_serviceCaptionWidensShortNames(t *testing.T) {
+	mc := &mockComposer{services: []string{"a", "b"}} // both 1 char, shorter than "Service"
+	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
+	m.screen = screenSelectContainers
+	m.services = mc.services
+	m.svcStatus = map[string]runner.ServiceStatus{
+		"a": {Running: true, Created: "2024-01-15 09:30"},
+		"b": {Running: true, Created: "2024-01-15 09:30"},
+	}
+	m.width = 200
+	m.height = 24
+
+	view := m.viewSelectContainers()
+
+	ansi := regexp.MustCompile(`\x1b\[[0-9;]*m`)
+	stripAnsi := func(s string) string { return ansi.ReplaceAllString(s, "") }
+
+	var captionLine, dataLine string
+	for _, ln := range strings.Split(view, "\n") {
+		bare := stripAnsi(ln)
+		if strings.Contains(bare, "Service") && strings.Contains(bare, "Created") && captionLine == "" {
+			captionLine = bare
+		}
+		if strings.Contains(bare, "2024-01-15") && dataLine == "" {
+			dataLine = bare
+		}
+	}
+	if captionLine == "" || dataLine == "" {
+		t.Fatalf("could not find caption/data lines in view:\n%s", view)
+	}
+	// "Created" caption must align with the date in the data row beneath it.
+	// Use rune-count position rather than byte index so multi-byte glyphs (●)
+	// in the data row don't skew the comparison.
+	runePos := func(s, sub string) int {
+		i := strings.Index(s, sub)
+		if i < 0 {
+			return -1
+		}
+		return utf8.RuneCountInString(s[:i])
+	}
+	if got, want := runePos(captionLine, "Created"), runePos(dataLine, "2024-01-15"); got != want {
+		t.Errorf("Created caption col=%d, data col=%d (caption widening didn't propagate to data rows)\ncaption=%q\ndata=%q", got, want, captionLine, dataLine)
+	}
+}
+
+// TestContainerScreen_statsColumnWidthsAreStable verifies that CPU/Mem
+// columns reserve fixed minimum widths so a transient high value (e.g. one
+// service briefly hitting 11% CPU on a periodic refresh) doesn't push every
+// other column rightward. Both small ("0.2%") and larger ("11.1%") values
+// must render with the SAME column width — anything smaller than the
+// reserved minimum gets left-padded.
+func TestContainerScreen_statsColumnWidthsAreStable(t *testing.T) {
+	mc := &mockComposer{services: []string{"small", "big"}}
+	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
+	m.screen = screenSelectContainers
+	m.services = mc.services
+	m.svcStatus = map[string]runner.ServiceStatus{
+		"small": {Running: true},
+		"big":   {Running: true},
+	}
+	m.stats = map[string]runner.ServiceStats{
+		"small": {CPUPercent: 0.2, MemoryUsed: 10 * 1024 * 1024, MemoryLimit: 128 * 1024 * 1024},
+		"big":   {CPUPercent: 11.1, MemoryUsed: 1503238553, MemoryLimit: 4 * 1024 * 1024 * 1024}, // ~1.4 GiB
+	}
+	m.width = 200
+	m.height = 24
+
+	view := m.viewSelectContainers()
+
+	// CPU is right-aligned. With cpuColMin=6, "0.2%" (4 chars) becomes
+	// "  0.2%" and "11.1%" (5 chars) becomes " 11.1%". Both should appear.
+	if !strings.Contains(view, "  0.2%") {
+		t.Errorf("expected right-aligned '  0.2%%' (4-char value in 6-char column), got:\n%s", view)
+	}
+	if !strings.Contains(view, " 11.1%") {
+		t.Errorf("expected right-aligned ' 11.1%%' (5-char value in 6-char column), got:\n%s", view)
+	}
+
+	// Both rows must have the same overall column layout — find the start of
+	// each row and assert that the "%" characters align at the same column index.
+	smallIdx := strings.Index(view, "small")
+	bigIdx := strings.Index(view, "big")
+	if smallIdx < 0 || bigIdx < 0 {
+		t.Fatalf("could not locate both service rows in view:\n%s", view)
+	}
+	// Walk forward from each row start to the next newline; find the % position.
+	pctCol := func(rowStart int) int {
+		lineEnd := strings.IndexByte(view[rowStart:], '\n')
+		if lineEnd < 0 {
+			lineEnd = len(view) - rowStart
+		}
+		line := view[rowStart : rowStart+lineEnd]
+		return strings.IndexByte(line, '%')
+	}
+	smallPct, bigPct := pctCol(smallIdx), pctCol(bigIdx)
+	if smallPct != bigPct {
+		t.Errorf("CPU percent signs misaligned: small at col %d, big at col %d (right-alignment + fixed width should make them equal)", smallPct, bigPct)
+	}
+}
+
 func TestContainerScreen_blankCellsForMissingStats(t *testing.T) {
 	// One service has stats, the other doesn't — stats-missing service should
 	// render without panic and contribute blank padded cells.

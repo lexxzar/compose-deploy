@@ -2170,16 +2170,25 @@ func (m Model) viewSelectContainers() string {
 		}
 	}
 
-	// Reserve CPU/Mem column widths as soon as stats have been requested so the
-	// captions render on the first frame instead of popping in when the ~1.5s
-	// docker stats call returns. Cells stay blank for services without data yet
-	// (running but not yet measured, or stopped — same as today).
+	// Reserve fixed minimum widths for CPU/Mem columns as soon as stats have
+	// been requested. Two goals: (a) captions render on the first frame
+	// instead of popping in when the ~1.5s docker stats call returns; (b) the
+	// columns don't wiggle on every 5s refresh as values fluctuate (e.g. one
+	// service briefly hitting 11% CPU shouldn't push every other column 1
+	// char to the right). The minimums are sized for the realistic worst case:
+	// 6 chars for CPU ("999.9%" covers a single core at 100% or scaled
+	// services aggregating across replicas), 11 chars for Mem ("1024M/1024M"
+	// covers values that haven't quite rolled over to the next unit).
+	const (
+		cpuColMin = 6  // len("999.9%")
+		memColMin = 11 // len("1024M/1024M")
+	)
 	if m.statsRequested {
-		if maxCPU < len("CPU") {
-			maxCPU = len("CPU")
+		if maxCPU < cpuColMin {
+			maxCPU = cpuColMin
 		}
-		if maxMem < len("Mem") {
-			maxMem = len("Mem")
+		if maxMem < memColMin {
+			maxMem = memColMin
 		}
 	}
 
@@ -2196,6 +2205,12 @@ func (m Model) viewSelectContainers() string {
 	// column to at least its caption width so the caption never overflows and
 	// shifts the following columns rightward.
 	if maxCreated > 0 || maxUptime > 0 || maxCPU > 0 || maxMem > 0 || maxPorts > 0 {
+		if len("Service") > maxName {
+			// Ensures the "Service" caption fits when every service name is
+			// shorter than the caption — also widens the data rows in lockstep
+			// (the same maxName is used in the row builder below).
+			maxName = len("Service")
+		}
 		if maxCreated > 0 && len("Created") > maxCreated {
 			maxCreated = len("Created")
 		}
@@ -2211,9 +2226,9 @@ func (m Model) viewSelectContainers() string {
 		if maxPorts > 0 && len("Ports") > maxPorts {
 			maxPorts = len("Ports")
 		}
-		// Left padding: cursor(2) + checkbox(3) + space(1) + health(1) + space(1) + dot(1) + space(1) + name
-		padding := strings.Repeat(" ", 10+maxName)
-		header := padding
+		// Left padding: cursor(2) + checkbox(3) + space(1) + health(1) + space(1) + dot(1) + space(1) = 10
+		// Then the "Service" caption sits in the same column as service names.
+		header := strings.Repeat(" ", 10) + fmt.Sprintf("%-*s", maxName, "Service")
 		if maxCreated > 0 {
 			header += fmt.Sprintf("  %-*s", maxCreated, "Created")
 		}
@@ -2221,7 +2236,9 @@ func (m Model) viewSelectContainers() string {
 			header += fmt.Sprintf("  %-*s", maxUptime, "Uptime")
 		}
 		if maxCPU > 0 {
-			header += fmt.Sprintf("  %-*s", maxCPU, "CPU")
+			// Right-aligned: percent sign anchors at the right edge so the
+			// caption visually lines up with the column's rightmost digits.
+			header += fmt.Sprintf("  %*s", maxCPU, "CPU")
 		}
 		if maxMem > 0 {
 			header += fmt.Sprintf("  %-*s", maxMem, "Mem")
@@ -2262,7 +2279,11 @@ func (m Model) viewSelectContainers() string {
 			line += fmt.Sprintf("  %-*s", maxUptime, st.Uptime)
 		}
 		if maxCPU > 0 {
-			line += fmt.Sprintf("  %-*s", maxCPU, cpuStr[svc])
+			// Right-aligned: percent signs stack vertically across rows so the
+			// magnitude of each value is readable at a glance. Mem stays
+			// left-aligned because it's a composite "used/limit" string and
+			// right-aligning the limit looks worse than left-aligning the used.
+			line += fmt.Sprintf("  %*s", maxCPU, cpuStr[svc])
 		}
 		if maxMem > 0 {
 			line += fmt.Sprintf("  %-*s", maxMem, memStr[svc])
