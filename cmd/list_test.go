@@ -623,6 +623,32 @@ func (m *mockComposer) Logs(_ context.Context, _ string, _ bool, _ int, _ io.Wri
 	return nil
 }
 
+// mockComposerBulk extends mockComposer with the bulkStatsAggregator interface
+// so collectMultiProjectStats's optimized path can be exercised in tests.
+// The bulkStats field is what ContainerStatsFromBulk returns; the inherited
+// stats / statsErr fields cover the fallback ContainerStats() path.
+// Call counters let tests assert which path was taken.
+type mockComposerBulk struct {
+	mockComposer
+	bulkStats           map[string]runner.ServiceStats
+	bulkErr             error
+	bulkCalls           int
+	containerStatsCalls int
+}
+
+func (m *mockComposerBulk) ContainerStats(ctx context.Context) (map[string]runner.ServiceStats, error) {
+	m.containerStatsCalls++
+	return m.mockComposer.ContainerStats(ctx)
+}
+
+func (m *mockComposerBulk) ContainerStatsFromBulk(_ context.Context, _ map[string]runner.ServiceStats) (map[string]runner.ServiceStats, error) {
+	m.bulkCalls++
+	if m.bulkErr != nil {
+		return nil, m.bulkErr
+	}
+	return m.bulkStats, nil
+}
+
 func TestCollectMultiProject_Success(t *testing.T) {
 	mocks := map[string]*mockComposer{
 		"/app1": {
@@ -2097,7 +2123,7 @@ func TestListCmd_multiProjectStatsFailure(t *testing.T) {
 	os.Stderr = wErr
 	t.Cleanup(func() { os.Stderr = oldStderr })
 
-	result := collectMultiProjectStats(context.Background(), projects, factory, true)
+	result := collectMultiProjectStats(context.Background(), projects, factory, true, nil)
 	wErr.Close()
 	os.Stderr = oldStderr
 
@@ -2225,9 +2251,12 @@ func TestFormatDotsGrouped_StatsColumns(t *testing.T) {
 }
 
 // TestMergeStatusStats_RequestedPopulatesPointers verifies that when
-// statsRequested is true, every service gets non-nil pointers — even those
-// absent from the stats map (mapped to zero values so JSON consumers see
-// the fields consistently).
+// statsRequested is true, services present in the stats map get non-nil
+// pointers while services absent from the map keep nil pointers (blank cells,
+// omitted JSON fields). The nil-vs-&0 distinction matters: &0 means a
+// legitimate idle container observed by docker; nil means "no data" (stopped,
+// or ps/stats race). Conflating them would emit fake "0.0%" / "0B/0B" cells
+// that look indistinguishable from real readings.
 func TestMergeStatusStats_RequestedPopulatesPointers(t *testing.T) {
 	services := []string{"web", "missing"}
 	status := map[string]runner.ServiceStatus{
@@ -2245,12 +2274,9 @@ func TestMergeStatusStats_RequestedPopulatesPointers(t *testing.T) {
 		t.Fatalf("order = [%s, %s], want [missing, web]", got[0].Name, got[1].Name)
 	}
 
-	// "missing" should have non-nil pointers (zero values) — fields appear in JSON.
-	if got[0].CPUPercent == nil || got[0].MemoryUsed == nil || got[0].MemoryLimit == nil {
-		t.Errorf("absent-from-stats service must have non-nil pointers, got %+v", got[0])
-	}
-	if got[0].CPUPercent != nil && *got[0].CPUPercent != 0 {
-		t.Errorf("absent service CPU = %v, want 0", *got[0].CPUPercent)
+	// "missing" is absent from stats → pointers stay nil (blank cells, JSON omits fields).
+	if got[0].CPUPercent != nil || got[0].MemoryUsed != nil || got[0].MemoryLimit != nil {
+		t.Errorf("absent-from-stats service must have nil pointers, got %+v", got[0])
 	}
 
 	// "web" should have the actual values.
@@ -2259,6 +2285,30 @@ func TestMergeStatusStats_RequestedPopulatesPointers(t *testing.T) {
 	}
 	if got[1].MemoryUsed == nil || *got[1].MemoryUsed != 100 {
 		t.Errorf("web MemoryUsed = %v, want 100", got[1].MemoryUsed)
+	}
+}
+
+// TestMergeStatusStats_LegitimateZeroPreserved verifies that a service present
+// in the stats map with zero values (idle container observed by docker) still
+// emits &0 pointers — JSON keys appear with value 0, text shows "0.0%" /
+// "0B/0B". This is the case pointer types were chosen to distinguish from
+// "absent from stats" (which renders blank).
+func TestMergeStatusStats_LegitimateZeroPreserved(t *testing.T) {
+	services := []string{"idle"}
+	status := map[string]runner.ServiceStatus{"idle": {Running: true}}
+	stats := map[string]runner.ServiceStats{
+		"idle": {CPUPercent: 0, MemoryUsed: 0, MemoryLimit: 0},
+	}
+
+	got := mergeStatusStats(services, status, stats, true)
+	if got[0].CPUPercent == nil || *got[0].CPUPercent != 0 {
+		t.Errorf("idle CPU should be &0, got %v", got[0].CPUPercent)
+	}
+	if got[0].MemoryUsed == nil || *got[0].MemoryUsed != 0 {
+		t.Errorf("idle MemoryUsed should be &0, got %v", got[0].MemoryUsed)
+	}
+	if got[0].MemoryLimit == nil || *got[0].MemoryLimit != 0 {
+		t.Errorf("idle MemoryLimit should be &0, got %v", got[0].MemoryLimit)
 	}
 }
 
@@ -2291,7 +2341,7 @@ func TestCollectMultiProjectStats_PopulatesStats(t *testing.T) {
 	projects := []compose.Project{{Name: "a", ConfigDir: "/a"}}
 	factory := func(dir string) runner.Composer { return mocks[dir] }
 
-	result := collectMultiProjectStats(context.Background(), projects, factory, true)
+	result := collectMultiProjectStats(context.Background(), projects, factory, true, nil)
 	if len(result) != 1 || len(result[0].Services) != 1 {
 		t.Fatalf("unexpected result shape: %+v", result)
 	}
@@ -2314,12 +2364,118 @@ func TestCollectMultiProjectStats_NotRequestedSkipsStatsCall(t *testing.T) {
 	factory := func(_ string) runner.Composer { return mock }
 
 	// With showStats=false, statsErr must not surface — ContainerStats() not invoked.
-	result := collectMultiProjectStats(context.Background(), projects, factory, false)
+	result := collectMultiProjectStats(context.Background(), projects, factory, false, nil)
 	if len(result) != 1 || len(result[0].Services) != 1 {
 		t.Fatalf("unexpected result shape: %+v", result)
 	}
 	if result[0].Services[0].CPUPercent != nil {
 		t.Errorf("CPUPercent must be nil without --stats, got %v", result[0].Services[0].CPUPercent)
+	}
+}
+
+// TestCollectMultiProjectStats_UsesBulkAggregator verifies that when bulkStats
+// is supplied AND the composer implements bulkStatsAggregator, the bulk path
+// runs and the per-project ContainerStats() fallback is NOT invoked. This is
+// the optimization that makes multi-project --stats pay one host-wide
+// `docker stats` cost regardless of project count.
+func TestCollectMultiProjectStats_UsesBulkAggregator(t *testing.T) {
+	mock := &mockComposerBulk{
+		mockComposer: mockComposer{
+			services: []string{"web"},
+			status:   map[string]runner.ServiceStatus{"web": {Running: true}},
+			// statsErr is what ContainerStats() returns. If the bulk path is taken
+			// correctly, ContainerStats() is never called and this error never
+			// surfaces — the test asserts a populated stats cell instead.
+			statsErr: fmt.Errorf("ContainerStats should not have been called when bulk is used"),
+		},
+		bulkStats: map[string]runner.ServiceStats{"web": {CPUPercent: 7.7}},
+	}
+	projects := []compose.Project{{Name: "a", ConfigDir: "/a"}}
+	factory := func(_ string) runner.Composer { return mock }
+	bulk := map[string]runner.ServiceStats{"deadbeef0000": {CPUPercent: 0}} // contents irrelevant; presence triggers the bulk path
+
+	result := collectMultiProjectStats(context.Background(), projects, factory, true, bulk)
+	if len(result) != 1 || len(result[0].Services) != 1 {
+		t.Fatalf("unexpected result shape: %+v", result)
+	}
+	s := result[0].Services[0]
+	if s.CPUPercent == nil || *s.CPUPercent != 7.7 {
+		t.Errorf("CPUPercent = %v, want 7.7 (bulk path)", s.CPUPercent)
+	}
+	if mock.containerStatsCalls != 0 {
+		t.Errorf("ContainerStats called %d times, want 0 (bulk should bypass it)", mock.containerStatsCalls)
+	}
+	if mock.bulkCalls != 1 {
+		t.Errorf("ContainerStatsFromBulk called %d times, want 1", mock.bulkCalls)
+	}
+}
+
+// TestCollectMultiProjectStats_EmptyBulkSkipsPerProjectRetry verifies that
+// when the host-wide stats fetch failed and the caller signaled this by
+// passing a non-nil empty map, the bulk path still runs (only `docker
+// compose ps` per project). Critically, per-project ContainerStats() is NOT
+// called — that would re-trigger the failing `docker stats` call N times
+// and violate the plan's "one ~1.5s cost regardless of project count"
+// guarantee on the soft-fail path.
+func TestCollectMultiProjectStats_EmptyBulkSkipsPerProjectRetry(t *testing.T) {
+	mock := &mockComposerBulk{
+		mockComposer: mockComposer{
+			services: []string{"web"},
+			status:   map[string]runner.ServiceStatus{"web": {Running: true}},
+			// ContainerStats() must NOT be called — assert via call count below.
+			// Set statsErr so any accidental call surfaces loudly in the result.
+			statsErr: fmt.Errorf("ContainerStats must not be called on empty-bulk soft-fail"),
+		},
+		// bulkStats here is what ContainerStatsFromBulk returns — irrelevant for
+		// this test since the function only joins against the (empty) bulk map
+		// passed in, not this mock field.
+		bulkStats: map[string]runner.ServiceStats{},
+	}
+	projects := []compose.Project{{Name: "a", ConfigDir: "/a"}}
+	factory := func(_ string) runner.Composer { return mock }
+
+	// Non-nil empty bulk map — the contract for "bulk fetch failed".
+	result := collectMultiProjectStats(context.Background(), projects, factory, true, map[string]runner.ServiceStats{})
+	if len(result) != 1 || len(result[0].Services) != 1 {
+		t.Fatalf("unexpected result shape: %+v", result)
+	}
+	if mock.containerStatsCalls != 0 {
+		t.Errorf("ContainerStats called %d times, want 0 (must not retry per-project on bulk failure)", mock.containerStatsCalls)
+	}
+	if mock.bulkCalls != 1 {
+		t.Errorf("ContainerStatsFromBulk called %d times, want 1", mock.bulkCalls)
+	}
+}
+
+// TestCollectMultiProjectStats_FallsBackWhenBulkNil verifies that when the
+// host-wide stats fetch failed (bulkStats nil), the per-project ContainerStats
+// fallback runs — behavior degrades to the legacy path rather than dropping
+// stats entirely.
+func TestCollectMultiProjectStats_FallsBackWhenBulkNil(t *testing.T) {
+	mock := &mockComposerBulk{
+		mockComposer: mockComposer{
+			services: []string{"web"},
+			status:   map[string]runner.ServiceStatus{"web": {Running: true}},
+			stats:    map[string]runner.ServiceStats{"web": {CPUPercent: 3.3}},
+		},
+		bulkStats: map[string]runner.ServiceStats{"web": {CPUPercent: 99}}, // would be used if bulk path taken
+	}
+	projects := []compose.Project{{Name: "a", ConfigDir: "/a"}}
+	factory := func(_ string) runner.Composer { return mock }
+
+	result := collectMultiProjectStats(context.Background(), projects, factory, true, nil)
+	if len(result) != 1 || len(result[0].Services) != 1 {
+		t.Fatalf("unexpected result shape: %+v", result)
+	}
+	s := result[0].Services[0]
+	if s.CPUPercent == nil || *s.CPUPercent != 3.3 {
+		t.Errorf("CPUPercent = %v, want 3.3 (per-project fallback path)", s.CPUPercent)
+	}
+	if mock.containerStatsCalls != 1 {
+		t.Errorf("ContainerStats called %d times, want 1 (fallback)", mock.containerStatsCalls)
+	}
+	if mock.bulkCalls != 0 {
+		t.Errorf("ContainerStatsFromBulk called %d times, want 0", mock.bulkCalls)
 	}
 }
 

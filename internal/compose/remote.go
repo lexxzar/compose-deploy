@@ -296,6 +296,19 @@ func (r *RemoteCompose) ContainerStatus(ctx context.Context) (map[string]runner.
 // ControlMaster connection, then joins by container ID and sum-aggregates per
 // service. See Compose.ContainerStats for the full contract.
 func (r *RemoteCompose) ContainerStats(ctx context.Context) (map[string]runner.ServiceStats, error) {
+	all, err := AllContainerStatsRemote(ctx, r)
+	if err != nil {
+		return nil, err
+	}
+	return r.ContainerStatsFromBulk(ctx, all)
+}
+
+// ContainerStatsFromBulk joins a pre-fetched host-wide stats map (from
+// AllContainerStatsRemote) against this remote project's container IDs and
+// returns per-service aggregated stats. See Compose.ContainerStatsFromBulk
+// for the full contract — this is the SSH counterpart that shares one
+// host-wide `docker stats` call across every project on the remote host.
+func (r *RemoteCompose) ContainerStatsFromBulk(ctx context.Context, bulk map[string]runner.ServiceStats) (map[string]runner.ServiceStats, error) {
 	cmd := r.remoteCommand(ctx, "ps", "-a", "--format", "json")
 	var out []byte
 	var err error
@@ -311,11 +324,7 @@ func (r *RemoteCompose) ContainerStats(ctx context.Context) (map[string]runner.S
 	if err != nil {
 		return nil, err
 	}
-	all, err := AllContainerStatsRemote(ctx, r)
-	if err != nil {
-		return nil, err
-	}
-	return aggregateStatsByService(idToService, all), nil
+	return aggregateStatsByService(idToService, bulk), nil
 }
 
 // findRemoteComposeFile runs a single SSH command that probes all compose file

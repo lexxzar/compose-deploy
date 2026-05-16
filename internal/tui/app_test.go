@@ -6466,8 +6466,11 @@ func TestStatsMsg_storesError(t *testing.T) {
 	if model.statsErr == nil || model.statsErr.Error() != wantErr.Error() {
 		t.Errorf("statsErr = %v, want %v", model.statsErr, wantErr)
 	}
-	if len(model.stats) != 1 || model.stats["web"].CPUPercent != 4.2 {
-		t.Errorf("stats mutated on error: got %+v", model.stats)
+	// On error, m.stats must be cleared — otherwise the screen would render
+	// stale CPU/Mem cells next to a "Stats unavailable" warning, contradicting
+	// itself and tempting users to trust outdated values.
+	if model.stats != nil {
+		t.Errorf("stats must be cleared on error, got %+v", model.stats)
 	}
 }
 
@@ -6625,6 +6628,58 @@ func TestEsc_bumpsStatsSession(t *testing.T) {
 
 	if model.statsSession <= 10 {
 		t.Errorf("statsSession = %d, want > 10 after esc back-nav", model.statsSession)
+	}
+}
+
+// TestExecDone_bumpsStatsSession verifies that returning from exec bumps the
+// session — without this, an older in-flight stats fetch from the prior
+// container-screen entry could land after the post-exec refresh and overwrite
+// fresher data with stale state.
+func TestExecDone_bumpsStatsSession(t *testing.T) {
+	mc := &mockComposer{services: []string{"web"}}
+	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
+	m.screen = screenSelectContainers
+	m.statsSession = 5
+
+	result, _ := m.Update(execDoneMsg{})
+	model := result.(Model)
+
+	if model.statsSession <= 5 {
+		t.Errorf("statsSession = %d, want > 5 after execDoneMsg", model.statsSession)
+	}
+}
+
+// TestLogsEsc_bumpsStatsSession verifies returning from the log viewer bumps
+// the session so any pre-logs in-flight stats fetch is filtered out.
+func TestLogsEsc_bumpsStatsSession(t *testing.T) {
+	mc := &mockComposer{services: []string{"web"}}
+	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
+	m.screen = screenLogs
+	m.statsSession = 7
+
+	result, _ := m.Update(tea.KeyMsg{Type: tea.KeyEsc})
+	model := result.(Model)
+
+	if model.statsSession <= 7 {
+		t.Errorf("statsSession = %d, want > 7 after logs esc", model.statsSession)
+	}
+}
+
+// TestProgressEsc_bumpsStatsSession verifies returning from the progress screen
+// (after a completed operation) bumps the session — same race protection as
+// exec/logs.
+func TestProgressEsc_bumpsStatsSession(t *testing.T) {
+	mc := &mockComposer{services: []string{"web"}}
+	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
+	m.screen = screenProgress
+	m.done = true
+	m.statsSession = 3
+
+	result, _ := m.Update(tea.KeyMsg{Type: tea.KeyEsc})
+	model := result.(Model)
+
+	if model.statsSession <= 3 {
+		t.Errorf("statsSession = %d, want > 3 after progress esc", model.statsSession)
 	}
 }
 

@@ -182,7 +182,7 @@ type Model struct {
 	svcStatus    map[string]runner.ServiceStatus // service name → status
 	stats        map[string]runner.ServiceStats  // service name → resource usage; populated asynchronously by refreshStats
 	statsErr     error                           // last error from ContainerStats; rendered in the same slot as svcErr (svcErr wins)
-	statsSession uint64                          // bumped on context change (project/server) so stale in-flight responses get filtered
+	statsSession uint64                          // bumped before every refreshStats() and on context change so older in-flight responses are filtered out
 	selected  map[int]bool
 	svcCursor int
 	svcOffset int // index of first visible service in scroll window
@@ -480,7 +480,11 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 		if msg.err != nil {
+			// Clear m.stats alongside setting statsErr so the screen never shows
+			// stale CPU/Mem cells next to a "Stats unavailable" warning — the
+			// contradiction would confuse users into trusting the stale values.
 			m.statsErr = msg.err
+			m.stats = nil
 			m.fixSvcOffset()
 			return m, nil
 		}
@@ -622,6 +626,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if msg.err != nil {
 			m.warning = fmt.Sprintf("exec failed: %v", msg.err)
 		}
+		m.statsSession++
 		return m, tea.Batch(m.refreshStatus(), m.refreshStats())
 
 	case pipelineDoneMsg:
@@ -944,6 +949,7 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.logsFormatted = ""
 			m.logsRawOff = 0
 			m.screen = screenSelectContainers
+			m.statsSession++
 			return m, tea.Batch(m.refreshStatus(), m.refreshStats())
 		case "w":
 			m.logsWrap = !m.logsWrap
@@ -1224,6 +1230,7 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 				m.eventCh = nil
 				m.cancel = nil
 				m.logContent = ""
+				m.statsSession++
 				return m, tea.Batch(m.refreshStatus(), m.refreshStats())
 			}
 			if m.cancel != nil {
@@ -2173,7 +2180,11 @@ func (m Model) viewSelectContainers() string {
 		line2 := "  r restart  •  d deploy  •  s stop  •  l logs  •  c config  •  x exec"
 		oneLine := line1 + "  •  " + line2[2:]
 		gap := "\n"
-		if below > 0 && m.warning == "" {
+		// Skip the leading newline only when the "▼ N more" indicator is the
+		// last thing rendered — both the warning and statsErr branches above
+		// already prepend their own newline, so a "" gap there would glue the
+		// help text onto the warning line.
+		if below > 0 && m.warning == "" && m.statsErr == nil {
 			gap = ""
 		}
 		if m.width >= len(oneLine)+2 {

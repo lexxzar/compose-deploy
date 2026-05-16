@@ -76,21 +76,12 @@ func mergeStatusStats(services []string, status map[string]runner.ServiceStatus,
 				result[i].CPUPercent = &cpu
 				result[i].MemoryUsed = &used
 				result[i].MemoryLimit = &limit
-			} else {
-				// Service is absent from stats (stopped, or race window between
-				// ps and stats). Emit zero values so JSON consumers see the
-				// fields and stopped services render blank via !Running in the
-				// cell formatters. Each pointer gets its own backing variable
-				// to avoid aliasing. When stats fetch failed entirely (stats
-				// is nil), this whole block is skipped so pointers stay nil
-				// — blank tabular cells, omitted JSON fields.
-				zeroF := 0.0
-				zeroUsed := int64(0)
-				zeroLimit := int64(0)
-				result[i].CPUPercent = &zeroF
-				result[i].MemoryUsed = &zeroUsed
-				result[i].MemoryLimit = &zeroLimit
 			}
+			// Service absent from stats (stopped, or ps/stats race): pointers
+			// stay nil so tabular cells render blank and JSON omits the fields.
+			// A legitimate zero from docker (idle container at 0% CPU) arrives
+			// as an entry in the stats map with zero-valued fields — that case
+			// still emits &0 pointers and renders "0.0%" / "0B/0B".
 		}
 	}
 	sort.Slice(result, func(i, j int) bool {
@@ -399,23 +390,37 @@ func listSingleProject(ctx context.Context, c runner.Composer, jsonOutput, showS
 // collectMultiProject gathers service statuses for each project using the factory to create composers.
 // Per-project errors are non-fatal: a warning is printed to stderr and the project is skipped.
 func collectMultiProject(ctx context.Context, projects []compose.Project, factory func(dir string) runner.Composer) []projectServices {
-	return collectMultiProjectStats(ctx, projects, factory, false)
+	return collectMultiProjectStats(ctx, projects, factory, false, nil)
+}
+
+// bulkStatsAggregator is the optional capability that a composer can implement
+// to consume a pre-fetched host-wide `docker stats` map and join only its own
+// `docker compose ps` output against it. Both *compose.Compose and
+// *compose.RemoteCompose satisfy this; test mocks that don't implement it fall
+// back to the per-project ContainerStats() path.
+type bulkStatsAggregator interface {
+	ContainerStatsFromBulk(ctx context.Context, bulk map[string]runner.ServiceStats) (map[string]runner.ServiceStats, error)
 }
 
 // collectMultiProjectStats is the stats-aware variant of collectMultiProject.
-// When showStats is true, it invokes ContainerStats() on each project's composer.
-// Per-project stats failures degrade gracefully: a warning is logged to stderr,
-// stats cells render blank for that project, and the rest of the listing
-// continues. Per-project status (ListServices/ContainerStatus) failures remain
-// fatal-to-the-project (the project is skipped entirely), matching the existing
-// convention — stats is strictly additive and never causes a project to drop.
+// When showStats is true, it populates per-service CPU/Mem cells for every
+// project. Per-project stats failures degrade gracefully: a warning is logged
+// to stderr, stats cells render blank for that project, and the rest of the
+// listing continues. Per-project status (ListServices/ContainerStatus)
+// failures remain fatal-to-the-project (the project is skipped entirely),
+// matching the existing convention — stats is strictly additive and never
+// causes a project to drop.
 //
-// Note: each project's composer calls ContainerStats independently, which —
-// under the current Composer interface — performs its own host-wide
-// `docker stats` fetch. A future optimization could share one bulk call across
-// projects; the interface intentionally does not expose that machinery so the
-// trade-off is contained to this file when needed.
-func collectMultiProjectStats(ctx context.Context, projects []compose.Project, factory func(dir string) runner.Composer, showStats bool) []projectServices {
+// Bulk-call sharing: when bulkStats is non-nil and the per-project composer
+// implements bulkStatsAggregator, ContainerStatsFromBulk runs against the
+// pre-fetched map — only `docker compose ps` runs per project, so the host
+// pays one ~1.5s `docker stats` cost regardless of project count. Callers
+// that fail to pre-fetch should still pass a non-nil empty map so this path
+// is preserved (no N×retry of the host-wide stats call). When bulkStats is
+// nil, the composer's ContainerStats() runs per project as a fallback —
+// reserved for callers that didn't request bulk sharing at all (e.g. test
+// mocks that don't implement bulkStatsAggregator).
+func collectMultiProjectStats(ctx context.Context, projects []compose.Project, factory func(dir string) runner.Composer, showStats bool, bulkStats map[string]runner.ServiceStats) []projectServices {
 	var result []projectServices
 	for _, proj := range projects {
 		c := factory(proj.ConfigDir)
@@ -434,7 +439,11 @@ func collectMultiProjectStats(ctx context.Context, projects []compose.Project, f
 
 		var stats map[string]runner.ServiceStats
 		if showStats {
-			stats, err = c.ContainerStats(ctx)
+			if bsa, ok := c.(bulkStatsAggregator); ok && bulkStats != nil {
+				stats, err = bsa.ContainerStatsFromBulk(ctx, bulkStats)
+			} else {
+				stats, err = c.ContainerStats(ctx)
+			}
 			if err != nil {
 				fmt.Fprintf(os.Stderr, "cdeploy: stats unavailable for %q: %v\n", proj.Name, err)
 				stats = nil
@@ -541,7 +550,19 @@ func runList(ctx context.Context, jsonOutput, showStats bool) error {
 			rc2.SetStandalone(rc.Standalone)
 			return rc2
 		}
-		grouped := collectMultiProjectStats(ctx, projects, factory, showStats)
+		// One host-wide `docker stats` call shared across every project. When
+		// the bulk fetch fails, warn once and pass a non-nil empty map so the
+		// per-project loop still uses the bulk path (just `docker compose ps`)
+		// instead of retrying the host-wide stats call N more times.
+		var bulkStats map[string]runner.ServiceStats
+		if showStats {
+			bulkStats, err = compose.AllContainerStatsRemote(ctx, rc)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "cdeploy: stats unavailable: %v\n", err)
+				bulkStats = map[string]runner.ServiceStats{}
+			}
+		}
+		grouped := collectMultiProjectStats(ctx, projects, factory, showStats, bulkStats)
 		return printMultiProject(grouped, jsonOutput)
 	}
 
@@ -583,6 +604,18 @@ func runList(ctx context.Context, jsonOutput, showStats bool) error {
 		lc.SetStandalone(c.Standalone)
 		return lc
 	}
-	grouped := collectMultiProjectStats(ctx, projects, factory, showStats)
+	// Single host-wide stats fetch shared across all local projects. On
+	// failure pass a non-nil empty map so per-project loop uses the bulk
+	// path (just `docker compose ps`) instead of retrying `docker stats`
+	// N more times.
+	var bulkStats map[string]runner.ServiceStats
+	if showStats {
+		bulkStats, err = compose.AllContainerStats(ctx, c)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "cdeploy: stats unavailable: %v\n", err)
+			bulkStats = map[string]runner.ServiceStats{}
+		}
+	}
+	grouped := collectMultiProjectStats(ctx, projects, factory, showStats, bulkStats)
 	return printMultiProject(grouped, jsonOutput)
 }
