@@ -43,6 +43,41 @@ func AllContainerStats(ctx context.Context, c *Compose) (map[string]runner.Servi
 	return parseStatsOutput(out)
 }
 
+// AllContainerStatsRemote returns CPU and memory usage for every running
+// container on the remote host, keyed by short container ID. It mirrors
+// AllContainerStats over an SSH ControlMaster connection so the multi-project
+// CLI path can share one host-wide stats call when targeting a remote server.
+//
+// Bypasses `rc.remoteCommand(...)` because `docker stats` is a top-level Docker
+// CLI command, NOT a compose subcommand — `remoteCommand` would build a
+// compose-flavored argv (`docker compose ...`) which produces a malformed
+// remote command. The SSH argv is built directly via `rc.sshArgs(...)` so
+// `SSHExtraArgs` are spliced immediately before the host argument, matching
+// the convention established by `EditCommand` and `ExecCommand` (which already
+// bypass `remoteCommand` for SSH/TTY reasons). The `outputCmd` test hook is
+// honored so command construction and parsing are testable.
+//
+// The output is parsed via parseStatsOutput which tolerates both NDJSON and
+// JSON-array forms.
+func AllContainerStatsRemote(ctx context.Context, rc *RemoteCompose) (map[string]runner.ServiceStats, error) {
+	sshArgv := rc.sshArgs(
+		[]string{"-S", rc.SocketPath, "-o", "ControlMaster=no"},
+		"docker stats --no-stream --format json",
+	)
+	cmd := exec.CommandContext(ctx, "ssh", sshArgv...)
+	var out []byte
+	var err error
+	if rc.outputCmd != nil {
+		out, err = rc.outputCmd(cmd)
+	} else {
+		out, err = cmd.Output()
+	}
+	if err != nil {
+		return nil, fmt.Errorf("fetching remote container stats: %w", withStderr(err))
+	}
+	return parseStatsOutput(out)
+}
+
 // statsEntry matches the JSON schema of `docker stats --no-stream --format json`.
 // Fields are camel-cased exactly as Docker emits them; only the fields we consume
 // are declared. `ID` is the short container ID (12 chars); used as the join key

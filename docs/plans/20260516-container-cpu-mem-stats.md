@@ -213,16 +213,16 @@ In `cmd/list.go`, when `--stats` is set and no `-C` is given, the bulk `AllConta
 
 **Important — bypass `remoteCommand()`:** Same reason as Task 3 — `remoteCommand()` builds compose-flavored argv (`docker compose ...`). Build the SSH argv directly, mirroring the pattern that `EditCommand` and `ExecCommand` already use in `remote.go`. Splice `SSHExtraArgs` **immediately before the host argument**, which is the convention documented in CLAUDE.md for every SSH argv site (`Connect`, `Close`, `Detect` probes, `remoteCommand`, `findRemoteComposeFile`, `ConfigFile`, `EditCommand`, `ExecCommand`).
 
-- [ ] add `AllContainerStatsRemote(ctx context.Context, rc *RemoteCompose) (map[string]runner.ServiceStats, error)`
-- [ ] build the SSH argv directly: `ssh` + ControlMaster args + port args (if set) + `SSHExtraArgs` + host + remote command `docker stats --no-stream --format json` — do NOT call `rc.remoteCommand(...)`
-- [ ] route through the existing test hook on `RemoteCompose`
-- [ ] add doc comment noting "bypasses `remoteCommand()` because `docker stats` is not a compose subcommand; follows the `EditCommand`/`ExecCommand` precedent"
-- [ ] parse the result via `parseStatsOutput`
-- [ ] write `TestAllContainerStatsRemote_argConstruction` — verify SSH argv shape ends with `..., "user@host", "docker stats --no-stream --format json"`; assert `compose` does not appear anywhere in argv
-- [ ] write `TestAllContainerStatsRemote_extraArgsSplice` — set `rc.SSHExtraArgs = []string{"-i", "/tmp/key"}`, verify they appear immediately before the host arg (not after, not at the end)
-- [ ] write `TestAllContainerStatsRemote_portArgs` — set port on the underlying SSH target, verify `-p NNNN` precedes `SSHExtraArgs`, both precede host
-- [ ] write `TestAllContainerStatsRemote_parsing` — inject test hook with canned NDJSON, assert correct map
-- [ ] run `go test ./internal/compose/...` — must pass before next task
+- [x] add `AllContainerStatsRemote(ctx context.Context, rc *RemoteCompose) (map[string]runner.ServiceStats, error)`
+- [x] build the SSH argv directly: `ssh` + ControlMaster args + port args (if set) + `SSHExtraArgs` + host + remote command `docker stats --no-stream --format json` — do NOT call `rc.remoteCommand(...)`
+- [x] route through the existing test hook on `RemoteCompose`
+- [x] add doc comment noting "bypasses `remoteCommand()` because `docker stats` is not a compose subcommand; follows the `EditCommand`/`ExecCommand` precedent"
+- [x] parse the result via `parseStatsOutput`
+- [x] write `TestAllContainerStatsRemote_argConstruction` — verify SSH argv shape ends with `..., "user@host", "docker stats --no-stream --format json"`; assert `compose` does not appear anywhere in argv
+- [x] write `TestAllContainerStatsRemote_extraArgsSplice` — set `rc.SSHExtraArgs = []string{"-i", "/tmp/key"}`, verify they appear immediately before the host arg (not after, not at the end)
+- [x] write `TestAllContainerStatsRemote_portArgs` — set port on the underlying SSH target, verify `-p NNNN` precedes `SSHExtraArgs`, both precede host
+- [x] write `TestAllContainerStatsRemote_parsing` — inject test hook with canned NDJSON, assert correct map
+- [x] run `go test ./internal/compose/...` — must pass before next task
 
 ### Task 5: Implement `ContainerStats()` method on `Compose` and `RemoteCompose`
 
