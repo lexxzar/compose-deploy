@@ -31,6 +31,12 @@ type mockComposer struct {
 	statusErr error
 	stats     map[string]runner.ServiceStats
 	statsErr  error
+
+	// Call counters — incremented when the corresponding tea.Cmd is actually
+	// invoked. Used by tick/refresh tests to assert that gated paths don't
+	// produce docker calls.
+	statusCalls int
+	statsCalls  int
 }
 
 func (m *mockComposer) Stop(ctx context.Context, containers []string, w io.Writer) error {
@@ -52,10 +58,12 @@ func (m *mockComposer) ListServices(ctx context.Context) ([]string, error) {
 	return m.services, m.err
 }
 func (m *mockComposer) ContainerStatus(ctx context.Context) (map[string]runner.ServiceStatus, error) {
+	m.statusCalls++
 	return m.status, m.statusErr
 }
 
 func (m *mockComposer) ContainerStats(ctx context.Context) (map[string]runner.ServiceStats, error) {
+	m.statsCalls++
 	return m.stats, m.statsErr
 }
 
@@ -1532,13 +1540,17 @@ func TestBreadcrumb_ServerOnly(t *testing.T) {
 	}
 }
 
-func TestInit_ServerScreen_ReturnsNil(t *testing.T) {
+func TestInit_ServerScreen_StartsTickOnly(t *testing.T) {
+	// The server list itself is static, but Init still kicks off the periodic
+	// refresh tick so it's already running by the time the user reaches the
+	// container screen. Without a preselected server, that's the *only* Cmd
+	// Init queues — no spurious connect.
 	mc := &mockComposer{}
 	m := NewModel(nil, io.Discard, mockFactory(mc), testServers, mockConnectCb(mc))
 
 	cmd := m.Init()
-	if cmd != nil {
-		t.Error("Init() should return nil for server screen (static list)")
+	if cmd == nil {
+		t.Fatal("Init() should return the refresh tick, got nil")
 	}
 }
 
@@ -2068,13 +2080,16 @@ func TestLogDoneMsg_IgnoredWhenNotOnLogScreen(t *testing.T) {
 }
 
 func TestPreselectedServer_OutOfRange(t *testing.T) {
+	// An out-of-range preselection must NOT trigger a connect — Init falls
+	// through to the no-preselection path, so the only Cmd returned is the
+	// background refresh tick.
 	mc := &mockComposer{}
 	m := NewModel(nil, io.Discard, mockFactory(mc), testServers, mockConnectCb(mc),
 		WithPreselectedServer(99))
 
 	cmd := m.Init()
-	if cmd != nil {
-		t.Error("Init() should return nil for out-of-range preselection")
+	if cmd == nil {
+		t.Fatal("Init() should return the refresh tick, got nil")
 	}
 }
 
@@ -3482,6 +3497,7 @@ func TestSvcVisibleCount_HeightZero(t *testing.T) {
 func TestSvcVisibleCount_NormalHeight(t *testing.T) {
 	mc := &mockComposer{}
 	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
+	m.statsRequested = false // exercise the "no columns" branch
 	m.services = []string{"a", "b", "c", "d", "e", "f", "g", "h", "i", "j"}
 	m.width = 130 // wide enough for one-line help
 	m.height = 10
@@ -3496,6 +3512,7 @@ func TestSvcVisibleCount_NormalHeight(t *testing.T) {
 func TestSvcVisibleCount_NarrowWidth(t *testing.T) {
 	mc := &mockComposer{}
 	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
+	m.statsRequested = false
 	m.services = []string{"a", "b", "c", "d", "e", "f", "g", "h", "i", "j"}
 	m.width = 40 // too narrow for one-line help
 	m.height = 10
@@ -3510,6 +3527,7 @@ func TestSvcVisibleCount_NarrowWidth(t *testing.T) {
 func TestSvcVisibleCount_Confirming(t *testing.T) {
 	mc := &mockComposer{}
 	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
+	m.statsRequested = false
 	m.services = []string{"a", "b", "c", "d", "e", "f", "g", "h", "i", "j"}
 	m.width = 120
 	m.height = 10
@@ -3525,6 +3543,7 @@ func TestSvcVisibleCount_Confirming(t *testing.T) {
 func TestSvcVisibleCount_Warning(t *testing.T) {
 	mc := &mockComposer{}
 	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
+	m.statsRequested = false
 	m.services = []string{"a", "b", "c", "d", "e", "f", "g", "h", "i", "j"}
 	m.width = 130
 	m.height = 10
@@ -3584,6 +3603,7 @@ func TestSvcVisibleCount_WithStatusColumns(t *testing.T) {
 func TestHasStatusColumns(t *testing.T) {
 	mc := &mockComposer{}
 	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
+	m.statsRequested = false // exercise the data-driven branch
 	m.services = []string{"a"}
 
 	// No status data
@@ -3634,9 +3654,43 @@ func TestHasStatusColumns(t *testing.T) {
 	}
 }
 
+// TestHasStatusColumns_StatsRequested verifies that statsRequested short-circuits
+// hasStatusColumns to true even when no per-service data has arrived yet. This
+// keeps the CPU/Mem column captions visible from the first frame instead of
+// popping in when the ~1.5s host-wide docker stats call returns.
+func TestHasStatusColumns_StatsRequested(t *testing.T) {
+	mc := &mockComposer{}
+	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
+	m.services = []string{"a"}
+	m.statsRequested = true
+	m.svcStatus = nil
+	m.stats = nil
+
+	if !m.hasStatusColumns() {
+		t.Error("hasStatusColumns() = false, want true when statsRequested && no data")
+	}
+}
+
+// TestNewModel_setsStatsRequestedForLocalFastTrack verifies that constructing
+// a Model with a local composer and no servers (the fast-track to
+// screenSelectContainers) flips statsRequested so the first frame reserves
+// the CPU/Mem column widths.
+func TestNewModel_setsStatsRequestedForLocalFastTrack(t *testing.T) {
+	mc := &mockComposer{}
+	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
+
+	if m.screen != screenSelectContainers {
+		t.Fatalf("screen = %v, want screenSelectContainers (precondition)", m.screen)
+	}
+	if !m.statsRequested {
+		t.Error("statsRequested = false, want true after NewModel local fast-track")
+	}
+}
+
 func TestFixSvcOffset_CursorBelowWindow(t *testing.T) {
 	mc := &mockComposer{}
 	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
+	m.statsRequested = false
 	m.services = []string{"a", "b", "c", "d", "e"}
 	m.width = 130
 	m.height = 9 // visible = 9-3-3 = 3
@@ -3653,6 +3707,7 @@ func TestFixSvcOffset_CursorBelowWindow(t *testing.T) {
 func TestFixSvcOffset_CursorAboveWindow(t *testing.T) {
 	mc := &mockComposer{}
 	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
+	m.statsRequested = false
 	m.services = []string{"a", "b", "c", "d", "e"}
 	m.width = 120
 	m.height = 9 // visible = 9-3-3 = 3
@@ -3699,6 +3754,7 @@ func TestFixSvcOffset_HeightZeroNoOp(t *testing.T) {
 func TestFixSvcOffset_ClampsMaxOffset(t *testing.T) {
 	mc := &mockComposer{}
 	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
+	m.statsRequested = false
 	m.services = []string{"a", "b", "c", "d", "e"}
 	m.width = 130
 	m.height = 9 // visible = 9-3-3 = 3
@@ -3715,6 +3771,7 @@ func TestFixSvcOffset_ClampsMaxOffset(t *testing.T) {
 func TestScrollDown_PastVisibleWindow(t *testing.T) {
 	mc := &mockComposer{services: []string{"a", "b", "c", "d", "e"}}
 	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
+	m.statsRequested = false // isolate scroll math from the captions row
 	m.screen = screenSelectContainers
 	m.services = mc.services
 	m.width = 130
@@ -3742,6 +3799,7 @@ func TestScrollDown_PastVisibleWindow(t *testing.T) {
 func TestScrollUp_PastTopOfWindow(t *testing.T) {
 	mc := &mockComposer{services: []string{"a", "b", "c", "d", "e"}}
 	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
+	m.statsRequested = false
 	m.screen = screenSelectContainers
 	m.services = mc.services
 	m.width = 130
@@ -3850,6 +3908,7 @@ func TestViewSelectContainers_UpIndicator(t *testing.T) {
 func TestViewSelectContainers_DownIndicator(t *testing.T) {
 	mc := &mockComposer{services: []string{"a", "b", "c", "d", "e"}}
 	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
+	m.statsRequested = false
 	m.screen = screenSelectContainers
 	m.services = mc.services
 	m.svcStatus = map[string]runner.ServiceStatus{}
@@ -3887,6 +3946,7 @@ func TestViewSelectContainers_NoIndicatorsWhenAllFit(t *testing.T) {
 func TestViewSelectContainers_BothIndicators(t *testing.T) {
 	mc := &mockComposer{services: []string{"a", "b", "c", "d", "e"}}
 	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
+	m.statsRequested = false
 	m.screen = screenSelectContainers
 	m.services = mc.services
 	m.svcStatus = map[string]runner.ServiceStatus{}
@@ -3927,6 +3987,7 @@ func TestViewSelectContainers_HeightZeroRendersAll(t *testing.T) {
 func TestViewSelectContainers_WindowedOnlyShowsVisibleServices(t *testing.T) {
 	mc := &mockComposer{services: []string{"aaa", "bbb", "ccc", "ddd", "eee"}}
 	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
+	m.statsRequested = false
 	m.screen = screenSelectContainers
 	m.services = mc.services
 	m.svcStatus = map[string]runner.ServiceStatus{}
@@ -6721,6 +6782,491 @@ func TestRefreshStats_propagatesError(t *testing.T) {
 	}
 }
 
+// --- Periodic refresh tick tests ---
+
+// fakeTickMsg replaces refreshTickMsg in tests so the tick override can be
+// distinguished from the real refreshTickMsg path. Tests assert on the cmd's
+// returned msg type to decide whether the handler reached the fetch branch.
+type fakeTickMsg struct{}
+
+// installFakeTick swaps tickCmdOverride to a non-blocking Cmd. Without this,
+// every test exercising the refreshTick path would leave a real 5s tea.Tick
+// goroutine running until the program exits.
+func installFakeTick(m *Model) {
+	m.tickCmdOverride = func() tea.Cmd {
+		return func() tea.Msg { return fakeTickMsg{} }
+	}
+}
+
+// TestRefreshTickMsg_fetchesOnContainerScreen verifies that a tick firing on
+// the container screen fans out to refreshStatus and refreshStats, AND queues
+// the next tick. Verified by unwrapping the returned tea.BatchMsg and counting
+// the docker calls each inner Cmd produces when invoked.
+func TestRefreshTickMsg_fetchesOnContainerScreen(t *testing.T) {
+	mc := &mockComposer{services: []string{"web"}}
+	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
+	installFakeTick(&m)
+	m.screen = screenSelectContainers
+	m.refreshInFlight = false // NewModel sets this true for local fast-track; we want the unblocked path
+	mc.statusCalls = 0
+	mc.statsCalls = 0
+
+	result, cmd := m.Update(refreshTickMsg{})
+	model := result.(Model)
+	if cmd == nil {
+		t.Fatal("refreshTickMsg on container screen should return a batch cmd, got nil")
+	}
+	if !model.refreshInFlight {
+		t.Error("handler should set refreshInFlight=true when firing the fetch batch")
+	}
+
+	batch, ok := cmd().(tea.BatchMsg)
+	if !ok {
+		t.Fatalf("expected tea.BatchMsg, got %T", cmd())
+	}
+	if len(batch) != 3 {
+		t.Fatalf("batch len = %d, want 3 (status + stats + tick)", len(batch))
+	}
+	// Invoke each inner Cmd; with the fake tick installed, none of them blocks.
+	for _, c := range batch {
+		_ = c()
+	}
+	if mc.statusCalls != 1 {
+		t.Errorf("statusCalls = %d, want 1", mc.statusCalls)
+	}
+	if mc.statsCalls != 1 {
+		t.Errorf("statsCalls = %d, want 1", mc.statsCalls)
+	}
+}
+
+// TestRefreshTickMsg_skipsWhenInFlight verifies that a tick firing while a
+// previous tick's fetch is still pending (refreshInFlight=true) reschedules
+// without firing another batch — preventing pile-up of docker stats / SSH calls
+// when each one takes longer than statsRefreshInterval.
+func TestRefreshTickMsg_skipsWhenInFlight(t *testing.T) {
+	mc := &mockComposer{services: []string{"web"}}
+	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
+	installFakeTick(&m)
+	m.screen = screenSelectContainers
+	m.refreshInFlight = true // previous tick's fetch is still pending
+
+	_, cmd := m.Update(refreshTickMsg{})
+	if cmd == nil {
+		t.Fatal("refreshTickMsg with in-flight fetch should still reschedule, got nil")
+	}
+	if _, isBatch := cmd().(tea.BatchMsg); isBatch {
+		t.Error("in-flight tick should return the tick alone, not a fetch batch")
+	}
+}
+
+// TestRefreshTickMsg_skipsOffScreen verifies that a tick firing on any screen
+// other than screenSelectContainers reschedules without producing the batch of
+// docker fetches.
+func TestRefreshTickMsg_skipsOffScreen(t *testing.T) {
+	mc := &mockComposer{services: []string{"web"}}
+	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
+	installFakeTick(&m)
+	m.screen = screenLogs
+
+	_, cmd := m.Update(refreshTickMsg{})
+	if cmd == nil {
+		t.Fatal("refreshTickMsg off-screen should still reschedule a tick, got nil")
+	}
+	if _, isBatch := cmd().(tea.BatchMsg); isBatch {
+		t.Error("off-screen tick should return the tick alone, not a fetch batch")
+	}
+}
+
+// TestRefreshTickMsg_skipsDuringConfirm verifies that a tick firing while a
+// confirmation prompt is up does NOT fan out to fetches (which would feel
+// jittery under the user's eye) — but still reschedules.
+func TestRefreshTickMsg_skipsDuringConfirm(t *testing.T) {
+	mc := &mockComposer{services: []string{"web"}}
+	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
+	installFakeTick(&m)
+	m.screen = screenSelectContainers
+	m.refreshInFlight = false
+	m.confirming = true
+
+	_, cmd := m.Update(refreshTickMsg{})
+	if cmd == nil {
+		t.Fatal("refreshTickMsg during confirm should still reschedule, got nil")
+	}
+	if _, isBatch := cmd().(tea.BatchMsg); isBatch {
+		t.Error("confirming tick should return the tick alone, not a fetch batch")
+	}
+}
+
+// TestRefreshTickMsg_skipsWhenComposerNil verifies that a tick firing when
+// the composer is nil (e.g. mid-disconnect transition) does NOT panic and
+// still reschedules.
+func TestRefreshTickMsg_skipsWhenComposerNil(t *testing.T) {
+	mc := &mockComposer{}
+	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
+	installFakeTick(&m)
+	m.screen = screenSelectContainers
+	m.refreshInFlight = false
+	m.composer = nil
+
+	_, cmd := m.Update(refreshTickMsg{})
+	if cmd == nil {
+		t.Fatal("refreshTickMsg with nil composer should still reschedule, got nil")
+	}
+	if _, isBatch := cmd().(tea.BatchMsg); isBatch {
+		t.Error("nil-composer tick should return the tick alone, not a fetch batch")
+	}
+}
+
+// TestStatsMsg_clearsRefreshInFlight verifies that a current-session statsMsg
+// arrival clears the in-flight guard so the next periodic tick can fire a
+// fresh fetch instead of skipping.
+func TestStatsMsg_clearsRefreshInFlight(t *testing.T) {
+	mc := &mockComposer{services: []string{"web"}}
+	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
+	m.screen = screenSelectContainers
+	m.statsSession = 5
+	m.refreshInFlight = true
+
+	result, _ := m.Update(statsMsg{stats: map[string]runner.ServiceStats{}, session: 5})
+	model := result.(Model)
+
+	if model.refreshInFlight {
+		t.Error("current-session statsMsg should clear refreshInFlight, got true")
+	}
+}
+
+// TestStatsMsg_errorClearsRefreshInFlight verifies the same on the error path
+// — without this, a permanently-failing docker stats call would leave the
+// guard stuck on and the periodic loop would never fire fetches again.
+func TestStatsMsg_errorClearsRefreshInFlight(t *testing.T) {
+	mc := &mockComposer{services: []string{"web"}}
+	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
+	m.screen = screenSelectContainers
+	m.statsSession = 5
+	m.refreshInFlight = true
+
+	result, _ := m.Update(statsMsg{err: errors.New("docker boom"), session: 5})
+	model := result.(Model)
+
+	if model.refreshInFlight {
+		t.Error("error statsMsg should clear refreshInFlight, got true")
+	}
+}
+
+// TestStatsMsg_offScreenClearsRefreshInFlight is the regression test for
+// the codex round-2 finding: if the user opens the config screen (or logs,
+// or progress) while a stats fetch is in flight, the response arrives with
+// m.screen != screenSelectContainers. The handler must still clear the
+// in-flight guard — otherwise, when the user returns to the container
+// screen, every periodic tick sees refreshInFlight=true and skips,
+// permanently silencing the loop.
+func TestStatsMsg_offScreenClearsRefreshInFlight(t *testing.T) {
+	mc := &mockComposer{services: []string{"web"}}
+	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
+	m.screen = screenConfig // user opened config while a fetch was pending
+	m.statsSession = 5
+	m.refreshInFlight = true
+
+	result, _ := m.Update(statsMsg{stats: map[string]runner.ServiceStats{}, session: 5})
+	model := result.(Model)
+
+	if model.refreshInFlight {
+		t.Error("off-screen current-session statsMsg should still clear refreshInFlight, got true")
+	}
+	// And the response data must NOT have been applied (screen check still gates display).
+	if model.stats != nil {
+		t.Errorf("off-screen statsMsg should not update m.stats, got %+v", model.stats)
+	}
+}
+
+// TestStatsMsg_staleSessionLeavesRefreshInFlight verifies that a stale
+// (different-session) response does NOT clear refreshInFlight. The context
+// bump at the navigation site already reset the flag; clearing it again on a
+// stale response could accidentally clear the new context's freshly-set
+// in-flight guard if the response arrives mid-transition.
+func TestStatsMsg_staleSessionLeavesRefreshInFlight(t *testing.T) {
+	mc := &mockComposer{services: []string{"web"}}
+	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
+	m.screen = screenSelectContainers
+	m.statsSession = 6 // current
+	m.refreshInFlight = true
+
+	result, _ := m.Update(statsMsg{stats: map[string]runner.ServiceStats{}, session: 3}) // stale
+	model := result.(Model)
+
+	if !model.refreshInFlight {
+		t.Error("stale statsMsg should NOT clear refreshInFlight, got false")
+	}
+}
+
+// --- statusMsg session guard tests ---
+
+// TestStatusMsg_currentSessionAccepted verifies the happy path for the new
+// statusSession filter.
+func TestStatusMsg_currentSessionAccepted(t *testing.T) {
+	mc := &mockComposer{}
+	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
+	m.screen = screenSelectContainers
+	m.statusSession = 7
+
+	result, _ := m.Update(statusMsg{
+		status:  map[string]runner.ServiceStatus{"web": {Running: true}},
+		session: 7,
+	})
+	model := result.(Model)
+
+	if !model.svcStatus["web"].Running {
+		t.Errorf("svcStatus[web].Running = false, want true (current-session msg should be applied)")
+	}
+}
+
+// TestStatusMsg_staleSessionIgnored is the regression test for the bug codex
+// flagged: a periodic-tick statusMsg from project A must NOT overwrite
+// svcStatus after the user has navigated to project B.
+func TestStatusMsg_staleSessionIgnored(t *testing.T) {
+	mc := &mockComposer{}
+	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
+	m.screen = screenSelectContainers
+	m.statusSession = 9
+	m.svcStatus = map[string]runner.ServiceStatus{"new": {Running: true}}
+
+	result, _ := m.Update(statusMsg{
+		status:  map[string]runner.ServiceStatus{"stale": {Running: true}},
+		session: 4, // older context
+	})
+	model := result.(Model)
+
+	if _, ok := model.svcStatus["stale"]; ok {
+		t.Error("stale statusMsg from older context overwrote svcStatus")
+	}
+	if !model.svcStatus["new"].Running {
+		t.Error("current svcStatus was clobbered by stale statusMsg")
+	}
+}
+
+// TestStatusMsg_offScreenIgnored verifies the screen-gate still applies, so
+// a refreshStatus response can't overwrite svcStatus while the user is on a
+// different screen (e.g. mid-progress).
+func TestStatusMsg_offScreenIgnored(t *testing.T) {
+	mc := &mockComposer{}
+	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
+	m.screen = screenProgress
+	m.statusSession = 1
+
+	result, _ := m.Update(statusMsg{
+		status:  map[string]runner.ServiceStatus{"x": {Running: true}},
+		session: 1,
+	})
+	model := result.(Model)
+
+	if _, ok := model.svcStatus["x"]; ok {
+		t.Error("statusMsg applied while off-screen; should have been ignored")
+	}
+}
+
+// TestRefreshStatus_capturesCurrentSession mirrors TestRefreshStats_capturesCurrentSession
+// for the new statusSession plumbing.
+func TestRefreshStatus_capturesCurrentSession(t *testing.T) {
+	mc := &mockComposer{}
+	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
+	m.statusSession = 42
+
+	msg, ok := m.refreshStatus()().(statusMsg)
+	if !ok {
+		t.Fatalf("expected statusMsg, got %T", m.refreshStatus()())
+	}
+	if msg.session != 42 {
+		t.Errorf("captured session = %d, want 42", msg.session)
+	}
+}
+
+// --- servicesMsg session guard tests ---
+
+// TestLoadServices_capturesCurrentSession verifies that loadServices() captures
+// the current statusSession at fire time so the response can be filtered.
+func TestLoadServices_capturesCurrentSession(t *testing.T) {
+	mc := &mockComposer{services: []string{"web"}}
+	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
+	m.statusSession = 23
+
+	msg, ok := m.loadServices()().(servicesMsg)
+	if !ok {
+		t.Fatalf("expected servicesMsg, got %T", m.loadServices()())
+	}
+	if msg.session != 23 {
+		t.Errorf("captured session = %d, want 23", msg.session)
+	}
+}
+
+// TestServicesMsg_currentSessionAccepted verifies the happy path.
+func TestServicesMsg_currentSessionAccepted(t *testing.T) {
+	mc := &mockComposer{}
+	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
+	m.screen = screenSelectContainers
+	m.statusSession = 7
+
+	result, _ := m.Update(servicesMsg{
+		services: []string{"web"},
+		status:   map[string]runner.ServiceStatus{"web": {Running: true}},
+		session:  7,
+	})
+	model := result.(Model)
+
+	if len(model.services) != 1 || model.services[0] != "web" {
+		t.Errorf("services = %v, want [web]", model.services)
+	}
+	if !model.svcStatus["web"].Running {
+		t.Error("svcStatus not applied for current-session msg")
+	}
+}
+
+// TestServicesMsg_staleSessionIgnored is the regression test for the codex
+// round-2 finding: loadServices from project A must NOT overwrite the services
+// list / svcStatus after the user has navigated to project B.
+func TestServicesMsg_staleSessionIgnored(t *testing.T) {
+	mc := &mockComposer{}
+	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
+	m.screen = screenSelectContainers
+	m.statusSession = 9 // current
+	m.services = []string{"new-svc"}
+	m.svcStatus = map[string]runner.ServiceStatus{"new-svc": {Running: true}}
+
+	result, _ := m.Update(servicesMsg{
+		services: []string{"stale-svc"},
+		status:   map[string]runner.ServiceStatus{"stale-svc": {Running: true}},
+		session:  4, // stale
+	})
+	model := result.(Model)
+
+	if len(model.services) != 1 || model.services[0] != "new-svc" {
+		t.Errorf("stale servicesMsg clobbered services: got %v, want [new-svc]", model.services)
+	}
+	if _, ok := model.svcStatus["stale-svc"]; ok {
+		t.Error("stale servicesMsg clobbered svcStatus")
+	}
+}
+
+// TestServicesMsg_offScreenIgnored verifies the screen-gate still applies.
+func TestServicesMsg_offScreenIgnored(t *testing.T) {
+	mc := &mockComposer{}
+	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
+	m.screen = screenProgress
+	m.statusSession = 1
+	m.services = []string{"existing"}
+
+	result, _ := m.Update(servicesMsg{
+		services: []string{"unwanted"},
+		status:   map[string]runner.ServiceStatus{"unwanted": {Running: true}},
+		session:  1,
+	})
+	model := result.(Model)
+
+	if len(model.services) != 1 || model.services[0] != "existing" {
+		t.Errorf("servicesMsg applied while off-screen: got %v, want [existing]", model.services)
+	}
+}
+
+// --- projectsMsg session guard tests ---
+
+// TestLoadProjects_capturesCurrentSession verifies loadProjects captures
+// m.projectsSession at fire time.
+func TestLoadProjects_capturesCurrentSession(t *testing.T) {
+	mc := &mockComposer{}
+	loader := func(context.Context) ([]compose.Project, error) {
+		return []compose.Project{{Name: "p", ConfigDir: "/p"}}, nil
+	}
+	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil, WithLocalProjectLoader(loader))
+	m.projectsSession = 17
+
+	msg, ok := m.loadProjects()().(projectsMsg)
+	if !ok {
+		t.Fatalf("expected projectsMsg, got %T", m.loadProjects()())
+	}
+	if msg.session != 17 {
+		t.Errorf("captured session = %d, want 17", msg.session)
+	}
+}
+
+// TestProjectsMsg_currentSessionAccepted verifies the happy path.
+func TestProjectsMsg_currentSessionAccepted(t *testing.T) {
+	mc := &mockComposer{}
+	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
+	m.screen = screenSelectProject
+	m.projectsSession = 7
+
+	result, _ := m.Update(projectsMsg{
+		projects: []compose.Project{{Name: "p", ConfigDir: "/p"}},
+		session:  7,
+	})
+	model := result.(Model)
+
+	if len(model.projects) != 1 || model.projects[0].Name != "p" {
+		t.Errorf("projects = %v, want [{Name: p}]", model.projects)
+	}
+}
+
+// TestProjectsMsg_staleSessionIgnored is the regression test for the codex
+// round-3 finding: loadProjects from server A must NOT overwrite m.projects
+// after the user has navigated to server B (which would let server B's
+// composerFactory get fed a path discovered on server A — potentially mounting
+// the wrong directory on deploy).
+func TestProjectsMsg_staleSessionIgnored(t *testing.T) {
+	mc := &mockComposer{}
+	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
+	m.screen = screenSelectProject
+	m.projectsSession = 9 // current (server B)
+	m.projects = []compose.Project{{Name: "b-proj", ConfigDir: "/b"}}
+
+	result, _ := m.Update(projectsMsg{
+		projects: []compose.Project{{Name: "a-proj", ConfigDir: "/a"}}, // stale, from server A
+		session:  4,
+	})
+	model := result.(Model)
+
+	if len(model.projects) != 1 || model.projects[0].Name != "b-proj" {
+		t.Errorf("stale projectsMsg clobbered projects: got %v, want [{b-proj}]", model.projects)
+	}
+}
+
+// TestProjectsMsg_offScreenIgnored verifies the screen-gate still applies.
+func TestProjectsMsg_offScreenIgnored(t *testing.T) {
+	mc := &mockComposer{}
+	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
+	m.screen = screenSelectServer // not the project picker
+	m.projectsSession = 3
+	m.projects = []compose.Project{{Name: "existing"}}
+
+	result, _ := m.Update(projectsMsg{
+		projects: []compose.Project{{Name: "unwanted"}},
+		session:  3,
+	})
+	model := result.(Model)
+
+	if len(model.projects) != 1 || model.projects[0].Name != "existing" {
+		t.Errorf("projectsMsg applied while off-screen: got %v, want [existing]", model.projects)
+	}
+}
+
+// TestProjectsMsg_errorWithCurrentSessionApplied verifies error responses on
+// the current session ARE applied — without this, a network error from the
+// remote loader would never surface.
+func TestProjectsMsg_errorWithCurrentSessionApplied(t *testing.T) {
+	mc := &mockComposer{}
+	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
+	m.screen = screenSelectProject
+	m.projectsSession = 5
+
+	result, _ := m.Update(projectsMsg{
+		err:     errors.New("ssh: connection refused"),
+		session: 5,
+	})
+	model := result.(Model)
+
+	if model.projErr == nil || model.projErr.Error() != "ssh: connection refused" {
+		t.Errorf("projErr = %v, want 'ssh: connection refused'", model.projErr)
+	}
+}
+
 // --- Task 9: CPU/Mem column rendering tests ---
 
 func TestContainerScreen_rendersStatsColumns(t *testing.T) {
@@ -6857,11 +7403,39 @@ func TestContainerScreen_blankCellsForStoppedService(t *testing.T) {
 	}
 }
 
-func TestContainerScreen_NoStatsCaptionsAbsent(t *testing.T) {
-	// With empty stats map and no status columns, no captions row appears.
+func TestContainerScreen_StatsCaptionsReservedBeforeData(t *testing.T) {
+	// Once stats have been requested, CPU/Mem captions are reserved from the
+	// first frame so they don't pop in when the ~1.5s docker stats call returns.
+	// Cells stay blank for services without data yet.
 	mc := &mockComposer{services: []string{"web"}}
 	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
 	m.screen = screenSelectContainers
+	m.statsRequested = true
+	m.services = mc.services
+	m.svcStatus = map[string]runner.ServiceStatus{
+		"web": {Running: true},
+	}
+	m.stats = nil
+	m.width = 120
+	m.height = 24
+
+	view := m.viewSelectContainers()
+	if !strings.Contains(view, "CPU") {
+		t.Errorf("CPU caption should be reserved when statsRequested, got:\n%s", view)
+	}
+	if !strings.Contains(view, "Mem") {
+		t.Errorf("Mem caption should be reserved when statsRequested, got:\n%s", view)
+	}
+}
+
+func TestContainerScreen_NoStatsCaptionsAbsentWithoutRequest(t *testing.T) {
+	// When stats have not been requested (statsRequested=false, e.g. a screen
+	// that never fetched stats), and no other status columns are present, the
+	// captions row is suppressed entirely.
+	mc := &mockComposer{services: []string{"web"}}
+	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
+	m.screen = screenSelectContainers
+	m.statsRequested = false
 	m.services = mc.services
 	m.svcStatus = map[string]runner.ServiceStatus{
 		"web": {Running: true},
@@ -6872,10 +7446,10 @@ func TestContainerScreen_NoStatsCaptionsAbsent(t *testing.T) {
 
 	view := m.viewSelectContainers()
 	if strings.Contains(view, "CPU") {
-		t.Errorf("CPU caption should be absent when no stats data, got:\n%s", view)
+		t.Errorf("CPU caption should be absent when !statsRequested && no data, got:\n%s", view)
 	}
 	if strings.Contains(view, "Mem") {
-		t.Errorf("Mem caption should be absent when no stats data, got:\n%s", view)
+		t.Errorf("Mem caption should be absent when !statsRequested && no data, got:\n%s", view)
 	}
 }
 

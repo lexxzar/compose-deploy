@@ -8,6 +8,7 @@ import (
 	"os/exec"
 	"slices"
 	"strings"
+	"time"
 	"unicode/utf8"
 
 	"github.com/charmbracelet/bubbles/spinner"
@@ -18,6 +19,12 @@ import (
 	"github.com/lexxzar/compose-deploy/internal/config"
 	"github.com/lexxzar/compose-deploy/internal/runner"
 )
+
+// statsRefreshInterval is how often the container screen re-fetches status and
+// stats while the user is viewing it. 5s balances responsiveness against the
+// cost of the host-wide `docker stats --no-stream` call (~1.5s per fetch) plus
+// the per-project `docker compose ps` call.
+const statsRefreshInterval = 5 * time.Second
 
 // ConfigProvider provides access to docker-compose configuration files.
 // Defined in the tui package (not runner) because it returns *exec.Cmd and
@@ -176,13 +183,18 @@ type Model struct {
 	projName        string // selected project name, for breadcrumbs
 	showPicker      bool   // true if the project picker was shown
 	composerFactory ComposerFactory
+	projectsSession uint64 // bumped at every transition that swaps the projectLoader (server pick, server disconnect, local fast-track, etc.) so a stale loadProjects from server A can't overwrite server B's list
 
 	// Screen 1: service select
 	services     []string
 	svcStatus    map[string]runner.ServiceStatus // service name → status
-	stats        map[string]runner.ServiceStats  // service name → resource usage; populated asynchronously by refreshStats
-	statsErr     error                           // last error from ContainerStats; rendered in the same slot as svcErr (svcErr wins)
-	statsSession uint64                          // bumped before every refreshStats() and on context change so older in-flight responses are filtered out
+	stats           map[string]runner.ServiceStats // service name → resource usage; populated asynchronously by refreshStats
+	statsErr        error                          // last error from ContainerStats; rendered in the same slot as svcErr (svcErr wins)
+	statsSession    uint64                         // bumped before every refreshStats() and on context change so older in-flight responses are filtered out
+	statusSession   uint64                         // mirror of statsSession for refreshStatus(); without it, periodic-tick statusMsg from project A could overwrite the svcStatus map after the user has navigated to project B
+	statsRequested  bool                           // true once refreshStats has been requested for the current container-screen entry; reserves CPU/Mem column widths so captions don't pop in when data arrives
+	refreshInFlight bool                           // true while a periodic-tick refreshStats fetch is pending; prevents the next tick from stacking another fetch on top of a slow docker stats / SSH call
+	tickCmdOverride func() tea.Cmd                 // test seam: when non-nil, replaces tea.Tick in refreshTick() with a non-blocking Cmd; production code never sets this
 	selected  map[int]bool
 	svcCursor int
 	svcOffset int // index of first visible service in scroll window
@@ -261,21 +273,31 @@ type stepEventMsg runner.StepEvent
 type projectsMsg struct {
 	projects []compose.Project
 	err      error
+	session  uint64 // captured from m.projectsSession at fetch time; without it, a stale load from server A could overwrite the project list after the user has switched to server B
 }
 type servicesMsg struct {
 	services []string
 	status   map[string]runner.ServiceStatus
 	err      error
+	session  uint64 // reuses m.statusSession: loadServices fetches both list + initial status, so it lives in the same context lifecycle as refreshStatus
 }
 type statusMsg struct {
-	status map[string]runner.ServiceStatus
-	err    error
+	status  map[string]runner.ServiceStatus
+	err     error
+	session uint64
 }
 type statsMsg struct {
 	stats   map[string]runner.ServiceStats
 	err     error
 	session uint64
 }
+
+// refreshTickMsg fires every statsRefreshInterval to drive periodic
+// status+stats refresh on screenSelectContainers. It's a singleton tick: the
+// handler always reschedules itself, so exactly one tick is in flight at any
+// time regardless of how many transitions into the screen happen.
+type refreshTickMsg struct{}
+
 type pipelineDoneMsg struct{}
 type logChunkMsg struct {
 	data    []byte
@@ -386,22 +408,30 @@ func NewModel(composer runner.Composer, logWriter io.Writer, factory ComposerFac
 		m.showPicker = true
 	} else {
 		m.screen = screenSelectContainers
+		m.statsRequested = true
+		m.refreshInFlight = true // Init() will fire refreshStats; statsMsg arrival clears the flag
 	}
 
 	return m
 }
 
 func (m Model) Init() tea.Cmd {
+	// Always start the periodic refresh tick — the handler gates on screen,
+	// so it's a no-op until the user reaches screenSelectContainers, but
+	// starting from Init means we never have to remember to kick it off in
+	// each individual screen transition.
+	tick := m.refreshTick()
+
 	if m.screen == screenSelectServer {
 		if m.hasPreselection && m.preselectedServer >= 0 && m.preselectedServer < len(m.servers) {
-			return func() tea.Msg { return preselectedConnectMsg{} }
+			return tea.Batch(func() tea.Msg { return preselectedConnectMsg{} }, tick)
 		}
-		return nil // server list is static from config
+		return tick // server list is static from config; only the tick is live
 	}
 	if m.showPicker {
-		return m.loadProjects()
+		return tea.Batch(m.loadProjects(), tick)
 	}
-	return tea.Batch(m.loadServices(), m.refreshStats())
+	return tea.Batch(m.loadServices(), m.refreshStats(), tick)
 }
 
 func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
@@ -443,6 +473,14 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m.handleKey(msg)
 
 	case projectsMsg:
+		// Drop responses from a stale projectLoader (server A's load lands after
+		// the user has switched to server B). Same race class as
+		// statusMsg/statsMsg/servicesMsg — without the guard, m.projects would
+		// be populated from server A while m.composerFactory now points at B,
+		// so selecting a project would feed B's factory an A-discovered path.
+		if m.screen != screenSelectProject || msg.session != m.projectsSession {
+			return m, nil
+		}
 		if msg.err != nil {
 			m.projErr = msg.err
 			return m, nil
@@ -453,6 +491,14 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case servicesMsg:
+		// Drop responses from a previous context (same race class as statusMsg/statsMsg):
+		// loadServices runs ListServices + ContainerStatus, so a stale response can
+		// overwrite both `services` and `svcStatus` for the new context. Sharing
+		// statusSession is intentional — loadServices is the initial-fetch sibling
+		// of refreshStatus and lives in the same lifecycle.
+		if m.screen != screenSelectContainers || msg.session != m.statusSession {
+			return m, nil
+		}
 		if msg.err != nil {
 			m.svcErr = msg.err
 			return m, nil
@@ -466,6 +512,13 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case statusMsg:
+		// Drop responses from a previous context — without this guard, a
+		// periodic-tick refreshStatus from project A could land after the user
+		// has navigated to project B and silently overwrite the new svcStatus
+		// map. Mirrors the statsSession filter on statsMsg.
+		if m.screen != screenSelectContainers || msg.session != m.statusSession {
+			return m, nil
+		}
 		if msg.err != nil {
 			m.svcErr = msg.err
 			return m, nil
@@ -476,7 +529,20 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case statsMsg:
-		if m.screen != screenSelectContainers || msg.session != m.statsSession {
+		// Stale-session responses are unconditionally dropped; they don't touch
+		// in-flight state either (the bump at the context-change site already
+		// reset refreshInFlight).
+		if msg.session != m.statsSession {
+			return m, nil
+		}
+		// Clear the in-flight guard FIRST, before the screen check. If the user
+		// navigated to an off-screen view (config, logs, progress) while a
+		// fetch was pending, the response would otherwise be discarded silently
+		// and leave refreshInFlight stuck at true, permanently suppressing
+		// further periodic refreshes when the user returns. Guard is per-session,
+		// so clearing it on the current-session response is always correct.
+		m.refreshInFlight = false
+		if m.screen != screenSelectContainers {
 			return m, nil
 		}
 		if msg.err != nil {
@@ -493,6 +559,19 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.fixSvcOffset()
 		return m, nil
 
+	case refreshTickMsg:
+		// Always reschedule the next tick to keep this a singleton background
+		// loop. Only fire actual refreshes when the user is on the container
+		// screen, not mid-confirmation, and no previous refresh is still in
+		// flight — on a slow remote SSH hop docker stats can take longer than
+		// statsRefreshInterval (5s), and without the m.refreshInFlight gate
+		// the next tick would stack another pair of fetches on top.
+		if m.screen != screenSelectContainers || m.confirming || m.composer == nil || m.refreshInFlight {
+			return m, m.refreshTick()
+		}
+		m.refreshInFlight = true
+		return m, tea.Batch(m.refreshStatus(), m.refreshStats(), m.refreshTick())
+
 	case stepEventMsg:
 		return m.handleStepEvent(runner.StepEvent(msg))
 
@@ -504,6 +583,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		connectCmd, factory, loader, disconnect := m.connectCb(server)
 		m.composerFactory = factory
 		m.projectLoader = loader
+		m.projectsSession++
 		m.disconnectFunc = disconnect
 		return m, tea.ExecProcess(connectCmd, func(err error) tea.Msg {
 			return connectResultMsg{err: err}
@@ -514,6 +594,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.serverErr = msg.err
 			m.composerFactory = m.localFactory
 			m.projectLoader = m.localProjectLoader
+			m.projectsSession++
 			m.disconnectFunc = nil
 			m.quitting = false
 			m.serverHost = ""
@@ -627,6 +708,9 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.warning = fmt.Sprintf("exec failed: %v", msg.err)
 		}
 		m.statsSession++
+		m.statusSession++
+		m.statsRequested = true
+		m.refreshInFlight = true
 		return m, tea.Batch(m.refreshStatus(), m.refreshStats())
 
 	case pipelineDoneMsg:
@@ -728,11 +812,15 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 				m.serverColor = ""
 				m.composerFactory = m.localFactory
 				m.projectLoader = m.localProjectLoader
+				m.projectsSession++
 				m.disconnectFunc = nil
 				m.quitting = false
 				if m.localComposer != nil {
 					m.composer = m.localComposer
 					m.statsSession++
+					m.statusSession++
+					m.statsRequested = true
+					m.refreshInFlight = true
 					m.showPicker = true
 					m.screen = screenSelectContainers
 					return m, tea.Batch(m.loadServices(), m.refreshStats())
@@ -748,6 +836,7 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 				connectCmd, factory, loader, disconnect := m.connectCb(server)
 				m.composerFactory = factory
 				m.projectLoader = loader
+				m.projectsSession++
 				m.disconnectFunc = disconnect
 				return m, tea.ExecProcess(connectCmd, func(err error) tea.Msg {
 					return connectResultMsg{err: err}
@@ -782,6 +871,9 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 				m.composerFactory = m.localFactory
 				m.composer = nil
 				m.statsSession++
+				m.statusSession++
+				m.projectsSession++
+				m.refreshInFlight = false
 				m.projName = ""
 				m.projects = nil
 				m.projCursor = 0
@@ -811,6 +903,9 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.projName = proj.Name
 			m.composer = m.composerFactory(proj.ConfigDir)
 			m.statsSession++
+			m.statusSession++
+			m.statsRequested = true
+			m.refreshInFlight = true
 			m.screen = screenSelectContainers
 			return m, tea.Batch(m.loadServices(), m.refreshStats())
 		}
@@ -845,6 +940,8 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 				m.screen = screenSelectProject
 				m.composer = nil
 				m.statsSession++
+				m.statusSession++
+				m.refreshInFlight = false
 				m.projName = ""
 				m.services = nil
 				m.svcStatus = nil
@@ -950,6 +1047,9 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.logsRawOff = 0
 			m.screen = screenSelectContainers
 			m.statsSession++
+			m.statusSession++
+			m.statsRequested = true
+			m.refreshInFlight = true
 			return m, tea.Batch(m.refreshStatus(), m.refreshStats())
 		case "w":
 			m.logsWrap = !m.logsWrap
@@ -1231,6 +1331,9 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 				m.cancel = nil
 				m.logContent = ""
 				m.statsSession++
+				m.statusSession++
+				m.statsRequested = true
+				m.refreshInFlight = true
 				return m, tea.Batch(m.refreshStatus(), m.refreshStats())
 			}
 			if m.cancel != nil {
@@ -1502,21 +1605,23 @@ func (m Model) readLogChunk() tea.Cmd {
 func (m Model) loadProjects() tea.Cmd {
 	loader := m.projectLoader
 	ctx := m.ctx
+	session := m.projectsSession
 	return func() tea.Msg {
 		if loader == nil {
-			return projectsMsg{err: fmt.Errorf("no project loader configured")}
+			return projectsMsg{err: fmt.Errorf("no project loader configured"), session: session}
 		}
 		projects, err := loader(ctx)
-		return projectsMsg{projects: projects, err: err}
+		return projectsMsg{projects: projects, err: err, session: session}
 	}
 }
 
 func (m Model) refreshStatus() tea.Cmd {
 	ctx := m.ctx
 	c := m.composer
+	session := m.statusSession
 	return func() tea.Msg {
 		status, err := c.ContainerStatus(ctx)
-		return statusMsg{status: status, err: err}
+		return statusMsg{status: status, err: err, session: session}
 	}
 }
 
@@ -1530,19 +1635,37 @@ func (m Model) refreshStats() tea.Cmd {
 	}
 }
 
+// refreshTick returns a Cmd that fires a refreshTickMsg after
+// statsRefreshInterval. The handler always reschedules another tick so this
+// runs forever as a singleton — there is never more than one pending tick
+// because every fired tick is replaced by exactly one new one.
+//
+// In tests, callers can set m.tickCmdOverride to substitute a non-blocking Cmd
+// (avoids leaving a real 5s tea.Tick goroutine running for each test). Production
+// code never sets this field — it always falls through to tea.Tick below.
+func (m Model) refreshTick() tea.Cmd {
+	if m.tickCmdOverride != nil {
+		return m.tickCmdOverride()
+	}
+	return tea.Tick(statsRefreshInterval, func(time.Time) tea.Msg {
+		return refreshTickMsg{}
+	})
+}
+
 func (m Model) loadServices() tea.Cmd {
 	ctx := m.ctx
 	c := m.composer
+	session := m.statusSession
 	return func() tea.Msg {
 		services, err := c.ListServices(ctx)
 		if err != nil {
-			return servicesMsg{err: err}
+			return servicesMsg{err: err, session: session}
 		}
 		status, err := c.ContainerStatus(ctx)
 		if err != nil {
-			return servicesMsg{err: err}
+			return servicesMsg{err: err, session: session}
 		}
-		return servicesMsg{services: services, status: status}
+		return servicesMsg{services: services, status: status, session: session}
 	}
 }
 
@@ -1579,10 +1702,15 @@ func (m Model) selectedCount() int {
 }
 
 // hasStatusColumns returns true if any service in m.services has non-empty Created, Uptime,
-// Ports, or stats data, indicating that column captions should be displayed.
+// Ports, or stats data, OR if stats have been requested for the current container-screen
+// entry. The statsRequested short-circuit ensures CPU/Mem column captions render from the
+// first frame instead of popping in ~1.5s later when the host-wide docker stats call returns.
 // The stats branch must match the render predicate in viewSelectContainers
 // (map-presence + running) so svcVisibleCount and the captions row stay in sync.
 func (m Model) hasStatusColumns() bool {
+	if m.statsRequested {
+		return true
+	}
 	for _, svc := range m.services {
 		if st, ok := m.svcStatus[svc]; ok {
 			if st.Created != "" || st.Uptime != "" || len(st.Ports) > 0 {
@@ -2039,6 +2167,19 @@ func (m Model) viewSelectContainers() string {
 					maxMem = w
 				}
 			}
+		}
+	}
+
+	// Reserve CPU/Mem column widths as soon as stats have been requested so the
+	// captions render on the first frame instead of popping in when the ~1.5s
+	// docker stats call returns. Cells stay blank for services without data yet
+	// (running but not yet measured, or stopped — same as today).
+	if m.statsRequested {
+		if maxCPU < len("CPU") {
+			maxCPU = len("CPU")
+		}
+		if maxMem < len("Mem") {
+			maxMem = len("Mem")
 		}
 	}
 
