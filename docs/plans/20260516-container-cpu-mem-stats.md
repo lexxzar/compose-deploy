@@ -194,16 +194,16 @@ In `cmd/list.go`, when `--stats` is set and no `-C` is given, the bulk `AllConta
 
 **Important — bypass `command()`:** `docker stats` is a top-level Docker CLI command, **not** a compose subcommand. `c.command(...)` prepends `compose` (or switches to `docker-compose` in standalone mode) which would produce a malformed argv. Build the `exec.Cmd` directly via `exec.CommandContext("docker", "stats", "--no-stream", "--format", "json")`. This is the first method on `Compose` to bypass `command()` — `EditCommand`/`ExecCommand` already bypass `remoteCommand()` for related reasons (they also need terminal access). Document this exception in the `AllContainerStats` doc comment.
 
-- [ ] add `AllContainerStats(ctx context.Context, c *Compose) (map[string]runner.ServiceStats, error)` in `internal/compose/stats.go`
-- [ ] build the command directly: `exec.CommandContext(ctx, "docker", "stats", "--no-stream", "--format", "json")` — do NOT call `c.command(...)`
-- [ ] execute via the existing `runOutput` test hook on `Compose` (the hook is consulted before exec, so this still honors `SetTestHooks`)
-- [ ] add doc comment explicitly noting "bypasses `command()` because `docker stats` is not a compose subcommand"
-- [ ] parse the result via `parseStatsOutput`
-- [ ] write `TestAllContainerStats_local_argConstruction` — inject test hook, capture argv, assert exact shape: `["docker", "stats", "--no-stream", "--format", "json"]` (no `compose` element)
-- [ ] write `TestAllContainerStats_local_standaloneMode_unchanged` — set `c.Standalone = true`, verify argv is still the same (does NOT become `docker-compose stats`)
-- [ ] write `TestAllContainerStats_local_parsing` — inject test hook returning canned NDJSON, assert returned map matches expected
-- [ ] write `TestAllContainerStats_local_error` — inject test hook returning error, assert error propagated
-- [ ] run `go test ./internal/compose/...` — must pass before next task
+- [x] add `AllContainerStats(ctx context.Context, c *Compose) (map[string]runner.ServiceStats, error)` in `internal/compose/stats.go`
+- [x] build the command directly: `exec.CommandContext(ctx, "docker", "stats", "--no-stream", "--format", "json")` — do NOT call `c.command(...)`
+- [x] execute via the existing `runOutput` test hook on `Compose` (the hook is consulted before exec, so this still honors `SetTestHooks`)
+- [x] add doc comment explicitly noting "bypasses `command()` because `docker stats` is not a compose subcommand"
+- [x] parse the result via `parseStatsOutput`
+- [x] write `TestAllContainerStats_local_argConstruction` — inject test hook, capture argv, assert exact shape: `["docker", "stats", "--no-stream", "--format", "json"]` (no `compose` element)
+- [x] write `TestAllContainerStats_local_standaloneMode_unchanged` — set `c.Standalone = true`, verify argv is still the same (does NOT become `docker-compose stats`)
+- [x] write `TestAllContainerStats_local_parsing` — inject test hook returning canned NDJSON, assert returned map matches expected
+- [x] write `TestAllContainerStats_local_error` — inject test hook returning error, assert error propagated
+- [x] run `go test ./internal/compose/...` — must pass before next task
 
 ### Task 4: Implement `AllContainerStatsRemote` — bypassing `remoteCommand()`, splicing `SSHExtraArgs`
 

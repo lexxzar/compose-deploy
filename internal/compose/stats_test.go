@@ -1,6 +1,10 @@
 package compose
 
 import (
+	"context"
+	"fmt"
+	"os/exec"
+	"reflect"
 	"strings"
 	"testing"
 )
@@ -265,5 +269,111 @@ func TestParseStatsOutput_PropagatesMemError(t *testing.T) {
 	_, err := parseStatsOutput([]byte(in))
 	if err == nil {
 		t.Fatal("expected error from malformed memory usage, got nil")
+	}
+}
+
+func TestAllContainerStats_local_argConstruction(t *testing.T) {
+	var captured *exec.Cmd
+	c := &Compose{
+		ProjectDir: "/proj",
+		UID:        "1000:1000",
+		outputCmd: func(cmd *exec.Cmd) ([]byte, error) {
+			captured = cmd
+			return []byte("[]"), nil
+		},
+	}
+	if _, err := AllContainerStats(context.Background(), c); err != nil {
+		t.Fatalf("AllContainerStats error: %v", err)
+	}
+	if captured == nil {
+		t.Fatal("outputCmd hook was not called")
+	}
+	wantArgs := []string{"docker", "stats", "--no-stream", "--format", "json"}
+	if !reflect.DeepEqual(captured.Args, wantArgs) {
+		t.Errorf("argv = %v, want %v", captured.Args, wantArgs)
+	}
+	// Sanity: 'compose' must not appear anywhere in argv (docker stats is not
+	// a compose subcommand).
+	for _, a := range captured.Args {
+		if a == "compose" {
+			t.Errorf("argv contains 'compose' element: %v", captured.Args)
+		}
+	}
+}
+
+func TestAllContainerStats_local_standaloneMode_unchanged(t *testing.T) {
+	// Even in standalone mode (docker-compose binary), the docker stats argv
+	// must remain unchanged — docker stats is a top-level docker CLI command,
+	// not a compose subcommand.
+	var captured *exec.Cmd
+	c := &Compose{
+		ProjectDir: "/proj",
+		UID:        "1000:1000",
+		Standalone: true,
+		outputCmd: func(cmd *exec.Cmd) ([]byte, error) {
+			captured = cmd
+			return []byte("[]"), nil
+		},
+	}
+	c.SetStandalone(true)
+	if _, err := AllContainerStats(context.Background(), c); err != nil {
+		t.Fatalf("AllContainerStats error: %v", err)
+	}
+	if captured == nil {
+		t.Fatal("outputCmd hook was not called")
+	}
+	wantArgs := []string{"docker", "stats", "--no-stream", "--format", "json"}
+	if !reflect.DeepEqual(captured.Args, wantArgs) {
+		t.Errorf("argv (standalone) = %v, want %v (unchanged)", captured.Args, wantArgs)
+	}
+	if captured.Args[0] == "docker-compose" {
+		t.Errorf("argv started with docker-compose: %v", captured.Args)
+	}
+}
+
+func TestAllContainerStats_local_parsing(t *testing.T) {
+	canned := strings.Join([]string{
+		`{"ID":"abc123","Name":"proj-api-1","CPUPerc":"4.20%","MemUsage":"124MiB / 512MiB"}`,
+		`{"ID":"def456","Name":"proj-db-1","CPUPerc":"0.50%","MemUsage":"50MB / 1GiB"}`,
+	}, "\n")
+	c := &Compose{
+		ProjectDir: "/proj",
+		UID:        "1000:1000",
+		outputCmd: func(cmd *exec.Cmd) ([]byte, error) {
+			return []byte(canned), nil
+		},
+	}
+	got, err := AllContainerStats(context.Background(), c)
+	if err != nil {
+		t.Fatalf("AllContainerStats error: %v", err)
+	}
+	if len(got) != 2 {
+		t.Fatalf("expected 2 entries, got %d", len(got))
+	}
+	if got["abc123"].CPUPercent != 4.2 {
+		t.Errorf("abc123 CPU = %v, want 4.2", got["abc123"].CPUPercent)
+	}
+	if got["abc123"].MemoryUsed != 130023424 {
+		t.Errorf("abc123 MemoryUsed = %d, want 130023424", got["abc123"].MemoryUsed)
+	}
+	if got["def456"].MemoryLimit != 1024*1024*1024 {
+		t.Errorf("def456 MemoryLimit = %d, want %d", got["def456"].MemoryLimit, 1024*1024*1024)
+	}
+}
+
+func TestAllContainerStats_local_error(t *testing.T) {
+	c := &Compose{
+		ProjectDir: "/proj",
+		UID:        "1000:1000",
+		outputCmd: func(cmd *exec.Cmd) ([]byte, error) {
+			return nil, fmt.Errorf("docker daemon unavailable")
+		},
+	}
+	_, err := AllContainerStats(context.Background(), c)
+	if err == nil {
+		t.Fatal("expected error from outputCmd failure, got nil")
+	}
+	if !strings.Contains(err.Error(), "container stats") {
+		t.Errorf("error = %q, want it to mention container stats", err.Error())
 	}
 }

@@ -1,13 +1,47 @@
 package compose
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
+	"os/exec"
 	"strconv"
 	"strings"
 
 	"github.com/lexxzar/compose-deploy/internal/runner"
 )
+
+// AllContainerStats returns CPU and memory usage for every running container on
+// the host, keyed by short container ID. It is the host-wide bulk helper used
+// by the multi-project CLI path so N projects share one stats call.
+//
+// Bypasses `c.command(...)` because `docker stats` is a top-level Docker CLI
+// command, NOT a compose subcommand. `c.command(...)` prepends `compose` (or
+// switches to `docker-compose` in standalone mode) which would produce a
+// malformed argv. The argv is built directly via
+// `exec.CommandContext("docker", "stats", "--no-stream", "--format", "json")`.
+// This is the first method on `Compose` to bypass `command()` —
+// `EditCommand`/`ExecCommand` already bypass for related reasons (terminal
+// access). The `outputCmd` test hook is still honored so command construction
+// and parsing are testable without invoking Docker.
+//
+// The output is parsed via parseStatsOutput which tolerates both NDJSON and
+// JSON-array forms. Only containers Docker is currently observing are
+// returned — stopped containers are absent.
+func AllContainerStats(ctx context.Context, c *Compose) (map[string]runner.ServiceStats, error) {
+	cmd := exec.CommandContext(ctx, "docker", "stats", "--no-stream", "--format", "json")
+	var out []byte
+	var err error
+	if c.outputCmd != nil {
+		out, err = c.outputCmd(cmd)
+	} else {
+		out, err = cmd.Output()
+	}
+	if err != nil {
+		return nil, fmt.Errorf("fetching container stats: %w", withStderr(err))
+	}
+	return parseStatsOutput(out)
+}
 
 // statsEntry matches the JSON schema of `docker stats --no-stream --format json`.
 // Fields are camel-cased exactly as Docker emits them; only the fields we consume
