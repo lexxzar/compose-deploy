@@ -343,12 +343,12 @@ In `cmd/list.go`, when `--stats` is set and no `-C` is given, the bulk `AllConta
 - Modify: `CLAUDE.md`
 - Modify: `README.md` (only if it documents the `list` command's flags)
 
-- [ ] update `CLAUDE.md` "Docker Compose" section: add `ContainerStats` to the method list, add `stats` to the subcommand list, note `docker stats --no-stream --format json` is the data source, and note that `ContainerStats` is the **first method to bypass `command()` / `remoteCommand()`** because `docker stats` is a top-level Docker CLI command rather than a compose subcommand (along with `EditCommand`/`ExecCommand` which already bypass `remoteCommand()` for SSH/TTY reasons)
-- [ ] add a new "Resource stats" subsection under TUI architecture: parallel fetch via `tea.Batch(refreshStatus(), refreshStats())`, stale guard checks `m.screen == screenSelectContainers`, blank cells for stopped/missing, error rendering precedence (svcErr wins over statsErr)
-- [ ] update "Multi-project discovery" section: mention bulk `AllContainerStats` join via container ID — one ~1.5s cost regardless of project count when `--stats` is set
-- [ ] update "Testing Approach" `internal/compose/` line: mention `parseStatsOutput`/`parseSize`/`parseCPUPercent`/`FormatBytes` are extracted for testability
-- [ ] if `README.md` documents `list` flags, add a one-line description of `--stats`
-- [ ] move this plan to `docs/plans/completed/`
+- [x] update `CLAUDE.md` "Docker Compose" section: add `ContainerStats` to the method list, add `stats` to the subcommand list, note `docker stats --no-stream --format json` is the data source, and note that `ContainerStats` is the **first method to bypass `command()` / `remoteCommand()`** because `docker stats` is a top-level Docker CLI command rather than a compose subcommand (along with `EditCommand`/`ExecCommand` which already bypass `remoteCommand()` for SSH/TTY reasons)
+- [x] add a new "Resource stats" subsection under TUI architecture: parallel fetch via `tea.Batch(refreshStatus(), refreshStats())`, stale guard checks `m.screen == screenSelectContainers`, blank cells for stopped/missing, error rendering precedence (svcErr wins over statsErr)
+- [x] update "Multi-project discovery" section: mention bulk `AllContainerStats` join via container ID — one ~1.5s cost regardless of project count when `--stats` is set
+- [x] update "Testing Approach" `internal/compose/` line: mention `parseStatsOutput`/`parseSize`/`parseCPUPercent`/`FormatBytes` are extracted for testability
+- [x] if `README.md` documents `list` flags, add a one-line description of `--stats`
+- [x] move this plan to `docs/plans/completed/`
 
 ## Post-Completion
 

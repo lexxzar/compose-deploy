@@ -96,8 +96,14 @@ cdeploy stop nginx
 # List services and their status
 cdeploy list
 
+# List services with CPU and memory usage (one ~1.5s docker stats call)
+cdeploy list --stats
+
 # List services as JSON (for scripts and CI)
 cdeploy list --json
+
+# Combine stats with JSON output
+cdeploy list --stats --json
 
 # Stream logs for a service
 cdeploy logs nginx
@@ -131,6 +137,8 @@ cdeploy exec web -- rails console
 ```
 
 `health`, `created`, `uptime`, and `ports` are omitted when not applicable (no healthcheck, stopped container, no published ports).
+
+With `--stats`, three additional fields are populated per running service: `cpu_percent` (`100.0` = one full core; sums across replicas for scaled services), `memory_used` (bytes), `memory_limit` (bytes; equals host memory when no explicit limit is set). The fields are omitted entirely when `--stats` is not passed, so existing scripts see byte-identical output. On stats fetch failure the CLI prints `cdeploy: stats unavailable: <err>` to stderr, exits 0, and renders blank cells — status is the load-bearing primary view.
 
 **Exit codes**: `0` on success, non-zero on failure (config errors, SSH/Docker failures, validation errors). Suitable for CI gating.
 
