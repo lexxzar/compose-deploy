@@ -310,17 +310,19 @@ In `cmd/list.go`, when `--stats` is set and no `-C` is given, the bulk `AllConta
 - Modify: `internal/tui/app.go`
 - Modify: `internal/tui/app_test.go`
 
-- [ ] update `hasStatusColumns()` to return true when any service has stats data, alongside the existing Created/Uptime checks
-- [ ] update the column captions row to include `CPU` and `Mem` headers when stats are present (preserving lipgloss alignment with the existing 10+maxName left-pad)
-- [ ] update the per-row render to emit CPU and Mem cells between Uptime and Ports — use `compose.FormatBytes` (single source of truth, defined in Task 2). Import from `internal/compose`; do not duplicate in `internal/tui/`.
-- [ ] stopped or stats-missing services render blank padded cells (same convention as Ports for stopped containers)
-- [ ] `statsErr` rendered in the same slot as `svcErr`; if both are set, prefer `svcErr` (the more important failure)
-- [ ] write `TestContainerScreen_rendersStatsColumns` — populate `m.stats` with two services, call `View()`, assert the output contains the CPU% and Mem strings in the expected order
-- [ ] write `TestContainerScreen_blankCellsForMissingStats` — `m.stats` empty, `View()` renders without panic, captions row absent (or columns blank)
-- [ ] write `TestContainerScreen_statsErrFallback` — set `m.statsErr`, `m.svcErr` nil, `View()` includes the stats error string
-- [ ] write `TestContainerScreen_svcErrPreferred` — both errors set, `View()` shows `svcErr` not `statsErr`
-- [ ] write `TestSvcVisibleCount_withStatsColumns` — verify `svcVisibleCount()` math is unchanged when the captions row contains the new CPU/Mem headers (captions row presence is binary, so the header line count remains the same as when only Created/Uptime were present)
-- [ ] run `go test ./internal/tui/...` — must pass before next task
+- [x] update `hasStatusColumns()` to return true when any service has stats data, alongside the existing Created/Uptime checks
+- [x] update the column captions row to include `CPU` and `Mem` headers when stats are present (preserving lipgloss alignment with the existing 10+maxName left-pad)
+- [x] update the per-row render to emit CPU and Mem cells between Uptime and Ports — use `compose.FormatBytes` (single source of truth, defined in Task 2). Import from `internal/compose`; do not duplicate in `internal/tui/`.
+- [x] stopped or stats-missing services render blank padded cells (same convention as Ports for stopped containers)
+- [x] `statsErr` rendered in the same slot as `svcErr`; if both are set, prefer `svcErr` (the more important failure)
+- [x] write `TestContainerScreen_rendersStatsColumns` — populate `m.stats` with two services, call `View()`, assert the output contains the CPU% and Mem strings in the expected order
+- [x] write `TestContainerScreen_blankCellsForMissingStats` — `m.stats` empty, `View()` renders without panic, captions row absent (or columns blank)
+- [x] write `TestContainerScreen_statsErrFallback` — set `m.statsErr`, `m.svcErr` nil, `View()` includes the stats error string
+- [x] write `TestContainerScreen_svcErrPreferred` — both errors set, `View()` shows `svcErr` not `statsErr`
+- [x] write `TestSvcVisibleCount_withStatsColumns` — verify `svcVisibleCount()` math is unchanged when the captions row contains the new CPU/Mem headers (captions row presence is binary, so the header line count remains the same as when only Created/Uptime were present)
+- [x] run `go test ./internal/tui/...` — must pass before next task
+- ➕ Implementation choices: (1) svcErr keeps its early-return; the "same slot" requirement is satisfied because svcErr blanks the screen and statsErr never renders when both are set. (2) statsErr renders as a soft warning line in the existing warning slot (`"Stats unavailable: <err>"` via `warningStyle`) — services stay visible because this is a soft failure. (3) `svcVisibleCount()` now increments `footerLines` when `m.statsErr != nil`, matching the existing `m.warning != ""` behavior, so the visible service count shrinks by one when the inline stats-warning takes a row. (4) Stopped services skip the CPU/Mem cells entirely (left blank in the padded column) regardless of whether a stale stats entry is present — defensive against leftover stats after a stop.
+- ➕ Added bonus tests not in the original list: `TestContainerScreen_blankCellsForStoppedService` (locks in the stopped-service blanking rule), `TestContainerScreen_NoStatsCaptionsAbsent` (captions row absent when no stats present), `TestHasStatusColumns_StatsDataAlone` (stats data alone triggers captions row even without Created/Uptime/Ports).
 
 ### Task 10: Verify acceptance criteria
 

@@ -6582,3 +6582,249 @@ func TestRefreshStats_propagatesError(t *testing.T) {
 		t.Errorf("err = %v, want %v", msg.err, wantErr)
 	}
 }
+
+// --- Task 9: CPU/Mem column rendering tests ---
+
+func TestContainerScreen_rendersStatsColumns(t *testing.T) {
+	mc := &mockComposer{services: []string{"web", "db"}}
+	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
+	m.screen = screenSelectContainers
+	m.services = mc.services
+	m.svcStatus = map[string]runner.ServiceStatus{
+		"web": {Running: true},
+		"db":  {Running: true},
+	}
+	m.stats = map[string]runner.ServiceStats{
+		"web": {CPUPercent: 4.2, MemoryUsed: 130023424, MemoryLimit: 536870912},
+		"db":  {CPUPercent: 1.1, MemoryUsed: 200 * 1024 * 1024, MemoryLimit: 1024 * 1024 * 1024},
+	}
+	m.width = 200
+	m.height = 24
+
+	view := m.viewSelectContainers()
+
+	// Captions row includes CPU and Mem headers.
+	if !strings.Contains(view, "CPU") {
+		t.Errorf("expected 'CPU' caption in view, got:\n%s", view)
+	}
+	if !strings.Contains(view, "Mem") {
+		t.Errorf("expected 'Mem' caption in view, got:\n%s", view)
+	}
+
+	// Per-row values: CPU formatted as one decimal + %, Mem as used/limit.
+	if !strings.Contains(view, "4.2%") {
+		t.Errorf("expected '4.2%%' for web CPU in view, got:\n%s", view)
+	}
+	if !strings.Contains(view, "1.1%") {
+		t.Errorf("expected '1.1%%' for db CPU in view, got:\n%s", view)
+	}
+	// 130023424 → "124M", 536870912 → "512M"
+	if !strings.Contains(view, "124M/512M") {
+		t.Errorf("expected '124M/512M' for web Mem in view, got:\n%s", view)
+	}
+	// 200*MiB → "200M", 1*GiB → "1G"
+	if !strings.Contains(view, "200M/1G") {
+		t.Errorf("expected '200M/1G' for db Mem in view, got:\n%s", view)
+	}
+
+	// Column order: Uptime ... CPU before Mem before Ports (Mem appears before any Ports section,
+	// even though Ports is absent here, so we just check CPU appears before Mem in caption row).
+	captionLineIdx := strings.Index(view, "CPU")
+	memCaptionIdx := strings.Index(view, "Mem")
+	if captionLineIdx >= 0 && memCaptionIdx >= 0 && captionLineIdx >= memCaptionIdx {
+		t.Errorf("expected 'CPU' caption before 'Mem' caption, CPU=%d Mem=%d", captionLineIdx, memCaptionIdx)
+	}
+}
+
+func TestContainerScreen_blankCellsForMissingStats(t *testing.T) {
+	// One service has stats, the other doesn't — stats-missing service should
+	// render without panic and contribute blank padded cells.
+	mc := &mockComposer{services: []string{"web", "db"}}
+	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
+	m.screen = screenSelectContainers
+	m.services = mc.services
+	m.svcStatus = map[string]runner.ServiceStatus{
+		"web": {Running: true},
+		"db":  {Running: true},
+	}
+	m.stats = map[string]runner.ServiceStats{
+		"web": {CPUPercent: 5.5, MemoryUsed: 100 * 1024 * 1024, MemoryLimit: 200 * 1024 * 1024},
+		// db absent from stats map
+	}
+	m.width = 200
+	m.height = 24
+
+	view := m.viewSelectContainers()
+
+	// Captions present because stats data exists on at least one service.
+	if !strings.Contains(view, "CPU") {
+		t.Errorf("expected CPU caption when any service has stats, got:\n%s", view)
+	}
+
+	// The "db" service should render without web's CPU value bleeding into it.
+	lines := strings.Split(view, "\n")
+	var dbLine string
+	for _, l := range lines {
+		if strings.Contains(l, " db ") || strings.HasSuffix(strings.TrimRight(l, " "), " db") || strings.Contains(l, "● db") {
+			dbLine = l
+			break
+		}
+	}
+	if dbLine == "" {
+		t.Fatalf("could not locate db service line in view:\n%s", view)
+	}
+	if strings.Contains(dbLine, "5.5%") {
+		t.Errorf("db line should not contain web's CPU value: %q", dbLine)
+	}
+	if strings.Contains(dbLine, "100M") {
+		t.Errorf("db line should not contain web's Mem value: %q", dbLine)
+	}
+}
+
+func TestContainerScreen_blankCellsForStoppedService(t *testing.T) {
+	// Stopped service should render blank CPU/Mem even if stats map has an entry
+	// (defensive: a leftover stats entry for a now-stopped container shouldn't leak).
+	mc := &mockComposer{services: []string{"web", "db"}}
+	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
+	m.screen = screenSelectContainers
+	m.services = mc.services
+	m.svcStatus = map[string]runner.ServiceStatus{
+		"web": {Running: true},
+		"db":  {Running: false},
+	}
+	m.stats = map[string]runner.ServiceStats{
+		"web": {CPUPercent: 9.9, MemoryUsed: 100 * 1024 * 1024, MemoryLimit: 200 * 1024 * 1024},
+		"db":  {CPUPercent: 7.7, MemoryUsed: 50 * 1024 * 1024, MemoryLimit: 100 * 1024 * 1024},
+	}
+	m.width = 200
+	m.height = 24
+
+	view := m.viewSelectContainers()
+	lines := strings.Split(view, "\n")
+	var dbLine string
+	for _, l := range lines {
+		if strings.Contains(l, " db ") || strings.HasSuffix(strings.TrimRight(l, " "), " db") {
+			dbLine = l
+			break
+		}
+	}
+	if dbLine == "" {
+		t.Fatalf("could not locate db service line:\n%s", view)
+	}
+	if strings.Contains(dbLine, "7.7%") {
+		t.Errorf("stopped db line should not contain stale CPU value: %q", dbLine)
+	}
+	if strings.Contains(dbLine, "50M") {
+		t.Errorf("stopped db line should not contain stale Mem value: %q", dbLine)
+	}
+}
+
+func TestContainerScreen_NoStatsCaptionsAbsent(t *testing.T) {
+	// With empty stats map and no status columns, no captions row appears.
+	mc := &mockComposer{services: []string{"web"}}
+	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
+	m.screen = screenSelectContainers
+	m.services = mc.services
+	m.svcStatus = map[string]runner.ServiceStatus{
+		"web": {Running: true},
+	}
+	m.stats = nil
+	m.width = 120
+	m.height = 24
+
+	view := m.viewSelectContainers()
+	if strings.Contains(view, "CPU") {
+		t.Errorf("CPU caption should be absent when no stats data, got:\n%s", view)
+	}
+	if strings.Contains(view, "Mem") {
+		t.Errorf("Mem caption should be absent when no stats data, got:\n%s", view)
+	}
+}
+
+func TestContainerScreen_statsErrFallback(t *testing.T) {
+	mc := &mockComposer{services: []string{"web"}}
+	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
+	m.screen = screenSelectContainers
+	m.services = mc.services
+	m.svcStatus = map[string]runner.ServiceStatus{"web": {Running: true}}
+	m.statsErr = errors.New("docker stats failed: timeout")
+	m.width = 200
+	m.height = 24
+
+	view := m.viewSelectContainers()
+
+	// Services are still listed (soft-fail; not a full-screen error).
+	if !strings.Contains(view, "web") {
+		t.Errorf("services should still render when only statsErr is set, got:\n%s", view)
+	}
+	// statsErr message renders inline as a warning.
+	if !strings.Contains(view, "Stats unavailable") {
+		t.Errorf("expected 'Stats unavailable' warning in view, got:\n%s", view)
+	}
+	if !strings.Contains(view, "docker stats failed: timeout") {
+		t.Errorf("expected statsErr message in view, got:\n%s", view)
+	}
+}
+
+func TestContainerScreen_svcErrPreferred(t *testing.T) {
+	mc := &mockComposer{services: []string{"web"}}
+	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
+	m.screen = screenSelectContainers
+	m.services = mc.services
+	m.svcStatus = map[string]runner.ServiceStatus{"web": {Running: true}}
+	m.svcErr = errors.New("services load failed")
+	m.statsErr = errors.New("stats fetch failed too")
+	m.width = 200
+	m.height = 24
+
+	view := m.viewSelectContainers()
+
+	// svcErr wins via early-return: its message appears.
+	if !strings.Contains(view, "services load failed") {
+		t.Errorf("svcErr message should appear, got:\n%s", view)
+	}
+	// statsErr message is suppressed when svcErr takes over the screen.
+	if strings.Contains(view, "stats fetch failed too") {
+		t.Errorf("statsErr should NOT appear when svcErr is set, got:\n%s", view)
+	}
+	if strings.Contains(view, "Stats unavailable") {
+		t.Errorf("Stats unavailable warning should NOT appear when svcErr is set, got:\n%s", view)
+	}
+}
+
+func TestSvcVisibleCount_withStatsColumns(t *testing.T) {
+	// With stats data present, the captions row still appears, so headerLines=4.
+	// The captions row presence is binary: adding CPU/Mem headers does not
+	// change the per-row line count beyond the existing Created/Uptime case.
+	mc := &mockComposer{}
+	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
+	m.services = []string{"a", "b", "c", "d", "e", "f", "g", "h", "i", "j"}
+	m.width = 130
+	m.height = 10
+	m.svcStatus = map[string]runner.ServiceStatus{
+		"a": {Running: true},
+	}
+	m.stats = map[string]runner.ServiceStats{
+		"a": {CPUPercent: 4.2, MemoryUsed: 100, MemoryLimit: 1000},
+	}
+
+	// header=4 (3 + captions row), footer=3 → 10-4-3 = 3
+	got := m.svcVisibleCount()
+	if got != 3 {
+		t.Errorf("svcVisibleCount() with stats columns = %d, want 3", got)
+	}
+}
+
+func TestHasStatusColumns_StatsDataAlone(t *testing.T) {
+	// Stats data alone (no Created/Uptime/Ports) should trigger captions row.
+	mc := &mockComposer{}
+	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
+	m.services = []string{"web"}
+	m.svcStatus = map[string]runner.ServiceStatus{"web": {Running: true}}
+	m.stats = map[string]runner.ServiceStats{
+		"web": {CPUPercent: 4.2},
+	}
+	if !m.hasStatusColumns() {
+		t.Error("hasStatusColumns() = false, want true with stats data present")
+	}
+}

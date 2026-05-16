@@ -1563,11 +1563,16 @@ func (m Model) selectedCount() int {
 }
 
 // hasStatusColumns returns true if any service in m.services has non-empty Created, Uptime,
-// or Ports data, indicating that column captions should be displayed.
+// Ports, or stats data, indicating that column captions should be displayed.
 func (m Model) hasStatusColumns() bool {
 	for _, svc := range m.services {
 		if st, ok := m.svcStatus[svc]; ok {
 			if st.Created != "" || st.Uptime != "" || len(st.Ports) > 0 {
+				return true
+			}
+		}
+		if st, ok := m.stats[svc]; ok {
+			if st.CPUPercent != 0 || st.MemoryUsed != 0 || st.MemoryLimit != 0 {
 				return true
 			}
 		}
@@ -1614,6 +1619,9 @@ func (m Model) svcVisibleCount() int {
 		}
 		if m.warning != "" {
 			footerLines++ // warning line
+		}
+		if m.statsErr != nil {
+			footerLines++ // soft-fail stats error line
 		}
 	}
 
@@ -1970,12 +1978,17 @@ func (m Model) viewSelectContainers() string {
 	// Calculate max widths for alignment (across ALL services, not just visible).
 	// portsStr caches FormatPorts(...) per service so the render loop below can
 	// reuse the formatted strings without re-calling FormatPorts (mirrors the
-	// pattern in cmd/list.go formatDots/formatDotsGrouped).
+	// pattern in cmd/list.go formatDots/formatDotsGrouped). cpuStr and memStr
+	// cache the formatted CPU/Mem cells per service for the same reason.
 	maxName := 0
 	maxCreated := 0
 	maxUptime := 0
+	maxCPU := 0
+	maxMem := 0
 	maxPorts := 0
 	portsStr := make(map[string]string, len(m.services))
+	cpuStr := make(map[string]string, len(m.services))
+	memStr := make(map[string]string, len(m.services))
 	for _, svc := range m.services {
 		if len(svc) > maxName {
 			maxName = len(svc)
@@ -1993,6 +2006,22 @@ func (m Model) viewSelectContainers() string {
 				maxPorts = w
 			}
 		}
+		if stx, ok := m.stats[svc]; ok {
+			// Only running services get stats cells; stopped containers leave blanks.
+			running := m.svcStatus[svc].Running
+			if running {
+				cpu := fmt.Sprintf("%.1f%%", stx.CPUPercent)
+				mem := fmt.Sprintf("%s/%s", compose.FormatBytes(stx.MemoryUsed), compose.FormatBytes(stx.MemoryLimit))
+				cpuStr[svc] = cpu
+				memStr[svc] = mem
+				if w := utf8.RuneCountInString(cpu); w > maxCPU {
+					maxCPU = w
+				}
+				if w := utf8.RuneCountInString(mem); w > maxMem {
+					maxMem = w
+				}
+			}
+		}
 	}
 
 	// Top gap: show scroll-up indicator or blank line
@@ -2007,12 +2036,18 @@ func (m Model) viewSelectContainers() string {
 	// Column captions row (only when status data exists). Widen each active
 	// column to at least its caption width so the caption never overflows and
 	// shifts the following columns rightward.
-	if maxCreated > 0 || maxUptime > 0 || maxPorts > 0 {
+	if maxCreated > 0 || maxUptime > 0 || maxCPU > 0 || maxMem > 0 || maxPorts > 0 {
 		if maxCreated > 0 && len("Created") > maxCreated {
 			maxCreated = len("Created")
 		}
 		if maxUptime > 0 && len("Uptime") > maxUptime {
 			maxUptime = len("Uptime")
+		}
+		if maxCPU > 0 && len("CPU") > maxCPU {
+			maxCPU = len("CPU")
+		}
+		if maxMem > 0 && len("Mem") > maxMem {
+			maxMem = len("Mem")
 		}
 		if maxPorts > 0 && len("Ports") > maxPorts {
 			maxPorts = len("Ports")
@@ -2025,6 +2060,12 @@ func (m Model) viewSelectContainers() string {
 		}
 		if maxUptime > 0 {
 			header += fmt.Sprintf("  %-*s", maxUptime, "Uptime")
+		}
+		if maxCPU > 0 {
+			header += fmt.Sprintf("  %-*s", maxCPU, "CPU")
+		}
+		if maxMem > 0 {
+			header += fmt.Sprintf("  %-*s", maxMem, "Mem")
 		}
 		if maxPorts > 0 {
 			header += fmt.Sprintf("  %-*s", maxPorts, "Ports")
@@ -2053,13 +2094,19 @@ func (m Model) viewSelectContainers() string {
 			dot = statusRunningDot.Render("●")
 		}
 
-		// Build line: cursor + checkbox + health + dot + name [+ created] [+ uptime] [+ ports]
+		// Build line: cursor + checkbox + health + dot + name [+ created] [+ uptime] [+ cpu] [+ mem] [+ ports]
 		line := fmt.Sprintf("%s%s %s %s %-*s", cursor, checkbox, health, dot, maxName, svc)
 		if maxCreated > 0 {
 			line += fmt.Sprintf("  %-*s", maxCreated, st.Created)
 		}
 		if maxUptime > 0 {
 			line += fmt.Sprintf("  %-*s", maxUptime, st.Uptime)
+		}
+		if maxCPU > 0 {
+			line += fmt.Sprintf("  %-*s", maxCPU, cpuStr[svc])
+		}
+		if maxMem > 0 {
+			line += fmt.Sprintf("  %-*s", maxMem, memStr[svc])
 		}
 		if maxPorts > 0 {
 			line += fmt.Sprintf("  %-*s", maxPorts, portsStr[svc])
@@ -2100,6 +2147,12 @@ func (m Model) viewSelectContainers() string {
 	} else {
 		if m.warning != "" {
 			b.WriteString("\n  " + warningStyle.Render(m.warning))
+		}
+		// statsErr renders in the same slot as svcErr — but svcErr early-returns
+		// above, so when both are set svcErr always wins. statsErr is soft-fail:
+		// services and status still render; only the CPU/Mem cells go blank.
+		if m.statsErr != nil {
+			b.WriteString("\n  " + warningStyle.Render(fmt.Sprintf("Stats unavailable: %v", m.statsErr)))
 		}
 		back := "q quit"
 		if m.showPicker {
