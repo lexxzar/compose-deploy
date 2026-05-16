@@ -153,30 +153,30 @@ Exact text choices to be finalised when reading the surrounding code in Task 2 �
 - Modify: `internal/tui/app.go`
 - Modify: `internal/tui/app_test.go`
 
-- [ ] add the q→esc pre-dispatch block in `handleKey()` immediately after the existing `quitting` intercept (the `if m.quitting { ... }` block), with carve-outs for `screenSelectServer` (quit), `screenSelectProject` with no servers (quit), `screenSelectContainers` with `!showPicker && !confirming` (quit), `screenProgress` while `!done && !failed` (no-op — must not cancel), and `screenSettingsForm` (pass through to textinput)
-- [ ] in `screenSelectProject` handler, change `case "q", "ctrl+c": return m.tryQuit()` to `case "ctrl+c": return m.tryQuit()`
-- [ ] in `screenSelectContainers` handler (both confirming sub-block and idle branch), change both `case "q", "ctrl+c": return m.tryQuit()` lines to `case "ctrl+c": return m.tryQuit()`
-- [ ] in `screenProgress` handler, change `case "q", "ctrl+c":` (which conditionally calls `m.tryQuit()`) to `case "ctrl+c":` with the same conditional body
-- [ ] in `screenLogs` handler, change `case "q", "ctrl+c": return m.tryQuit()` to `case "ctrl+c": return m.tryQuit()`
-- [ ] in `screenConfig` handler, change `case "q", "ctrl+c": return m.tryQuit()` to `case "ctrl+c": return m.tryQuit()`
-- [ ] in `screenSettingsList` (idle branch, not the delete-confirm sub-block), change `case "q", "ctrl+c": return m.tryQuit()` to `case "ctrl+c": return m.tryQuit()`
-- [ ] update existing `TestQuitConfirmation_AllRemoteScreens` (app_test.go:5393): remove every test case whose key is `"q"` on a nested screen — those scenarios are now back-nav, not disconnect-prompt — and keep only the `ctrl+c` cases (rename test if helpful, e.g. `TestCtrlCConfirmation_AllRemoteScreens`)
-- [ ] add `TestQBackNavigation_ContainerScreen`: `screenSelectContainers` with `showPicker = true` and services loaded; press `q`; assert `screen == screenSelectProject`, `composer == nil`, `services == nil`
-- [ ] add `TestQBackNavigation_ContainerScreenCancelsConfirming`: `screenSelectContainers` with `confirming = true`, `pendingOp = runner.Deploy`; press `q`; assert `confirming == false`, `screen == screenSelectContainers`, no `tea.Quit`
-- [ ] add `TestQBackNavigation_LogsScreen`: `screenLogs` with `logsService = "nginx"`; press `q`; assert `screen == screenSelectContainers`, `logsService == ""`
-- [ ] add `TestQBackNavigation_ConfigScreen`: `screenConfig` with `configContent` set; press `q`; assert `screen == screenSelectContainers`, `configContent == nil`
-- [ ] add `TestQBackNavigation_SettingsList`: `screenSettingsList` with config loaded; press `q`; assert `screen == screenSelectServer`
-- [ ] add `TestQBackNavigation_SettingsListCancelsDelete`: `screenSettingsList` with `settingsDelete = true`; press `q`; assert `settingsDelete == false` and `screen == screenSettingsList` (the existing `esc` handler at app.go:981-983 only resets the delete flag — it does not navigate)
-- [ ] add `TestQBackNavigation_ProjectScreen`: `screenSelectProject` with at least one server in `m.servers` and a `disconnectFunc` that increments a captured counter; press `q`; assert `screen == screenSelectServer`, `disconnectFunc == nil` after; invoke the returned `tea.Cmd` and assert (a) it returns a `disconnectDoneMsg{}` and (b) the counter incremented to 1 (matches the existing `esc` behavior at app.go:725-730)
-- [ ] add `TestQBackNavigation_ProgressDoneReturnsToContainers`: `screenProgress` with `done = true`; press `q`; assert `screen == screenSelectContainers`
-- [ ] add `TestQOnProgressWhileRunningIsNoop`: `screenProgress` with `done = false`, `failed = false`, a `cancel` function spy; press `q`; assert `screen == screenProgress` (unchanged), `cancel` was **not** called, no `tea.Cmd` returned. This guards the `screenProgress` carve-out — without it, `q→esc` rewrite would cancel the deploy.
-- [ ] add `TestQQuitsAtRoot_ProjectScreenNoServers`: `screenSelectProject` with `servers = nil`; press `q`; assert the returned `tea.Cmd` produces `tea.QuitMsg`
-- [ ] add `TestQQuitsAtRoot_ContainerScreenStandalone`: `screenSelectContainers` with `showPicker = false`, `confirming = false`; press `q`; assert the returned `tea.Cmd` produces `tea.QuitMsg`
-- [ ] add `TestQTypedIntoSettingsFormInput`: `screenSettingsForm`, focus on the name input (`settingsField = 0`), input initially empty; send `tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'q'}}`; assert `settingsInputs[0].Value()` contains `"q"` and `screen == screenSettingsForm`
-- [ ] add `TestCtrlCStillTriggersDisconnectPrompt`: on `screenSelectContainers` with `disconnectFunc != nil`; press `ctrl+c`; assert `quitting == true`, no `tea.Quit` yet (confirms the safety prompt path still works)
-- [ ] add `TestQDuringQuittingPromptStillSwallowed`: `m.quitting = true` (any screen), press `q`; assert `quitting` stays true, no `tea.Cmd` returned (the existing intercept at app.go:639-648 runs before the new pre-dispatch and swallows `q`)
-- [ ] update help-footer strings in `view*()` functions per the table in Technical Details: nested screens render `"q back"`, root screens keep `"q quit"`. Read the surrounding `if` conditions to choose the right wording for each location.
-- [ ] run `go test ./internal/tui/ -count=1 -v` — must pass before next task
+- [x] add the q→esc pre-dispatch block in `handleKey()` immediately after the existing `quitting` intercept (the `if m.quitting { ... }` block), with carve-outs for `screenSelectServer` (quit), `screenSelectProject` with no servers (quit), `screenSelectContainers` with `!showPicker && !confirming` (quit), `screenProgress` while `!done && !failed` (no-op — must not cancel), and `screenSettingsForm` (pass through to textinput)
+- [x] in `screenSelectProject` handler, change `case "q", "ctrl+c": return m.tryQuit()` to `case "ctrl+c": return m.tryQuit()`
+- [x] in `screenSelectContainers` handler (both confirming sub-block and idle branch), change both `case "q", "ctrl+c": return m.tryQuit()` lines to `case "ctrl+c": return m.tryQuit()`
+- [x] in `screenProgress` handler, change `case "q", "ctrl+c":` (which conditionally calls `m.tryQuit()`) to `case "ctrl+c":` with the same conditional body
+- [x] in `screenLogs` handler, change `case "q", "ctrl+c": return m.tryQuit()` to `case "ctrl+c": return m.tryQuit()`
+- [x] in `screenConfig` handler, change `case "q", "ctrl+c": return m.tryQuit()` to `case "ctrl+c": return m.tryQuit()`
+- [x] in `screenSettingsList` (idle branch, not the delete-confirm sub-block), change `case "q", "ctrl+c": return m.tryQuit()` to `case "ctrl+c": return m.tryQuit()`
+- [x] update existing `TestQuitConfirmation_AllRemoteScreens` (app_test.go:5393): remove every test case whose key is `"q"` on a nested screen — those scenarios are now back-nav, not disconnect-prompt — and keep only the `ctrl+c` cases (rename test if helpful, e.g. `TestCtrlCConfirmation_AllRemoteScreens`)
+- [x] add `TestQBackNavigation_ContainerScreen`: `screenSelectContainers` with `showPicker = true` and services loaded; press `q`; assert `screen == screenSelectProject`, `composer == nil`, `services == nil`
+- [x] add `TestQBackNavigation_ContainerScreenCancelsConfirming`: `screenSelectContainers` with `confirming = true`, `pendingOp = runner.Deploy`; press `q`; assert `confirming == false`, `screen == screenSelectContainers`, no `tea.Quit`
+- [x] add `TestQBackNavigation_LogsScreen`: `screenLogs` with `logsService = "nginx"`; press `q`; assert `screen == screenSelectContainers`, `logsService == ""`
+- [x] add `TestQBackNavigation_ConfigScreen`: `screenConfig` with `configContent` set; press `q`; assert `screen == screenSelectContainers`, `configContent == nil`
+- [x] add `TestQBackNavigation_SettingsList`: `screenSettingsList` with config loaded; press `q`; assert `screen == screenSelectServer`
+- [x] add `TestQBackNavigation_SettingsListCancelsDelete`: `screenSettingsList` with `settingsDelete = true`; press `q`; assert `settingsDelete == false` and `screen == screenSettingsList` (the existing `esc` handler at app.go:981-983 only resets the delete flag — it does not navigate)
+- [x] add `TestQBackNavigation_ProjectScreen`: `screenSelectProject` with at least one server in `m.servers` and a `disconnectFunc` that increments a captured counter; press `q`; assert `screen == screenSelectServer`, `disconnectFunc == nil` after; invoke the returned `tea.Cmd` and assert (a) it returns a `disconnectDoneMsg{}` and (b) the counter incremented to 1 (matches the existing `esc` behavior at app.go:725-730)
+- [x] add `TestQBackNavigation_ProgressDoneReturnsToContainers`: `screenProgress` with `done = true`; press `q`; assert `screen == screenSelectContainers`
+- [x] add `TestQOnProgressWhileRunningIsNoop`: `screenProgress` with `done = false`, `failed = false`, a `cancel` function spy; press `q`; assert `screen == screenProgress` (unchanged), `cancel` was **not** called, no `tea.Cmd` returned. This guards the `screenProgress` carve-out — without it, `q→esc` rewrite would cancel the deploy.
+- [x] add `TestQQuitsAtRoot_ProjectScreenNoServers`: `screenSelectProject` with `servers = nil`; press `q`; assert the returned `tea.Cmd` produces `tea.QuitMsg`
+- [x] add `TestQQuitsAtRoot_ContainerScreenStandalone`: `screenSelectContainers` with `showPicker = false`, `confirming = false`; press `q`; assert the returned `tea.Cmd` produces `tea.QuitMsg`
+- [x] add `TestQTypedIntoSettingsFormInput`: `screenSettingsForm`, focus on the name input (`settingsField = 0`), input initially empty; send `tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'q'}}`; assert `settingsInputs[0].Value()` contains `"q"` and `screen == screenSettingsForm`
+- [x] add `TestCtrlCStillTriggersDisconnectPrompt`: on `screenSelectContainers` with `disconnectFunc != nil`; press `ctrl+c`; assert `quitting == true`, no `tea.Quit` yet (confirms the safety prompt path still works)
+- [x] add `TestQDuringQuittingPromptStillSwallowed`: `m.quitting = true` (any screen), press `q`; assert `quitting` stays true, no `tea.Cmd` returned (the existing intercept at app.go:639-648 runs before the new pre-dispatch and swallows `q`)
+- [x] update help-footer strings in `view*()` functions per the table in Technical Details: nested screens render `"q back"`, root screens keep `"q quit"`. Read the surrounding `if` conditions to choose the right wording for each location.
+- [x] run `go test ./internal/tui/ -count=1 -v` — must pass before next task
 
 ### Task 2: Update documentation
 
