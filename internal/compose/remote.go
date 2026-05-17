@@ -42,6 +42,15 @@ type RemoteCompose struct {
 
 	detected bool // true after Detect() or SetStandalone() has been called
 
+	// dryRunSupported caches whether `docker compose pull` advertises the
+	// `--dry-run` flag (Compose v2.22+) on the remote host. dryRunDetected gates
+	// the one-shot probe — set to true after the first call to
+	// detectDryRunSupport() (either branch). Mirrors the local Compose pair so
+	// tests can force either branch via SetDryRunSupport without invoking the
+	// probe over SSH.
+	dryRunSupported bool
+	dryRunDetected  bool
+
 	// testing hooks; nil = use real exec
 	runCmd    func(*exec.Cmd) error
 	outputCmd func(*exec.Cmd) ([]byte, error)
@@ -117,6 +126,15 @@ func (r *RemoteCompose) Detect(ctx context.Context) error {
 func (r *RemoteCompose) SetStandalone(standalone bool) {
 	r.Standalone = standalone
 	r.detected = true
+}
+
+// SetDryRunSupport forces the cached dry-run capability without invoking the
+// probe. Tests use this to exercise either branch of CheckUpdates without
+// shelling out for `docker compose pull --help`. Mirrors the local
+// Compose.SetDryRunSupport — the flag-plus-detected pair is set in lock-step.
+func (r *RemoteCompose) SetDryRunSupport(supported bool) {
+	r.dryRunSupported = supported
+	r.dryRunDetected = true
 }
 
 // shellEscape wraps an argument in single quotes for safe SSH transport.
@@ -503,4 +521,186 @@ func (r *RemoteCompose) ListProjects(ctx context.Context) ([]Project, error) {
 		return nil, fmt.Errorf("listing remote projects: %w", withStderr(err))
 	}
 	return parseProjects(out)
+}
+
+// detectDryRunSupport runs the one-shot probe over SSH to determine whether
+// the remote host's `docker compose` advertises `--dry-run` on the `pull`
+// subcommand. The probe goes through remoteCommand() because `docker compose
+// pull --help` is a compose subcommand — no need to bypass like the
+// manifest-inspect fallback path does. Result is cached on the RemoteCompose
+// struct. A probe failure (binary missing, SSH transport error) is treated as
+// "unsupported" rather than propagated — CheckUpdates falls back to the
+// manifest-inspect path in that case. Mirrors Compose.detectDryRunSupport.
+func (r *RemoteCompose) detectDryRunSupport(ctx context.Context) {
+	if r.dryRunDetected {
+		return
+	}
+	cmd := r.remoteCommand(ctx, pullHelpArgs...)
+	var out []byte
+	var err error
+	if r.outputCmd != nil {
+		out, err = r.outputCmd(cmd)
+	} else {
+		out, err = cmd.CombinedOutput()
+	}
+	r.dryRunDetected = true
+	if err != nil {
+		r.dryRunSupported = false
+		return
+	}
+	r.dryRunSupported = detectDryRunFromHelp(string(out))
+}
+
+// CheckUpdates reports per-service "image update available" verdicts for the
+// remote project. See Compose.CheckUpdates for the full contract — this is
+// the SSH counterpart and behaves identically with respect to tri-state
+// semantics, soft per-image failure, and absent-as-unknown.
+//
+// Two implementation paths:
+//
+//  1. Dry-run path goes through remoteCommand() — it's a regular compose
+//     subcommand, so the existing SSH plumbing (CURRENT_UID, cd ProjectDir,
+//     ControlMaster socket) carries it.
+//
+//  2. Fallback path builds the SSH argv DIRECTLY for `docker image inspect`
+//     and `docker manifest inspect` — both are top-level docker CLI commands,
+//     NOT compose subcommands, so remoteCommand() would build a malformed
+//     `docker compose image inspect` argv. SSHExtraArgs is spliced
+//     immediately before the host argument via sshArgs(), mirroring the
+//     AllContainerStatsRemote / EditCommand / ExecCommand convention.
+func (r *RemoteCompose) CheckUpdates(ctx context.Context, services []string) (map[string]bool, error) {
+	r.detectDryRunSupport(ctx)
+	if r.dryRunSupported {
+		return r.checkUpdatesDryRun(ctx, services)
+	}
+	return r.checkUpdatesFallback(ctx, services)
+}
+
+// checkUpdatesDryRun runs `docker compose pull --dry-run --quiet
+// --policy=missing [services...]` on the remote host and parses the stderr
+// verdict. The dry-run subcommand writes verdicts to STDERR, so
+// CombinedOutput is used to capture them — stdout is empty under `--quiet`.
+func (r *RemoteCompose) checkUpdatesDryRun(ctx context.Context, services []string) (map[string]bool, error) {
+	args := append([]string{}, dryRunArgs...)
+	args = append(args, services...)
+	cmd := r.remoteCommand(ctx, args...)
+	var out []byte
+	var err error
+	if r.outputCmd != nil {
+		out, err = r.outputCmd(cmd)
+	} else {
+		out, err = cmd.CombinedOutput()
+	}
+	if err != nil {
+		// Dry-run can exit non-zero on registry errors yet still emit useful
+		// per-service lines on stderr — return whatever the parser can
+		// recover alongside the error so callers can surface partial results.
+		results := parseDryRunOutput(string(out))
+		return results, fmt.Errorf("remote compose pull --dry-run: %w", withStderr(err))
+	}
+	return parseDryRunOutput(string(out)), nil
+}
+
+// checkUpdatesFallback implements the manifest-inspect path used when
+// `--dry-run` is unavailable on the remote host. See Compose.CheckUpdates for
+// the full contract.
+func (r *RemoteCompose) checkUpdatesFallback(ctx context.Context, services []string) (map[string]bool, error) {
+	images, err := r.fetchServiceImages(ctx)
+	if err != nil {
+		return nil, err
+	}
+	wanted := filterServices(images, services)
+	out := make(map[string]bool, len(wanted))
+	for svc, img := range wanted {
+		updated, ok := r.compareImageDigest(ctx, img)
+		if !ok {
+			continue
+		}
+		out[svc] = updated
+	}
+	return out, nil
+}
+
+// fetchServiceImages runs `docker compose config --format json` on the
+// remote host and returns the service-name → image map. Build-only services
+// (no `image:`) are absent. Goes through remoteCommand() — regular compose
+// subcommand.
+func (r *RemoteCompose) fetchServiceImages(ctx context.Context) (map[string]string, error) {
+	cmd := r.remoteCommand(ctx, configImagesArgs...)
+	var out []byte
+	var err error
+	if r.outputCmd != nil {
+		out, err = r.outputCmd(cmd)
+	} else {
+		out, err = cmd.Output()
+	}
+	if err != nil {
+		return nil, fmt.Errorf("fetching remote compose config: %w", withStderr(err))
+	}
+	return parseConfigImages(out)
+}
+
+// compareImageDigest fetches the local and remote digests for image and
+// returns (updateAvailable, ok). ok=false means at least one side could not
+// be determined (treat as "unknown" — caller leaves cell blank).
+//
+// Both inspect calls are top-level docker CLI commands (`docker image
+// inspect`, `docker manifest inspect`), so they CANNOT go through
+// remoteCommand() — that would prepend `compose` and produce a malformed
+// argv on the remote host. The SSH argv is built directly via r.sshArgs() so
+// SSHExtraArgs is spliced immediately before the host argument, matching the
+// AllContainerStatsRemote / EditCommand / ExecCommand convention.
+//
+// The remote shell command is `docker image inspect ...` / `docker manifest
+// inspect ...` — args are shell-escaped before being joined into the SSH
+// command string so values containing spaces or quotes survive transport.
+func (r *RemoteCompose) compareImageDigest(ctx context.Context, image string) (bool, bool) {
+	localOut, ok := r.runRemoteDockerCmd(ctx, imageInspectArgs(image))
+	if !ok {
+		return false, false
+	}
+	localDigest := parseLocalDigest(string(localOut))
+	if localDigest == "" {
+		return false, false
+	}
+	remoteOut, ok := r.runRemoteDockerCmd(ctx, manifestInspectArgs(image))
+	if !ok {
+		return false, false
+	}
+	remoteDigest := parseManifestDigest(remoteOut)
+	if remoteDigest == "" {
+		return false, false
+	}
+	return localDigest != remoteDigest, true
+}
+
+// runRemoteDockerCmd runs a top-level `docker <args...>` command on the
+// remote host via SSH, bypassing remoteCommand() (which is compose-specific).
+// SSHExtraArgs is spliced immediately before the host argument via
+// r.sshArgs(). Returns (output, ok) — ok=false on any error, so the caller
+// can treat a per-image failure as "unknown" and leave the tri-state cell
+// blank rather than aborting the whole batch.
+func (r *RemoteCompose) runRemoteDockerCmd(ctx context.Context, dockerArgs []string) ([]byte, bool) {
+	escaped := make([]string, 0, len(dockerArgs)+1)
+	escaped = append(escaped, "docker")
+	for _, a := range dockerArgs {
+		escaped = append(escaped, shellEscape(a))
+	}
+	remoteCmd := strings.Join(escaped, " ")
+	sshArgv := r.sshArgs(
+		[]string{"-S", r.SocketPath, "-o", "ControlMaster=no"},
+		remoteCmd,
+	)
+	cmd := exec.CommandContext(ctx, "ssh", sshArgv...)
+	var out []byte
+	var err error
+	if r.outputCmd != nil {
+		out, err = r.outputCmd(cmd)
+	} else {
+		out, err = cmd.Output()
+	}
+	if err != nil {
+		return nil, false
+	}
+	return out, true
 }

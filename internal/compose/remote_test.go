@@ -1850,3 +1850,527 @@ func TestRemoteConfigResolved_ErrorIncludesStderr(t *testing.T) {
 		t.Errorf("error = %q, want stderr text included", err.Error())
 	}
 }
+
+// --- RemoteCompose.CheckUpdates tests ---
+
+// isRemoteShellCmd reports whether the trailing arg of a ssh argv (the
+// remote shell command) contains the given substring. Used to discriminate
+// between different remote command invocations in a single outputCmd hook.
+func isRemoteShellCmd(args []string, substr string) bool {
+	if len(args) == 0 {
+		return false
+	}
+	return strings.Contains(args[len(args)-1], substr)
+}
+
+func TestRemoteSetDryRunSupport(t *testing.T) {
+	r := &RemoteCompose{
+		Host:       "user@example.com",
+		ProjectDir: "/app",
+		SocketPath: "/tmp/cdeploy-ctrl-abc-99",
+	}
+	if r.dryRunDetected {
+		t.Fatal("dryRunDetected should be false initially")
+	}
+	r.SetDryRunSupport(true)
+	if !r.dryRunSupported || !r.dryRunDetected {
+		t.Fatalf("after SetDryRunSupport(true): supported=%v detected=%v",
+			r.dryRunSupported, r.dryRunDetected)
+	}
+	// Should not invoke probe after SetDryRunSupport.
+	calls := 0
+	r.outputCmd = func(cmd *exec.Cmd) ([]byte, error) {
+		calls++
+		return nil, fmt.Errorf("probe should not run")
+	}
+	r.detectDryRunSupport(context.Background())
+	if calls != 0 {
+		t.Errorf("probe ran after SetDryRunSupport (calls=%d)", calls)
+	}
+}
+
+func TestRemoteDetectDryRunSupport_Probe(t *testing.T) {
+	calls := 0
+	var captured *exec.Cmd
+	r := &RemoteCompose{
+		Host:       "user@example.com",
+		ProjectDir: "/app",
+		SocketPath: "/tmp/cdeploy-ctrl-abc-99",
+		outputCmd: func(cmd *exec.Cmd) ([]byte, error) {
+			calls++
+			captured = cmd
+			return []byte("Options:\n  --dry-run    Execute command in dry run mode\n"), nil
+		},
+	}
+	r.detectDryRunSupport(context.Background())
+	if !r.dryRunSupported {
+		t.Fatal("dryRunSupported = false, want true (help mentions --dry-run)")
+	}
+	if !r.dryRunDetected {
+		t.Fatal("dryRunDetected should be true after probe")
+	}
+	// Cached: second call must NOT invoke the hook again.
+	r.detectDryRunSupport(context.Background())
+	if calls != 1 {
+		t.Errorf("probe ran %d times, want 1 (cached)", calls)
+	}
+	// Verify the probe is `docker compose pull --help` over SSH.
+	if captured == nil {
+		t.Fatal("outputCmd hook was not called")
+	}
+	if captured.Args[0] != "ssh" {
+		t.Errorf("argv[0] = %q, want ssh", captured.Args[0])
+	}
+	remoteCmd := captured.Args[len(captured.Args)-1]
+	if !strings.Contains(remoteCmd, "pull") || !strings.Contains(remoteCmd, "--help") {
+		t.Errorf("remote shell command = %q, want it to contain pull --help", remoteCmd)
+	}
+	// Sanity: probe goes through remoteCommand → has CURRENT_UID and cd prefix.
+	if !strings.Contains(remoteCmd, "CURRENT_UID") {
+		t.Errorf("remote shell command = %q, want CURRENT_UID prefix", remoteCmd)
+	}
+	if !strings.Contains(remoteCmd, "cd '/app'") {
+		t.Errorf("remote shell command = %q, want cd '/app' prefix", remoteCmd)
+	}
+}
+
+func TestRemoteDetectDryRunSupport_ProbeFailureMarksUnsupported(t *testing.T) {
+	r := &RemoteCompose{
+		Host:       "user@example.com",
+		ProjectDir: "/app",
+		SocketPath: "/tmp/cdeploy-ctrl-abc-99",
+		outputCmd: func(cmd *exec.Cmd) ([]byte, error) {
+			return nil, fmt.Errorf("ssh: connection refused")
+		},
+	}
+	r.detectDryRunSupport(context.Background())
+	if !r.dryRunDetected {
+		t.Fatal("detected should be true after probe attempt")
+	}
+	if r.dryRunSupported {
+		t.Fatal("dryRunSupported should be false when probe fails")
+	}
+}
+
+func TestRemoteCheckUpdates_DryRunPath(t *testing.T) {
+	var captured *exec.Cmd
+	r := &RemoteCompose{
+		Host:       "user@example.com",
+		ProjectDir: "/app",
+		SocketPath: "/tmp/cdeploy-ctrl-abc-99",
+		outputCmd: func(cmd *exec.Cmd) ([]byte, error) {
+			captured = cmd
+			return []byte(" DRY-RUN MODE -  alpine Skipped - Image is already present locally\n DRY-RUN MODE -  needupdate Pulling\n"), nil
+		},
+	}
+	r.SetDryRunSupport(true)
+	got, err := r.CheckUpdates(context.Background(), nil)
+	if err != nil {
+		t.Fatalf("CheckUpdates: %v", err)
+	}
+	want := map[string]bool{"alpine": false, "needupdate": true}
+	if len(got) != len(want) {
+		t.Fatalf("results = %#v, want %#v", got, want)
+	}
+	for k, v := range want {
+		if g, ok := got[k]; !ok || g != v {
+			t.Errorf("results[%q] = (%v, ok=%v), want (%v, true)", k, g, ok, v)
+		}
+	}
+	if captured == nil {
+		t.Fatal("outputCmd was not invoked")
+	}
+	// Dry-run path goes through remoteCommand → ssh + CURRENT_UID + cd prefix.
+	if captured.Args[0] != "ssh" {
+		t.Errorf("argv[0] = %q, want ssh", captured.Args[0])
+	}
+	remoteCmd := captured.Args[len(captured.Args)-1]
+	if !strings.Contains(remoteCmd, "pull") {
+		t.Errorf("remote shell command = %q, want pull", remoteCmd)
+	}
+	if !strings.Contains(remoteCmd, "'--dry-run'") {
+		t.Errorf("remote shell command = %q, want --dry-run (escaped)", remoteCmd)
+	}
+	if !strings.Contains(remoteCmd, "'--quiet'") {
+		t.Errorf("remote shell command = %q, want --quiet (escaped)", remoteCmd)
+	}
+	if !strings.Contains(remoteCmd, "'--policy=missing'") {
+		t.Errorf("remote shell command = %q, want --policy=missing (escaped)", remoteCmd)
+	}
+	if !strings.Contains(remoteCmd, "CURRENT_UID") {
+		t.Errorf("remote shell command = %q, want CURRENT_UID prefix", remoteCmd)
+	}
+}
+
+func TestRemoteCheckUpdates_DryRunPath_AppendsServices(t *testing.T) {
+	var captured *exec.Cmd
+	r := &RemoteCompose{
+		Host:       "user@example.com",
+		ProjectDir: "/app",
+		SocketPath: "/tmp/cdeploy-ctrl-abc-99",
+		outputCmd: func(cmd *exec.Cmd) ([]byte, error) {
+			captured = cmd
+			return []byte(""), nil
+		},
+	}
+	r.SetDryRunSupport(true)
+	if _, err := r.CheckUpdates(context.Background(), []string{"web", "db"}); err != nil {
+		t.Fatalf("CheckUpdates: %v", err)
+	}
+	remoteCmd := captured.Args[len(captured.Args)-1]
+	if !strings.Contains(remoteCmd, "'web'") {
+		t.Errorf("remote shell command = %q, want 'web'", remoteCmd)
+	}
+	if !strings.Contains(remoteCmd, "'db'") {
+		t.Errorf("remote shell command = %q, want 'db'", remoteCmd)
+	}
+}
+
+func TestRemoteCheckUpdates_DryRunPath_PartialOnError(t *testing.T) {
+	r := &RemoteCompose{
+		Host:       "user@example.com",
+		ProjectDir: "/app",
+		SocketPath: "/tmp/cdeploy-ctrl-abc-99",
+		outputCmd: func(cmd *exec.Cmd) ([]byte, error) {
+			return []byte(" DRY-RUN MODE -  web Pulling \n"), fmt.Errorf("manifest fetch failed")
+		},
+	}
+	r.SetDryRunSupport(true)
+	got, err := r.CheckUpdates(context.Background(), nil)
+	if err == nil {
+		t.Fatal("expected error from remote dry-run failure")
+	}
+	if !strings.Contains(err.Error(), "remote compose pull --dry-run") {
+		t.Errorf("error = %q, want it to mention remote dry-run", err.Error())
+	}
+	// Partial map survives.
+	if v, ok := got["web"]; !ok || !v {
+		t.Errorf("partial results = %#v, want web=true", got)
+	}
+}
+
+func TestRemoteCheckUpdates_FallbackPath(t *testing.T) {
+	configJSON := `{"services":{"web":{"image":"nginx:latest"},"db":{"image":"postgres:16"},"builder":{"image":""}}}`
+	var argvs [][]string
+	r := &RemoteCompose{
+		Host:       "user@example.com",
+		ProjectDir: "/app",
+		SocketPath: "/tmp/cdeploy-ctrl-abc-99",
+		outputCmd: func(cmd *exec.Cmd) ([]byte, error) {
+			argvs = append(argvs, append([]string{}, cmd.Args...))
+			// Discriminate by the remote shell command (last arg).
+			switch {
+			case isRemoteShellCmd(cmd.Args, "compose") && isRemoteShellCmd(cmd.Args, "config"):
+				return []byte(configJSON), nil
+			case isRemoteShellCmd(cmd.Args, "image") && isRemoteShellCmd(cmd.Args, "inspect"):
+				// Extract the image from the shell command (last token after spaces,
+				// after stripping shell quotes).
+				rc := cmd.Args[len(cmd.Args)-1]
+				toks := strings.Fields(rc)
+				img := strings.Trim(toks[len(toks)-1], "'")
+				return []byte(img + "@sha256:local-" + img + "\n"), nil
+			case isRemoteShellCmd(cmd.Args, "manifest") && isRemoteShellCmd(cmd.Args, "inspect"):
+				rc := cmd.Args[len(cmd.Args)-1]
+				toks := strings.Fields(rc)
+				img := strings.Trim(toks[len(toks)-1], "'")
+				switch img {
+				case "nginx:latest":
+					return []byte(`{"Descriptor":{"digest":"sha256:remote-nginx:latest"}}`), nil
+				case "postgres:16":
+					return []byte(`{"Descriptor":{"digest":"sha256:local-postgres:16"}}`), nil
+				}
+				return nil, fmt.Errorf("unexpected image: %s", img)
+			}
+			return nil, fmt.Errorf("unexpected cmd: %v", cmd.Args)
+		},
+	}
+	r.SetDryRunSupport(false)
+	got, err := r.CheckUpdates(context.Background(), nil)
+	if err != nil {
+		t.Fatalf("CheckUpdates: %v", err)
+	}
+	wantByService := map[string]bool{"web": true, "db": false}
+	if len(got) != len(wantByService) {
+		t.Fatalf("results = %#v, want %#v", got, wantByService)
+	}
+	for k, v := range wantByService {
+		if g, ok := got[k]; !ok || g != v {
+			t.Errorf("results[%q] = (%v, ok=%v), want (%v, true)", k, g, ok, v)
+		}
+	}
+	// First call is the compose config fetch (goes through remoteCommand →
+	// remote shell contains both "compose" AND "config").
+	if len(argvs) < 1 {
+		t.Fatal("no calls recorded")
+	}
+	first := argvs[0][len(argvs[0])-1]
+	if !strings.Contains(first, "compose") || !strings.Contains(first, "config") {
+		t.Errorf("first call remote shell = %q, want compose config", first)
+	}
+	// All subsequent image/manifest inspect calls must bypass remoteCommand —
+	// the remote shell must NOT contain "compose" (top-level docker commands).
+	for _, a := range argvs[1:] {
+		rc := a[len(a)-1]
+		if strings.Contains(rc, "compose") {
+			t.Errorf("inspect remote shell contains 'compose': %q", rc)
+		}
+		// Must also NOT contain CURRENT_UID / cd prefix — direct SSH argv.
+		if strings.Contains(rc, "CURRENT_UID") {
+			t.Errorf("inspect remote shell contains CURRENT_UID (should bypass remoteCommand): %q", rc)
+		}
+		if strings.HasPrefix(rc, "cd ") {
+			t.Errorf("inspect remote shell starts with 'cd ' (should bypass remoteCommand): %q", rc)
+		}
+	}
+}
+
+func TestRemoteCheckUpdates_FallbackPath_InspectFailureLeavesAbsent(t *testing.T) {
+	configJSON := `{"services":{"web":{"image":"nginx:latest"}}}`
+	r := &RemoteCompose{
+		Host:       "user@example.com",
+		ProjectDir: "/app",
+		SocketPath: "/tmp/cdeploy-ctrl-abc-99",
+		outputCmd: func(cmd *exec.Cmd) ([]byte, error) {
+			if isRemoteShellCmd(cmd.Args, "compose") && isRemoteShellCmd(cmd.Args, "config") {
+				return []byte(configJSON), nil
+			}
+			if isRemoteShellCmd(cmd.Args, "image") && isRemoteShellCmd(cmd.Args, "inspect") {
+				// Image not pulled locally → inspect fails. The service must
+				// stay absent from the result (tri-state unknown).
+				return nil, fmt.Errorf("no such image")
+			}
+			return nil, fmt.Errorf("unexpected cmd: %v", cmd.Args)
+		},
+	}
+	r.SetDryRunSupport(false)
+	got, err := r.CheckUpdates(context.Background(), nil)
+	if err != nil {
+		t.Fatalf("CheckUpdates: %v", err)
+	}
+	if _, ok := got["web"]; ok {
+		t.Errorf("expected web to be absent (inspect failure → unknown), got %#v", got)
+	}
+}
+
+func TestRemoteCheckUpdates_FallbackPath_ConfigFailureReturnsError(t *testing.T) {
+	r := &RemoteCompose{
+		Host:       "user@example.com",
+		ProjectDir: "/app",
+		SocketPath: "/tmp/cdeploy-ctrl-abc-99",
+		outputCmd: func(cmd *exec.Cmd) ([]byte, error) {
+			return nil, fmt.Errorf("ssh transport error")
+		},
+	}
+	r.SetDryRunSupport(false)
+	_, err := r.CheckUpdates(context.Background(), nil)
+	if err == nil {
+		t.Fatal("expected error when config fetch fails")
+	}
+	if !strings.Contains(err.Error(), "fetching remote compose config") {
+		t.Errorf("error = %q, want it to mention remote compose config", err.Error())
+	}
+}
+
+func TestRemoteCheckUpdates_FallbackPath_ManifestFailureLeavesAbsent(t *testing.T) {
+	configJSON := `{"services":{"web":{"image":"nginx:latest"}}}`
+	r := &RemoteCompose{
+		Host:       "user@example.com",
+		ProjectDir: "/app",
+		SocketPath: "/tmp/cdeploy-ctrl-abc-99",
+		outputCmd: func(cmd *exec.Cmd) ([]byte, error) {
+			if isRemoteShellCmd(cmd.Args, "compose") && isRemoteShellCmd(cmd.Args, "config") {
+				return []byte(configJSON), nil
+			}
+			if isRemoteShellCmd(cmd.Args, "image") && isRemoteShellCmd(cmd.Args, "inspect") {
+				return []byte("nginx:latest@sha256:local-nginx\n"), nil
+			}
+			if isRemoteShellCmd(cmd.Args, "manifest") && isRemoteShellCmd(cmd.Args, "inspect") {
+				return nil, fmt.Errorf("auth required")
+			}
+			return nil, fmt.Errorf("unexpected cmd: %v", cmd.Args)
+		},
+	}
+	r.SetDryRunSupport(false)
+	got, err := r.CheckUpdates(context.Background(), nil)
+	if err != nil {
+		t.Fatalf("CheckUpdates: %v", err)
+	}
+	if _, ok := got["web"]; ok {
+		t.Errorf("expected web to be absent (manifest failure → unknown), got %#v", got)
+	}
+}
+
+func TestRemoteCheckUpdates_ProbeRouting(t *testing.T) {
+	// Unforced: CheckUpdates must call the probe first, then route based on
+	// the result. We stub the probe to advertise --dry-run and verify the
+	// second call is the dry-run subcommand (not the config fallback).
+	calls := 0
+	r := &RemoteCompose{
+		Host:       "user@example.com",
+		ProjectDir: "/app",
+		SocketPath: "/tmp/cdeploy-ctrl-abc-99",
+		outputCmd: func(cmd *exec.Cmd) ([]byte, error) {
+			calls++
+			rc := cmd.Args[len(cmd.Args)-1]
+			if strings.Contains(rc, "pull") && strings.Contains(rc, "--help") {
+				return []byte("--dry-run    Execute command in dry run mode"), nil
+			}
+			// Subsequent call must be the dry-run pull, not config.
+			if !strings.Contains(rc, "--dry-run") {
+				t.Errorf("expected dry-run call after probe, got: %q", rc)
+			}
+			return []byte(""), nil
+		},
+	}
+	if _, err := r.CheckUpdates(context.Background(), nil); err != nil {
+		t.Fatalf("CheckUpdates: %v", err)
+	}
+	if calls != 2 {
+		t.Errorf("expected 2 calls (probe + dry-run), got %d", calls)
+	}
+}
+
+// Verify SSHExtraArgs (e.g. -i /tmp/key) is spliced immediately before the
+// host argument in the fallback path's direct SSH argv for `docker image
+// inspect` / `docker manifest inspect`. Mirrors
+// TestAllContainerStatsRemote_extraArgsSplice.
+func TestRemoteCheckUpdates_FallbackPath_ExtraArgsSpliced(t *testing.T) {
+	configJSON := `{"services":{"web":{"image":"nginx:latest"}}}`
+	extras := []string{"-i", "/tmp/key"}
+	host := "user@example.com"
+	var inspectArgvs [][]string
+	r := &RemoteCompose{
+		Host:         host,
+		ProjectDir:   "/app",
+		SocketPath:   "/tmp/cdeploy-ctrl-abc-99",
+		SSHExtraArgs: extras,
+		outputCmd: func(cmd *exec.Cmd) ([]byte, error) {
+			rc := cmd.Args[len(cmd.Args)-1]
+			switch {
+			case strings.Contains(rc, "compose") && strings.Contains(rc, "config"):
+				return []byte(configJSON), nil
+			case strings.Contains(rc, "image") && strings.Contains(rc, "inspect"):
+				inspectArgvs = append(inspectArgvs, append([]string{}, cmd.Args...))
+				return []byte("nginx:latest@sha256:local-nginx\n"), nil
+			case strings.Contains(rc, "manifest") && strings.Contains(rc, "inspect"):
+				inspectArgvs = append(inspectArgvs, append([]string{}, cmd.Args...))
+				return []byte(`{"Descriptor":{"digest":"sha256:remote-nginx"}}`), nil
+			}
+			return nil, fmt.Errorf("unexpected cmd: %v", cmd.Args)
+		},
+	}
+	r.SetDryRunSupport(false)
+	if _, err := r.CheckUpdates(context.Background(), nil); err != nil {
+		t.Fatalf("CheckUpdates: %v", err)
+	}
+	if len(inspectArgvs) != 2 {
+		t.Fatalf("expected 2 inspect calls (image + manifest), got %d", len(inspectArgvs))
+	}
+	for i, argv := range inspectArgvs {
+		label := fmt.Sprintf("inspect[%d]", i)
+		assertExtraBeforeHost(t, label, argv, host, extras)
+		// Sanity: the fallback path's direct SSH argv must match the
+		// AllContainerStatsRemote shape: `ssh -S <sock> -o ControlMaster=no
+		// -i /tmp/key -- <host> <remoteCmd>`.
+		if argv[0] != "ssh" {
+			t.Errorf("%s: argv[0] = %q, want ssh", label, argv[0])
+		}
+		// SocketPath must be present (uses ControlMaster).
+		foundSock := false
+		for j, a := range argv {
+			if a == "-S" && j+1 < len(argv) && argv[j+1] == r.SocketPath {
+				foundSock = true
+				break
+			}
+		}
+		if !foundSock {
+			t.Errorf("%s: argv missing -S %q: %v", label, r.SocketPath, argv)
+		}
+	}
+}
+
+// Verify the dry-run path also splices SSHExtraArgs before host (goes through
+// remoteCommand which uses sshArgs).
+func TestRemoteCheckUpdates_DryRunPath_ExtraArgsSpliced(t *testing.T) {
+	extras := []string{"-p", "2222"}
+	host := "user@example.com"
+	var captured []string
+	r := &RemoteCompose{
+		Host:         host,
+		ProjectDir:   "/app",
+		SocketPath:   "/tmp/cdeploy-ctrl-abc-99",
+		SSHExtraArgs: extras,
+		outputCmd: func(cmd *exec.Cmd) ([]byte, error) {
+			captured = append([]string(nil), cmd.Args...)
+			return []byte(""), nil
+		},
+	}
+	r.SetDryRunSupport(true)
+	if _, err := r.CheckUpdates(context.Background(), nil); err != nil {
+		t.Fatalf("CheckUpdates: %v", err)
+	}
+	assertExtraBeforeHost(t, "CheckUpdates dry-run", captured, host, extras)
+}
+
+// Verify the probe (detectDryRunSupport) also splices SSHExtraArgs — it goes
+// through remoteCommand, so it inherits sshArgs splicing.
+func TestRemoteDetectDryRunSupport_ExtraArgsSpliced(t *testing.T) {
+	extras := []string{"-i", "/tmp/key", "-p", "2222"}
+	host := "user@example.com"
+	var captured []string
+	r := &RemoteCompose{
+		Host:         host,
+		ProjectDir:   "/app",
+		SocketPath:   "/tmp/cdeploy-ctrl-abc-99",
+		SSHExtraArgs: extras,
+		outputCmd: func(cmd *exec.Cmd) ([]byte, error) {
+			captured = append([]string(nil), cmd.Args...)
+			return []byte("--dry-run"), nil
+		},
+	}
+	r.detectDryRunSupport(context.Background())
+	if !r.dryRunSupported {
+		t.Fatal("expected dryRunSupported=true after probe with --dry-run in help")
+	}
+	assertExtraBeforeHost(t, "detectDryRunSupport probe", captured, host, extras)
+}
+
+// Verify shell-escaping survives for image names with special characters in
+// the fallback path (registry hosts with colons, version tags with slashes,
+// digests, etc.).
+func TestRemoteCheckUpdates_FallbackPath_ShellEscapesImage(t *testing.T) {
+	configJSON := `{"services":{"web":{"image":"registry.example.com:5000/team/web:v1.2.3"}}}`
+	var inspectArgvs []string
+	r := &RemoteCompose{
+		Host:       "user@example.com",
+		ProjectDir: "/app",
+		SocketPath: "/tmp/cdeploy-ctrl-abc-99",
+		outputCmd: func(cmd *exec.Cmd) ([]byte, error) {
+			rc := cmd.Args[len(cmd.Args)-1]
+			switch {
+			case strings.Contains(rc, "compose") && strings.Contains(rc, "config"):
+				return []byte(configJSON), nil
+			case strings.Contains(rc, "image") && strings.Contains(rc, "inspect"):
+				inspectArgvs = append(inspectArgvs, rc)
+				return []byte("foo@sha256:abc\n"), nil
+			case strings.Contains(rc, "manifest") && strings.Contains(rc, "inspect"):
+				inspectArgvs = append(inspectArgvs, rc)
+				return []byte(`{"Descriptor":{"digest":"sha256:abc"}}`), nil
+			}
+			return nil, fmt.Errorf("unexpected: %v", cmd.Args)
+		},
+	}
+	r.SetDryRunSupport(false)
+	if _, err := r.CheckUpdates(context.Background(), nil); err != nil {
+		t.Fatalf("CheckUpdates: %v", err)
+	}
+	if len(inspectArgvs) != 2 {
+		t.Fatalf("expected 2 inspect commands, got %d", len(inspectArgvs))
+	}
+	for _, rc := range inspectArgvs {
+		// Image must be shell-escaped (single-quoted) to survive transport.
+		if !strings.Contains(rc, "'registry.example.com:5000/team/web:v1.2.3'") {
+			t.Errorf("remote shell = %q, want escaped image", rc)
+		}
+	}
+}

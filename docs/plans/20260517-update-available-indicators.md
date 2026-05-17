@@ -118,11 +118,11 @@ The CLI mirrors the TUI: single-project mode (`-C` specified) always checks; mul
 - Modify: `internal/compose/remote.go`
 - Modify: `internal/compose/remote_test.go`
 
-- [ ] add `dryRunSupported`/`dryRunDetected` to `RemoteCompose`; extend `SetTestHooks` symmetrically
-- [ ] implement `CheckUpdates` on `RemoteCompose`: dry-run path goes through `remoteCommand()` (regular compose subcommand); fallback path builds the SSH argv directly for `docker image inspect` and `docker manifest inspect` (top-level docker commands) — splice `SSHExtraArgs` immediately before the host arg, matching `AllContainerStatsRemote`
-- [ ] assert in tests that probe runs `docker compose pull --help` over SSH and caches
-- [ ] write tests covering: SSH argv shape for both branches; `SSHExtraArgs` spliced in the right slot for fallback; `ServerHost`/port handling matches existing tests; error propagation
-- [ ] run `go test ./internal/compose/...` — must pass before Task 4
+- [x] add `dryRunSupported`/`dryRunDetected` to `RemoteCompose`; extend `SetTestHooks` symmetrically (added `SetDryRunSupport(bool)` mirroring the local Compose pattern; the existing two-argument `SetTestHooks` already exposes `outputCmd` for argv capture so no broader extension was needed)
+- [x] implement `CheckUpdates` on `RemoteCompose`: dry-run path goes through `remoteCommand()` (regular compose subcommand); fallback path builds the SSH argv directly for `docker image inspect` and `docker manifest inspect` (top-level docker commands) — splice `SSHExtraArgs` immediately before the host arg, matching `AllContainerStatsRemote` (implemented in `internal/compose/remote.go`; the fallback path uses a new private helper `runRemoteDockerCmd` that builds the SSH argv via `r.sshArgs()` so the same splicing convention applies; image names are shell-escaped before being joined into the SSH command string)
+- [x] assert in tests that probe runs `docker compose pull --help` over SSH and caches (`TestRemoteDetectDryRunSupport_Probe`)
+- [x] write tests covering: SSH argv shape for both branches; `SSHExtraArgs` spliced in the right slot for fallback; `ServerHost`/port handling matches existing tests; error propagation (`TestRemoteCheckUpdates_DryRunPath`, `TestRemoteCheckUpdates_FallbackPath`, `TestRemoteCheckUpdates_FallbackPath_ExtraArgsSpliced`, `TestRemoteCheckUpdates_DryRunPath_ExtraArgsSpliced`, `TestRemoteCheckUpdates_DryRunPath_PartialOnError`, `TestRemoteCheckUpdates_FallbackPath_ConfigFailureReturnsError`, `TestRemoteCheckUpdates_FallbackPath_InspectFailureLeavesAbsent`, `TestRemoteCheckUpdates_FallbackPath_ManifestFailureLeavesAbsent`, `TestRemoteCheckUpdates_FallbackPath_ShellEscapesImage`, `TestRemoteCheckUpdates_ProbeRouting`)
+- [x] run `go test ./internal/compose/...` — must pass before Task 4
 
 ### Task 4: Runner interface + `ServiceStatus.UpdateAvailable`
 
