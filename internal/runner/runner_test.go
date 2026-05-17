@@ -69,6 +69,10 @@ func (m *mockComposer) ContainerStats(ctx context.Context) (map[string]ServiceSt
 	return nil, nil
 }
 
+func (m *mockComposer) CheckUpdates(ctx context.Context, services []string) (map[string]bool, error) {
+	return nil, nil
+}
+
 func (m *mockComposer) Logs(ctx context.Context, service string, follow bool, tail int, w io.Writer) error {
 	return nil
 }

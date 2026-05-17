@@ -37,6 +37,13 @@ type serviceStatus struct {
 	CPUPercent  *float64 `json:"cpu_percent,omitempty"`
 	MemoryUsed  *int64   `json:"memory_used,omitempty"`
 	MemoryLimit *int64   `json:"memory_limit,omitempty"`
+	// UpdateAvailable is the tri-state "newer image in registry" hint. nil =
+	// unknown (not checked, build-only, error), &true = update available,
+	// &false = current. Pointer + omitempty keeps the field out of JSON output
+	// for callers that did not opt into update detection (--updates is opt-in
+	// in both single- and multi-project modes), so existing JSON consumers see
+	// the original wire shape.
+	UpdateAvailable *bool `json:"update_available,omitempty"`
 }
 
 // projectServices groups service statuses under a project name for grouped display.
@@ -48,7 +55,7 @@ type projectServices struct {
 // mergeStatus combines the canonical service list with container status.
 // Services missing from the status map are treated as stopped.
 func mergeStatus(services []string, status map[string]runner.ServiceStatus) []serviceStatus {
-	return mergeStatusStats(services, status, nil, false)
+	return mergeStatusStats(services, status, nil, false, nil)
 }
 
 // mergeStatusStats is the stats-aware variant of mergeStatus. When statsRequested
@@ -56,7 +63,12 @@ func mergeStatus(services []string, status map[string]runner.ServiceStatus) []se
 // services absent from the stats map — typically stopped containers, which
 // renders as blank cells). When statsRequested is false, stats fields stay nil
 // and are omitted from JSON output (wire-shape compatible).
-func mergeStatusStats(services []string, status map[string]runner.ServiceStatus, stats map[string]runner.ServiceStats, statsRequested bool) []serviceStatus {
+//
+// The updates map is tri-state per service: presence in the map sets
+// UpdateAvailable to &v (so &true and &false are both possible), absence
+// leaves it nil. A nil map skips hydration entirely — callers that did not
+// opt into update detection get the legacy wire shape.
+func mergeStatusStats(services []string, status map[string]runner.ServiceStatus, stats map[string]runner.ServiceStats, statsRequested bool, updates map[string]bool) []serviceStatus {
 	result := make([]serviceStatus, len(services))
 	for i, svc := range services {
 		st := status[svc]
@@ -82,6 +94,15 @@ func mergeStatusStats(services []string, status map[string]runner.ServiceStatus,
 			// A legitimate zero from docker (idle container at 0% CPU) arrives
 			// as an entry in the stats map with zero-valued fields — that case
 			// still emits &0 pointers and renders "0.0%" / "0B/0B".
+		}
+		if updates != nil {
+			if v, ok := updates[svc]; ok {
+				vv := v
+				result[i].UpdateAvailable = &vv
+			}
+			// Absent from updates: pointer stays nil (build-only services, or
+			// services dropped by the parser) — renders as blank cell, JSON
+			// omits the field.
 		}
 	}
 	sort.Slice(result, func(i, j int) bool {
@@ -164,6 +185,13 @@ func formatDots(items []serviceStatus) string {
 		}
 	}
 
+	// Always reserve 2 trailing cells in the name column for the inline update
+	// glyph (leading space + U+21E7), regardless of whether any service in the
+	// rendered list currently carries the flag. Reserving unconditionally
+	// keeps following columns aligned across invocations and matches the TUI
+	// rendering (see internal/tui/app.go).
+	maxName += 2
+
 	var b strings.Builder
 	for i, item := range items {
 		if i > 0 {
@@ -177,7 +205,20 @@ func formatDots(items []serviceStatus) string {
 		b.WriteByte(' ')
 		b.WriteString(healthIcon(item.Health))
 		b.WriteByte(' ')
-		b.WriteString(fmt.Sprintf("%-*s", maxName, item.Name))
+		// nameCell is padded manually rather than via %-*s because the glyph
+		// is multi-byte (3 bytes) but renders in one terminal cell, and the
+		// styled rendering carries ANSI escapes that don't count toward
+		// display width. utf8.RuneCountInString is the right width metric.
+		nameWidth := utf8.RuneCountInString(item.Name)
+		nameCell := item.Name
+		if item.UpdateAvailable != nil && *item.UpdateAvailable {
+			nameCell = item.Name + " " + styleWarning.Render(compose.UpdateGlyph)
+			nameWidth += 2 // space + glyph cell
+		}
+		if pad := maxName - nameWidth; pad > 0 {
+			nameCell += strings.Repeat(" ", pad)
+		}
+		b.WriteString(nameCell)
 		if maxCreated > 0 {
 			b.WriteString("  ")
 			b.WriteString(fmt.Sprintf("%-*s", maxCreated, item.Created))
@@ -249,6 +290,13 @@ func formatDotsGrouped(projects []projectServices) string {
 			}
 		}
 
+		// Always reserve +2 cells in name column for the inline update glyph,
+		// regardless of whether any service in this project currently has the
+		// flag. Per-project (not global) so each project's column widths stay
+		// independent — matches the existing per-project pattern for
+		// Created/Uptime/CPU/Mem.
+		maxName += 2
+
 		for i, item := range proj.Services {
 			b.WriteByte('\n')
 			b.WriteString("  ")
@@ -260,7 +308,19 @@ func formatDotsGrouped(projects []projectServices) string {
 			b.WriteByte(' ')
 			b.WriteString(healthIcon(item.Health))
 			b.WriteByte(' ')
-			b.WriteString(fmt.Sprintf("%-*s", maxName, item.Name))
+			// Manual padding because the glyph is multi-byte / single-cell
+			// and the styled rendering carries ANSI escapes that don't count
+			// toward display width.
+			nameWidth := utf8.RuneCountInString(item.Name)
+			nameCell := item.Name
+			if item.UpdateAvailable != nil && *item.UpdateAvailable {
+				nameCell = item.Name + " " + styleWarning.Render(compose.UpdateGlyph)
+				nameWidth += 2
+			}
+			if pad := maxName - nameWidth; pad > 0 {
+				nameCell += strings.Repeat(" ", pad)
+			}
+			b.WriteString(nameCell)
 			if maxCreated > 0 {
 				b.WriteString("  ")
 				b.WriteString(fmt.Sprintf("%-*s", maxCreated, item.Created))
@@ -298,6 +358,7 @@ func formatJSON(items []serviceStatus) (string, error) {
 func newListCmd() *cobra.Command {
 	var jsonOutput bool
 	var showStats bool
+	var showUpdates bool
 
 	cmd := &cobra.Command{
 		Use:   "list",
@@ -311,7 +372,15 @@ When -C is specified, shows only that project's services in a flat list.
 With --stats, includes per-service CPU and memory usage columns. The bulk
 docker stats call adds ~1.5s of latency, so --stats is off by default; scripts
 and CI pay nothing unless they ask for it. On stats fetch failure the rest of
-the listing still renders and a warning is printed to stderr.`,
+the listing still renders and a warning is printed to stderr.
+
+With --updates, includes a per-service image-update indicator: a ⇧ glyph next
+to services whose registry image is newer than the local one. Each service
+costs one registry round-trip (buildx/manifest-inspect); for projects with
+many services this can add noticeable latency (especially on remote SSH), so
+--updates is off by default in both single- and multi-project modes. Failures
+are non-fatal: a warning is written to stderr, the cell stays blank, and the
+rest of the listing renders.`,
 		Example: `  # List services in current directory (if compose file exists)
   cdeploy list
 
@@ -329,11 +398,16 @@ the listing still renders and a warning is printed to stderr.`,
   cdeploy list --stats
   cdeploy list -s prod --stats --json
 
+  # Include image-update indicators (opt-in; costs one registry probe per service)
+  cdeploy list --updates
+  cdeploy list -C /opt/myapp --updates
+  cdeploy list -s prod --updates --json
+
   # Output as JSON for scripting
   cdeploy list --json
   cdeploy list -s prod --json | jq '.[] | select(.running)'`,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			return runList(cmd.Context(), jsonOutput, showStats)
+			return runList(cmd.Context(), jsonOutput, showStats, showUpdates)
 		},
 		SilenceUsage:  true,
 		SilenceErrors: true,
@@ -341,6 +415,7 @@ the listing still renders and a warning is printed to stderr.`,
 
 	cmd.Flags().BoolVar(&jsonOutput, "json", false, "output as JSON")
 	cmd.Flags().BoolVar(&showStats, "stats", false, "include CPU and memory usage columns (adds ~1.5s latency)")
+	cmd.Flags().BoolVar(&showUpdates, "updates", false, "check each service's image for available updates (adds one registry round-trip per service)")
 
 	return cmd
 }
@@ -349,7 +424,13 @@ the listing still renders and a warning is printed to stderr.`,
 // When showStats is true, fetches per-service CPU/memory via ContainerStats.
 // Stats fetch failures are soft: a warning is printed to stderr, stats cells
 // render blank, and the listing succeeds (stats are a secondary view).
-func listSingleProject(ctx context.Context, c runner.Composer, jsonOutput, showStats bool) error {
+//
+// checkUpdates controls whether per-service update verdicts are fetched via
+// Composer.CheckUpdates. The flag is decoupled from showStats so callers can
+// opt into either view independently. On error: stderr warning "cdeploy:
+// updates unavailable: <err>" (mirrors the existing stats-failure phrasing),
+// exit 0, update_available cells stay nil / blank.
+func listSingleProject(ctx context.Context, c runner.Composer, jsonOutput, showStats, checkUpdates bool) error {
 	services, err := c.ListServices(ctx)
 	if err != nil {
 		return fmt.Errorf("listing services: %w", err)
@@ -369,7 +450,16 @@ func listSingleProject(ctx context.Context, c runner.Composer, jsonOutput, showS
 		}
 	}
 
-	items := mergeStatusStats(services, status, stats, showStats)
+	var updates map[string]bool
+	if checkUpdates {
+		updates, err = c.CheckUpdates(ctx, nil)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "cdeploy: updates unavailable: %v\n", err)
+			updates = nil // mergeStatusStats leaves UpdateAvailable nil → blank cell, field omitted from JSON
+		}
+	}
+
+	items := mergeStatusStats(services, status, stats, showStats, updates)
 
 	if jsonOutput {
 		out, err := formatJSON(items)
@@ -390,7 +480,7 @@ func listSingleProject(ctx context.Context, c runner.Composer, jsonOutput, showS
 // collectMultiProject gathers service statuses for each project using the factory to create composers.
 // Per-project errors are non-fatal: a warning is printed to stderr and the project is skipped.
 func collectMultiProject(ctx context.Context, projects []compose.Project, factory func(dir string) runner.Composer) []projectServices {
-	return collectMultiProjectStats(ctx, projects, factory, false, nil)
+	return collectMultiProjectStats(ctx, projects, factory, false, nil, false)
 }
 
 // bulkStatsAggregator is the optional capability that a composer can implement
@@ -420,7 +510,7 @@ type bulkStatsAggregator interface {
 // nil, the composer's ContainerStats() runs per project as a fallback —
 // reserved for callers that didn't request bulk sharing at all (e.g. test
 // mocks that don't implement bulkStatsAggregator).
-func collectMultiProjectStats(ctx context.Context, projects []compose.Project, factory func(dir string) runner.Composer, showStats bool, bulkStats map[string]runner.ServiceStats) []projectServices {
+func collectMultiProjectStats(ctx context.Context, projects []compose.Project, factory func(dir string) runner.Composer, showStats bool, bulkStats map[string]runner.ServiceStats, checkUpdates bool) []projectServices {
 	var result []projectServices
 	for _, proj := range projects {
 		c := factory(proj.ConfigDir)
@@ -450,7 +540,21 @@ func collectMultiProjectStats(ctx context.Context, projects []compose.Project, f
 			}
 		}
 
-		items := mergeStatusStats(services, status, stats, showStats)
+		// Per-project update check is opt-in (--updates flag) because each
+		// project triggers its own registry probes (dry-run or manifest
+		// inspect) — at multi-project scale on a host with many projects
+		// this can balloon registry traffic. Failure is non-fatal: warn,
+		// blank cells, continue. Phrasing mirrors `stats unavailable for ...`.
+		var updates map[string]bool
+		if checkUpdates {
+			updates, err = c.CheckUpdates(ctx, nil)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "cdeploy: updates unavailable for %q: %v\n", proj.Name, err)
+				updates = nil
+			}
+		}
+
+		items := mergeStatusStats(services, status, stats, showStats, updates)
 		result = append(result, projectServices{Name: proj.Name, Services: items})
 	}
 	return result
@@ -486,7 +590,7 @@ func printMultiProject(grouped []projectServices, jsonOutput bool) error {
 	return nil
 }
 
-func runList(ctx context.Context, jsonOutput, showStats bool) error {
+func runList(ctx context.Context, jsonOutput, showStats, showUpdates bool) error {
 	if err := checkRemoteMutex(serverName, sshTarget, identityFile); err != nil {
 		return err
 	}
@@ -496,12 +600,14 @@ func runList(ctx context.Context, jsonOutput, showStats bool) error {
 
 	if sshTarget != "" {
 		// --ssh always implies a single project (resolveSSHRemote requires --project-dir).
+		// Update check is opt-in via --updates because each service costs one
+		// SSH round-trip to buildx/manifest-inspect — 20+ services adds 10s+.
 		rc, cleanup, err := resolveSSHRemote(ctx, sshTarget, projectDir, identityFile, listNewRemote)
 		if err != nil {
 			return err
 		}
 		defer cleanup()
-		return listSingleProject(ctx, rc, jsonOutput, showStats)
+		return listSingleProject(ctx, rc, jsonOutput, showStats, showUpdates)
 	}
 
 	if serverName != "" {
@@ -530,12 +636,15 @@ func runList(ctx context.Context, jsonOutput, showStats bool) error {
 			return err
 		}
 
-		// Single-project mode: -C explicitly specified
+		// Single-project mode: -C explicitly specified. Update check is opt-in
+		// via --updates because each service costs one SSH round-trip to
+		// buildx/manifest-inspect.
 		if projDir != "" {
-			return listSingleProject(ctx, rc, jsonOutput, showStats)
+			return listSingleProject(ctx, rc, jsonOutput, showStats, showUpdates)
 		}
 
-		// Multi-project mode: discover all projects on the server
+		// Multi-project mode: discover all projects on the server.
+		// Updates are opt-in via --updates (registry probes per project).
 		projects, err := rc.ListProjects(ctx)
 		if err != nil {
 			return fmt.Errorf("listing projects on %s: %w", serverName, err)
@@ -562,7 +671,7 @@ func runList(ctx context.Context, jsonOutput, showStats bool) error {
 				bulkStats = map[string]runner.ServiceStats{}
 			}
 		}
-		grouped := collectMultiProjectStats(ctx, projects, factory, showStats, bulkStats)
+		grouped := collectMultiProjectStats(ctx, projects, factory, showStats, bulkStats, showUpdates)
 		return printMultiProject(grouped, jsonOutput)
 	}
 
@@ -578,13 +687,15 @@ func runList(ctx context.Context, jsonOutput, showStats bool) error {
 	c := listNewLocal(dir)
 
 	if projectDir != "" {
+		// Single-project mode. Update check is opt-in via --updates because
+		// each service costs one registry round-trip to buildx/manifest-inspect.
 		if !listHasCompose(dir) {
 			return fmt.Errorf("no compose file found in %s", dir)
 		}
 		if err := c.Detect(ctx); err != nil {
 			return err
 		}
-		return listSingleProject(ctx, c, jsonOutput, showStats)
+		return listSingleProject(ctx, c, jsonOutput, showStats, showUpdates)
 	}
 
 	// Local multi-project: discover all projects on the system
@@ -616,6 +727,6 @@ func runList(ctx context.Context, jsonOutput, showStats bool) error {
 			bulkStats = map[string]runner.ServiceStats{}
 		}
 	}
-	grouped := collectMultiProjectStats(ctx, projects, factory, showStats, bulkStats)
+	grouped := collectMultiProjectStats(ctx, projects, factory, showStats, bulkStats, showUpdates)
 	return printMultiProject(grouped, jsonOutput)
 }

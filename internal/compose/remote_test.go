@@ -2,6 +2,7 @@ package compose
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -1848,5 +1849,654 @@ func TestRemoteConfigResolved_ErrorIncludesStderr(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "remote config parse error") {
 		t.Errorf("error = %q, want stderr text included", err.Error())
+	}
+}
+
+// --- RemoteCompose.CheckUpdates tests ---
+
+// isRemoteShellCmd reports whether the trailing arg of a ssh argv (the
+// remote shell command) contains the given substring. Used to discriminate
+// between different remote command invocations in a single outputCmd hook.
+func isRemoteShellCmd(args []string, substr string) bool {
+	if len(args) == 0 {
+		return false
+	}
+	return strings.Contains(args[len(args)-1], substr)
+}
+
+func TestRemoteCheckUpdates_FallbackPath(t *testing.T) {
+	configJSON := `{"services":{"web":{"image":"nginx:latest"},"db":{"image":"postgres:16"},"builder":{"image":""}}}`
+	var argvs [][]string
+	r := &RemoteCompose{
+		Host:       "user@example.com",
+		ProjectDir: "/app",
+		SocketPath: "/tmp/cdeploy-ctrl-abc-99",
+		outputCmd: func(cmd *exec.Cmd) ([]byte, error) {
+			argvs = append(argvs, append([]string{}, cmd.Args...))
+			// Discriminate by the remote shell command (last arg). buildx must
+			// be checked BEFORE the image case because "imagetools" contains
+			// the substring "image" and would otherwise match the image case.
+			switch {
+			case isRemoteShellCmd(cmd.Args, "compose") && isRemoteShellCmd(cmd.Args, "config"):
+				return []byte(configJSON), nil
+			case isRemoteShellCmd(cmd.Args, "buildx") && isRemoteShellCmd(cmd.Args, "imagetools"):
+				// Simulate buildx plugin missing — exercise the manifest fallback.
+				return nil, fmt.Errorf("exit status 1: docker: 'buildx' is not a docker command")
+			case isRemoteShellCmd(cmd.Args, "image") && isRemoteShellCmd(cmd.Args, "inspect"):
+				// Extract the image from the shell command (last token after spaces,
+				// after stripping shell quotes).
+				rc := cmd.Args[len(cmd.Args)-1]
+				toks := strings.Fields(rc)
+				img := strings.Trim(toks[len(toks)-1], "'")
+				return []byte(img + "@sha256:local-" + img + "\n"), nil
+			case isRemoteShellCmd(cmd.Args, "manifest") && isRemoteShellCmd(cmd.Args, "inspect"):
+				rc := cmd.Args[len(cmd.Args)-1]
+				toks := strings.Fields(rc)
+				img := strings.Trim(toks[len(toks)-1], "'")
+				switch img {
+				case "nginx:latest":
+					return []byte(`{"Descriptor":{"digest":"sha256:remote-nginx:latest"}}`), nil
+				case "postgres:16":
+					return []byte(`{"Descriptor":{"digest":"sha256:local-postgres:16"}}`), nil
+				}
+				return nil, fmt.Errorf("unexpected image: %s", img)
+			}
+			return nil, fmt.Errorf("unexpected cmd: %v", cmd.Args)
+		},
+	}
+	got, err := r.CheckUpdates(context.Background(), nil)
+	if err != nil {
+		t.Fatalf("CheckUpdates: %v", err)
+	}
+	wantByService := map[string]bool{"web": true, "db": false}
+	if len(got) != len(wantByService) {
+		t.Fatalf("results = %#v, want %#v", got, wantByService)
+	}
+	for k, v := range wantByService {
+		if g, ok := got[k]; !ok || g != v {
+			t.Errorf("results[%q] = (%v, ok=%v), want (%v, true)", k, g, ok, v)
+		}
+	}
+	// First call is the compose config fetch (goes through remoteCommand →
+	// remote shell contains both "compose" AND "config").
+	if len(argvs) < 1 {
+		t.Fatal("no calls recorded")
+	}
+	first := argvs[0][len(argvs[0])-1]
+	if !strings.Contains(first, "compose") || !strings.Contains(first, "config") {
+		t.Errorf("first call remote shell = %q, want compose config", first)
+	}
+	// All subsequent image/manifest inspect calls must bypass remoteCommand —
+	// the remote shell must NOT contain "compose" (top-level docker commands).
+	for _, a := range argvs[1:] {
+		rc := a[len(a)-1]
+		if strings.Contains(rc, "compose") {
+			t.Errorf("inspect remote shell contains 'compose': %q", rc)
+		}
+		// Must also NOT contain CURRENT_UID / cd prefix — direct SSH argv.
+		if strings.Contains(rc, "CURRENT_UID") {
+			t.Errorf("inspect remote shell contains CURRENT_UID (should bypass remoteCommand): %q", rc)
+		}
+		if strings.HasPrefix(rc, "cd ") {
+			t.Errorf("inspect remote shell starts with 'cd ' (should bypass remoteCommand): %q", rc)
+		}
+	}
+}
+
+func TestRemoteCheckUpdates_FallbackPath_InspectFailureLeavesAbsent(t *testing.T) {
+	// Multi-image project: one image fails locally, the other succeeds. The
+	// failing service stays absent (tri-state unknown), the succeeding one is
+	// reported. Cascading-failure detection (every image failing) does NOT
+	// fire when at least one image succeeds.
+	configJSON := `{"services":{"web":{"image":"nginx:latest"},"db":{"image":"postgres:16"}}}`
+	r := &RemoteCompose{
+		Host:       "user@example.com",
+		ProjectDir: "/app",
+		SocketPath: "/tmp/cdeploy-ctrl-abc-99",
+		outputCmd: func(cmd *exec.Cmd) ([]byte, error) {
+			if isRemoteShellCmd(cmd.Args, "compose") && isRemoteShellCmd(cmd.Args, "config") {
+				return []byte(configJSON), nil
+			}
+			rc := cmd.Args[len(cmd.Args)-1]
+			// buildx imagetools — check BEFORE the image case because
+			// "imagetools" contains the substring "image".
+			if isRemoteShellCmd(cmd.Args, "buildx") && isRemoteShellCmd(cmd.Args, "imagetools") {
+				return nil, fmt.Errorf("exit status 1: 'buildx' is not a docker command")
+			}
+			if isRemoteShellCmd(cmd.Args, "image") && isRemoteShellCmd(cmd.Args, "inspect") {
+				if strings.Contains(rc, "nginx:latest") {
+					// nginx not pulled → inspect fails for that one.
+					return nil, fmt.Errorf("no such image")
+				}
+				return []byte("postgres:16@sha256:local-postgres\n"), nil
+			}
+			if isRemoteShellCmd(cmd.Args, "manifest") && isRemoteShellCmd(cmd.Args, "inspect") {
+				return []byte(`{"Descriptor":{"digest":"sha256:local-postgres"}}`), nil
+			}
+			return nil, fmt.Errorf("unexpected cmd: %v", cmd.Args)
+		},
+	}
+	got, err := r.CheckUpdates(context.Background(), nil)
+	if err != nil {
+		t.Fatalf("CheckUpdates: %v", err)
+	}
+	if _, ok := got["web"]; ok {
+		t.Errorf("expected web to be absent (inspect failure → unknown), got %#v", got)
+	}
+	if v, ok := got["db"]; !ok || v {
+		t.Errorf("db = %v (ok=%v), want false (matching digests)", v, ok)
+	}
+}
+
+// TestRemoteCheckUpdates_TransportFailureAbortsBatch pins the
+// transport-vs-per-image classification: when an inspect call hits an SSH
+// transport failure (matched via stderr against sshTransportStderrPatterns),
+// the batch aborts early with errSSHTransport wrapped in the returned
+// error so the caller surfaces the real diagnostic rather than silently
+// emitting an "all unknown" map. Single-image projects also trigger this
+// path (any transport failure poisons the whole batch).
+func TestRemoteCheckUpdates_TransportFailureAbortsBatch(t *testing.T) {
+	configJSON := `{"services":{"web":{"image":"nginx:latest"}}}`
+	r := &RemoteCompose{
+		Host:       "user@example.com",
+		ProjectDir: "/app",
+		SocketPath: "/tmp/cdeploy-ctrl-abc-99",
+		// Config fetch goes through remoteCommand() and uses outputCmd —
+		// it doesn't need classification.
+		outputCmd: func(cmd *exec.Cmd) ([]byte, error) {
+			if isRemoteShellCmd(cmd.Args, "compose") && isRemoteShellCmd(cmd.Args, "config") {
+				return []byte(configJSON), nil
+			}
+			// Inspect calls should NOT hit this path — outputErrCmd takes
+			// precedence in runRemoteDockerCmd. Surface a clear failure if
+			// the hook precedence ever regresses.
+			return nil, fmt.Errorf("test bug: inspect call hit outputCmd, expected outputErrCmd")
+		},
+	}
+	// Inspect calls go through runRemoteDockerCmd which prefers outputErrCmd
+	// — drive the classifier with explicit stderr text so the test mirrors
+	// the production stderr-capture path instead of the legacy err.Error()
+	// fallback.
+	r.SetOutputErrHook(func(cmd *exec.Cmd) ([]byte, string, error) {
+		return nil, "ssh: connection lost", fmt.Errorf("exit status 255")
+	})
+	_, err := r.CheckUpdates(context.Background(), nil)
+	if err == nil {
+		t.Fatal("expected error when transport fails")
+	}
+	if !errors.Is(err, errSSHTransport) {
+		t.Errorf("error = %q, want errSSHTransport wrapped", err.Error())
+	}
+	if !strings.Contains(err.Error(), "ssh: connection lost") {
+		t.Errorf("error = %q, want underlying stderr wrapped", err.Error())
+	}
+}
+
+// TestRemoteCheckUpdates_FreshDeploySingleServiceNoCascade is the regression
+// for the iteration-2 finding: a single-service project where the image
+// hasn't been pulled to the remote host yet (a normal fresh-deploy state)
+// MUST NOT trigger a cascading-failure error. `docker image inspect` returns
+// exit 1 with "No such image" on stderr — that's a per-image docker error,
+// not an SSH transport failure, so CheckUpdates should soft-absorb it and
+// return an empty map without error, mirroring local Compose behaviour.
+func TestRemoteCheckUpdates_FreshDeploySingleServiceNoCascade(t *testing.T) {
+	configJSON := `{"services":{"web":{"image":"nginx:latest"}}}`
+	r := &RemoteCompose{
+		Host:       "user@example.com",
+		ProjectDir: "/app",
+		SocketPath: "/tmp/cdeploy-ctrl-abc-99",
+		outputCmd: func(cmd *exec.Cmd) ([]byte, error) {
+			if isRemoteShellCmd(cmd.Args, "compose") && isRemoteShellCmd(cmd.Args, "config") {
+				return []byte(configJSON), nil
+			}
+			// Synthesise the docker-style stderr — does NOT match any
+			// transport pattern, so classifySSHError will return a
+			// non-errSSHTransport error and CheckUpdates will absorb it.
+			return nil, fmt.Errorf("exit status 1: Error: No such image: nginx:latest")
+		},
+	}
+	got, err := r.CheckUpdates(context.Background(), nil)
+	if err != nil {
+		t.Fatalf("CheckUpdates: %v (expected nil — per-image docker errors should be absorbed)", err)
+	}
+	if len(got) != 0 {
+		t.Errorf("got %#v, want empty map (web absent → unknown)", got)
+	}
+}
+
+// TestRemoteCheckUpdates_SystemicRegistryFailureSurfaces is the
+// iteration-4 parity with local Compose: when EVERY remote-side digest
+// fetch fails with a network-shaped stderr AND no service got a verdict,
+// the cascade fires and CheckUpdates returns "registry unreachable"
+// rather than silently returning an empty map. Without this, narrowing
+// sshTransportStderrPatterns to SSH-only signatures means a Docker Hub
+// outage seen from the remote host produces blank glyphs for every
+// service with no diagnostic — looks identical to "everything is
+// up-to-date" to the user.
+func TestRemoteCheckUpdates_SystemicRegistryFailureSurfaces(t *testing.T) {
+	configJSON := `{"services":{"web":{"image":"nginx:latest"},"db":{"image":"postgres:16"}}}`
+	r := &RemoteCompose{
+		Host:       "user@example.com",
+		ProjectDir: "/app",
+		SocketPath: "/tmp/cdeploy-ctrl-abc-99",
+		outputCmd: func(cmd *exec.Cmd) ([]byte, error) {
+			if isRemoteShellCmd(cmd.Args, "compose") && isRemoteShellCmd(cmd.Args, "config") {
+				return []byte(configJSON), nil
+			}
+			// Local inspect on the remote host succeeds for both images.
+			if isRemoteShellCmd(cmd.Args, "image") && isRemoteShellCmd(cmd.Args, "inspect") &&
+				!isRemoteShellCmd(cmd.Args, "buildx") {
+				rc := cmd.Args[len(cmd.Args)-1]
+				if strings.Contains(rc, "nginx") {
+					return []byte("nginx:latest@sha256:local-nginx\n"), nil
+				}
+				return []byte("postgres:16@sha256:local-postgres\n"), nil
+			}
+			// buildx imagetools — registry-network error (DNS failure).
+			if isRemoteShellCmd(cmd.Args, "buildx") && isRemoteShellCmd(cmd.Args, "imagetools") {
+				return nil, fmt.Errorf("exit status 1: dial tcp: lookup registry-1.docker.io: no such host")
+			}
+			// manifest inspect — same registry-network error.
+			if isRemoteShellCmd(cmd.Args, "manifest") && isRemoteShellCmd(cmd.Args, "inspect") {
+				return nil, fmt.Errorf("exit status 1: dial tcp: lookup registry-1.docker.io: no such host")
+			}
+			return nil, fmt.Errorf("unexpected cmd: %v", cmd.Args)
+		},
+	}
+	got, err := r.CheckUpdates(context.Background(), nil)
+	if err == nil {
+		t.Fatal("expected error when every remote registry fetch hits a network failure")
+	}
+	if !strings.Contains(err.Error(), "registry unreachable") {
+		t.Errorf("error = %q, want it to mention 'registry unreachable'", err.Error())
+	}
+	if !strings.Contains(err.Error(), "no such host") {
+		t.Errorf("error = %q, want it to wrap the underlying DNS error", err.Error())
+	}
+	if len(got) != 0 {
+		t.Errorf("got = %#v, want empty map (every service unknown)", got)
+	}
+}
+
+// TestRemoteCheckUpdates_PartialRegistryFailureDoesNotCascade documents
+// the negative case for the remote registry cascade: when one image
+// succeeds and another fails with a network-shaped error, the cascade
+// MUST NOT fire — the succeeded service still gets a verdict, the failed
+// one stays absent.
+func TestRemoteCheckUpdates_PartialRegistryFailureDoesNotCascade(t *testing.T) {
+	configJSON := `{"services":{"web":{"image":"nginx:latest"},"db":{"image":"postgres:16"}}}`
+	// Use full 64-char hex digests so parseImagetoolsDigest's strict regex
+	// validates them. The two services have distinct digests; the matching
+	// "remote = local" digest for db proves the verdict is UpdateAvailable=false.
+	dbHex := strings.Repeat("d", 64)
+	dbDigest := "sha256:" + dbHex
+	r := &RemoteCompose{
+		Host:       "user@example.com",
+		ProjectDir: "/app",
+		SocketPath: "/tmp/cdeploy-ctrl-abc-99",
+		outputCmd: func(cmd *exec.Cmd) ([]byte, error) {
+			if isRemoteShellCmd(cmd.Args, "compose") && isRemoteShellCmd(cmd.Args, "config") {
+				return []byte(configJSON), nil
+			}
+			rc := cmd.Args[len(cmd.Args)-1]
+			// buildx imagetools — check BEFORE image case (substring overlap).
+			if isRemoteShellCmd(cmd.Args, "buildx") && isRemoteShellCmd(cmd.Args, "imagetools") {
+				if strings.Contains(rc, "nginx") {
+					return nil, fmt.Errorf("exit status 1: dial tcp: lookup registry-1.docker.io: no such host")
+				}
+				// db's buildx call succeeds with a matching digest.
+				return []byte("Name:      postgres:16\nMediaType: application/vnd.oci.image.index.v1+json\nDigest:    " + dbDigest + "\n"), nil
+			}
+			if isRemoteShellCmd(cmd.Args, "image") && isRemoteShellCmd(cmd.Args, "inspect") {
+				if strings.Contains(rc, "nginx") {
+					return []byte("nginx:latest@sha256:" + strings.Repeat("a", 64) + "\n"), nil
+				}
+				return []byte("postgres:16@" + dbDigest + "\n"), nil
+			}
+			if isRemoteShellCmd(cmd.Args, "manifest") && isRemoteShellCmd(cmd.Args, "inspect") {
+				return nil, fmt.Errorf("exit status 1: dial tcp: lookup registry-1.docker.io: no such host")
+			}
+			return nil, fmt.Errorf("unexpected cmd: %v", cmd.Args)
+		},
+	}
+	got, err := r.CheckUpdates(context.Background(), nil)
+	if err != nil {
+		t.Fatalf("unexpected error on partial registry failure: %v", err)
+	}
+	if v, ok := got["db"]; !ok || v {
+		t.Errorf("db = %v (ok=%v), want false (matching digests)", v, ok)
+	}
+	if _, present := got["web"]; present {
+		t.Errorf("web should be absent on registry failure, got %v", got["web"])
+	}
+}
+
+func TestRemoteCheckUpdates_FallbackPath_ConfigFailureReturnsError(t *testing.T) {
+	r := &RemoteCompose{
+		Host:       "user@example.com",
+		ProjectDir: "/app",
+		SocketPath: "/tmp/cdeploy-ctrl-abc-99",
+		outputCmd: func(cmd *exec.Cmd) ([]byte, error) {
+			return nil, fmt.Errorf("ssh transport error")
+		},
+	}
+	_, err := r.CheckUpdates(context.Background(), nil)
+	if err == nil {
+		t.Fatal("expected error when config fetch fails")
+	}
+	if !strings.Contains(err.Error(), "fetching remote compose config") {
+		t.Errorf("error = %q, want it to mention remote compose config", err.Error())
+	}
+}
+
+func TestRemoteCheckUpdates_FallbackPath_ManifestFailureLeavesAbsent(t *testing.T) {
+	// Multi-image: one image's manifest call fails (per-image registry/auth
+	// error), the other succeeds. The failing service stays absent;
+	// cascading-failure detection does NOT fire because at least one image
+	// succeeded.
+	configJSON := `{"services":{"web":{"image":"nginx:latest"},"db":{"image":"postgres:16"}}}`
+	r := &RemoteCompose{
+		Host:       "user@example.com",
+		ProjectDir: "/app",
+		SocketPath: "/tmp/cdeploy-ctrl-abc-99",
+		outputCmd: func(cmd *exec.Cmd) ([]byte, error) {
+			if isRemoteShellCmd(cmd.Args, "compose") && isRemoteShellCmd(cmd.Args, "config") {
+				return []byte(configJSON), nil
+			}
+			rc := cmd.Args[len(cmd.Args)-1]
+			// buildx imagetools — check BEFORE the image case because
+			// "imagetools" contains the substring "image".
+			if isRemoteShellCmd(cmd.Args, "buildx") && isRemoteShellCmd(cmd.Args, "imagetools") {
+				return nil, fmt.Errorf("exit status 1: 'buildx' is not a docker command")
+			}
+			if isRemoteShellCmd(cmd.Args, "image") && isRemoteShellCmd(cmd.Args, "inspect") {
+				if strings.Contains(rc, "nginx:latest") {
+					return []byte("nginx:latest@sha256:local-nginx\n"), nil
+				}
+				return []byte("postgres:16@sha256:local-postgres\n"), nil
+			}
+			if isRemoteShellCmd(cmd.Args, "manifest") && isRemoteShellCmd(cmd.Args, "inspect") {
+				if strings.Contains(rc, "nginx:latest") {
+					return nil, fmt.Errorf("auth required")
+				}
+				return []byte(`{"Descriptor":{"digest":"sha256:local-postgres"}}`), nil
+			}
+			return nil, fmt.Errorf("unexpected cmd: %v", cmd.Args)
+		},
+	}
+	got, err := r.CheckUpdates(context.Background(), nil)
+	if err != nil {
+		t.Fatalf("CheckUpdates: %v", err)
+	}
+	if _, ok := got["web"]; ok {
+		t.Errorf("expected web to be absent (manifest failure → unknown), got %#v", got)
+	}
+	if v, ok := got["db"]; !ok || v {
+		t.Errorf("db = %v (ok=%v), want false (matching digests)", v, ok)
+	}
+}
+
+// Verify SSHExtraArgs (e.g. -i /tmp/key) is spliced immediately before the
+// host argument in the fallback path's direct SSH argv for `docker image
+// inspect` / `docker manifest inspect`. Mirrors
+// TestAllContainerStatsRemote_extraArgsSplice.
+func TestRemoteCheckUpdates_FallbackPath_ExtraArgsSpliced(t *testing.T) {
+	configJSON := `{"services":{"web":{"image":"nginx:latest"}}}`
+	extras := []string{"-i", "/tmp/key"}
+	host := "user@example.com"
+	var inspectArgvs [][]string
+	r := &RemoteCompose{
+		Host:         host,
+		ProjectDir:   "/app",
+		SocketPath:   "/tmp/cdeploy-ctrl-abc-99",
+		SSHExtraArgs: extras,
+		outputCmd: func(cmd *exec.Cmd) ([]byte, error) {
+			rc := cmd.Args[len(cmd.Args)-1]
+			switch {
+			case strings.Contains(rc, "compose") && strings.Contains(rc, "config"):
+				return []byte(configJSON), nil
+			// buildx imagetools — check BEFORE the image case because the rc
+			// for buildx imagetools contains the substring "image" too.
+			case strings.Contains(rc, "buildx") && strings.Contains(rc, "imagetools"):
+				inspectArgvs = append(inspectArgvs, append([]string{}, cmd.Args...))
+				// Simulate buildx missing → exercise the manifest fallback.
+				return nil, fmt.Errorf("exit status 1: 'buildx' is not a docker command")
+			case strings.Contains(rc, "image") && strings.Contains(rc, "inspect"):
+				inspectArgvs = append(inspectArgvs, append([]string{}, cmd.Args...))
+				return []byte("nginx:latest@sha256:local-nginx\n"), nil
+			case strings.Contains(rc, "manifest") && strings.Contains(rc, "inspect"):
+				inspectArgvs = append(inspectArgvs, append([]string{}, cmd.Args...))
+				return []byte(`{"Descriptor":{"digest":"sha256:remote-nginx"}}`), nil
+			}
+			return nil, fmt.Errorf("unexpected cmd: %v", cmd.Args)
+		},
+	}
+	if _, err := r.CheckUpdates(context.Background(), nil); err != nil {
+		t.Fatalf("CheckUpdates: %v", err)
+	}
+	if len(inspectArgvs) != 3 {
+		t.Fatalf("expected 3 inspect calls (image + buildx + manifest), got %d", len(inspectArgvs))
+	}
+	for i, argv := range inspectArgvs {
+		label := fmt.Sprintf("inspect[%d]", i)
+		assertExtraBeforeHost(t, label, argv, host, extras)
+		// Sanity: the fallback path's direct SSH argv must match the
+		// AllContainerStatsRemote shape: `ssh -S <sock> -o ControlMaster=no
+		// -i /tmp/key -- <host> <remoteCmd>`.
+		if argv[0] != "ssh" {
+			t.Errorf("%s: argv[0] = %q, want ssh", label, argv[0])
+		}
+		// SocketPath must be present (uses ControlMaster).
+		foundSock := false
+		for j, a := range argv {
+			if a == "-S" && j+1 < len(argv) && argv[j+1] == r.SocketPath {
+				foundSock = true
+				break
+			}
+		}
+		if !foundSock {
+			t.Errorf("%s: argv missing -S %q: %v", label, r.SocketPath, argv)
+		}
+	}
+}
+
+// Verify shell-escaping survives for image names with special characters in
+// the fallback path (registry hosts with colons, version tags with slashes,
+// digests, etc.).
+func TestRemoteCheckUpdates_FallbackPath_ShellEscapesImage(t *testing.T) {
+	configJSON := `{"services":{"web":{"image":"registry.example.com:5000/team/web:v1.2.3"}}}`
+	var inspectArgvs []string
+	r := &RemoteCompose{
+		Host:       "user@example.com",
+		ProjectDir: "/app",
+		SocketPath: "/tmp/cdeploy-ctrl-abc-99",
+		outputCmd: func(cmd *exec.Cmd) ([]byte, error) {
+			rc := cmd.Args[len(cmd.Args)-1]
+			switch {
+			case strings.Contains(rc, "compose") && strings.Contains(rc, "config"):
+				return []byte(configJSON), nil
+			// buildx imagetools — check BEFORE the image case because rc contains "image".
+			case strings.Contains(rc, "buildx") && strings.Contains(rc, "imagetools"):
+				inspectArgvs = append(inspectArgvs, rc)
+				// Simulate buildx missing → exercise the manifest fallback.
+				return nil, fmt.Errorf("exit status 1: 'buildx' is not a docker command")
+			case strings.Contains(rc, "image") && strings.Contains(rc, "inspect"):
+				inspectArgvs = append(inspectArgvs, rc)
+				return []byte("foo@sha256:abc\n"), nil
+			case strings.Contains(rc, "manifest") && strings.Contains(rc, "inspect"):
+				inspectArgvs = append(inspectArgvs, rc)
+				return []byte(`{"Descriptor":{"digest":"sha256:abc"}}`), nil
+			}
+			return nil, fmt.Errorf("unexpected: %v", cmd.Args)
+		},
+	}
+	if _, err := r.CheckUpdates(context.Background(), nil); err != nil {
+		t.Fatalf("CheckUpdates: %v", err)
+	}
+	if len(inspectArgvs) != 3 {
+		t.Fatalf("expected 3 inspect commands (image + buildx + manifest), got %d", len(inspectArgvs))
+	}
+	for _, rc := range inspectArgvs {
+		// Image must be shell-escaped (single-quoted) to survive transport.
+		if !strings.Contains(rc, "'registry.example.com:5000/team/web:v1.2.3'") {
+			t.Errorf("remote shell = %q, want escaped image", rc)
+		}
+	}
+}
+
+// TestClassifySSHError_ControlMasterPatterns is the iteration-3 regression
+// for ControlMaster (persistent socket) failure modes: when the SSH mux
+// socket dies mid-batch, the stderr matches one of mux_client / client_loop /
+// "broken pipe" / ControlSocket / "session open refused" / multiplex —
+// all of which MUST be classified as transport failures so cascading-
+// failure detection fires and the user gets an actionable diagnostic
+// instead of a silently blank glyph column.
+func TestClassifySSHError_ControlMasterPatterns(t *testing.T) {
+	tests := []struct {
+		name        string
+		stderr      string
+		wantTrans   bool // expect errSSHTransport wrap
+		wantInclude string
+	}{
+		{
+			name:      "client_loop broken pipe",
+			stderr:    "client_loop: send disconnect: Broken pipe",
+			wantTrans: true,
+		},
+		{
+			name:      "mux_client request_session broken pipe",
+			stderr:    "mux_client_request_session: read from master failed: Broken pipe",
+			wantTrans: true,
+		},
+		{
+			name:      "mux_client hello_exchange write packet",
+			stderr:    "mux_client_hello_exchange: write packet: Broken pipe",
+			wantTrans: true,
+		},
+		{
+			name:      "ControlSocket missing",
+			stderr:    "ControlSocket /tmp/cdeploy-ctrl-abc-99: No such file or directory",
+			wantTrans: true,
+		},
+		{
+			name:      "session open refused",
+			stderr:    "mux_client_request_session: session request failed: Session open refused by peer",
+			wantTrans: true,
+		},
+		{
+			name:      "multiplex master state",
+			stderr:    "multiplex: master state corrupt",
+			wantTrans: true,
+		},
+		{
+			name:      "per-image docker no such image",
+			stderr:    "Error response from daemon: No such image: nginx:latest",
+			wantTrans: false,
+		},
+		{
+			name:      "per-image manifest unknown",
+			stderr:    "manifest unknown",
+			wantTrans: false,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := classifySSHError(fmt.Errorf("ssh exit 255"), tt.stderr)
+			if tt.wantTrans {
+				if !errors.Is(got, errSSHTransport) {
+					t.Errorf("got %q, want errSSHTransport wrap (stderr=%q)", got.Error(), tt.stderr)
+				}
+			} else {
+				if errors.Is(got, errSSHTransport) {
+					t.Errorf("got %q wrapped in errSSHTransport, want plain error (stderr=%q)", got.Error(), tt.stderr)
+				}
+			}
+		})
+	}
+}
+
+// TestClassifySSHError_SshExchangeIdentificationIsTransport is the
+// iteration-5 regression for the `ssh:`-vs-`ssh_` pattern gap: the
+// literal substring `ssh:` (with colon) does NOT match real-world
+// `ssh_exchange_identification:` stderr lines, which previously fell
+// through to looksLikeNetworkErr (because "Connection closed"/"reset"
+// are in that pattern list) and triggered the misleading
+// "registry unreachable" cascade instead of the SSH-transport cascade.
+// Worst case, neither cascade matched and the user saw a silent failure
+// (no glyphs, no diagnostic).
+func TestClassifySSHError_SshExchangeIdentificationIsTransport(t *testing.T) {
+	tests := []struct {
+		name      string
+		stderr    string
+		wantTrans bool
+	}{
+		{
+			name:      "exchange identification connection closed",
+			stderr:    "ssh_exchange_identification: Connection closed by remote host",
+			wantTrans: true,
+		},
+		{
+			name:      "exchange identification read reset",
+			stderr:    "ssh_exchange_identification: read: Connection reset by peer",
+			wantTrans: true,
+		},
+		{
+			name:      "exchange identification mixed case",
+			stderr:    "SSH_exchange_identification: server unexpectedly closed",
+			wantTrans: true,
+		},
+		{
+			name:      "lost connection",
+			stderr:    "ssh: connect to host example.com port 22: lost connection",
+			wantTrans: true,
+		},
+		// Negative pin: bare per-image docker error must NOT be classified as transport.
+		{
+			name:      "per-image no such image",
+			stderr:    "Error response from daemon: No such image: nginx:latest",
+			wantTrans: false,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := classifySSHError(fmt.Errorf("exit status 255"), tt.stderr)
+			if tt.wantTrans {
+				if !errors.Is(got, errSSHTransport) {
+					t.Errorf("got %q, want errSSHTransport wrap (stderr=%q)", got.Error(), tt.stderr)
+				}
+			} else {
+				if errors.Is(got, errSSHTransport) {
+					t.Errorf("got %q wrapped in errSSHTransport, want plain error (stderr=%q)", got.Error(), tt.stderr)
+				}
+			}
+		})
+	}
+}
+
+// TestRunRemoteDockerCmd_OutputErrHook proves the iteration-3 fix for
+// finding #7: tests can now provide explicit (stdout, stderr, err) so
+// classification doesn't depend on the err.Error()-as-stderr heuristic.
+// The hook drives a synthetic transport-pattern stderr; the result MUST
+// classify as errSSHTransport even though err.Error() itself doesn't
+// contain the transport pattern.
+func TestRunRemoteDockerCmd_OutputErrHook(t *testing.T) {
+	r := &RemoteCompose{
+		Host:       "user@example.com",
+		SocketPath: "/tmp/cdeploy-ctrl-abc-99",
+	}
+	r.SetOutputErrHook(func(cmd *exec.Cmd) ([]byte, string, error) {
+		// Plain error text — would NOT match transport patterns on its own.
+		// Explicit stderr DOES match → must classify as transport.
+		return nil, "client_loop: send disconnect: Broken pipe", fmt.Errorf("exit status 255")
+	})
+	_, err := r.runRemoteDockerCmd(context.Background(), []string{"image", "inspect", "nginx"})
+	if err == nil {
+		t.Fatal("expected error")
+	}
+	if !errors.Is(err, errSSHTransport) {
+		t.Errorf("got %q, want errSSHTransport (explicit stderr drove classification)", err.Error())
+	}
+	if !strings.Contains(err.Error(), "Broken pipe") {
+		t.Errorf("got %q, want stderr text included for diagnostic", err.Error())
 	}
 }

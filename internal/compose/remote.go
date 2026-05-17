@@ -3,6 +3,7 @@ package compose
 import (
 	"context"
 	"crypto/sha256"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -12,6 +13,95 @@ import (
 
 	"github.com/lexxzar/compose-deploy/internal/runner"
 )
+
+// errSSHTransport is a sentinel marker wrapped around errors that originated
+// from the SSH transport layer (socket dead, host unreachable, connection
+// reset, hostname unresolved, etc.) — as distinguished from errors that
+// originated from the remote `docker` command itself (image not found,
+// manifest auth failure, unknown image, etc.). CheckUpdates uses this to
+// decide whether to abort the batch (transport failure → every subsequent
+// call will fail the same way) or absorb the failure as a per-image
+// "unknown" (matching local Compose.CheckUpdates).
+var errSSHTransport = errors.New("ssh transport failure")
+
+// sshTransportStderrPatterns is the heuristic match list applied to stderr
+// of a failed `ssh ... docker ...` invocation to classify it as transport
+// rather than per-image. Anything not matching these patterns is treated as
+// a docker-layer error (per-image absent, possibly elevated to
+// registry-network-failure cascade if looksLikeNetworkErr matches).
+// Patterns are matched case-insensitively against the trimmed stderr string.
+//
+// Patterns are deliberately SSH-specific (iteration 4 narrowing): every
+// entry below names a string only ssh(1) or its ControlMaster machinery
+// emits, never the docker daemon or registry client. The previous list
+// included generic networking phrases ("connection refused",
+// "connection reset", "broken pipe", "no route to host", "network is
+// unreachable", etc.) that also appear in docker daemon stderr when
+// docker fails to reach a remote registry — classifying those as SSH
+// transport would abort the entire CheckUpdates batch even though
+// other images would have succeeded. Registry network failures are now
+// detected separately via looksLikeNetworkErr (used by both local
+// Compose.CheckUpdates and RemoteCompose.CheckUpdates cascades). The
+// only SSH-side pattern that ALSO appears in docker stderr is
+// "broken pipe" (a transport keepalive), so it's gated by sharing the
+// line with one of the explicitly-SSH markers ("mux_client",
+// "client_loop") rather than as a standalone pattern.
+//
+// ControlMaster failure modes (mux_client_*, client_loop,
+// "ControlSocket ... No such file or directory", "session open refused")
+// are included so a dead persistent socket during a long-running TUI
+// session triggers cascading-failure abort rather than silently
+// classifying every per-image inspect as "absent".
+var sshTransportStderrPatterns = []string{
+	"ssh:",
+	// iteration-5: explicit underscore-prefixed ssh(1) handshake diagnostics —
+	// `ssh:` (with colon) does NOT match `ssh_exchange_identification` because
+	// the latter has an underscore between `ssh` and the next token. Without
+	// this entry, common real-world SSH handshake failures (peer closed during
+	// banner exchange, RST during identification) fell through to
+	// looksLikeNetworkErr and produced misleading "registry unreachable"
+	// diagnostics — and worst case, N per-image calls all waited on the
+	// same broken transport instead of aborting after the first.
+	"ssh_exchange_identification",
+	"could not resolve hostname",
+	"kex_exchange_identification",
+	"permission denied (publickey",
+	"control socket connect",
+	"port forwarding failed",
+	"lost connection", // ssh(1) emits "lost connection" on abrupt transport teardown
+	// ControlMaster (persistent socket) failure modes — all of these are
+	// emitted only by ssh(1)'s multiplexing layer, never by docker:
+	"mux_client",           // mux_client_request_session / mux_client_hello_exchange
+	"client_loop",          // client_loop: send disconnect
+	"controlsocket",        // ControlSocket /tmp/cdeploy-ctrl-...: No such file or directory
+	"multiplex",            // multiplex master state
+	"session open refused", // Session open refused by peer
+}
+
+// classifySSHError inspects stderr from a failed `ssh ... docker ...`
+// invocation and returns the error wrapped in errSSHTransport when the
+// stderr matches one of the known transport-failure patterns; otherwise
+// returns the error wrapped only with the stderr diagnostic so the caller
+// sees actionable detail. ssh(1) is hardcoded to exit 255 on transport
+// errors, but that signal alone is unreliable (some hosts return arbitrary
+// exit codes for transport-adjacent failures), so we drive classification
+// from stderr content. stderrText is the trimmed stderr from the exec.Cmd.
+func classifySSHError(err error, stderrText string) error {
+	stderrText = strings.TrimSpace(stderrText)
+	lower := strings.ToLower(stderrText)
+	for _, p := range sshTransportStderrPatterns {
+		if strings.Contains(lower, p) {
+			if stderrText != "" {
+				return fmt.Errorf("%w: %v: %s", errSSHTransport, err, stderrText)
+			}
+			return fmt.Errorf("%w: %v", errSSHTransport, err)
+		}
+	}
+	if stderrText != "" {
+		return fmt.Errorf("%w: %s", err, stderrText)
+	}
+	return err
+}
 
 // Compile-time interface satisfaction checks.
 var _ runner.Composer = (*RemoteCompose)(nil)
@@ -45,6 +135,15 @@ type RemoteCompose struct {
 	// testing hooks; nil = use real exec
 	runCmd    func(*exec.Cmd) error
 	outputCmd func(*exec.Cmd) ([]byte, error)
+
+	// outputErrCmd is an optional richer test hook used only by
+	// runRemoteDockerCmd. It returns (stdout, stderr, err) so the test can
+	// drive classifySSHError with explicit stderr text rather than relying
+	// on the err.Error() heuristic — which was only ever an approximation
+	// of production's real stderr capture and could diverge in non-obvious
+	// ways. When nil, runRemoteDockerCmd falls back to outputCmd and
+	// synthesises stderr from err.Error() (the legacy behaviour).
+	outputErrCmd func(*exec.Cmd) ([]byte, string, error)
 }
 
 // NewRemote creates a RemoteCompose instance. The socket path is deterministic
@@ -63,6 +162,14 @@ func NewRemote(host, projectDir string) *RemoteCompose {
 func (r *RemoteCompose) SetTestHooks(run func(*exec.Cmd) error, output func(*exec.Cmd) ([]byte, error)) {
 	r.runCmd = run
 	r.outputCmd = output
+}
+
+// SetOutputErrHook installs an optional richer test hook for
+// runRemoteDockerCmd that returns (stdout, stderr, err). Use this in
+// tests that want to drive classifySSHError with explicit stderr text
+// instead of the err.Error() fallback. Pass nil to clear.
+func (r *RemoteCompose) SetOutputErrHook(fn func(*exec.Cmd) ([]byte, string, error)) {
+	r.outputErrCmd = fn
 }
 
 // Detect probes for the docker compose variant available on the remote host.
@@ -503,4 +610,249 @@ func (r *RemoteCompose) ListProjects(ctx context.Context) ([]Project, error) {
 		return nil, fmt.Errorf("listing remote projects: %w", withStderr(err))
 	}
 	return parseProjects(out)
+}
+
+// CheckUpdates reports per-service "image update available" verdicts for the
+// remote project. See Compose.CheckUpdates for the full contract — this is
+// the SSH counterpart and behaves identically with respect to tri-state
+// semantics, soft per-image failure, and absent-as-unknown.
+//
+// Implementation builds the SSH argv DIRECTLY for `docker image inspect`
+// and `docker manifest inspect` — both are top-level docker CLI commands,
+// NOT compose subcommands, so remoteCommand() would build a malformed
+// `docker compose image inspect` argv. SSHExtraArgs is spliced immediately
+// before the host argument via sshArgs(), mirroring the
+// AllContainerStatsRemote / EditCommand / ExecCommand convention.
+//
+// SSH transport robustness: failures are classified into two buckets via
+// `runRemoteDockerCmd`'s sentinel-error machinery (errSSHTransport):
+//  1. Transport-level failures (SSH socket dead, host unreachable, connection
+//     reset, etc.) — these poison the entire batch. If even ONE image hits a
+//     transport failure, we surface the wrapped error so the caller doesn't
+//     silently treat "SSH dead" as "no updates available". Returning early
+//     skips the remaining round-trips (they'll fail the same way anyway).
+//  2. Per-image docker errors (image not pulled, manifest auth failure,
+//     unknown manifest, etc.) — these are absorbed into "absent" tri-state,
+//     matching local Compose.CheckUpdates. A fresh-deploy single-service
+//     project no longer trips a false cascade just because the image hasn't
+//     been pulled to the remote yet ("No such image" is a normal docker
+//     exit-1 condition, not a transport failure).
+func (r *RemoteCompose) CheckUpdates(ctx context.Context, services []string) (map[string]bool, error) {
+	images, err := r.fetchServiceImages(ctx)
+	if err != nil {
+		return nil, err
+	}
+	wanted := filterServices(images, services)
+	out := make(map[string]bool, len(wanted))
+	// Track per-image network-failure outcomes to detect a systemic registry
+	// problem on the remote host (parity with local Compose). Without this,
+	// the SSH-only sshTransportStderrPatterns means a Docker Hub outage seen
+	// from the remote becomes a silent absent-for-everything verdict — every
+	// service blank, no diagnostic. The cascade fires when EVERY non-
+	// transport failure matches looksLikeNetworkErr AND no service got a
+	// verdict.
+	var (
+		networkAttempts int
+		networkFailures int
+		firstNetErr     error
+	)
+	for svc, img := range wanted {
+		updated, ok, derr := r.compareImageDigest(ctx, img)
+		if derr != nil {
+			if errors.Is(derr, errSSHTransport) {
+				// Transport failure — every subsequent image will hit the same
+				// error, so abort the batch and surface the diagnostic.
+				return out, fmt.Errorf("remote update check transport failure: %w", derr)
+			}
+			// Non-transport per-image failure: classify for the registry
+			// cascade. Network-shaped errors (DNS, connection refused, TLS,
+			// 429, etc.) feed the network-failure counter so a host-wide
+			// Docker Hub / registry outage surfaces as
+			// "registry unreachable" rather than blank glyphs. Anything
+			// else (image not pulled on remote, manifest unknown, auth
+			// required) stays absorbed as "unknown" — matching local
+			// Compose.CheckUpdates.
+			networkAttempts++
+			if looksLikeNetworkErr(derr) {
+				networkFailures++
+				if firstNetErr == nil {
+					firstNetErr = derr
+				}
+			}
+			continue
+		}
+		if !ok {
+			continue
+		}
+		out[svc] = updated
+	}
+	if len(out) == 0 && networkAttempts > 0 && networkFailures == networkAttempts {
+		return out, fmt.Errorf("registry unreachable: %w", firstNetErr)
+	}
+	return out, nil
+}
+
+// fetchServiceImages runs `docker compose config --format json` on the
+// remote host and returns the service-name → image map. Build-only services
+// (no `image:`) are absent. Goes through remoteCommand() — regular compose
+// subcommand.
+func (r *RemoteCompose) fetchServiceImages(ctx context.Context) (map[string]string, error) {
+	cmd := r.remoteCommand(ctx, configImagesArgs...)
+	var out []byte
+	var err error
+	if r.outputCmd != nil {
+		out, err = r.outputCmd(cmd)
+	} else {
+		out, err = cmd.Output()
+	}
+	if err != nil {
+		return nil, fmt.Errorf("fetching remote compose config: %w", withStderr(err))
+	}
+	return parseConfigImages(out)
+}
+
+// compareImageDigest fetches the local and remote digests for image and
+// returns (updateAvailable, ok, err). ok=true with nil err means a
+// definitive verdict; ok=false with nil err means at least one side could
+// not be determined for a non-failure reason (parse returned empty —
+// image not pulled on the remote, manifest output didn't carry a digest).
+// ok=false with non-nil err means the underlying SSH/docker call failed;
+// transport failures are wrapped in errSSHTransport so CheckUpdates can
+// abort the whole batch, everything else is a per-image failure that
+// CheckUpdates classifies via looksLikeNetworkErr for the registry
+// cascade. Signature matches Compose.compareImageDigest (3-tuple) so
+// empty-digest cases are distinguishable from positive verdicts without
+// polluting the cascade counters with synthetic errors.
+//
+// Both inspect calls are top-level docker CLI commands (`docker image
+// inspect`, `docker manifest inspect` / `docker buildx imagetools
+// inspect`), so they CANNOT go through remoteCommand() — that would
+// prepend `compose` and produce a malformed argv on the remote host. The
+// SSH argv is built directly via r.sshArgs() so SSHExtraArgs is spliced
+// immediately before the host argument, matching the
+// AllContainerStatsRemote / EditCommand / ExecCommand convention.
+//
+// The remote shell command is `docker image inspect ...` / `docker manifest
+// inspect ...` — args are shell-escaped before being joined into the SSH
+// command string so values containing spaces or quotes survive transport.
+//
+// See manifestInspectArgs for the multi-arch limitation.
+func (r *RemoteCompose) compareImageDigest(ctx context.Context, image string) (bool, bool, error) {
+	localOut, lerr := r.runRemoteDockerCmd(ctx, imageInspectArgs(image))
+	if lerr != nil {
+		return false, false, lerr
+	}
+	localDigest := parseLocalDigest(string(localOut), image)
+	if localDigest == "" {
+		return false, false, nil
+	}
+	remoteDigest, ok, rerr := r.fetchRemoteDigest(ctx, image)
+	if rerr != nil {
+		return false, false, rerr
+	}
+	if !ok || remoteDigest == "" {
+		return false, false, nil
+	}
+	return localDigest != remoteDigest, true, nil
+}
+
+// fetchRemoteDigest queries the remote registry's manifest digest for image
+// over SSH, preferring `docker buildx imagetools inspect` (multi-arch-
+// correct: returns the manifest-list digest which matches the local
+// RepoDigest) and falling back to `docker manifest inspect --verbose` when
+// imagetools fails (older Docker on the remote, no buildx plugin, etc.).
+// Returns (digest, true, nil) on a definitive verdict;
+// ("", false, nil) when both commands succeeded-or-failed cleanly but
+// parsing yielded no digest (callers treat empty as "unknown");
+// ("", false, err) when a transport error or surviving docker error
+// prevented digest retrieval. Transport errors short-circuit the fallback
+// since the SSH hop is dead.
+func (r *RemoteCompose) fetchRemoteDigest(ctx context.Context, image string) (string, bool, error) {
+	out, err := r.runRemoteDockerCmd(ctx, imagetoolsInspectArgs(image))
+	if err == nil {
+		if d := parseImagetoolsDigest(out); d != "" {
+			return d, true, nil
+		}
+	} else if errors.Is(err, errSSHTransport) {
+		// Don't retry over a broken SSH transport — surface the failure so
+		// CheckUpdates can abort the batch.
+		return "", false, err
+	}
+	// Fallback: `docker manifest inspect --verbose` (multi-arch limitation).
+	out, err = r.runRemoteDockerCmd(ctx, manifestInspectArgs(image))
+	if err != nil {
+		return "", false, err
+	}
+	d := parseManifestDigest(out)
+	if d == "" {
+		return "", false, nil
+	}
+	return d, true, nil
+}
+
+// runRemoteDockerCmd runs a top-level `docker <args...>` command on the
+// remote host via SSH, bypassing remoteCommand() (which is compose-specific).
+// SSHExtraArgs is spliced immediately before the host argument via
+// r.sshArgs(). Returns (output, err) — err non-nil on any failure. Errors
+// are classified by classifySSHError: transport failures (SSH socket dead,
+// host unreachable, etc.) are wrapped in errSSHTransport so callers can
+// distinguish them from per-image docker errors (image not pulled, manifest
+// auth failure, etc.) and decide whether to abort the batch or absorb the
+// failure as "unknown".
+//
+// Stderr is captured explicitly via a bytes.Buffer (rather than relying on
+// cmd.Output's automatic ExitError.Stderr population, which works only for
+// *exec.ExitError) so test hooks that synthesise non-ExitError failures
+// still surface stderr context, AND so the classifySSHError heuristic can
+// inspect stderr regardless of how the failure was produced.
+func (r *RemoteCompose) runRemoteDockerCmd(ctx context.Context, dockerArgs []string) ([]byte, error) {
+	escaped := make([]string, 0, len(dockerArgs)+1)
+	escaped = append(escaped, "docker")
+	for _, a := range dockerArgs {
+		escaped = append(escaped, shellEscape(a))
+	}
+	remoteCmd := strings.Join(escaped, " ")
+	sshArgv := r.sshArgs(
+		[]string{"-S", r.SocketPath, "-o", "ControlMaster=no"},
+		remoteCmd,
+	)
+	cmd := exec.CommandContext(ctx, "ssh", sshArgv...)
+	// Richest test hook: explicit (stdout, stderr, err) so classifySSHError
+	// sees real stderr-equivalent text rather than guessing from err.Error().
+	if r.outputErrCmd != nil {
+		out, stderr, err := r.outputErrCmd(cmd)
+		if err != nil {
+			return nil, classifySSHError(err, stderr)
+		}
+		return out, nil
+	}
+	var out []byte
+	var err error
+	if r.outputCmd != nil {
+		out, err = r.outputCmd(cmd)
+		if err != nil {
+			// Legacy test hook path: outputCmd returns only (stdout, err)
+			// with no separate stderr, so classifySSHError sees an empty
+			// stderr string and falls back to plain-error wrapping. Tests
+			// that want to drive transport-vs-per-image classification
+			// must use SetOutputErrHook (outputErrCmd above), which gives
+			// the test explicit control over the stderr text. Previous
+			// "synthesise stderr from err.Error()" divergence between
+			// production (real stderr) and tests (err string) led to
+			// false confidence in test coverage of the classifier.
+			return nil, classifySSHError(err, "")
+		}
+		return out, nil
+	}
+	// Production path: capture stderr to inspect it for transport patterns.
+	// cmd.Output() would set Stderr only when *exec.ExitError, which is the
+	// usual case for a non-zero exit; capturing explicitly removes the type
+	// constraint and gives us deterministic stderr text for classification.
+	var stderr strings.Builder
+	cmd.Stderr = &stderr
+	out, err = cmd.Output()
+	if err != nil {
+		return nil, classifySSHError(err, stderr.String())
+	}
+	return out, nil
 }
