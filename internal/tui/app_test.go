@@ -3508,7 +3508,7 @@ func TestSvcVisibleCount_NormalHeight(t *testing.T) {
 	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
 	m.statsRequested = false // exercise the "no columns" branch
 	m.services = []string{"a", "b", "c", "d", "e", "f", "g", "h", "i", "j"}
-	m.width = 130 // wide enough for one-line help
+	m.width = 160 // wide enough for one-line help
 	m.height = 10
 
 	// header=3, footer=3 (one-line help on wide terminal) → 10-3-3 = 4
@@ -3554,7 +3554,7 @@ func TestSvcVisibleCount_Warning(t *testing.T) {
 	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
 	m.statsRequested = false
 	m.services = []string{"a", "b", "c", "d", "e", "f", "g", "h", "i", "j"}
-	m.width = 130
+	m.width = 160
 	m.height = 10
 	m.warning = "something wrong"
 
@@ -3596,7 +3596,7 @@ func TestSvcVisibleCount_WithStatusColumns(t *testing.T) {
 	mc := &mockComposer{}
 	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
 	m.services = []string{"a", "b", "c", "d", "e", "f", "g", "h", "i", "j"}
-	m.width = 130
+	m.width = 160
 	m.height = 10
 	m.svcStatus = map[string]runner.ServiceStatus{
 		"a": {Running: true, Created: "2024-01-15 09:30", Uptime: "3h"},
@@ -3701,7 +3701,7 @@ func TestFixSvcOffset_CursorBelowWindow(t *testing.T) {
 	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
 	m.statsRequested = false
 	m.services = []string{"a", "b", "c", "d", "e"}
-	m.width = 130
+	m.width = 160
 	m.height = 9 // visible = 9-3-3 = 3
 	m.svcCursor = 4
 	m.svcOffset = 0
@@ -3765,7 +3765,7 @@ func TestFixSvcOffset_ClampsMaxOffset(t *testing.T) {
 	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
 	m.statsRequested = false
 	m.services = []string{"a", "b", "c", "d", "e"}
-	m.width = 130
+	m.width = 160
 	m.height = 9 // visible = 9-3-3 = 3
 	m.svcCursor = 4
 	m.svcOffset = 10 // way too high
@@ -3783,11 +3783,11 @@ func TestScrollDown_PastVisibleWindow(t *testing.T) {
 	m.statsRequested = false // isolate scroll math from the captions row
 	m.screen = screenSelectContainers
 	m.services = mc.services
-	m.width = 130
+	m.width = 160
 	m.height = 9 // visible = 9-3-3 = 3
 
 	// Set initial size
-	updated, _ := m.Update(tea.WindowSizeMsg{Width: 130, Height: 9})
+	updated, _ := m.Update(tea.WindowSizeMsg{Width: 160, Height: 9})
 	m = updated.(Model)
 
 	// Press down 4 times to reach index 4
@@ -3811,7 +3811,7 @@ func TestScrollUp_PastTopOfWindow(t *testing.T) {
 	m.statsRequested = false
 	m.screen = screenSelectContainers
 	m.services = mc.services
-	m.width = 130
+	m.width = 160
 	m.height = 9 // visible = 9-3-3 = 3
 	m.svcCursor = 4
 	m.svcOffset = 2
@@ -3862,7 +3862,7 @@ func TestSelectAll_DoesNotChangeOffset(t *testing.T) {
 	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
 	m.screen = screenSelectContainers
 	m.services = mc.services
-	m.width = 130
+	m.width = 160
 	m.height = 9 // visible = 3
 	m.svcCursor = 3
 	m.svcOffset = 1
@@ -3880,13 +3880,13 @@ func TestWindowResize_FixesOffset(t *testing.T) {
 	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
 	m.screen = screenSelectContainers
 	m.services = mc.services
-	m.width = 130
+	m.width = 160
 	m.height = 20 // all fit
 	m.svcCursor = 4
 	m.svcOffset = 0
 
 	// Shrink terminal
-	updated, _ := m.Update(tea.WindowSizeMsg{Width: 130, Height: 9}) // visible=3
+	updated, _ := m.Update(tea.WindowSizeMsg{Width: 160, Height: 9}) // visible=3
 	m = updated.(Model)
 
 	// cursor=4 should force offset adjustment
@@ -3903,7 +3903,7 @@ func TestViewSelectContainers_UpIndicator(t *testing.T) {
 	m.screen = screenSelectContainers
 	m.services = mc.services
 	m.svcStatus = map[string]runner.ServiceStatus{}
-	m.width = 130
+	m.width = 160
 	m.height = 9 // visible = 3
 	m.svcCursor = 3
 	m.svcOffset = 2
@@ -3921,7 +3921,7 @@ func TestViewSelectContainers_DownIndicator(t *testing.T) {
 	m.screen = screenSelectContainers
 	m.services = mc.services
 	m.svcStatus = map[string]runner.ServiceStatus{}
-	m.width = 130
+	m.width = 160
 	m.height = 9 // visible = 3
 	m.svcCursor = 0
 	m.svcOffset = 0
@@ -3959,7 +3959,7 @@ func TestViewSelectContainers_BothIndicators(t *testing.T) {
 	m.screen = screenSelectContainers
 	m.services = mc.services
 	m.svcStatus = map[string]runner.ServiceStatus{}
-	m.width = 130
+	m.width = 160
 	m.height = 9 // visible = 3
 	m.svcCursor = 2
 	m.svcOffset = 1
@@ -4000,7 +4000,7 @@ func TestViewSelectContainers_WindowedOnlyShowsVisibleServices(t *testing.T) {
 	m.screen = screenSelectContainers
 	m.services = mc.services
 	m.svcStatus = map[string]runner.ServiceStatus{}
-	m.width = 130
+	m.width = 160
 	m.height = 9 // visible = 3
 	m.svcCursor = 2
 	m.svcOffset = 1 // showing bbb, ccc, ddd
@@ -7659,7 +7659,7 @@ func TestSvcVisibleCount_withStatsColumns(t *testing.T) {
 	mc := &mockComposer{}
 	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
 	m.services = []string{"a", "b", "c", "d", "e", "f", "g", "h", "i", "j"}
-	m.width = 130
+	m.width = 160
 	m.height = 10
 	m.svcStatus = map[string]runner.ServiceStatus{
 		"a": {Running: true},
@@ -8215,5 +8215,209 @@ func TestUpdatesCacheKey_Composition(t *testing.T) {
 				t.Errorf("updatesCacheKey() = %q, want %q", got, tc.want)
 			}
 		})
+	}
+}
+
+// --- Task 6: TUI rendering tests for update-available glyph ---
+
+// trueP / falseP are tiny helpers for building *bool pointers in tri-state
+// UpdateAvailable assignments without taking the address of a literal at every
+// call site.
+func trueP() *bool  { v := true; return &v }
+func falseP() *bool { v := false; return &v }
+
+// TestViewSelectContainers_UpdateGlyphRendered verifies the U+21E7 glyph
+// appears in View() output for a service whose UpdateAvailable is &true, and
+// does NOT appear for services whose flag is &false or nil.
+func TestViewSelectContainers_UpdateGlyphRendered(t *testing.T) {
+	mc := &mockComposer{}
+	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
+	m.screen = screenSelectContainers
+	m.services = []string{"web", "db", "cache"}
+	m.svcStatus = map[string]runner.ServiceStatus{
+		"web":   {Running: true, UpdateAvailable: trueP()},
+		"db":    {Running: true, UpdateAvailable: falseP()},
+		"cache": {Running: true}, // nil = unknown, no glyph
+	}
+
+	v := m.View()
+	if !strings.Contains(v, updateGlyph) {
+		t.Errorf("View() should contain update glyph %q when a service has UpdateAvailable=&true; got:\n%s", updateGlyph, v)
+	}
+
+	// More targeted: the glyph must be on the same line as "web", not "db" or
+	// "cache". Scan per-line to assert that mapping precisely.
+	for _, line := range strings.Split(v, "\n") {
+		if strings.Contains(line, updateGlyph) {
+			if !strings.Contains(line, "web") {
+				t.Errorf("update glyph rendered on wrong line; expected on 'web' row, got: %q", line)
+			}
+			if strings.Contains(line, "db ") || strings.Contains(line, "cache") {
+				t.Errorf("update glyph leaked onto db/cache row: %q", line)
+			}
+		}
+	}
+}
+
+// TestViewSelectContainers_UpdateGlyphOnStoppedService verifies the glyph
+// shows even when the service is stopped — the indicator is about the image
+// version, not container state.
+func TestViewSelectContainers_UpdateGlyphOnStoppedService(t *testing.T) {
+	mc := &mockComposer{}
+	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
+	m.screen = screenSelectContainers
+	m.services = []string{"web"}
+	m.svcStatus = map[string]runner.ServiceStatus{
+		"web": {Running: false, UpdateAvailable: trueP()},
+	}
+
+	v := m.View()
+	if !strings.Contains(v, updateGlyph) {
+		t.Errorf("View() should contain update glyph for stopped service with UpdateAvailable=&true; got:\n%s", v)
+	}
+}
+
+// TestViewSelectContainers_UpdateAlignment_PreservesColumns verifies that
+// when ANY service in the rendered list has an available update, the name
+// column is widened by 2 cells for ALL rows — so any following column
+// (Created/Uptime) stays put across rows that have/lack the glyph.
+func TestViewSelectContainers_UpdateAlignment_PreservesColumns(t *testing.T) {
+	mc := &mockComposer{}
+	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
+	m.screen = screenSelectContainers
+	m.services = []string{"web", "db", "cache"}
+	m.svcStatus = map[string]runner.ServiceStatus{
+		// Created/Uptime are present so the Created column renders, giving us
+		// a stable column to align against.
+		"web":   {Running: true, Created: "2024-01-15 09:30", Uptime: "3h", UpdateAvailable: trueP()},
+		"db":    {Running: true, Created: "2024-01-15 09:30", Uptime: "3h"},
+		"cache": {Running: true, Created: "2024-01-15 09:30", Uptime: "3h"},
+	}
+
+	v := m.View()
+	lines := strings.Split(v, "\n")
+
+	// Compare each row's Created-column position by *display cells* (rune
+	// count of the ANSI-stripped prefix up to the date). Byte-indexing would
+	// be off by 2 for the row with the glyph since U+21E7 is 3 bytes / 1
+	// cell — the very mismatch this column padding is designed to compensate
+	// for.
+	stripped := map[string]int{}
+	ansi := regexp.MustCompile(`\x1b\[[0-9;]*m`)
+	for _, line := range lines {
+		clean := ansi.ReplaceAllString(line, "")
+		for _, svc := range m.services {
+			if !strings.Contains(clean, svc) || !strings.Contains(clean, "2024-01-15") {
+				continue
+			}
+			byteIdx := strings.Index(clean, "2024-01-15")
+			stripped[svc] = utf8.RuneCountInString(clean[:byteIdx])
+		}
+	}
+	if len(stripped) != 3 {
+		t.Fatalf("ANSI-stripped scan should find all 3 rows, got %d: %+v", len(stripped), stripped)
+	}
+	webCol := stripped["web"]
+	dbCol := stripped["db"]
+	cacheCol := stripped["cache"]
+	if webCol != dbCol || dbCol != cacheCol {
+		t.Errorf("Created column misalignment: web=%d db=%d cache=%d (must be equal — glyph reservation should pad non-glyph rows)", webCol, dbCol, cacheCol)
+	}
+}
+
+// TestViewSelectContainers_HelpFooterIncludesUpdates verifies the `U updates`
+// token is present in the footer on the container-select screen.
+func TestViewSelectContainers_HelpFooterIncludesUpdates(t *testing.T) {
+	mc := &mockComposer{}
+	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
+	m.screen = screenSelectContainers
+	m.services = []string{"web"}
+	m.svcStatus = map[string]runner.ServiceStatus{"web": {Running: true}}
+	m.width = 200 // comfortably wide so one-line help fits
+	m.height = 24
+
+	v := m.View()
+	if !strings.Contains(v, "U updates") {
+		t.Errorf("View() footer should contain 'U updates' token; got:\n%s", v)
+	}
+}
+
+// TestViewSelectContainers_SoftWarningPriority_StatsBeatsUpdates verifies
+// that when both statsErr and updatesErr are set, statsErr wins the
+// soft-warning slot and the updates warning does NOT appear.
+func TestViewSelectContainers_SoftWarningPriority_StatsBeatsUpdates(t *testing.T) {
+	mc := &mockComposer{}
+	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
+	m.screen = screenSelectContainers
+	m.services = []string{"web"}
+	m.svcStatus = map[string]runner.ServiceStatus{"web": {Running: true}}
+	m.width = 200
+	m.height = 24
+	m.statsErr = errors.New("stats boom")
+	m.updatesErr = "updates boom"
+
+	v := m.View()
+	if !strings.Contains(v, "Stats unavailable") || !strings.Contains(v, "stats boom") {
+		t.Errorf("View() should show statsErr warning when both errors are set; got:\n%s", v)
+	}
+	if strings.Contains(v, "updates: updates boom") {
+		t.Errorf("View() should NOT show updatesErr warning when statsErr is set; got:\n%s", v)
+	}
+}
+
+// TestViewSelectContainers_SoftWarningPriority_UpdatesAloneShown verifies
+// that updatesErr renders in the warning slot when statsErr is empty.
+func TestViewSelectContainers_SoftWarningPriority_UpdatesAloneShown(t *testing.T) {
+	mc := &mockComposer{}
+	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
+	m.screen = screenSelectContainers
+	m.services = []string{"web"}
+	m.svcStatus = map[string]runner.ServiceStatus{"web": {Running: true}}
+	m.width = 200
+	m.height = 24
+	m.statsErr = nil
+	m.updatesErr = "registry timeout"
+
+	v := m.View()
+	if !strings.Contains(v, "updates: registry timeout") {
+		t.Errorf("View() should show updatesErr warning when statsErr is empty; got:\n%s", v)
+	}
+}
+
+// TestViewSelectContainers_NoGlyph_NoReservation verifies that when NO service
+// has an update available, the name column is NOT padded by 2 extra cells —
+// alignment math should be identical to the pre-feature baseline.
+func TestViewSelectContainers_NoGlyph_NoReservation(t *testing.T) {
+	mc := &mockComposer{}
+	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
+	m.screen = screenSelectContainers
+	m.services = []string{"web", "db"}
+	m.svcStatus = map[string]runner.ServiceStatus{
+		// All UpdateAvailable=nil → no glyph, no reservation.
+		"web": {Running: true, Created: "2024-01-15 09:30"},
+		"db":  {Running: true, Created: "2024-01-15 09:30"},
+	}
+
+	v := m.View()
+	if strings.Contains(v, updateGlyph) {
+		t.Errorf("View() should NOT contain update glyph when no service has UpdateAvailable=&true; got:\n%s", v)
+	}
+	// Sanity check that rows still align (the Created column starts at the
+	// same offset). Without the reservation, the maxName is exactly the
+	// longest service-name length (3 for "web", 2 for "db" → maxName=3).
+	ansi := regexp.MustCompile(`\x1b\[[0-9;]*m`)
+	cols := map[string]int{}
+	for _, line := range strings.Split(v, "\n") {
+		clean := ansi.ReplaceAllString(line, "")
+		for _, svc := range m.services {
+			if !strings.Contains(clean, svc) || !strings.Contains(clean, "2024-01-15") {
+				continue
+			}
+			byteIdx := strings.Index(clean, "2024-01-15")
+			cols[svc] = utf8.RuneCountInString(clean[:byteIdx])
+		}
+	}
+	if cols["web"] != cols["db"] {
+		t.Errorf("Created column misalignment without glyph: web=%d db=%d", cols["web"], cols["db"])
 	}
 }

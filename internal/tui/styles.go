@@ -61,6 +61,13 @@ var (
 	warningStyle = lipgloss.NewStyle().
 			Foreground(lipgloss.Color("3"))
 
+	// updateGlyphStyle paints the update-available glyph (rendered after
+	// the service name on the container-select screen and in CLI list output)
+	// in the same yellow used for warnings — it is a soft, attention-drawing
+	// signal, not an error.
+	updateGlyphStyle = lipgloss.NewStyle().
+				Foreground(lipgloss.Color("3"))
+
 	helpStyle = lipgloss.NewStyle().
 			Foreground(lipgloss.Color("8")).
 			MarginTop(1)

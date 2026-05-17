@@ -33,6 +33,14 @@ const statsRefreshInterval = 5 * time.Second
 // user re-enters the container screen repeatedly during a deploy session".
 const updatesCacheTTL = 10 * time.Minute
 
+// updateGlyph is the rune appended after a service name when an update is
+// available in the registry. U+21E7 "Upwards White Arrow" — visually
+// distinct from the status dot, easy to spot, narrow enough to keep the
+// column alignment math simple (one display cell). Rendered in yellow via
+// updateGlyphStyle; reused by tests so the assertions stay in sync with
+// rendering if the rune ever changes.
+const updateGlyph = "⇧"
+
 // ConfigProvider provides access to docker-compose configuration files.
 // Defined in the tui package (not runner) because it returns *exec.Cmd and
 // is TUI-only. Both Compose and RemoteCompose implement it.
@@ -1926,6 +1934,10 @@ func (m Model) hasStatusColumns() bool {
 			if st.Created != "" || st.Uptime != "" || len(st.Ports) > 0 {
 				return true
 			}
+			// An available update on its own should not change the header-line
+			// count (it's rendered inline next to the name, not as a separate
+			// column). The Service captions row is governed by the other
+			// columns; if none of those are present, no captions row is shown.
 		}
 		if _, ok := m.stats[svc]; ok {
 			if m.svcStatus[svc].Running {
@@ -1964,7 +1976,7 @@ func (m Model) svcVisibleCount() int {
 			back = "q back"
 		}
 		line1 := fmt.Sprintf("  space toggle  •  a all  •  %s", back)
-		line2 := "  r restart  •  d deploy  •  s stop  •  l logs  •  c config  •  x exec"
+		line2 := "  r restart  •  d deploy  •  s stop  •  l logs  •  c config  •  x exec  •  U updates"
 		oneLine := line1 + "  •  " + line2[2:]
 		if m.width >= len(oneLine)+2 {
 			// helpStyle MarginTop (1) + gap-or-indicator (1) + one help line (1) = 3
@@ -1976,8 +1988,12 @@ func (m Model) svcVisibleCount() int {
 		if m.warning != "" {
 			footerLines++ // warning line
 		}
-		if m.statsErr != nil {
-			footerLines++ // soft-fail stats error line
+		// Soft-warning slot priority: svcErr > statsErr > updatesErr. svcErr
+		// early-returns from the renderer so it doesn't appear here; statsErr
+		// and updatesErr are mutually exclusive in the renderer too, so the
+		// footer reserves at most one line for the active warning.
+		if m.statsErr != nil || m.updatesErr != "" {
+			footerLines++ // soft-fail warning line
 		}
 	}
 
@@ -2342,6 +2358,7 @@ func (m Model) viewSelectContainers() string {
 	maxCPU := 0
 	maxMem := 0
 	maxPorts := 0
+	hasUpdates := false
 	portsStr := make(map[string]string, len(m.services))
 	cpuStr := make(map[string]string, len(m.services))
 	memStr := make(map[string]string, len(m.services))
@@ -2361,6 +2378,9 @@ func (m Model) viewSelectContainers() string {
 			if w := utf8.RuneCountInString(s); w > maxPorts {
 				maxPorts = w
 			}
+			if st.UpdateAvailable != nil && *st.UpdateAvailable {
+				hasUpdates = true
+			}
 		}
 		if stx, ok := m.stats[svc]; ok {
 			// Only running services get stats cells; stopped containers leave blanks.
@@ -2378,6 +2398,17 @@ func (m Model) viewSelectContainers() string {
 				}
 			}
 		}
+	}
+
+	// Reserve 2 trailing cells in the name column whenever any service in the
+	// rendered list has an available update — one for the leading space, one
+	// for the U+21E7 glyph. Reserving unconditionally (rather than per-row)
+	// keeps following columns from shifting if a service's UpdateAvailable
+	// flips mid-poll. Services without updates pad to the same width with
+	// plain spaces; services with updates render `name + " " + glyph` and pad
+	// any remaining slack so the column edge stays put for longer names.
+	if hasUpdates {
+		maxName += 2
 	}
 
 	// Reserve fixed minimum widths for CPU/Mem columns as soon as stats have
@@ -2481,7 +2512,21 @@ func (m Model) viewSelectContainers() string {
 		}
 
 		// Build line: cursor + checkbox + health + dot + name [+ created] [+ uptime] [+ cpu] [+ mem] [+ ports]
-		line := fmt.Sprintf("%s%s %s %s %-*s", cursor, checkbox, health, dot, maxName, svc)
+		// nameCell is padded manually rather than via %-*s so styled glyphs
+		// (whose ANSI escapes don't count as display width) line up correctly.
+		// utf8.RuneCountInString approximates display width for the glyph
+		// because it occupies one terminal cell (U+21E7) — matches the +2
+		// reservation logic above.
+		nameWidth := utf8.RuneCountInString(svc)
+		nameCell := svc
+		if st.UpdateAvailable != nil && *st.UpdateAvailable {
+			nameCell = svc + " " + updateGlyphStyle.Render(updateGlyph)
+			nameWidth += 2 // space + glyph cell
+		}
+		if pad := maxName - nameWidth; pad > 0 {
+			nameCell += strings.Repeat(" ", pad)
+		}
+		line := fmt.Sprintf("%s%s %s %s %s", cursor, checkbox, health, dot, nameCell)
 		if maxCreated > 0 {
 			line += fmt.Sprintf("  %-*s", maxCreated, st.Created)
 		}
@@ -2538,25 +2583,33 @@ func (m Model) viewSelectContainers() string {
 		if m.warning != "" {
 			b.WriteString("\n  " + warningStyle.Render(m.warning))
 		}
-		// statsErr renders in the same slot as svcErr — but svcErr early-returns
-		// above, so when both are set svcErr always wins. statsErr is soft-fail:
-		// services and status still render; only the CPU/Mem cells go blank.
-		if m.statsErr != nil {
+		// Soft-warning slot priority: svcErr > statsErr > updatesErr.
+		// svcErr early-returns from the renderer above, so when both are set
+		// svcErr always wins. statsErr and updatesErr are mutually exclusive
+		// here — at most one is shown so the line count stays predictable
+		// (svcVisibleCount accounts for at most one extra footer line).
+		warnRendered := false
+		switch {
+		case m.statsErr != nil:
 			b.WriteString("\n  " + warningStyle.Render(fmt.Sprintf("Stats unavailable: %v", m.statsErr)))
+			warnRendered = true
+		case m.updatesErr != "":
+			b.WriteString("\n  " + warningStyle.Render(fmt.Sprintf("updates: %s", m.updatesErr)))
+			warnRendered = true
 		}
 		back := "q quit"
 		if m.showPicker {
 			back = "q back"
 		}
 		line1 := fmt.Sprintf("  space toggle  •  a all  •  %s", back)
-		line2 := "  r restart  •  d deploy  •  s stop  •  l logs  •  c config  •  x exec"
+		line2 := "  r restart  •  d deploy  •  s stop  •  l logs  •  c config  •  x exec  •  U updates"
 		oneLine := line1 + "  •  " + line2[2:]
 		gap := "\n"
 		// Skip the leading newline only when the "▼ N more" indicator is the
 		// last thing rendered — both the warning and statsErr branches above
 		// already prepend their own newline, so a "" gap there would glue the
 		// help text onto the warning line.
-		if below > 0 && m.warning == "" && m.statsErr == nil {
+		if below > 0 && m.warning == "" && !warnRendered {
 			gap = ""
 		}
 		if m.width >= len(oneLine)+2 {
