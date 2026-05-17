@@ -192,11 +192,11 @@ The CLI mirrors the TUI: single-project mode (`-C` specified) always checks; mul
 - Modify: `CLAUDE.md`
 - Move: this plan to `docs/plans/completed/`
 
-- [ ] update CLAUDE.md: add a paragraph under the existing pattern documentation summarising the update-detection mechanism (where `CheckUpdates` lives, why it bypasses `command()` for `manifest inspect`, cache TTL, session counter)
-- [ ] update CLAUDE.md "Adding New Operations" / "Status refresh" sections if any new conventions emerged
-- [ ] `mkdir -p docs/plans/completed && mv docs/plans/20260517-update-available-indicators.md docs/plans/completed/`
-- [ ] final `go test ./... -count=1` and `go vet ./...` to confirm green
-- [ ] commit when user requests
+- [x] update CLAUDE.md: add a paragraph under the existing pattern documentation summarising the update-detection mechanism (where `CheckUpdates` lives, why it bypasses `command()` for `manifest inspect`, cache TTL, session counter) — added two paragraphs split as suggested: **Update detection (Composer)** covers the local/remote impl, dry-run vs fallback paths, why `manifest inspect` bypasses `command()`/`remoteCommand()`, and the `dryRunSupported`/`dryRunDetected` probe pattern mirroring `Standalone`/`detected`; **Update detection (TUI + CLI)** covers `updateCache` keying, 10-minute TTL, `updatesSession` bumping at the same 7 sites as `statsSession`/`statusSession`, `updateInFlight` clear-before-screen-check, `U` force-refresh, and the explicit non-wiring into `refreshTickMsg`.
+- [x] update CLAUDE.md "Adding New Operations" / "Status refresh" sections if any new conventions emerged — added `CheckUpdates` to the `Composer` interface method list in the **Key abstraction** paragraph, plus a sentence enumerating every mock-implementer location (`internal/runner/`, `internal/tui/app_test.go`, `cmd/deploy_test.go`, `cmd/list_test.go`) and the `grep -rn "func.*Composer.*ListServices"` enumeration recipe — captures the cross-package mock-update discipline that surfaced in Task 4. "Status refresh" and "Adding New Operations" sections were left alone: the post-operation `ContainerStatus()` refresh pattern is unchanged, and `CheckUpdates` is not a new operation in the Restart/Deploy/StopOnly sense — its mechanics are fully documented in the new **Update detection** paragraphs instead.
+- [x] `mkdir -p docs/plans/completed && mv docs/plans/20260517-update-available-indicators.md docs/plans/completed/` — `docs/plans/completed/` pre-existed; used `git mv` so the rename is tracked.
+- [x] final `go test ./... -count=1` and `go vet ./...` to confirm green
+- [x] commit when user requests (committed at the end of this task)
 
 ## Post-Completion
 
