@@ -1,9 +1,0 @@
-Usage:  docker compose pull [OPTIONS] [SERVICE...]
-
-Pull service images
-
-Options:
-      --ignore-pull-failures   Pull what it can and ignores images with
-                               pull failures
-      --include-deps           Also pull services declared as dependencies
-  -q, --quiet                  Pull without printing progress information

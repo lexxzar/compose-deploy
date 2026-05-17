@@ -22,13 +22,6 @@ var (
 	listHasCompose = compose.HasComposeFile
 )
 
-// updateGlyph is the rune appended after a service name when an update is
-// available. U+21E7 (UPWARDS WHITE ARROW). Mirrors the TUI rendering so a
-// user moving between `cdeploy list` and the TUI sees the same indicator.
-// The +2-cell column reservation in formatDots/formatDotsGrouped accounts
-// for a leading space + the single-cell glyph.
-const updateGlyph = "⇧"
-
 type serviceStatus struct {
 	Project string        `json:"project,omitempty"`
 	Name    string        `json:"service"`
@@ -225,7 +218,7 @@ func formatDots(items []serviceStatus) string {
 		nameWidth := utf8.RuneCountInString(item.Name)
 		nameCell := item.Name
 		if item.UpdateAvailable != nil && *item.UpdateAvailable {
-			nameCell = item.Name + " " + styleWarning.Render(updateGlyph)
+			nameCell = item.Name + " " + styleWarning.Render(compose.UpdateGlyph)
 			nameWidth += 2 // space + glyph cell
 		}
 		if pad := maxName - nameWidth; pad > 0 {
@@ -332,7 +325,7 @@ func formatDotsGrouped(projects []projectServices) string {
 			nameWidth := utf8.RuneCountInString(item.Name)
 			nameCell := item.Name
 			if item.UpdateAvailable != nil && *item.UpdateAvailable {
-				nameCell = item.Name + " " + styleWarning.Render(updateGlyph)
+				nameCell = item.Name + " " + styleWarning.Render(compose.UpdateGlyph)
 				nameWidth += 2
 			}
 			if pad := maxName - nameWidth; pad > 0 {

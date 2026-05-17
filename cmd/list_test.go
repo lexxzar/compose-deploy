@@ -2689,17 +2689,17 @@ func TestFormatDots_UpdateGlyphRendered(t *testing.T) {
 	}
 
 	out := formatDots(items)
-	if !strings.Contains(out, updateGlyph) {
-		t.Errorf("output should contain update glyph %q when a service has UpdateAvailable=&true; got:\n%s", updateGlyph, out)
+	if !strings.Contains(out, compose.UpdateGlyph) {
+		t.Errorf("output should contain update glyph %q when a service has UpdateAvailable=&true; got:\n%s", compose.UpdateGlyph, out)
 	}
 
 	lines := strings.Split(out, "\n")
 	for _, line := range lines {
 		// Only the "web" line should carry the glyph — db (&false) and cache (nil) must not.
-		if strings.Contains(line, "db") && strings.Contains(line, updateGlyph) {
+		if strings.Contains(line, "db") && strings.Contains(line, compose.UpdateGlyph) {
 			t.Errorf("db (&false) must not show update glyph, got: %q", line)
 		}
-		if strings.Contains(line, "cache") && strings.Contains(line, updateGlyph) {
+		if strings.Contains(line, "cache") && strings.Contains(line, compose.UpdateGlyph) {
 			t.Errorf("cache (nil) must not show update glyph, got: %q", line)
 		}
 	}
@@ -2714,7 +2714,7 @@ func TestFormatDots_UpdateGlyphOnStoppedService(t *testing.T) {
 	}
 
 	out := formatDots(items)
-	if !strings.Contains(out, updateGlyph) {
+	if !strings.Contains(out, compose.UpdateGlyph) {
 		t.Errorf("output should contain update glyph for stopped service with UpdateAvailable=&true; got:\n%s", out)
 	}
 }
@@ -2767,7 +2767,7 @@ func TestFormatDots_NoUpdateNoReservation(t *testing.T) {
 	}
 
 	out := formatDots(items)
-	if strings.Contains(out, updateGlyph) {
+	if strings.Contains(out, compose.UpdateGlyph) {
 		t.Errorf("output must not contain update glyph when no service has UpdateAvailable=&true, got:\n%s", out)
 	}
 
@@ -2804,7 +2804,7 @@ func TestFormatDotsGrouped_UpdateGlyphRendered(t *testing.T) {
 	}
 
 	out := formatDotsGrouped(projects)
-	if !strings.Contains(out, updateGlyph) {
+	if !strings.Contains(out, compose.UpdateGlyph) {
 		t.Errorf("grouped output should contain update glyph, got:\n%s", out)
 	}
 }
@@ -2854,7 +2854,7 @@ func TestListCmd_singleProjectUpdatesFailure(t *testing.T) {
 		t.Errorf("stdout missing service name on updates fail, got: %q", stdout)
 	}
 	// No glyph since update unknown.
-	if strings.Contains(stdout, updateGlyph) {
+	if strings.Contains(stdout, compose.UpdateGlyph) {
 		t.Errorf("stdout must not contain update glyph on updates fail, got: %q", stdout)
 	}
 }

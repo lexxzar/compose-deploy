@@ -33,13 +33,18 @@ const statsRefreshInterval = 5 * time.Second
 // user re-enters the container screen repeatedly during a deploy session".
 const updatesCacheTTL = 10 * time.Minute
 
-// updateGlyph is the rune appended after a service name when an update is
-// available in the registry. U+21E7 "Upwards White Arrow" — visually
-// distinct from the status dot, easy to spot, narrow enough to keep the
-// column alignment math simple (one display cell). Rendered in yellow via
-// updateGlyphStyle; reused by tests so the assertions stay in sync with
-// rendering if the rune ever changes.
-const updateGlyph = "⇧"
+// updatesErrorTTL is the short cache window for FAILED CheckUpdates fetches.
+// A failure cache entry suppresses retries for this window so a persistent
+// fault (SSH dead, registry down, auth issue) cannot drive a 5-second
+// refetch loop via the statusMsg self-heal — every 5s tick would otherwise
+// see an empty cache, queue a refresh, fail, repeat (10-min lingering user
+// generates ~120 doomed CheckUpdates attempts × all services).
+//
+// The shorter TTL (vs updatesCacheTTL) preserves the "transient errors clear
+// quickly" property: after a 30s blip the next screen activity refetches,
+// instead of waiting the full 10-min success TTL. Bumped via context-change
+// session resets and U keypress just like success entries.
+const updatesErrorTTL = 30 * time.Second
 
 // ConfigProvider provides access to docker-compose configuration files.
 // Defined in the tui package (not runner) because it returns *exec.Cmd and
@@ -319,14 +324,39 @@ type statsMsg struct {
 	session uint64
 }
 
-// updateEntry holds one cached CheckUpdates result. err is captured so we can
-// re-surface the soft-warning slot when re-entering the screen within TTL
-// rather than silently hiding the prior failure. results is a partial map
+// updateEntry holds one cached CheckUpdates result. results is a partial map
 // (services with verdicts only) — absent services are tri-state "unknown".
+//
+// Errors ARE cached, but with a much shorter TTL (updatesErrorTTL ~30s vs.
+// updatesCacheTTL 10m). The error entry has results=nil and err=true. This
+// gives us two properties at once:
+//
+//  1. No 5-second tight retry loop on persistent failure. Without the cached
+//     failure, every 5s statusMsg tick would self-heal: empty cache →
+//     queue refresh → fail → empty cache → repeat. On a slow remote SSH hop
+//     or a Docker Hub outage that's ~120 failed CheckUpdates attempts in 10
+//     minutes (multiplied by services per project), hammering the registry.
+//
+//  2. Transient errors clear quickly. After ~30s the cache entry ages out
+//     and the next screen activity (or self-heal) refetches — much sooner
+//     than the 10-minute success TTL.
+//
+// A new error entry also overwrites any prior successful entry for the same
+// key (don't trust stale success once the latest refresh disagreed). The
+// hydration paths (servicesMsg / statusMsg cache-replay) check err and skip
+// hydration for failure entries, so cached failures never paint glyphs.
 type updateEntry struct {
 	fetchedAt time.Time
 	results   map[string]bool
-	err       error
+	err       bool
+	// errMsg is the original error text from CheckUpdates. It's only set when
+	// err == true. Stored alongside the failure flag so cache-hit paths
+	// (maybeRefreshUpdatesCmd, servicesMsg/statusMsg cache replays) can
+	// restore m.updatesErr on re-entry within updatesErrorTTL — otherwise a
+	// user who navigates away from the container screen and back (which
+	// clears updatesErr) would see blank glyphs with no warning, even though
+	// the system knows the data is stale-bad.
+	errMsg string
 }
 
 // updatesMsg carries the result of a refreshUpdates fetch. session is
@@ -562,9 +592,17 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.svcOffset = 0
 		// Re-apply any cached update verdicts so cached glyphs survive the
 		// status-map overwrite. Race-safe regardless of whether the synthetic
-		// cache-hit updatesMsg arrives before or after this messsage.
-		if entry, fresh := m.updatesCacheLookup(); fresh && entry.results != nil {
-			m.hydrateUpdates(entry.results)
+		// cache-hit updatesMsg arrives before or after this messsage. On a
+		// fresh CACHED FAILURE entry (within updatesErrorTTL) restore the
+		// warning text from the cache too — otherwise periodic re-entries
+		// or initial-load arrivals would silently drop the soft warning
+		// while the same failure is still known-bad.
+		if entry, fresh := m.updatesCacheLookup(); fresh {
+			if entry.err {
+				m.updatesErr = entry.errMsg
+			} else if entry.results != nil {
+				m.hydrateUpdates(entry.results)
+			}
 		}
 		return m, nil
 
@@ -584,10 +622,30 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.svcStatus = msg.status
 		// Re-apply cached update verdicts (status fetch wipes UpdateAvailable
 		// fields when overwriting the map). Same rationale as servicesMsg.
-		if entry, fresh := m.updatesCacheLookup(); fresh && entry.results != nil {
-			m.hydrateUpdates(entry.results)
+		// On a fresh CACHED FAILURE entry (within updatesErrorTTL) restore
+		// the warning text so the periodic status tick doesn't silently
+		// drop the soft warning while the same failure is still known-bad.
+		entry, fresh := m.updatesCacheLookup()
+		if fresh {
+			if entry.err {
+				m.updatesErr = entry.errMsg
+			} else if entry.results != nil {
+				m.hydrateUpdates(entry.results)
+			}
 		}
 		m.fixSvcOffset()
+		// Self-heal: if no fresh cache entry exists (TTL expired or never
+		// fetched) and no refreshUpdates is in flight, queue a fresh fetch.
+		// Without this, a user who lingers on the container screen past the
+		// TTL window would see update glyphs vanish silently on the next
+		// periodic statusMsg — the overwrite above wipes UpdateAvailable
+		// and the cache lookup misses, so nothing replaces them. Mirror
+		// maybeRefreshUpdatesCmd's in-flight guard discipline so we never
+		// stack a second fetch.
+		if !fresh && !m.updateInFlight && m.composer != nil {
+			m.updateInFlight = true
+			return m, m.refreshUpdates()
+		}
 		return m, nil
 
 	case statsMsg:
@@ -622,37 +680,115 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case updatesMsg:
-		// Stale-session responses are unconditionally dropped; the bump at
-		// the context-change site already reset updateInFlight.
+		// Clear the in-flight guard FIRST — before BOTH the session check
+		// and the screen check. Two scenarios motivate clearing on stale
+		// arrivals as well as current ones:
+		//   (a) Off-screen current-session: the user opened logs/config/
+		//       progress while the fetch was pending. The response arrives
+		//       off-screen; without clearing first, the guard would stick
+		//       on, silently blocking the next maybeRefreshUpdatesCmd /
+		//       U keypress when the user returns to the container screen.
+		//   (b) Stale session: the user pressed U (in-flight=true),
+		//       navigated away, and the bump moved the session forward.
+		//       The original fetch returns with the OLD session; without
+		//       clearing first, the guard stays on forever — every
+		//       subsequent U keypress is silently swallowed by its own
+		//       in-flight guard, and maybeRefreshUpdatesCmd on cache hits
+		//       skips the fetch too. Clearing on any arrival is safe
+		//       because the cache write below is still gated on session
+		//       match (so stale results don't pollute the cache), and the
+		//       new-context handler that bumped the session also fires its
+		//       own refreshUpdates (which sets the flag back to true if a
+		//       new fetch is actually in flight). Worst case: a stale
+		//       arrival clears the flag while a new fetch is also pending
+		//       — then a U keypress could stack a second fetch, which is
+		//       wasteful but harmless (session check still drops the
+		//       stale one).
+		m.updateInFlight = false
 		if msg.session != m.updatesSession {
 			return m, nil
 		}
-		// Clear the in-flight guard FIRST, before the screen check — same
-		// reason as statsMsg / refreshInFlight: if the user opened logs/
-		// config/progress while the fetch was pending, the response arrives
-		// off-screen and the guard would otherwise be stuck on.
-		m.updateInFlight = false
-		// Always write to the cache (even on error) so the next screen entry
-		// within TTL doesn't immediately re-fetch. Errors propagate to the
-		// soft-warning slot when the user is on the container screen.
+		// Cache BOTH successful results and failures, with different TTLs.
+		// Success entries live for updatesCacheTTL (10m); failure entries
+		// for updatesErrorTTL (~30s). A new entry always overwrites the
+		// prior one for the same key — a fresh failure evicts a stale
+		// success (don't trust outdated verdicts the latest refresh
+		// disagreed with), and a fresh success replaces a cached failure.
+		//
+		// Caching failures (with a short TTL) prevents the 5-second tight
+		// retry loop that would otherwise emerge from the statusMsg
+		// self-heal: every 5s tick → empty cache → queue refresh → fail
+		// → empty cache → repeat. With a short-TTL failure entry, the
+		// self-heal sees a "fresh" hit and skips the refetch until the
+		// 30s window expires, at which point a retry is appropriate.
 		key := m.updatesCacheKey()
 		if m.updateCache == nil {
 			m.updateCache = make(map[string]updateEntry)
 		}
-		m.updateCache[key] = updateEntry{
-			fetchedAt: time.Now(),
-			results:   msg.results,
-			err:       msg.err,
+		if msg.err == nil {
+			m.updateCache[key] = updateEntry{
+				fetchedAt: time.Now(),
+				results:   msg.results,
+			}
+		} else {
+			m.updateCache[key] = updateEntry{
+				fetchedAt: time.Now(),
+				results:   nil,
+				err:       true,
+				errMsg:    msg.err.Error(),
+			}
 		}
-		if m.screen != screenSelectContainers {
-			return m, nil
-		}
+		// State mutations below happen regardless of which screen the user is
+		// on: m.svcStatus is the source of truth that the next entry to
+		// screenSelectContainers (re-)renders from, so leaving stale
+		// UpdateAvailable glyphs in it during an off-screen window would let
+		// them resurface when the user returns — e.g. from the config screen,
+		// which is read-only and does NOT trigger refreshStatus, so nothing
+		// downstream would clear them. Similarly updatesErr must be set
+		// off-screen so the soft warning is in place the moment the user
+		// returns. Only fixSvcOffset is screen-coupled (it touches scroll
+		// offsets only meaningful while the container list is rendered).
 		if msg.err != nil {
 			m.updatesErr = msg.err.Error()
+			// Clear UpdateAvailable for every service: when the latest
+			// fetch failed we can't trust ANY of the previous verdicts
+			// (the registry/SSH path is broken). Leaving stale glyphs
+			// alongside the "updates unavailable" warning is confusing
+			// — the soft warning says "data is bad" while the glyphs
+			// say "here's the data." Discarding partial verdicts on
+			// error matches the runner.Composer contract.
+			for svc, st := range m.svcStatus {
+				st.UpdateAvailable = nil
+				m.svcStatus[svc] = st
+			}
+			// Setting updatesErr adds a soft-warning footer line, which
+			// shrinks svcVisibleCount() by one. If the cursor was sitting
+			// at the previously-last-visible row, it now falls outside the
+			// window. Call fixSvcOffset off-screen too — the helper only
+			// touches svcOffset based on svcCursor/services/visibleCount,
+			// none of which are screen-coupled — so the user returns to a
+			// correctly-scrolled list instead of an off-screen cursor that
+			// only snaps back on the next keypress. The config screen path
+			// is the worst case (no refreshStatus on return).
+			m.fixSvcOffset()
 			return m, nil
 		}
 		m.updatesErr = ""
+		// Fresh successful refresh: clear UpdateAvailable for every service
+		// in svcStatus BEFORE hydrating so verdicts the new result omits
+		// (build-only this time, failed lookup, removed from compose) lose
+		// their stale glyph. Cache-replay paths in servicesMsg/statusMsg
+		// stay purely additive — they're not introducing new data, just
+		// preserving existing verdicts across a status-map overwrite.
+		for svc, st := range m.svcStatus {
+			st.UpdateAvailable = nil
+			m.svcStatus[svc] = st
+		}
 		m.hydrateUpdates(msg.results)
+		// Clearing updatesErr (when previously set) frees a footer line and
+		// grows svcVisibleCount() by one. Run fixSvcOffset unconditionally
+		// — also covers the symmetric off-screen success case, and the
+		// helper is a cheap clamp when nothing actually changed.
 		m.fixSvcOffset()
 		return m, nil
 
@@ -694,13 +830,29 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.projectsSession++
 			m.disconnectFunc = nil
 			m.quitting = false
+			// Clear ALL transient state from the failed connect attempt: name,
+			// host, color, and update-detection flags. Without these, a
+			// subsequent connect attempt to a different server would inherit
+			// stale serverName (used in updatesCacheKey) and a leaked
+			// updateInFlight that would suppress the next periodic refresh.
+			m.serverName = ""
 			m.serverHost = ""
 			m.serverColor = ""
+			m.updatesErr = ""
+			m.updateInFlight = false
 			return m, nil
 		}
 		m.serverErr = nil
 		m.showPicker = true
 		m.screen = screenSelectProject
+		// Note: only projectsSession is bumped here (above, via the no-op
+		// initial reset). statsSession / statusSession / updatesSession are
+		// intentionally NOT bumped at this site because the user has not yet
+		// entered a context that uses those counters — m.composer is still
+		// nil until a project is picked. The bumps for those three counters
+		// happen at the project-pick handler (below) where m.composer is
+		// swapped in, matching the "session is bumped at every site that
+		// swaps the resource the counter guards" discipline.
 		return m, m.loadProjects()
 
 	case disconnectDoneMsg:
@@ -809,6 +961,11 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.updatesSession++
 		m.statsRequested = true
 		m.refreshInFlight = true
+		// Reset updateInFlight before calling maybeRefreshUpdatesCmd: the
+		// session bump above invalidates any pending updatesMsg, so the
+		// guard inside maybeRefreshUpdatesCmd must not refuse to fire a
+		// fresh fetch just because a now-stale fetch is still in flight.
+		m.updateInFlight = false
 		cmds := []tea.Cmd{m.refreshStatus(), m.refreshStats()}
 		if c := m.maybeRefreshUpdatesCmd(); c != nil {
 			cmds = append(cmds, c)
@@ -917,6 +1074,15 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 				m.projectsSession++
 				m.disconnectFunc = nil
 				m.quitting = false
+				// Explicit cleanup for downstream state from any previous
+				// server selection — per CLAUDE.md "Backward-navigation state
+				// cleanup" discipline. projDir/projName feed the updatesCache
+				// key, so leaving stale values would lookup the wrong cache
+				// slot. updatesErr left over from a prior remote session
+				// would leak into the local view's soft-warning slot.
+				m.projDir = ""
+				m.projName = ""
+				m.updatesErr = ""
 				if m.localComposer != nil {
 					m.composer = m.localComposer
 					m.statsSession++
@@ -924,6 +1090,13 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 					m.updatesSession++
 					m.statsRequested = true
 					m.refreshInFlight = true
+					// Reset updateInFlight before calling
+					// maybeRefreshUpdatesCmd: the session bump above
+					// invalidates any pending updatesMsg, so the guard
+					// inside maybeRefreshUpdatesCmd must not refuse to fire
+					// a fresh fetch just because a now-stale fetch is still
+					// in flight.
+					m.updateInFlight = false
 					m.showPicker = true
 					m.screen = screenSelectContainers
 					cmds := []tea.Cmd{m.loadServices(), m.refreshStats()}
@@ -1019,6 +1192,11 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.updatesSession++
 			m.statsRequested = true
 			m.refreshInFlight = true
+			// Reset updateInFlight before calling maybeRefreshUpdatesCmd: the
+			// session bump above invalidates any pending updatesMsg, so the
+			// guard inside maybeRefreshUpdatesCmd must not refuse to fire a
+			// fresh fetch just because a now-stale fetch is still in flight.
+			m.updateInFlight = false
 			m.screen = screenSelectContainers
 			cmds := []tea.Cmd{m.loadServices(), m.refreshStats()}
 			if c := m.maybeRefreshUpdatesCmd(); c != nil {
@@ -1154,6 +1332,13 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			if m.composer == nil {
 				return m, nil
 			}
+			// Guard against stacking: if a refreshUpdates is already in
+			// flight (e.g. the user mashes U or a previous request hasn't
+			// completed), the previous response will hydrate the same
+			// session. Firing another fetch would only burn registry calls.
+			if m.updateInFlight {
+				return m, nil
+			}
 			m.updateInFlight = true
 			return m, m.refreshUpdates()
 		}
@@ -1183,6 +1368,11 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.updatesSession++
 			m.statsRequested = true
 			m.refreshInFlight = true
+			// Reset updateInFlight before calling maybeRefreshUpdatesCmd: the
+			// session bump above invalidates any pending updatesMsg, so the
+			// guard inside maybeRefreshUpdatesCmd must not refuse to fire a
+			// fresh fetch just because a now-stale fetch is still in flight.
+			m.updateInFlight = false
 			cmds := []tea.Cmd{m.refreshStatus(), m.refreshStats()}
 			if c := m.maybeRefreshUpdatesCmd(); c != nil {
 				cmds = append(cmds, c)
@@ -1459,6 +1649,27 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			}
 		case "esc":
 			if m.done || m.failed {
+				// Invalidate the update-availability cache for the current
+				// project/server on a SUCCESSFUL operation that may have
+				// changed image freshness. Deploy pulls a new image (so the
+				// previous "update available" glyph is almost certainly
+				// stale); Restart picks up a newer image when the user has
+				// `pull_policy: always` in compose, and is harmless to
+				// invalidate otherwise (worst case: one extra CheckUpdates
+				// call). Skipping invalidation on `m.failed` keeps a stale
+				// cache rather than spuriously clearing user-visible state
+				// after a failed deploy. The cache key matches
+				// updatesCacheKey()'s format (projDir|serverName) so the
+				// next maybeRefreshUpdatesCmd misses, sees no in-flight
+				// fetch, and enqueues a fresh refresh. This block runs
+				// BEFORE the m.done/m.failed reset below — otherwise
+				// reading m.done after clearing it would always evaluate
+				// false and the invalidation would never fire.
+				if m.done && (m.pendingOp == runner.Deploy || m.pendingOp == runner.Restart) {
+					if m.updateCache != nil {
+						delete(m.updateCache, m.updatesCacheKey())
+					}
+				}
 				m.screen = screenSelectContainers
 				m.confirming = false
 				m.steps = nil
@@ -1472,6 +1683,12 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 				m.updatesSession++
 				m.statsRequested = true
 				m.refreshInFlight = true
+				// Reset updateInFlight before calling maybeRefreshUpdatesCmd:
+				// the session bump above invalidates any pending updatesMsg,
+				// so the guard inside maybeRefreshUpdatesCmd must not refuse
+				// to fire a fresh fetch just because a now-stale fetch is
+				// still in flight.
+				m.updateInFlight = false
 				cmds := []tea.Cmd{m.refreshStatus(), m.refreshStats()}
 				if c := m.maybeRefreshUpdatesCmd(); c != nil {
 					cmds = append(cmds, c)
@@ -1803,12 +2020,23 @@ func (m Model) updatesCacheKey() string {
 // each entry's UpdateAvailable field. Services absent from results retain
 // the tri-state nil (unknown). Called only when results is non-nil and the
 // user is on screenSelectContainers.
+//
+// Verdicts for services absent from svcStatus are dropped silently;
+// compose config and ContainerStatus may transiently disagree during a
+// refresh (e.g. a service added to compose.yml between the two fetches).
+// Synthesising a phantom zero-valued svcStatus entry would (a) make any
+// future iterator over svcStatus see a fake service, and (b) leak memory
+// across project switches if the verdict referenced a service that no
+// longer exists in the active project.
 func (m *Model) hydrateUpdates(results map[string]bool) {
 	if m.svcStatus == nil {
-		m.svcStatus = make(map[string]runner.ServiceStatus)
+		return
 	}
 	for svc, avail := range results {
-		st := m.svcStatus[svc]
+		st, ok := m.svcStatus[svc]
+		if !ok {
+			continue
+		}
 		v := avail
 		st.UpdateAvailable = &v
 		m.svcStatus[svc] = st
@@ -1816,7 +2044,13 @@ func (m *Model) hydrateUpdates(results map[string]bool) {
 }
 
 // updatesCacheLookup returns the cached entry for the current context and a
-// freshness flag. Fresh means the entry exists and is within TTL.
+// freshness flag. Fresh means the entry exists and is still within its TTL.
+// Failure entries (entry.err == true) use the shorter updatesErrorTTL window
+// so a persistent fault doesn't drive a 5-second refetch loop via the
+// statusMsg self-heal; success entries use the longer updatesCacheTTL. A
+// fresh failure entry suppresses refetches but also fails to hydrate (its
+// results map is nil), so cached failures show as blank glyphs alongside
+// the updatesErr warning.
 func (m Model) updatesCacheLookup() (updateEntry, bool) {
 	if m.updateCache == nil {
 		return updateEntry{}, false
@@ -1825,7 +2059,11 @@ func (m Model) updatesCacheLookup() (updateEntry, bool) {
 	if !ok {
 		return updateEntry{}, false
 	}
-	fresh := time.Since(entry.fetchedAt) < updatesCacheTTL
+	ttl := updatesCacheTTL
+	if entry.err {
+		ttl = updatesErrorTTL
+	}
+	fresh := time.Since(entry.fetchedAt) < ttl
 	return entry, fresh
 }
 
@@ -1835,15 +2073,46 @@ func (m Model) updatesCacheLookup() (updateEntry, bool) {
 // / refreshStats / loadServices. Cache hits surface via the post-overwrite
 // hydration in servicesMsg/statusMsg handlers — no synthetic msg needed.
 //
-// On cache hit the cached err is restored to updatesErr so a transient
-// failure stays visible across the screen leave/return cycle instead of
-// silently disappearing during the TTL window. (svcErr/statsErr win — see
-// the View() priority order.)
+// Cache hits on SUCCESS entries clear updatesErr (the stored success is the
+// latest ground truth, so any stale warning from before is no longer valid).
+// Cache hits on FAILURE entries leave updatesErr alone — the warning was
+// itself produced by the cached failure, and we don't want to clear it just
+// because we're skipping the refetch during the error TTL window.
+//
+// A cache miss (no entry, or stale entry past its TTL) with no in-flight
+// fetch enqueues a fresh refresh. Failure entries use the much shorter
+// updatesErrorTTL window (~30s) vs success's updatesCacheTTL (10m) — see
+// updateEntry doc — so retries happen reasonably soon while the screen
+// activity isn't pinned to a 5-second refetch loop.
+//
+// In-flight guard: when a previous refreshUpdates is still pending
+// (updateInFlight == true), returns nil rather than stacking another fetch.
+// The pending response's session check will drop it if it's stale (context
+// changed), so we avoid burning extra registry calls — same rationale as
+// refreshTickMsg's refreshInFlight gate. The U keypress already has its
+// own equivalent guard; this is defense-in-depth for all call sites.
+//
+// Invariant for context-change callers: every site that bumps
+// updatesSession (project pick, execDone, esc back from progress/logs,
+// entryLocal fast-track) must reset m.updateInFlight = false BEFORE
+// calling this helper. Skipping the reset would let a stale in-flight
+// fetch from a previous context block the new context's fresh fetch
+// (the stale response would still arrive and clear the flag, but the
+// new context's fetch would have been dropped at the bump site —
+// resulting in no glyphs until the next periodic tick).
 func (m *Model) maybeRefreshUpdatesCmd() tea.Cmd {
+	if m.updateInFlight {
+		return nil
+	}
 	entry, fresh := m.updatesCacheLookup()
 	if fresh {
-		if entry.err != nil {
-			m.updatesErr = entry.err.Error()
+		if entry.err {
+			// Restore the warning text from the cached failure: navigating
+			// away clears m.updatesErr, but the cached failure is still the
+			// latest ground truth within the error TTL, so re-entry should
+			// surface the same warning rather than showing blank glyphs
+			// with no explanation.
+			m.updatesErr = entry.errMsg
 		} else {
 			m.updatesErr = ""
 		}
@@ -2520,7 +2789,7 @@ func (m Model) viewSelectContainers() string {
 		nameWidth := utf8.RuneCountInString(svc)
 		nameCell := svc
 		if st.UpdateAvailable != nil && *st.UpdateAvailable {
-			nameCell = svc + " " + updateGlyphStyle.Render(updateGlyph)
+			nameCell = svc + " " + updateGlyphStyle.Render(compose.UpdateGlyph)
 			nameWidth += 2 // space + glyph cell
 		}
 		if pad := maxName - nameWidth; pad > 0 {

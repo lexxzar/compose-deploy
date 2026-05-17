@@ -60,7 +60,7 @@ The TUI has six main screens, plus an inline settings editor reachable from scre
 
 1. **Server select** — choose a remote server or "Local" (only shown when servers are configured); press `s` to open the settings editor for managing servers
 2. **Project select** — pick a Docker Compose project (auto-skipped if the current directory has a compose file)
-3. **Service select** — pick services and choose an action (`r` restart, `d` deploy, `s` stop, `l` logs, `c` config, `x` exec); also shows CPU% and Mem (used/limit) columns for running services, refreshed on screen entry and after every operation
+3. **Service select** — pick services and choose an action (`r` restart, `d` deploy, `s` stop, `l` logs, `c` config, `x` exec, `U` re-check updates); also shows CPU% and Mem (used/limit) columns for running services, refreshed on screen entry and after every operation. Services whose registry image is newer than the local copy get a yellow `⇧` marker next to the service name; the indicator is cached for 10 minutes and `U` forces a refresh.
 4. **Progress** — watch step-by-step execution with status indicators
 5. **Logs** — live-stream logs for the selected service
 6. **Config** — inspect or edit the compose file, toggle between raw and resolved config, and see validation status
@@ -105,6 +105,10 @@ cdeploy list --json
 # Combine stats with JSON output
 cdeploy list --stats --json
 
+# Show image-update indicators (single-project mode auto-enables this)
+cdeploy list -C /opt/myapp        # single-project: always checks
+cdeploy list --updates            # multi-project: opt in explicitly
+
 # Stream logs for a service
 cdeploy logs nginx
 
@@ -131,14 +135,28 @@ cdeploy exec web -- rails console
     "uptime": "2d",
     "ports": [
       { "host": "0.0.0.0", "host_port": 8080, "container_port": 80, "protocol": "tcp" }
-    ]
+    ],
+    "update_available": true
   }
 ]
 ```
 
-`health`, `created`, `uptime`, and `ports` are omitted when not applicable (no healthcheck, stopped container, no published ports).
+`health`, `created`, `uptime`, `ports`, and `update_available` are omitted when not applicable (no healthcheck, stopped container, no published ports, update check not performed or build-only service).
 
 With `--stats`, three additional fields are populated per running service: `cpu_percent` (`100.0` = one full core; sums across replicas for scaled services), `memory_used` (bytes), `memory_limit` (bytes; equals host memory when no explicit limit is set). The fields are omitted entirely when `--stats` is not passed, so existing scripts see byte-identical output. On stats fetch failure the CLI prints `cdeploy: stats unavailable: <err>` to stderr (single-project mode) or `cdeploy: stats unavailable for "<project>": <err>` (multi-project mode), exits 0, and renders blank cells — status is the load-bearing primary view.
+
+### Update-available indicators (`--updates`)
+
+A yellow `⇧` glyph next to a service name in `cdeploy list` and the TUI service-select screen means the image in the registry has a different digest than the locally pulled copy. The check runs `docker compose config --format json` to map services to images, then per-image `docker image inspect` (local RepoDigest) and `docker buildx imagetools inspect` (registry manifest-list digest), falling back to `docker manifest inspect --verbose` when the buildx plugin is unavailable. Build-only services and services whose digest cannot be determined render a blank cell — the indicator is tri-state (unknown / current / update available).
+
+- **Single-project mode** (`-C` specified, or `--ssh` which requires `-C`): always checks for updates.
+- **Multi-project mode** (no `-C`): opt-in via `--updates` because each project triggers its own registry probes.
+
+Failures are non-fatal: `cdeploy: updates unavailable: <err>` (single-project) or `cdeploy: updates unavailable for "<project>": <err>` (multi-project) is written to stderr, the cell stays blank, exit code 0. JSON output adds `update_available: true|false` with `omitempty`; existing JSON consumers see the original wire shape when the flag is absent.
+
+In the TUI, the indicator is cached for 10 minutes per (project, server) context. Press `U` on the service-select screen to bypass the cache and re-check immediately.
+
+**Multi-arch images:** for multi-arch images (commonly: `nginx`, `postgres`, `alpine`, `node`, `redis`), the check uses `docker buildx imagetools inspect` which returns the manifest-LIST digest — matching what `docker image inspect` records locally — so multi-arch images are reported correctly. The legacy `docker manifest inspect --verbose` fallback (used only when the buildx plugin is unavailable, i.e. very old Docker installs) returns per-platform descriptor digests that never match the local manifest-list digest and can produce false positives for multi-arch images; upgrading to Docker v23+ (which ships buildx by default) eliminates that case. Run `docker pull` manually to confirm a flagged update before deploying if you suspect a false positive.
 
 **Exit codes**: `0` on success, non-zero on failure (config errors, SSH/Docker failures, validation errors). Suitable for CI gating.
 

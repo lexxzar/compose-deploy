@@ -245,10 +245,28 @@ func TestLoadProjects_NilLoader_ReturnsError(t *testing.T) {
 func TestInit_LoadsServicesWhenPickerSkipped(t *testing.T) {
 	mc := &mockComposer{}
 	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
+	installFakeTick(&m)
 
 	cmd := m.Init()
 	if cmd == nil {
-		t.Error("Init() should return loadServices command when picker is skipped")
+		t.Fatal("Init() should return a batch command when picker is skipped")
+	}
+	// Drive the batch so the constituent Cmds actually invoke the mock —
+	// catches regressions where Init() returns a Cmd that looks right but
+	// doesn't actually trigger the expected refreshes (e.g. refreshUpdates
+	// silently dropped from the batch).
+	msg := cmd()
+	batch, ok := msg.(tea.BatchMsg)
+	if !ok {
+		t.Fatalf("Init() should return a tea.Batch, got %T", msg)
+	}
+	for _, child := range batch {
+		if child != nil {
+			_ = child()
+		}
+	}
+	if mc.updatesCalls == 0 {
+		t.Error("Init batch should invoke CheckUpdates (refreshUpdates not in fan-out)")
 	}
 }
 
@@ -889,6 +907,118 @@ func TestEscFromProgress_GoesToContainers(t *testing.T) {
 	}
 	if m.confirming {
 		t.Error("confirming should be false after returning from progress")
+	}
+}
+
+// TestEscFromProgress_InvalidatesUpdateCache_OnDeploy is the iteration-3
+// regression for the "stale glyph after Deploy" UX bug: after a successful
+// Deploy (which pulls a new image), the cached "update available" verdict
+// is no longer accurate, and the user expects fresh feedback rather than
+// up to ~10 minutes of stale glyph. Esc-from-progress on a successful
+// Deploy must delete the cache entry so maybeRefreshUpdatesCmd misses and
+// schedules a fresh CheckUpdates.
+func TestEscFromProgress_InvalidatesUpdateCache_OnDeploy(t *testing.T) {
+	mc := &mockComposer{}
+	m := NewModel(nil, io.Discard, mockFactory(mc), nil, nil)
+	m.screen = screenProgress
+	m.done = true
+	m.pendingOp = runner.Deploy
+	m.composer = mc
+	installFakeTick(&m)
+	// Prime the cache with a fresh entry for the current context.
+	key := m.updatesCacheKey()
+	avail := true
+	m.updateCache = map[string]updateEntry{
+		key: {
+			fetchedAt: time.Now(),
+			results:   map[string]bool{"web": avail},
+		},
+	}
+
+	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyEsc})
+	m = updated.(Model)
+
+	if _, present := m.updateCache[key]; present {
+		t.Errorf("cache entry %q should have been deleted after successful Deploy", key)
+	}
+}
+
+// TestEscFromProgress_InvalidatesUpdateCache_OnRestart mirrors the Deploy
+// case for Restart. Most restarts do not pull a new image, but users with
+// `pull_policy: always` in compose DO get a fresh image on restart; the
+// cost of invalidating the cache for the rare-but-real case is one extra
+// CheckUpdates call.
+func TestEscFromProgress_InvalidatesUpdateCache_OnRestart(t *testing.T) {
+	mc := &mockComposer{}
+	m := NewModel(nil, io.Discard, mockFactory(mc), nil, nil)
+	m.screen = screenProgress
+	m.done = true
+	m.pendingOp = runner.Restart
+	m.composer = mc
+	installFakeTick(&m)
+	key := m.updatesCacheKey()
+	avail := true
+	m.updateCache = map[string]updateEntry{
+		key: {fetchedAt: time.Now(), results: map[string]bool{"web": avail}},
+	}
+
+	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyEsc})
+	m = updated.(Model)
+
+	if _, present := m.updateCache[key]; present {
+		t.Errorf("cache entry %q should have been deleted after successful Restart", key)
+	}
+}
+
+// TestEscFromProgress_PreservesUpdateCache_OnFailedOp documents the
+// negative case: a failed operation must NOT clear the cache (the previous
+// verdict is the most recent ground truth we have; spurious clearing
+// would erase user-visible state for no benefit).
+func TestEscFromProgress_PreservesUpdateCache_OnFailedOp(t *testing.T) {
+	mc := &mockComposer{}
+	m := NewModel(nil, io.Discard, mockFactory(mc), nil, nil)
+	m.screen = screenProgress
+	m.failed = true
+	m.pendingOp = runner.Deploy
+	m.composer = mc
+	installFakeTick(&m)
+	key := m.updatesCacheKey()
+	avail := true
+	m.updateCache = map[string]updateEntry{
+		key: {fetchedAt: time.Now(), results: map[string]bool{"web": avail}},
+	}
+
+	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyEsc})
+	m = updated.(Model)
+
+	if _, present := m.updateCache[key]; !present {
+		t.Errorf("cache entry %q should have survived a failed Deploy", key)
+	}
+}
+
+// TestEscFromProgress_PreservesUpdateCache_OnStopOnly documents the
+// negative case for the Stop operation: stopping a service doesn't change
+// image freshness (containers go away but the local image stays), so the
+// cache MUST survive.
+func TestEscFromProgress_PreservesUpdateCache_OnStopOnly(t *testing.T) {
+	mc := &mockComposer{}
+	m := NewModel(nil, io.Discard, mockFactory(mc), nil, nil)
+	m.screen = screenProgress
+	m.done = true
+	m.pendingOp = runner.StopOnly
+	m.composer = mc
+	installFakeTick(&m)
+	key := m.updatesCacheKey()
+	avail := true
+	m.updateCache = map[string]updateEntry{
+		key: {fetchedAt: time.Now(), results: map[string]bool{"web": avail}},
+	}
+
+	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyEsc})
+	m = updated.(Model)
+
+	if _, present := m.updateCache[key]; !present {
+		t.Errorf("cache entry %q should have survived a Stop op", key)
 	}
 }
 
@@ -7811,10 +7941,17 @@ func TestUpdatesMsg_errorSetsErrAndClearsInFlight(t *testing.T) {
 	}
 }
 
-// TestUpdatesMsg_staleLeavesInFlight verifies the stale-session response
-// does NOT touch updateInFlight (the context-change handler already reset
-// it; mirrors the stats stale behavior).
-func TestUpdatesMsg_staleLeavesInFlight(t *testing.T) {
+// TestUpdatesMsg_staleClearsInFlight verifies the iteration-4 semantics:
+// the in-flight guard is cleared on ANY arrival (stale or current), not
+// just current-session arrivals. The previous semantics ("stale leaves
+// flag alone, context-change handler resets it") had a sticky-flag bug:
+// when the user pressed U (in-flight=true) then navigated away and back,
+// the stale response would arrive with the OLD session — and on a cache
+// hit path, maybeRefreshUpdatesCmd's new in-flight guard would silently
+// swallow every subsequent fetch. Clearing on stale arrivals as well is
+// safe because the cache write below is still session-gated, so a stale
+// result can't pollute the cache.
+func TestUpdatesMsg_staleClearsInFlight(t *testing.T) {
 	mc := &mockComposer{}
 	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
 	m.screen = screenSelectContainers
@@ -7827,8 +7964,8 @@ func TestUpdatesMsg_staleLeavesInFlight(t *testing.T) {
 	})
 	model := result.(Model)
 
-	if !model.updateInFlight {
-		t.Error("stale updatesMsg should NOT clear updateInFlight")
+	if model.updateInFlight {
+		t.Error("stale updatesMsg should clear updateInFlight (iteration-4 semantics)")
 	}
 }
 
@@ -7951,24 +8088,315 @@ func TestMaybeRefreshUpdates_CacheHitSkipsFetch(t *testing.T) {
 	}
 }
 
-// TestMaybeRefreshUpdates_CacheHitRestoresErr verifies that a cached error
-// is restored to updatesErr so the soft-warning slot continues to show the
-// failure across screen leave/return cycles within TTL.
-func TestMaybeRefreshUpdates_CacheHitRestoresErr(t *testing.T) {
+// TestUpdatesMsg_ErrorCachedWithShortTTL pins the iter-2 contract: failed
+// fetches ARE cached, but with a short error TTL (updatesErrorTTL). The
+// failure entry has results=nil and err=true. Surfaces updatesErr. The
+// short-TTL caching prevents the 5-second refetch loop a previous
+// "delete on error" implementation produced via the statusMsg self-heal.
+func TestUpdatesMsg_ErrorCachedWithShortTTL(t *testing.T) {
 	mc := &mockComposer{}
 	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
 	m.screen = screenSelectContainers
-	m.updatesErr = ""
+	m.updateInFlight = true
+
+	result, _ := m.Update(updatesMsg{
+		results: map[string]bool{"web": true}, // partial — should NOT be cached on error
+		err:     errors.New("registry boom"),
+		session: m.updatesSession,
+	})
+	model := result.(Model)
+	if model.updatesErr == "" {
+		t.Error("updatesErr should be set when fetch returns an error")
+	}
+	entry, ok := model.updateCache[model.updatesCacheKey()]
+	if !ok {
+		t.Fatal("cache SHOULD contain an error entry after errored fetch")
+	}
+	if !entry.err {
+		t.Error("cache entry after error should have err=true")
+	}
+	if entry.results != nil {
+		t.Errorf("cache entry after error should have results=nil, got %v", entry.results)
+	}
+	// Within the error TTL, maybeRefreshUpdatesCmd should NOT re-fetch.
+	if cmd := model.maybeRefreshUpdatesCmd(); cmd != nil {
+		t.Error("cache hit on fresh error entry should NOT fire refreshUpdates (prevents tight retry loop)")
+	}
+}
+
+// TestUpdatesMsg_ErrorClearsCachedSuccess pins the iter-1 codex finding:
+// a failed refresh must invalidate any prior successful cache entry for the
+// same key. Without this, the successful predecessor's verdict sticks for
+// the full TTL window and the next screen entry hydrates from data the
+// most-recent refresh proved unreliable. With iter-2 semantics, the
+// "invalidation" is now an OVERWRITE with an err=true entry (results=nil)
+// rather than a delete — same end result for hydration (nil results
+// don't paint glyphs), with the added benefit of suppressing tight retry.
+func TestUpdatesMsg_ErrorClearsCachedSuccess(t *testing.T) {
+	mc := &mockComposer{}
+	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
+	m.screen = screenSelectContainers
+	m.updateInFlight = true
+	// Seed a known-good prior success at the current key.
+	key := m.updatesCacheKey()
 	m.updateCache = map[string]updateEntry{
-		m.updatesCacheKey(): {
+		key: {
 			fetchedAt: time.Now(),
-			err:       errors.New("registry boom"),
+			results:   map[string]bool{"web": true},
 		},
 	}
 
-	_ = m.maybeRefreshUpdatesCmd()
-	if !strings.Contains(m.updatesErr, "registry boom") {
-		t.Errorf("cached err should be restored to updatesErr, got %q", m.updatesErr)
+	result, _ := m.Update(updatesMsg{
+		err:     errors.New("registry boom"),
+		session: m.updatesSession,
+	})
+	model := result.(Model)
+
+	entry, ok := model.updateCache[key]
+	if !ok {
+		t.Fatal("errored refresh should leave an error entry, not delete the key entirely")
+	}
+	if !entry.err {
+		t.Error("errored refresh should overwrite the prior success with an err=true entry")
+	}
+	if entry.results != nil {
+		t.Errorf("errored refresh should drop the prior success's results, got %v", entry.results)
+	}
+	// Within the error TTL, maybeRefreshUpdatesCmd should NOT re-fetch.
+	if cmd := model.maybeRefreshUpdatesCmd(); cmd != nil {
+		t.Error("post-error fresh-error-cache hit should NOT fire refreshUpdates")
+	}
+}
+
+// TestUpdatesMsg_ErrorClearsGlyphs (iter-2 fix #2): when CheckUpdates errors,
+// the handler must clear UpdateAvailable on every svcStatus entry. Without
+// this, the user sees both the "updates unavailable" soft warning AND stale
+// ⇧ glyphs from a prior successful fetch — confusing inconsistency.
+func TestUpdatesMsg_ErrorClearsGlyphs(t *testing.T) {
+	mc := &mockComposer{}
+	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
+	m.screen = screenSelectContainers
+	m.updateInFlight = true
+	// Seed svcStatus with prior verdicts from a previous successful fetch.
+	trueVal, falseVal := true, false
+	m.svcStatus = map[string]runner.ServiceStatus{
+		"web":   {Running: true, UpdateAvailable: &trueVal},
+		"db":    {Running: true, UpdateAvailable: &falseVal},
+		"cache": {Running: true, UpdateAvailable: &trueVal},
+	}
+
+	result, _ := m.Update(updatesMsg{
+		err:     errors.New("registry timeout"),
+		session: m.updatesSession,
+	})
+	model := result.(Model)
+
+	for svc, st := range model.svcStatus {
+		if st.UpdateAvailable != nil {
+			t.Errorf("svcStatus[%q].UpdateAvailable should be nil after error, got %v", svc, *st.UpdateAvailable)
+		}
+	}
+	if model.updatesErr == "" {
+		t.Error("updatesErr should be set so the soft warning renders")
+	}
+}
+
+// TestUpdatesMsg_ErrorExpiresAfterErrorTTL (iter-2 fix #1): after an error
+// is cached, once the short error TTL has elapsed the entry should no
+// longer be "fresh" and the next maybeRefreshUpdatesCmd should re-fetch.
+// Verifies the bounded-retry property: persistent failures don't lock in
+// for the full 10-minute success TTL.
+func TestUpdatesMsg_ErrorExpiresAfterErrorTTL(t *testing.T) {
+	mc := &mockComposer{}
+	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
+	m.screen = screenSelectContainers
+	m.updateInFlight = false
+	// Seed an error entry that's already past updatesErrorTTL.
+	key := m.updatesCacheKey()
+	m.updateCache = map[string]updateEntry{
+		key: {
+			fetchedAt: time.Now().Add(-2 * updatesErrorTTL),
+			err:       true,
+		},
+	}
+
+	if cmd := m.maybeRefreshUpdatesCmd(); cmd == nil {
+		t.Error("stale error entry (past errorTTL) should fire refreshUpdates on next call")
+	}
+	if !m.updateInFlight {
+		t.Error("stale error entry should set updateInFlight=true")
+	}
+}
+
+// TestStatusMsg_ErrorEntryNotRefetchedTightly (iter-2 fix #1, regression):
+// the statusMsg self-heal must NOT re-fetch when a fresh error entry is in
+// the cache. Multiple 5-second statusMsg ticks within updatesErrorTTL
+// should result in ZERO CheckUpdates calls — that's the whole point of
+// the errorTTL cache.
+func TestStatusMsg_ErrorEntryNotRefetchedTightly(t *testing.T) {
+	mc := &mockComposer{services: []string{"web"}, updates: map[string]bool{"web": true}}
+	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
+	installFakeTick(&m)
+	m.screen = screenSelectContainers
+	m.composer = mc
+	m.statusSession = 11
+	m.updateInFlight = false
+	// Fresh error entry (just-failed).
+	m.updateCache = map[string]updateEntry{
+		m.updatesCacheKey(): {
+			fetchedAt: time.Now(),
+			err:       true,
+		},
+	}
+
+	// Simulate three 5-second ticks delivering statusMsg.
+	for i := 0; i < 3; i++ {
+		result, cmd := m.Update(statusMsg{
+			status:  map[string]runner.ServiceStatus{"web": {Running: true}},
+			session: 11,
+		})
+		m = result.(Model)
+		if cmd != nil {
+			t.Fatalf("iter %d: statusMsg with fresh error cache must NOT trigger refresh, got cmd %T", i, cmd())
+		}
+	}
+	if mc.updatesCalls != 0 {
+		t.Errorf("fresh-error-cache should suppress all self-heal fetches, got %d CheckUpdates calls", mc.updatesCalls)
+	}
+}
+
+// TestUpdatesMsg_FreshResultClearsStaleVerdict pins the iter-1 codex finding:
+// when a successful refresh's results map omits a service that was previously
+// marked with UpdateAvailable, the stale verdict must be cleared. The
+// updatesMsg success path is the only site that should clear missing
+// services — cache-hit replays in servicesMsg/statusMsg stay additive.
+func TestUpdatesMsg_FreshResultClearsStaleVerdict(t *testing.T) {
+	mc := &mockComposer{}
+	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
+	m.screen = screenSelectContainers
+	m.updateInFlight = true
+	// Seed svcStatus with prior verdicts for two services.
+	trueVal, falseVal := true, false
+	m.svcStatus = map[string]runner.ServiceStatus{
+		"web": {Running: true, UpdateAvailable: &trueVal},
+		"db":  {Running: true, UpdateAvailable: &falseVal},
+	}
+
+	// New refresh result omits "db" — it should drop back to nil.
+	result, _ := m.Update(updatesMsg{
+		results: map[string]bool{"web": true},
+		session: m.updatesSession,
+	})
+	model := result.(Model)
+
+	if model.svcStatus["db"].UpdateAvailable != nil {
+		t.Errorf("fresh result that omits db should clear its UpdateAvailable, got %v", model.svcStatus["db"].UpdateAvailable)
+	}
+	if model.svcStatus["web"].UpdateAvailable == nil || !*model.svcStatus["web"].UpdateAvailable {
+		t.Errorf("web verdict from results should hydrate, got %v", model.svcStatus["web"].UpdateAvailable)
+	}
+}
+
+// TestStatusMsg_ExpiredCacheTriggersRefresh pins the iter-1 codex finding:
+// when a periodic statusMsg arrives and the update cache is expired/missing,
+// the handler must queue a fresh refreshUpdates so glyphs don't vanish
+// silently after TTL elapses while the user stays on the container screen.
+// Mirrors the in-flight discipline used for stats.
+func TestStatusMsg_ExpiredCacheTriggersRefresh(t *testing.T) {
+	mc := &mockComposer{services: []string{"web"}, updates: map[string]bool{"web": true}}
+	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
+	installFakeTick(&m)
+	m.screen = screenSelectContainers
+	m.composer = mc
+	m.statusSession = 7
+	m.updateInFlight = false
+	// Expired cache entry for the current key.
+	m.updateCache = map[string]updateEntry{
+		m.updatesCacheKey(): {
+			fetchedAt: time.Now().Add(-2 * updatesCacheTTL),
+			results:   map[string]bool{"web": true},
+		},
+	}
+
+	result, cmd := m.Update(statusMsg{
+		status:  map[string]runner.ServiceStatus{"web": {Running: true}},
+		session: 7,
+	})
+	model := result.(Model)
+
+	if !model.updateInFlight {
+		t.Error("expired-cache statusMsg should set updateInFlight=true")
+	}
+	if cmd == nil {
+		t.Fatal("expired-cache statusMsg should return a non-nil refreshUpdates Cmd")
+	}
+	// Invoke the Cmd to confirm CheckUpdates was actually called (proves the
+	// returned Cmd is refreshUpdates, not some unrelated artifact).
+	if _, ok := cmd().(updatesMsg); !ok {
+		t.Errorf("expired-cache statusMsg Cmd should return updatesMsg, got %T", cmd())
+	}
+	if mc.updatesCalls == 0 {
+		t.Error("expired-cache statusMsg should call CheckUpdates")
+	}
+}
+
+// TestStatusMsg_FreshCacheDoesNotRefresh ensures the self-heal only fires
+// when the cache is stale — a fresh entry should be re-hydrated without
+// triggering a fetch.
+func TestStatusMsg_FreshCacheDoesNotRefresh(t *testing.T) {
+	mc := &mockComposer{}
+	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
+	m.screen = screenSelectContainers
+	m.composer = mc
+	m.statusSession = 4
+	m.updateInFlight = false
+	m.updateCache = map[string]updateEntry{
+		m.updatesCacheKey(): {
+			fetchedAt: time.Now(),
+			results:   map[string]bool{"web": true},
+		},
+	}
+
+	_, cmd := m.Update(statusMsg{
+		status:  map[string]runner.ServiceStatus{"web": {Running: true}},
+		session: 4,
+	})
+
+	if cmd != nil {
+		t.Errorf("fresh-cache statusMsg should NOT trigger refresh, got cmd %T", cmd())
+	}
+	if mc.updatesCalls != 0 {
+		t.Errorf("fresh-cache statusMsg should not call CheckUpdates, got %d calls", mc.updatesCalls)
+	}
+}
+
+// TestStatusMsg_ExpiredCacheRespectInFlight verifies the self-heal honors the
+// in-flight guard: if a refreshUpdates is already pending, statusMsg must not
+// stack a second fetch.
+func TestStatusMsg_ExpiredCacheRespectInFlight(t *testing.T) {
+	mc := &mockComposer{}
+	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
+	m.screen = screenSelectContainers
+	m.composer = mc
+	m.statusSession = 5
+	m.updateInFlight = true // already in flight
+	m.updateCache = map[string]updateEntry{
+		m.updatesCacheKey(): {
+			fetchedAt: time.Now().Add(-2 * updatesCacheTTL),
+			results:   map[string]bool{"web": true},
+		},
+	}
+
+	_, cmd := m.Update(statusMsg{
+		status:  map[string]runner.ServiceStatus{"web": {Running: true}},
+		session: 5,
+	})
+
+	if cmd != nil {
+		t.Error("in-flight refresh should suppress statusMsg self-heal")
+	}
+	if mc.updatesCalls != 0 {
+		t.Errorf("in-flight guard should prevent CheckUpdates, got %d calls", mc.updatesCalls)
 	}
 }
 
@@ -8142,6 +8570,135 @@ func TestUpdatesSession_NotBumpedAtConnectResultError(t *testing.T) {
 	}
 }
 
+// TestUpdatesSession_BumpSitesFireRefresh drives one representative site
+// from each fan-out branch (project pick, execDone, esc-from-progress,
+// esc-from-logs, entryLocal fast-track) and confirms the returned batch
+// actually invokes CheckUpdates. The bump-only assertions above don't
+// catch a regression where the session bumps but refreshUpdates is dropped
+// from the batch — this test does.
+func TestUpdatesSession_BumpSitesFireRefresh(t *testing.T) {
+	cases := []struct {
+		name  string
+		setup func(*Model)
+		key   tea.Msg
+	}{
+		{
+			name: "project_pick",
+			setup: func(m *Model) {
+				m.screen = screenSelectProject
+				m.projects = []compose.Project{{Name: "p1", ConfigDir: "/p1"}}
+				m.projCursor = 0
+			},
+			key: tea.KeyMsg{Type: tea.KeyEnter},
+		},
+		{
+			name: "execDoneMsg",
+			setup: func(m *Model) {
+				m.screen = screenSelectContainers
+			},
+			key: execDoneMsg{err: nil},
+		},
+		{
+			name: "esc_progress_to_container",
+			setup: func(m *Model) {
+				m.screen = screenProgress
+				m.done = true
+			},
+			key: tea.KeyMsg{Type: tea.KeyEsc},
+		},
+		{
+			name: "esc_logs_to_container",
+			setup: func(m *Model) {
+				m.screen = screenLogs
+			},
+			key: tea.KeyMsg{Type: tea.KeyEsc},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			mc := &mockComposer{services: []string{"web"}}
+			m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
+			installFakeTick(&m)
+			tc.setup(&m)
+			// Pre-set composer so refreshUpdates() actually has something
+			// to call against (loadServices/refreshStats/refreshUpdates all
+			// gate on a non-nil composer via the factory).
+			if m.composer == nil {
+				m.composer = mc
+			}
+			_, cmd := m.Update(tc.key)
+			if cmd == nil {
+				t.Fatalf("%s: expected non-nil batch Cmd", tc.name)
+			}
+			msg := cmd()
+			batch, ok := msg.(tea.BatchMsg)
+			if !ok {
+				// Some sites return tea.ExecProcess or other singletons —
+				// in that case there's nothing to drain. Mark as PASS.
+				return
+			}
+			for _, child := range batch {
+				if child != nil {
+					_ = child()
+				}
+			}
+			if mc.updatesCalls == 0 {
+				t.Errorf("%s: batch did not invoke CheckUpdates", tc.name)
+			}
+		})
+	}
+}
+
+// TestUKeyPress_SwallowedDuringConfirmation pins the no-op behaviour of U
+// when a confirmation prompt is active. Without this guard a user could
+// burn registry calls by mashing U mid-confirmation, and any in-flight
+// fetch would race against the imminent operation.
+func TestUKeyPress_SwallowedDuringConfirmation(t *testing.T) {
+	mc := &mockComposer{services: []string{"web"}}
+	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
+	installFakeTick(&m)
+	m.screen = screenSelectContainers
+	m.composer = mc
+	m.confirming = true
+	m.updateInFlight = false
+
+	_, cmd := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'U'}})
+	if mc.updatesCalls != 0 {
+		t.Errorf("U during confirmation should not call CheckUpdates (got %d calls)", mc.updatesCalls)
+	}
+	if m.updateInFlight {
+		t.Error("U during confirmation should not set updateInFlight")
+	}
+	if cmd != nil {
+		// Drain to be safe — if the model returned a Cmd we want to ensure
+		// it doesn't make calls either.
+		_ = cmd()
+		if mc.updatesCalls != 0 {
+			t.Errorf("U during confirmation returned a Cmd that called CheckUpdates (got %d calls)", mc.updatesCalls)
+		}
+	}
+}
+
+// TestUKeyPress_GuardsAgainstStacking verifies the updateInFlight guard
+// added to the U handler: if a fetch is already in flight, additional U
+// presses are no-ops. Prevents the user mashing U from queueing N fetches.
+func TestUKeyPress_GuardsAgainstStacking(t *testing.T) {
+	mc := &mockComposer{services: []string{"web"}}
+	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
+	installFakeTick(&m)
+	m.screen = screenSelectContainers
+	m.composer = mc
+	m.updateInFlight = true // simulate prior fetch still pending
+
+	_, cmd := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'U'}})
+	if cmd != nil {
+		t.Error("U with in-flight fetch should return nil Cmd")
+	}
+	if mc.updatesCalls != 0 {
+		t.Errorf("U with in-flight fetch should not call CheckUpdates (got %d calls)", mc.updatesCalls)
+	}
+}
+
 // TestUpdateInFlight_ResetOnLeaveScreen_ContainerToProj verifies that
 // updateInFlight is explicitly reset to false when navigating back from the
 // container screen (mirrors refreshInFlight cleanup at the same site).
@@ -8241,14 +8798,14 @@ func TestViewSelectContainers_UpdateGlyphRendered(t *testing.T) {
 	}
 
 	v := m.View()
-	if !strings.Contains(v, updateGlyph) {
-		t.Errorf("View() should contain update glyph %q when a service has UpdateAvailable=&true; got:\n%s", updateGlyph, v)
+	if !strings.Contains(v, compose.UpdateGlyph) {
+		t.Errorf("View() should contain update glyph %q when a service has UpdateAvailable=&true; got:\n%s", compose.UpdateGlyph, v)
 	}
 
 	// More targeted: the glyph must be on the same line as "web", not "db" or
 	// "cache". Scan per-line to assert that mapping precisely.
 	for _, line := range strings.Split(v, "\n") {
-		if strings.Contains(line, updateGlyph) {
+		if strings.Contains(line, compose.UpdateGlyph) {
 			if !strings.Contains(line, "web") {
 				t.Errorf("update glyph rendered on wrong line; expected on 'web' row, got: %q", line)
 			}
@@ -8272,7 +8829,7 @@ func TestViewSelectContainers_UpdateGlyphOnStoppedService(t *testing.T) {
 	}
 
 	v := m.View()
-	if !strings.Contains(v, updateGlyph) {
+	if !strings.Contains(v, compose.UpdateGlyph) {
 		t.Errorf("View() should contain update glyph for stopped service with UpdateAvailable=&true; got:\n%s", v)
 	}
 }
@@ -8399,7 +8956,7 @@ func TestViewSelectContainers_NoGlyph_NoReservation(t *testing.T) {
 	}
 
 	v := m.View()
-	if strings.Contains(v, updateGlyph) {
+	if strings.Contains(v, compose.UpdateGlyph) {
 		t.Errorf("View() should NOT contain update glyph when no service has UpdateAvailable=&true; got:\n%s", v)
 	}
 	// Sanity check that rows still align (the Created column starts at the
@@ -8419,5 +8976,271 @@ func TestViewSelectContainers_NoGlyph_NoReservation(t *testing.T) {
 	}
 	if cols["web"] != cols["db"] {
 		t.Errorf("Created column misalignment without glyph: web=%d db=%d", cols["web"], cols["db"])
+	}
+}
+
+// TestHydrateUpdates_SkipsUnknownServices is the regression for iteration-2
+// finding #8: when CheckUpdates returns a verdict for a service that is NOT
+// in m.svcStatus (e.g. transient race between `compose config` listing and
+// `compose config --services` at fetch time, or a verdict referring to a
+// stale service after project switch), hydrateUpdates MUST NOT synthesise a
+// phantom svcStatus entry. The renderer iterates m.services not the status
+// map so today it'd be invisible, but a phantom would leak across project
+// switches and surface in any future map-key iterator.
+func TestHydrateUpdates_SkipsUnknownServices(t *testing.T) {
+	m := &Model{
+		svcStatus: map[string]runner.ServiceStatus{
+			"web": {Running: true},
+		},
+	}
+	yes := true
+	m.hydrateUpdates(map[string]bool{
+		"web":     true,  // known: hydrate
+		"phantom": false, // unknown: skip
+	})
+	if got := len(m.svcStatus); got != 1 {
+		t.Errorf("svcStatus len = %d, want 1 (phantom must not be created); got %#v", got, m.svcStatus)
+	}
+	web, ok := m.svcStatus["web"]
+	if !ok {
+		t.Fatal("web entry missing after hydrate")
+	}
+	if web.UpdateAvailable == nil || *web.UpdateAvailable != yes {
+		t.Errorf("web.UpdateAvailable = %v, want &true", web.UpdateAvailable)
+	}
+	if !web.Running {
+		t.Error("web.Running flipped to false during hydrate — phantom-style overwrite")
+	}
+	if _, leaked := m.svcStatus["phantom"]; leaked {
+		t.Errorf("phantom entry leaked into svcStatus: %#v", m.svcStatus["phantom"])
+	}
+}
+
+// TestHydrateUpdates_NilStatusMapNoOp ensures hydrateUpdates is safe to call
+// when m.svcStatus is nil — early-returns without panicking and without
+// allocating a phantom map (allocating would mask a real cleanup bug where
+// the status map should have been populated by loadServices first).
+func TestHydrateUpdates_NilStatusMapNoOp(t *testing.T) {
+	m := &Model{}
+	m.hydrateUpdates(map[string]bool{"web": true})
+	if m.svcStatus != nil {
+		t.Errorf("svcStatus = %#v, want nil (hydrate must not allocate when source map was missing)", m.svcStatus)
+	}
+}
+
+// TestUpdatesMsg_OffScreenErrorClearsState (iter-3 fix #1): when a
+// CheckUpdates failure arrives while the user is off-screen (config, logs,
+// progress), the handler MUST still set m.updatesErr AND clear stale
+// UpdateAvailable verdicts on svcStatus. Otherwise the user returns and
+// sees old ⇧ glyphs alongside no warning — worst-case for the config
+// screen, which is read-only and does NOT trigger refreshStatus, so
+// nothing downstream would clear the stale glyphs.
+func TestUpdatesMsg_OffScreenErrorClearsState(t *testing.T) {
+	mc := &mockComposer{}
+	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
+	m.screen = screenConfig // off-screen
+	m.updatesSession = 4
+	m.updateInFlight = true
+	trueVal := true
+	m.svcStatus = map[string]runner.ServiceStatus{
+		"web": {Running: true, UpdateAvailable: &trueVal},
+		"db":  {Running: true, UpdateAvailable: &trueVal},
+	}
+
+	result, _ := m.Update(updatesMsg{
+		err:     errors.New("registry timeout"),
+		session: 4,
+	})
+	model := result.(Model)
+
+	if model.updateInFlight {
+		t.Error("off-screen error updatesMsg should clear updateInFlight")
+	}
+	if !strings.Contains(model.updatesErr, "registry timeout") {
+		t.Errorf("off-screen error must still set updatesErr, got %q", model.updatesErr)
+	}
+	for svc, st := range model.svcStatus {
+		if st.UpdateAvailable != nil {
+			t.Errorf("svcStatus[%q].UpdateAvailable should be cleared off-screen on error, got %v", svc, *st.UpdateAvailable)
+		}
+	}
+	// Cache should hold an error entry with the message preserved.
+	entry, ok := model.updateCache[model.updatesCacheKey()]
+	if !ok {
+		t.Fatal("cache must hold an error entry after off-screen failure")
+	}
+	if !entry.err {
+		t.Error("cache entry should have err=true")
+	}
+	if !strings.Contains(entry.errMsg, "registry timeout") {
+		t.Errorf("cache entry errMsg should preserve the error text, got %q", entry.errMsg)
+	}
+}
+
+// TestMaybeRefreshUpdatesCmd_CachedErrorRestoresWarning (iter-3 fix #2):
+// when a user navigates away from the container screen (clearing
+// m.updatesErr) and re-enters within updatesErrorTTL while the cache holds
+// a recent failure, maybeRefreshUpdatesCmd must restore the warning text
+// from the cached errMsg — otherwise the user sees blank glyphs with no
+// explanation while the system still knows the data is stale-bad.
+func TestMaybeRefreshUpdatesCmd_CachedErrorRestoresWarning(t *testing.T) {
+	mc := &mockComposer{}
+	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
+	m.screen = screenSelectContainers
+	m.updateInFlight = false
+	// Simulate the post-navigation state: cleared updatesErr, fresh error
+	// entry in cache with the original error message.
+	m.updatesErr = ""
+	m.updateCache = map[string]updateEntry{
+		m.updatesCacheKey(): {
+			fetchedAt: time.Now(),
+			err:       true,
+			errMsg:    "registry unreachable: dial tcp: i/o timeout",
+		},
+	}
+
+	cmd := m.maybeRefreshUpdatesCmd()
+	if cmd != nil {
+		t.Error("fresh cached error should NOT trigger a refetch (errorTTL window)")
+	}
+	if !strings.Contains(m.updatesErr, "registry unreachable") {
+		t.Errorf("cached error msg should be restored to m.updatesErr, got %q", m.updatesErr)
+	}
+}
+
+// TestStatusMsg_CachedErrorRestoresWarning is the periodic-refresh
+// counterpart: when statusMsg arrives and the cache holds a fresh error
+// entry, the soft warning must be restored from entry.errMsg so the
+// periodic tick doesn't silently drop the warning while the failure is
+// still known-bad.
+func TestStatusMsg_CachedErrorRestoresWarning(t *testing.T) {
+	mc := &mockComposer{services: []string{"web"}}
+	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
+	installFakeTick(&m)
+	m.screen = screenSelectContainers
+	m.composer = mc
+	m.statusSession = 12
+	m.updateInFlight = false
+	m.updatesErr = ""
+	m.updateCache = map[string]updateEntry{
+		m.updatesCacheKey(): {
+			fetchedAt: time.Now(),
+			err:       true,
+			errMsg:    "registry boom",
+		},
+	}
+
+	result, _ := m.Update(statusMsg{
+		status:  map[string]runner.ServiceStatus{"web": {Running: true}},
+		session: 12,
+	})
+	model := result.(Model)
+
+	if !strings.Contains(model.updatesErr, "registry boom") {
+		t.Errorf("statusMsg should restore cached error warning, got %q", model.updatesErr)
+	}
+}
+
+// TestServicesMsg_CachedErrorRestoresWarning: initial-load arrivals must
+// also restore the cached error warning (servicesMsg cache replay mirrors
+// the statusMsg path).
+func TestServicesMsg_CachedErrorRestoresWarning(t *testing.T) {
+	mc := &mockComposer{}
+	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
+	m.screen = screenSelectContainers
+	m.statusSession = 3
+	m.updatesErr = ""
+	m.updateCache = map[string]updateEntry{
+		m.updatesCacheKey(): {
+			fetchedAt: time.Now(),
+			err:       true,
+			errMsg:    "stale-bad",
+		},
+	}
+
+	result, _ := m.Update(servicesMsg{
+		services: []string{"web"},
+		status:   map[string]runner.ServiceStatus{"web": {Running: true}},
+		session:  3,
+	})
+	model := result.(Model)
+
+	if model.updatesErr != "stale-bad" {
+		t.Errorf("servicesMsg cache-replay should restore cached error warning, got %q", model.updatesErr)
+	}
+	if model.svcStatus["web"].UpdateAvailable != nil {
+		t.Errorf("cached error must NOT hydrate glyphs, got %v", model.svcStatus["web"].UpdateAvailable)
+	}
+}
+
+// TestUpdatesMsg_ErrorCacheStoresErrMsg ensures the cache write path
+// populates entry.errMsg with the original error text, so downstream
+// cache-hit paths can restore the warning across navigation.
+func TestUpdatesMsg_ErrorCacheStoresErrMsg(t *testing.T) {
+	mc := &mockComposer{}
+	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
+	m.screen = screenSelectContainers
+	m.updateInFlight = true
+
+	result, _ := m.Update(updatesMsg{
+		err:     errors.New("docker hub timeout"),
+		session: m.updatesSession,
+	})
+	model := result.(Model)
+
+	entry, ok := model.updateCache[model.updatesCacheKey()]
+	if !ok {
+		t.Fatal("error entry should be in cache")
+	}
+	if entry.errMsg != "docker hub timeout" {
+		t.Errorf("entry.errMsg = %q, want %q", entry.errMsg, "docker hub timeout")
+	}
+}
+
+// TestUpdatesMsg_OffScreenErrorFixesOffset (iter-4 fix): when an updates
+// failure arrives while the user is off-screen, setting m.updatesErr adds
+// a footer warning line, which shrinks svcVisibleCount() by one. If the
+// cursor was previously at the last visible row, it now falls outside the
+// window. The handler MUST call fixSvcOffset() so the user returns to a
+// correctly-scrolled list — worst case is the config screen, which does
+// not refresh status on return, so without this fix the cursor stays out
+// of view until the user presses a navigation key.
+func TestUpdatesMsg_OffScreenErrorFixesOffset(t *testing.T) {
+	mc := &mockComposer{}
+	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
+	m.statsRequested = false // keep captions row out of the height math
+	m.screen = screenConfig  // off-screen — user is in config viewer
+	m.updatesSession = 7
+	m.updateInFlight = true
+	// Geometry: width=160 (forces one-line help => footerLines=3 baseline),
+	// height=9 → visible = 9-3-3 = 3 when no updatesErr; visible = 9-3-4 = 2
+	// once updatesErr is set. Cursor=2 with offset=0 sits at the last
+	// visible row pre-error; post-error it falls outside the new window.
+	m.width = 160
+	m.height = 9
+	m.services = []string{"a", "b", "c", "d", "e"}
+	m.svcStatus = map[string]runner.ServiceStatus{
+		"a": {Running: true},
+		"b": {Running: true},
+		"c": {Running: true},
+		"d": {Running: true},
+		"e": {Running: true},
+	}
+	m.svcCursor = 2
+	m.svcOffset = 0
+
+	result, _ := m.Update(updatesMsg{
+		err:     errors.New("registry timeout"),
+		session: 7,
+	})
+	model := result.(Model)
+
+	if model.updatesErr == "" {
+		t.Fatal("precondition: off-screen error must set updatesErr")
+	}
+	// New visible = 2, cursor = 2 → offset should be 2-2+1 = 1 to keep
+	// cursor visible in window [1, 3).
+	if model.svcOffset != 1 {
+		t.Errorf("svcOffset = %d, want 1 (cursor=2 must stay visible after footer grew)", model.svcOffset)
 	}
 }

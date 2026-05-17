@@ -211,14 +211,6 @@ type Compose struct {
 
 	detected bool // true after Detect() or SetStandalone() has been called
 
-	// dryRunSupported caches whether `docker compose pull` advertises the
-	// `--dry-run` flag (Compose v2.22+). dryRunDetected gates the one-shot probe
-	// — set to true after the first call to detectDryRunSupport() (either branch).
-	// Together they mirror the Standalone/detected pair so tests can force either
-	// branch via SetDryRunSupport without invoking the probe.
-	dryRunSupported bool
-	dryRunDetected  bool
-
 	// testing hooks; nil = use real exec
 	runCmd    func(*exec.Cmd) error
 	outputCmd func(*exec.Cmd) ([]byte, error)
@@ -282,15 +274,6 @@ func (c *Compose) Detect(ctx context.Context) error {
 func (c *Compose) SetStandalone(standalone bool) {
 	c.Standalone = standalone
 	c.detected = true
-}
-
-// SetDryRunSupport forces the cached dry-run capability without invoking the
-// probe. Tests use this to exercise either branch of CheckUpdates without
-// shelling out for `docker compose pull --help`. Mirrors SetStandalone — the
-// flag-plus-detected pair is set in lock-step.
-func (c *Compose) SetDryRunSupport(supported bool) {
-	c.dryRunSupported = supported
-	c.dryRunDetected = true
 }
 
 // ListServices returns the list of services defined in the compose file.

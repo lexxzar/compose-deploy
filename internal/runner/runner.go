@@ -76,11 +76,20 @@ type Composer interface {
 	// An empty services slice means "check every service in the project".
 	// Only services for which a verdict could be derived appear in the map;
 	// absent entries mean "unknown" (build-only services, registry errors,
-	// services skipped by the dry-run output, etc.) and the caller must
-	// treat that as the tri-state nil — same contract as
-	// ServiceStatus.UpdateAvailable. Errors are partial-friendly: a non-nil
-	// error may still be accompanied by a usable map of the services that
-	// were resolved before the failure.
+	// per-image inspect failures, etc.) and the caller must treat that as
+	// the tri-state nil — same contract as ServiceStatus.UpdateAvailable.
+	//
+	// Error contract: when a non-nil error is returned, callers SHOULD treat
+	// the accompanying map as untrusted. Implementations may return a partial
+	// map alongside an error (e.g. RemoteCompose returns the verdicts it
+	// resolved before an SSH transport failure aborted the batch), but those
+	// partial verdicts may be inconsistent with the unresolved services — a
+	// service shown as "current" might actually have an update that the
+	// failed fetch would have detected. Soft-failure consumers (CLI list,
+	// TUI) should display the error and discard the partial verdicts (i.e.
+	// `if err != nil { updates = nil }`) rather than rendering a mixed view.
+	// Tests/callers that need every-verdict-or-fail semantics can still
+	// detect via `err != nil`.
 	CheckUpdates(ctx context.Context, services []string) (map[string]bool, error)
 	// Logs streams docker compose logs for a single service to w.
 	// When follow is true, it streams until ctx is cancelled.
