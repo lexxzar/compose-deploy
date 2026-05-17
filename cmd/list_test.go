@@ -2866,6 +2866,52 @@ func TestListCmd_singleProjectUpdatesFailure(t *testing.T) {
 	}
 }
 
+// TestListSingleProject_UpdatesGatedByFlag verifies that when checkUpdates=false,
+// listSingleProject does NOT invoke CheckUpdates on the composer. The --updates
+// flag is the single gate for the registry round-trips; without it, even
+// single-project mode (-C, --ssh) must not pay the per-service probe cost.
+func TestListSingleProject_UpdatesGatedByFlag(t *testing.T) {
+	mock := &mockComposer{
+		services:   []string{"web", "db"},
+		status:     map[string]runner.ServiceStatus{"web": {Running: true}, "db": {Running: true}},
+		updatesErr: fmt.Errorf("CheckUpdates must not be called when checkUpdates=false"),
+	}
+
+	_ = captureStdout(t, func() {
+		if err := listSingleProject(context.Background(), mock, false, false, false); err != nil {
+			t.Errorf("unexpected error: %v", err)
+		}
+	})
+
+	if mock.updatesCalls != 0 {
+		t.Errorf("CheckUpdates called %d times, want 0 (flag-gated)", mock.updatesCalls)
+	}
+}
+
+// TestListSingleProject_UpdatesCalledWhenFlagSet verifies the inverse: with
+// checkUpdates=true, listSingleProject DOES invoke CheckUpdates and threads
+// the verdicts into the rendered output.
+func TestListSingleProject_UpdatesCalledWhenFlagSet(t *testing.T) {
+	mock := &mockComposer{
+		services: []string{"web"},
+		status:   map[string]runner.ServiceStatus{"web": {Running: true}},
+		updates:  map[string]bool{"web": true},
+	}
+
+	out := captureStdout(t, func() {
+		if err := listSingleProject(context.Background(), mock, false, false, true); err != nil {
+			t.Errorf("unexpected error: %v", err)
+		}
+	})
+
+	if mock.updatesCalls != 1 {
+		t.Errorf("CheckUpdates called %d times, want 1", mock.updatesCalls)
+	}
+	if !strings.Contains(out, compose.UpdateGlyph) {
+		t.Errorf("output missing update glyph when checkUpdates=true and verdict is true, got: %q", out)
+	}
+}
+
 // TestCollectMultiProjectStats_PopulatesUpdates verifies the multi-project
 // path threads update verdicts through to each project's services when
 // checkUpdates=true.

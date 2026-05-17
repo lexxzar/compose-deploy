@@ -40,9 +40,9 @@ type serviceStatus struct {
 	// UpdateAvailable is the tri-state "newer image in registry" hint. nil =
 	// unknown (not checked, build-only, error), &true = update available,
 	// &false = current. Pointer + omitempty keeps the field out of JSON output
-	// for callers that did not opt into update detection (single-project always
-	// checks; multi-project only when --updates is set), so existing JSON
-	// consumers see the original wire shape.
+	// for callers that did not opt into update detection (--updates is opt-in
+	// in both single- and multi-project modes), so existing JSON consumers see
+	// the original wire shape.
 	UpdateAvailable *bool `json:"update_available,omitempty"`
 }
 
@@ -374,11 +374,13 @@ docker stats call adds ~1.5s of latency, so --stats is off by default; scripts
 and CI pay nothing unless they ask for it. On stats fetch failure the rest of
 the listing still renders and a warning is printed to stderr.
 
-Single-project mode (-C specified) always checks for image updates and shows
-a ⇧ glyph next to services whose registry image is newer than the local one.
-Multi-project mode gates the check behind --updates (one registry probe per
-project can be expensive). Update-check failures are non-fatal: a warning is
-written to stderr, the cell stays blank, and the rest of the listing renders.`,
+With --updates, includes a per-service image-update indicator: a ⇧ glyph next
+to services whose registry image is newer than the local one. Each service
+costs one registry round-trip (buildx/manifest-inspect); for projects with
+many services this can add noticeable latency (especially on remote SSH), so
+--updates is off by default in both single- and multi-project modes. Failures
+are non-fatal: a warning is written to stderr, the cell stays blank, and the
+rest of the listing renders.`,
 		Example: `  # List services in current directory (if compose file exists)
   cdeploy list
 
@@ -396,8 +398,9 @@ written to stderr, the cell stays blank, and the rest of the listing renders.`,
   cdeploy list --stats
   cdeploy list -s prod --stats --json
 
-  # Include image-update indicators in multi-project mode
+  # Include image-update indicators (opt-in; costs one registry probe per service)
   cdeploy list --updates
+  cdeploy list -C /opt/myapp --updates
   cdeploy list -s prod --updates --json
 
   # Output as JSON for scripting
@@ -412,7 +415,7 @@ written to stderr, the cell stays blank, and the rest of the listing renders.`,
 
 	cmd.Flags().BoolVar(&jsonOutput, "json", false, "output as JSON")
 	cmd.Flags().BoolVar(&showStats, "stats", false, "include CPU and memory usage columns (adds ~1.5s latency)")
-	cmd.Flags().BoolVar(&showUpdates, "updates", false, "in multi-project mode, check each project's images for available updates (single-project mode always checks)")
+	cmd.Flags().BoolVar(&showUpdates, "updates", false, "check each service's image for available updates (adds one registry round-trip per service)")
 
 	return cmd
 }
@@ -597,13 +600,14 @@ func runList(ctx context.Context, jsonOutput, showStats, showUpdates bool) error
 
 	if sshTarget != "" {
 		// --ssh always implies a single project (resolveSSHRemote requires --project-dir).
-		// Single-project mode always checks for updates — no need for the --updates flag.
+		// Update check is opt-in via --updates because each service costs one
+		// SSH round-trip to buildx/manifest-inspect — 20+ services adds 10s+.
 		rc, cleanup, err := resolveSSHRemote(ctx, sshTarget, projectDir, identityFile, listNewRemote)
 		if err != nil {
 			return err
 		}
 		defer cleanup()
-		return listSingleProject(ctx, rc, jsonOutput, showStats, true)
+		return listSingleProject(ctx, rc, jsonOutput, showStats, showUpdates)
 	}
 
 	if serverName != "" {
@@ -632,9 +636,11 @@ func runList(ctx context.Context, jsonOutput, showStats, showUpdates bool) error
 			return err
 		}
 
-		// Single-project mode: -C explicitly specified — always checks updates.
+		// Single-project mode: -C explicitly specified. Update check is opt-in
+		// via --updates because each service costs one SSH round-trip to
+		// buildx/manifest-inspect.
 		if projDir != "" {
-			return listSingleProject(ctx, rc, jsonOutput, showStats, true)
+			return listSingleProject(ctx, rc, jsonOutput, showStats, showUpdates)
 		}
 
 		// Multi-project mode: discover all projects on the server.
@@ -681,14 +687,15 @@ func runList(ctx context.Context, jsonOutput, showStats, showUpdates bool) error
 	c := listNewLocal(dir)
 
 	if projectDir != "" {
-		// Single-project mode — always check updates.
+		// Single-project mode. Update check is opt-in via --updates because
+		// each service costs one registry round-trip to buildx/manifest-inspect.
 		if !listHasCompose(dir) {
 			return fmt.Errorf("no compose file found in %s", dir)
 		}
 		if err := c.Detect(ctx); err != nil {
 			return err
 		}
-		return listSingleProject(ctx, c, jsonOutput, showStats, true)
+		return listSingleProject(ctx, c, jsonOutput, showStats, showUpdates)
 	}
 
 	// Local multi-project: discover all projects on the system

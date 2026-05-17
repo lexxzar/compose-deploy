@@ -105,9 +105,10 @@ cdeploy list --json
 # Combine stats with JSON output
 cdeploy list --stats --json
 
-# Show image-update indicators (single-project mode auto-enables this)
-cdeploy list -C /opt/myapp        # single-project: always checks
-cdeploy list --updates            # multi-project: opt in explicitly
+# Show image-update indicators (opt-in; one registry probe per service)
+cdeploy list --updates
+cdeploy list -C /opt/myapp --updates
+cdeploy list -s prod --updates --json
 
 # Stream logs for a service
 cdeploy logs nginx
@@ -149,8 +150,7 @@ With `--stats`, three additional fields are populated per running service: `cpu_
 
 A yellow `⇧` glyph next to a service name in `cdeploy list` and the TUI service-select screen means the image in the registry has a different digest than the locally pulled copy. The check runs `docker compose config --format json` to map services to images, then per-image `docker image inspect` (local RepoDigest) and `docker buildx imagetools inspect` (registry manifest-list digest), falling back to `docker manifest inspect --verbose` when the buildx plugin is unavailable. Build-only services and services whose digest cannot be determined render a blank cell — the indicator is tri-state (unknown / current / update available).
 
-- **Single-project mode** (`-C` specified, or `--ssh` which requires `-C`): always checks for updates.
-- **Multi-project mode** (no `-C`): opt-in via `--updates` because each project triggers its own registry probes.
+`--updates` is opt-in in both single- and multi-project modes — each service costs one registry round-trip (buildx/manifest-inspect), and projects with many services (especially over SSH) can take 10+ seconds. Omit the flag for fast `cdeploy list` invocations; add it when you actually want to know what's behind.
 
 Failures are non-fatal: `cdeploy: updates unavailable: <err>` (single-project) or `cdeploy: updates unavailable for "<project>": <err>` (multi-project) is written to stderr, the cell stays blank, exit code 0. JSON output adds `update_available: true|false` with `omitempty`; existing JSON consumers see the original wire shape when the flag is absent.
 
