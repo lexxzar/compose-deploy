@@ -8941,16 +8941,20 @@ func TestViewSelectContainers_SoftWarningPriority_UpdatesAloneShown(t *testing.T
 	}
 }
 
-// TestViewSelectContainers_NoGlyph_NoReservation verifies that when NO service
-// has an update available, the name column is NOT padded by 2 extra cells —
-// alignment math should be identical to the pre-feature baseline.
-func TestViewSelectContainers_NoGlyph_NoReservation(t *testing.T) {
+// TestViewSelectContainers_NoGlyph_ReservationAlwaysApplied verifies that
+// even when NO service has an update available, the name column STILL reserves
+// 2 trailing cells for the glyph. This keeps the Created/Uptime/CPU/Mem/Ports
+// columns at a stable offset across mid-poll changes — when a verdict arrives,
+// clears, or refreshes, downstream columns don't shift.
+func TestViewSelectContainers_NoGlyph_ReservationAlwaysApplied(t *testing.T) {
 	mc := &mockComposer{}
 	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
 	m.screen = screenSelectContainers
 	m.services = []string{"web", "db"}
 	m.svcStatus = map[string]runner.ServiceStatus{
-		// All UpdateAvailable=nil → no glyph, no reservation.
+		// All UpdateAvailable=nil → no glyph rendered, but the reservation
+		// must still apply so downstream columns don't shift when a verdict
+		// later arrives.
 		"web": {Running: true, Created: "2024-01-15 09:30"},
 		"db":  {Running: true, Created: "2024-01-15 09:30"},
 	}
@@ -8959,9 +8963,8 @@ func TestViewSelectContainers_NoGlyph_NoReservation(t *testing.T) {
 	if strings.Contains(v, compose.UpdateGlyph) {
 		t.Errorf("View() should NOT contain update glyph when no service has UpdateAvailable=&true; got:\n%s", v)
 	}
-	// Sanity check that rows still align (the Created column starts at the
-	// same offset). Without the reservation, the maxName is exactly the
-	// longest service-name length (3 for "web", 2 for "db" → maxName=3).
+	// Both rows must align at the Created column (no glyph present, but
+	// reservation applied uniformly to every row).
 	ansi := regexp.MustCompile(`\x1b\[[0-9;]*m`)
 	cols := map[string]int{}
 	for _, line := range strings.Split(v, "\n") {
@@ -8976,6 +8979,30 @@ func TestViewSelectContainers_NoGlyph_NoReservation(t *testing.T) {
 	}
 	if cols["web"] != cols["db"] {
 		t.Errorf("Created column misalignment without glyph: web=%d db=%d", cols["web"], cols["db"])
+	}
+
+	// Verify the reservation is actually applied: render a second View with
+	// one service flagged as updated. The Created column offset must be
+	// IDENTICAL to the no-glyph case — that's the column-stability property.
+	trueVal := true
+	m.svcStatus = map[string]runner.ServiceStatus{
+		"web": {Running: true, Created: "2024-01-15 09:30", UpdateAvailable: &trueVal},
+		"db":  {Running: true, Created: "2024-01-15 09:30"},
+	}
+	v2 := m.View()
+	cols2 := map[string]int{}
+	for _, line := range strings.Split(v2, "\n") {
+		clean := ansi.ReplaceAllString(line, "")
+		for _, svc := range m.services {
+			if !strings.Contains(clean, svc) || !strings.Contains(clean, "2024-01-15") {
+				continue
+			}
+			byteIdx := strings.Index(clean, "2024-01-15")
+			cols2[svc] = utf8.RuneCountInString(clean[:byteIdx])
+		}
+	}
+	if cols["web"] != cols2["web"] {
+		t.Errorf("Created column shifted when verdict arrived: no-glyph=%d with-glyph=%d (should be stable)", cols["web"], cols2["web"])
 	}
 }
 

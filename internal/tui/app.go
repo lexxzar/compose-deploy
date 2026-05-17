@@ -2627,7 +2627,6 @@ func (m Model) viewSelectContainers() string {
 	maxCPU := 0
 	maxMem := 0
 	maxPorts := 0
-	hasUpdates := false
 	portsStr := make(map[string]string, len(m.services))
 	cpuStr := make(map[string]string, len(m.services))
 	memStr := make(map[string]string, len(m.services))
@@ -2646,9 +2645,6 @@ func (m Model) viewSelectContainers() string {
 			portsStr[svc] = s
 			if w := utf8.RuneCountInString(s); w > maxPorts {
 				maxPorts = w
-			}
-			if st.UpdateAvailable != nil && *st.UpdateAvailable {
-				hasUpdates = true
 			}
 		}
 		if stx, ok := m.stats[svc]; ok {
@@ -2669,16 +2665,13 @@ func (m Model) viewSelectContainers() string {
 		}
 	}
 
-	// Reserve 2 trailing cells in the name column whenever any service in the
-	// rendered list has an available update — one for the leading space, one
-	// for the U+21E7 glyph. Reserving unconditionally (rather than per-row)
-	// keeps following columns from shifting if a service's UpdateAvailable
-	// flips mid-poll. Services without updates pad to the same width with
-	// plain spaces; services with updates render `name + " " + glyph` and pad
-	// any remaining slack so the column edge stays put for longer names.
-	if hasUpdates {
-		maxName += 2
-	}
+	// Always reserve 2 trailing cells in the name column for the inline update
+	// glyph (leading space + U+21E7). Reserving unconditionally — not gated on
+	// "any service currently has the flag" — keeps following columns from
+	// shifting when a verdict arrives or clears mid-poll (cache refresh, U
+	// force-refresh, error invalidating glyphs). Services without updates pad
+	// with plain spaces; services with updates render `name + " " + glyph`.
+	maxName += 2
 
 	// Reserve fixed minimum widths for CPU/Mem columns as soon as stats have
 	// been requested. Two goals: (a) captions render on the first frame

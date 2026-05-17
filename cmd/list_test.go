@@ -2756,36 +2756,43 @@ func TestFormatDots_UpdateAlignment_PreservesColumns(t *testing.T) {
 	}
 }
 
-// TestFormatDots_NoUpdateNoReservation verifies that when no service has the
-// update flag set (all nil or &false), maxName is not padded by +2 — the
-// reservation is conditional on at least one &true. This keeps single-project
-// output as tight as it was before the feature.
-func TestFormatDots_NoUpdateNoReservation(t *testing.T) {
-	items := []serviceStatus{
+// TestFormatDots_NoUpdateReservationAlwaysApplied verifies that the name
+// column ALWAYS reserves 2 trailing cells for the glyph, even when no service
+// currently has the update flag. This keeps downstream column offsets stable
+// across invocations and mirrors the TUI behavior.
+func TestFormatDots_NoUpdateReservationAlwaysApplied(t *testing.T) {
+	itemsNone := []serviceStatus{
 		{Name: "web", Running: true, UpdateAvailable: boolPtr(false)},
 		{Name: "db", Running: true}, // nil
 	}
-
-	out := formatDots(items)
-	if strings.Contains(out, compose.UpdateGlyph) {
-		t.Errorf("output must not contain update glyph when no service has UpdateAvailable=&true, got:\n%s", out)
+	itemsWith := []serviceStatus{
+		{Name: "web", Running: true, UpdateAvailable: boolPtr(true)},
+		{Name: "db", Running: true},
 	}
 
-	// Sanity: the longest name is "web" (3 chars). With no reservation, the
-	// padded name column should be 3 chars wide; with reservation it would be
-	// 5. We can't observe maxName directly, so we observe the line-end of the
-	// name region: there should be no trailing spaces between "web" and EOL
-	// (no other columns are set).
-	lines := strings.Split(out, "\n")
-	for _, line := range lines {
-		// Each row ends with the padded name (no further columns). If +2
-		// reservation kicked in incorrectly, the line would have 2 extra
-		// trailing spaces. Trim trailing spaces and re-add only what we
-		// expect — if a difference appears the reservation leaked.
+	outNone := formatDots(itemsNone)
+	outWith := formatDots(itemsWith)
+
+	if strings.Contains(outNone, compose.UpdateGlyph) {
+		t.Errorf("no-glyph output must not contain glyph, got:\n%s", outNone)
+	}
+	if !strings.Contains(outWith, compose.UpdateGlyph) {
+		t.Errorf("with-glyph output must contain glyph, got:\n%s", outWith)
+	}
+
+	// Stability check: each name row in both outputs must be padded to the
+	// same width. Trim trailing spaces from each name-region and verify the
+	// no-glyph variant has 2 extra trailing spaces (the reserved glyph slot)
+	// where the with-glyph variant has " ⇧".
+	noneLines := strings.Split(outNone, "\n")
+	for _, line := range noneLines {
 		trimmed := strings.TrimRight(line, " ")
-		// The trimmed line should end at the service name (no extra padding).
-		if !strings.HasSuffix(trimmed, "web") && !strings.HasSuffix(trimmed, "db") {
-			t.Errorf("line ends with unexpected padding (reservation leaked?): %q", line)
+		// With unconditional reservation, the line should NOT end at the
+		// bare service name — it should have 2 trailing spaces reserved for
+		// the glyph slot. After TrimRight, the difference from the raw line
+		// length should be at least 2.
+		if len(line)-len(trimmed) < 2 {
+			t.Errorf("no-glyph line missing reserved 2 trailing cells (column stability broken): %q (trimmed=%q)", line, trimmed)
 		}
 	}
 }

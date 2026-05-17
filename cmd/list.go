@@ -158,7 +158,6 @@ func formatDots(items []serviceStatus) string {
 	maxCPU := 0
 	maxMem := 0
 	maxPorts := 0
-	hasUpdates := false
 	portsStr := make([]string, len(items))
 	cpuStr := make([]string, len(items))
 	memStr := make([]string, len(items))
@@ -184,19 +183,14 @@ func formatDots(items []serviceStatus) string {
 		if w := utf8.RuneCountInString(portsStr[i]); w > maxPorts {
 			maxPorts = w
 		}
-		if item.UpdateAvailable != nil && *item.UpdateAvailable {
-			hasUpdates = true
-		}
 	}
 
-	// Reserve 2 trailing cells in the name column whenever any service in the
-	// rendered list has an available update — one for the leading space, one
-	// for the U+21E7 glyph. Reserving unconditionally (rather than per-row)
-	// keeps following columns aligned regardless of which row carries the
-	// flag. Mirrors the TUI rendering (see internal/tui/app.go).
-	if hasUpdates {
-		maxName += 2
-	}
+	// Always reserve 2 trailing cells in the name column for the inline update
+	// glyph (leading space + U+21E7), regardless of whether any service in the
+	// rendered list currently carries the flag. Reserving unconditionally
+	// keeps following columns aligned across invocations and matches the TUI
+	// rendering (see internal/tui/app.go).
+	maxName += 2
 
 	var b strings.Builder
 	for i, item := range items {
@@ -269,7 +263,6 @@ func formatDotsGrouped(projects []projectServices) string {
 		maxCPU := 0
 		maxMem := 0
 		maxPorts := 0
-		hasUpdates := false
 		portsStr := make([]string, len(proj.Services))
 		cpuStr := make([]string, len(proj.Services))
 		memStr := make([]string, len(proj.Services))
@@ -295,18 +288,14 @@ func formatDotsGrouped(projects []projectServices) string {
 			if w := utf8.RuneCountInString(portsStr[i]); w > maxPorts {
 				maxPorts = w
 			}
-			if item.UpdateAvailable != nil && *item.UpdateAvailable {
-				hasUpdates = true
-			}
 		}
 
-		// Reserve +2 cells in name column for the inline update glyph when
-		// any service in this project has the flag. Per-project (not global)
-		// so each project's column widths stay independent — matches the
-		// existing per-project pattern for Created/Uptime/CPU/Mem.
-		if hasUpdates {
-			maxName += 2
-		}
+		// Always reserve +2 cells in name column for the inline update glyph,
+		// regardless of whether any service in this project currently has the
+		// flag. Per-project (not global) so each project's column widths stay
+		// independent — matches the existing per-project pattern for
+		// Created/Uptime/CPU/Mem.
+		maxName += 2
 
 		for i, item := range proj.Services {
 			b.WriteByte('\n')
