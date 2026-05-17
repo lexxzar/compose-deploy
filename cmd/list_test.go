@@ -586,11 +586,14 @@ func TestMergeStatus_CopiesCreatedAndUptime(t *testing.T) {
 
 // mockComposer implements runner.Composer for testing.
 type mockComposer struct {
-	services []string
-	status   map[string]runner.ServiceStatus
-	stats    map[string]runner.ServiceStats
-	statsErr error
-	err      error
+	services     []string
+	status       map[string]runner.ServiceStatus
+	stats        map[string]runner.ServiceStats
+	statsErr     error
+	updates      map[string]bool
+	updatesErr   error
+	updatesCalls int
+	err          error
 }
 
 func (m *mockComposer) ListServices(_ context.Context) ([]string, error) {
@@ -615,7 +618,11 @@ func (m *mockComposer) ContainerStats(_ context.Context) (map[string]runner.Serv
 }
 
 func (m *mockComposer) CheckUpdates(_ context.Context, _ []string) (map[string]bool, error) {
-	return nil, nil
+	m.updatesCalls++
+	if m.updatesErr != nil {
+		return nil, m.updatesErr
+	}
+	return m.updates, nil
 }
 
 func (m *mockComposer) Stop(_ context.Context, _ []string, _ io.Writer) error   { return nil }
@@ -810,7 +817,7 @@ func TestListCmd_ExplicitProjectDir_NoComposeFile(t *testing.T) {
 	projectDir = dir
 	t.Cleanup(func() { projectDir = old })
 
-	err := runList(context.Background(), false, false)
+	err := runList(context.Background(), false, false, false)
 	if err == nil {
 		t.Fatal("expected error when -C points to directory without compose file")
 	}
@@ -851,7 +858,7 @@ func TestListSingleProject_Dots(t *testing.T) {
 	}
 
 	out := captureStdout(t, func() {
-		err := listSingleProject(context.Background(), mock, false, false)
+		err := listSingleProject(context.Background(), mock, false, false, false)
 		if err != nil {
 			t.Errorf("unexpected error: %v", err)
 		}
@@ -875,7 +882,7 @@ func TestListSingleProject_JSON(t *testing.T) {
 	}
 
 	out := captureStdout(t, func() {
-		err := listSingleProject(context.Background(), mock, true, false)
+		err := listSingleProject(context.Background(), mock, true, false, false)
 		if err != nil {
 			t.Errorf("unexpected error: %v", err)
 		}
@@ -893,7 +900,7 @@ func TestListSingleProject_JSON(t *testing.T) {
 func TestListSingleProject_ListServicesError(t *testing.T) {
 	mock := &mockComposer{err: fmt.Errorf("docker down")}
 
-	err := listSingleProject(context.Background(), mock, false, false)
+	err := listSingleProject(context.Background(), mock, false, false, false)
 	if err == nil {
 		t.Fatal("expected error, got nil")
 	}
@@ -909,7 +916,7 @@ func TestListSingleProject_ContainerStatusError(t *testing.T) {
 		statusErr: fmt.Errorf("connection lost"),
 	}
 
-	err := listSingleProject(context.Background(), statusErr, false, false)
+	err := listSingleProject(context.Background(), statusErr, false, false, false)
 	if err == nil {
 		t.Fatal("expected error, got nil")
 	}
@@ -1033,7 +1040,7 @@ func TestRunList_LocalSingleProject(t *testing.T) {
 	projectDir = "/explicit/dir"
 
 	out := captureStdout(t, func() {
-		err := runList(context.Background(), false, false)
+		err := runList(context.Background(), false, false, false)
 		if err != nil {
 			t.Errorf("unexpected error: %v", err)
 		}
@@ -1082,7 +1089,7 @@ func TestRunList_LocalDiscoveryFromComposeDir(t *testing.T) {
 	projectDir = ""
 
 	out := captureStdout(t, func() {
-		err := runList(context.Background(), false, false)
+		err := runList(context.Background(), false, false, false)
 		if err != nil {
 			t.Errorf("unexpected error: %v", err)
 		}
@@ -1143,7 +1150,7 @@ func TestRunList_LocalMultiProject(t *testing.T) {
 	projectDir = ""
 
 	out := captureStdout(t, func() {
-		err := runList(context.Background(), false, false)
+		err := runList(context.Background(), false, false, false)
 		if err != nil {
 			t.Errorf("unexpected error: %v", err)
 		}
@@ -1191,7 +1198,7 @@ func TestRunList_LocalMultiProject_JSON(t *testing.T) {
 	projectDir = ""
 
 	out := captureStdout(t, func() {
-		err := runList(context.Background(), true, false)
+		err := runList(context.Background(), true, false, false)
 		if err != nil {
 			t.Errorf("unexpected error: %v", err)
 		}
@@ -1233,7 +1240,7 @@ func TestRunList_LocalListProjectsError(t *testing.T) {
 	}
 	projectDir = ""
 
-	err := runList(context.Background(), false, false)
+	err := runList(context.Background(), false, false, false)
 	if err == nil {
 		t.Fatal("expected error, got nil")
 	}
@@ -1269,7 +1276,7 @@ func TestRunList_LocalNoProjects(t *testing.T) {
 	}
 	projectDir = ""
 
-	err := runList(context.Background(), false, false)
+	err := runList(context.Background(), false, false, false)
 	if err == nil {
 		t.Fatal("expected error, got nil")
 	}
@@ -1304,7 +1311,7 @@ func TestRunList_LocalDetectFailure(t *testing.T) {
 	projectDir = "/explicit/dir"
 	serverName = ""
 
-	err := runList(context.Background(), false, false)
+	err := runList(context.Background(), false, false, false)
 	if err == nil {
 		t.Fatal("expected error when Detect fails")
 	}
@@ -1339,7 +1346,7 @@ func TestRunList_LocalMultiProjectDetectFailure(t *testing.T) {
 	projectDir = ""
 	serverName = ""
 
-	err := runList(context.Background(), false, false)
+	err := runList(context.Background(), false, false, false)
 	if err == nil {
 		t.Fatal("expected error when Detect fails")
 	}
@@ -1400,7 +1407,7 @@ func TestRunList_ServerSingleProject(t *testing.T) {
 	}
 
 	out := captureStdout(t, func() {
-		err := runList(context.Background(), false, false)
+		err := runList(context.Background(), false, false, false)
 		if err != nil {
 			t.Errorf("unexpected error: %v", err)
 		}
@@ -1464,7 +1471,7 @@ func TestRunList_ServerMultiProject(t *testing.T) {
 	}
 
 	out := captureStdout(t, func() {
-		err := runList(context.Background(), false, false)
+		err := runList(context.Background(), false, false, false)
 		if err != nil {
 			t.Errorf("unexpected error: %v", err)
 		}
@@ -1506,7 +1513,7 @@ func TestListCmd_RemoteIgnoresServerProjectDir(t *testing.T) {
 	}
 	t.Cleanup(func() { listNewRemote = oldNewRemote })
 
-	_ = runList(context.Background(), false, false)
+	_ = runList(context.Background(), false, false, false)
 
 	if capturedProjDir != "" {
 		t.Errorf("listNewRemote received projDir = %q, want empty (server.ProjectDir should be ignored)", capturedProjDir)
@@ -1527,7 +1534,7 @@ func TestRunList_SSHAndServerMutex(t *testing.T) {
 	sshTarget = "user@host"
 	projectDir = "/srv/app"
 
-	err := runList(context.Background(), false, false)
+	err := runList(context.Background(), false, false, false)
 	if err == nil {
 		t.Fatal("expected mutex error, got nil")
 	}
@@ -1550,7 +1557,7 @@ func TestRunList_SSHRequiresProjectDir(t *testing.T) {
 	sshTarget = "user@host"
 	projectDir = ""
 
-	err := runList(context.Background(), false, false)
+	err := runList(context.Background(), false, false, false)
 	if err == nil {
 		t.Fatal("expected error, got nil")
 	}
@@ -1600,7 +1607,7 @@ func TestRunList_SSHHappyPath(t *testing.T) {
 		return rc
 	}
 
-	if err := runList(context.Background(), false, false); err != nil {
+	if err := runList(context.Background(), false, false, false); err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 
@@ -1863,7 +1870,7 @@ func TestRunList_SSHHappyPathWithIdentity(t *testing.T) {
 		return rc
 	}
 
-	if err := runList(context.Background(), false, false); err != nil {
+	if err := runList(context.Background(), false, false, false); err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 	if capturedConfigArgs == nil {
@@ -1895,7 +1902,7 @@ func TestList_IdentityWithoutSSH(t *testing.T) {
 	projectDir = ""
 	identityFile = "/tmp/k"
 
-	err := runList(context.Background(), false, false)
+	err := runList(context.Background(), false, false, false)
 	if err == nil {
 		t.Fatal("expected error when --identity is set without --ssh")
 	}
@@ -1966,7 +1973,7 @@ func TestListJSON_omitsStatsFieldsWithoutFlag(t *testing.T) {
 	}
 
 	out := captureStdout(t, func() {
-		if err := listSingleProject(context.Background(), mock, true, false); err != nil {
+		if err := listSingleProject(context.Background(), mock, true, false, false); err != nil {
 			t.Errorf("unexpected error: %v", err)
 		}
 	})
@@ -1990,7 +1997,7 @@ func TestListJSON_includesStatsFieldsWithFlag(t *testing.T) {
 	}
 
 	out := captureStdout(t, func() {
-		if err := listSingleProject(context.Background(), mock, true, true); err != nil {
+		if err := listSingleProject(context.Background(), mock, true, true, false); err != nil {
 			t.Errorf("unexpected error: %v", err)
 		}
 	})
@@ -2034,7 +2041,7 @@ func TestListJSON_includesStatsFieldsWithZeroValues(t *testing.T) {
 	}
 
 	out := captureStdout(t, func() {
-		if err := listSingleProject(context.Background(), mock, true, true); err != nil {
+		if err := listSingleProject(context.Background(), mock, true, true, false); err != nil {
 			t.Errorf("unexpected error: %v", err)
 		}
 	})
@@ -2066,7 +2073,7 @@ func TestListCmd_singleProjectStatsFailure(t *testing.T) {
 	t.Cleanup(func() { os.Stderr = oldStderr })
 
 	stdout := captureStdout(t, func() {
-		if err := listSingleProject(context.Background(), mock, false, true); err != nil {
+		if err := listSingleProject(context.Background(), mock, false, true, false); err != nil {
 			t.Errorf("listSingleProject must not return error on stats fail, got: %v", err)
 		}
 	})
@@ -2130,7 +2137,7 @@ func TestListCmd_multiProjectStatsFailure(t *testing.T) {
 	os.Stderr = wErr
 	t.Cleanup(func() { os.Stderr = oldStderr })
 
-	result := collectMultiProjectStats(context.Background(), projects, factory, true, nil)
+	result := collectMultiProjectStats(context.Background(), projects, factory, true, nil, false)
 	wErr.Close()
 	os.Stderr = oldStderr
 
@@ -2274,7 +2281,7 @@ func TestMergeStatusStats_RequestedPopulatesPointers(t *testing.T) {
 		"web": {CPUPercent: 1.5, MemoryUsed: 100, MemoryLimit: 1000},
 	}
 
-	got := mergeStatusStats(services, status, stats, true)
+	got := mergeStatusStats(services, status, stats, true, nil)
 
 	// alphabetical sort: "missing" < "web"
 	if got[0].Name != "missing" || got[1].Name != "web" {
@@ -2307,7 +2314,7 @@ func TestMergeStatusStats_LegitimateZeroPreserved(t *testing.T) {
 		"idle": {CPUPercent: 0, MemoryUsed: 0, MemoryLimit: 0},
 	}
 
-	got := mergeStatusStats(services, status, stats, true)
+	got := mergeStatusStats(services, status, stats, true, nil)
 	if got[0].CPUPercent == nil || *got[0].CPUPercent != 0 {
 		t.Errorf("idle CPU should be &0, got %v", got[0].CPUPercent)
 	}
@@ -2329,7 +2336,7 @@ func TestMergeStatusStats_NotRequestedLeavesNil(t *testing.T) {
 		"web": {CPUPercent: 99.9, MemoryUsed: 1, MemoryLimit: 1},
 	}
 
-	got := mergeStatusStats(services, status, stats, false)
+	got := mergeStatusStats(services, status, stats, false, nil)
 	if got[0].CPUPercent != nil || got[0].MemoryUsed != nil || got[0].MemoryLimit != nil {
 		t.Errorf("stats pointers must remain nil when not requested, got %+v", got[0])
 	}
@@ -2348,7 +2355,7 @@ func TestCollectMultiProjectStats_PopulatesStats(t *testing.T) {
 	projects := []compose.Project{{Name: "a", ConfigDir: "/a"}}
 	factory := func(dir string) runner.Composer { return mocks[dir] }
 
-	result := collectMultiProjectStats(context.Background(), projects, factory, true, nil)
+	result := collectMultiProjectStats(context.Background(), projects, factory, true, nil, false)
 	if len(result) != 1 || len(result[0].Services) != 1 {
 		t.Fatalf("unexpected result shape: %+v", result)
 	}
@@ -2371,7 +2378,7 @@ func TestCollectMultiProjectStats_NotRequestedSkipsStatsCall(t *testing.T) {
 	factory := func(_ string) runner.Composer { return mock }
 
 	// With showStats=false, statsErr must not surface — ContainerStats() not invoked.
-	result := collectMultiProjectStats(context.Background(), projects, factory, false, nil)
+	result := collectMultiProjectStats(context.Background(), projects, factory, false, nil, false)
 	if len(result) != 1 || len(result[0].Services) != 1 {
 		t.Fatalf("unexpected result shape: %+v", result)
 	}
@@ -2401,7 +2408,7 @@ func TestCollectMultiProjectStats_UsesBulkAggregator(t *testing.T) {
 	factory := func(_ string) runner.Composer { return mock }
 	bulk := map[string]runner.ServiceStats{"deadbeef0000": {CPUPercent: 0}} // contents irrelevant; presence triggers the bulk path
 
-	result := collectMultiProjectStats(context.Background(), projects, factory, true, bulk)
+	result := collectMultiProjectStats(context.Background(), projects, factory, true, bulk, false)
 	if len(result) != 1 || len(result[0].Services) != 1 {
 		t.Fatalf("unexpected result shape: %+v", result)
 	}
@@ -2442,7 +2449,7 @@ func TestCollectMultiProjectStats_EmptyBulkSkipsPerProjectRetry(t *testing.T) {
 	factory := func(_ string) runner.Composer { return mock }
 
 	// Non-nil empty bulk map — the contract for "bulk fetch failed".
-	result := collectMultiProjectStats(context.Background(), projects, factory, true, map[string]runner.ServiceStats{})
+	result := collectMultiProjectStats(context.Background(), projects, factory, true, map[string]runner.ServiceStats{}, false)
 	if len(result) != 1 || len(result[0].Services) != 1 {
 		t.Fatalf("unexpected result shape: %+v", result)
 	}
@@ -2470,7 +2477,7 @@ func TestCollectMultiProjectStats_FallsBackWhenBulkNil(t *testing.T) {
 	projects := []compose.Project{{Name: "a", ConfigDir: "/a"}}
 	factory := func(_ string) runner.Composer { return mock }
 
-	result := collectMultiProjectStats(context.Background(), projects, factory, true, nil)
+	result := collectMultiProjectStats(context.Background(), projects, factory, true, nil, false)
 	if len(result) != 1 || len(result[0].Services) != 1 {
 		t.Fatalf("unexpected result shape: %+v", result)
 	}
@@ -2509,6 +2516,463 @@ func TestFormatMemCell_BlankWhenNil(t *testing.T) {
 	for _, c := range cases {
 		if got := formatMemCell(c); got != "" {
 			t.Errorf("%s: formatMemCell = %q, want empty", c.Name, got)
+		}
+	}
+}
+
+// boolPtr is a tiny helper used by the update-availability tests to make
+// &true / &false expressions readable in struct literals.
+func boolPtr(b bool) *bool { return &b }
+
+// TestListCmd_updatesFlagRegistration verifies the --updates flag is registered
+// on `list` with a `false` default and accepts being set.
+func TestListCmd_updatesFlagRegistration(t *testing.T) {
+	cmd := NewRootCmd()
+
+	var listCmd *cobra.Command
+	for _, sub := range cmd.Commands() {
+		if sub.Name() == "list" {
+			listCmd = sub
+			break
+		}
+	}
+	if listCmd == nil {
+		t.Fatal("list subcommand not found")
+	}
+
+	flag := listCmd.Flags().Lookup("updates")
+	if flag == nil {
+		t.Fatal("--updates flag not registered on list")
+	}
+	if flag.DefValue != "false" {
+		t.Errorf("--updates default = %q, want %q", flag.DefValue, "false")
+	}
+	if err := flag.Value.Set("true"); err != nil {
+		t.Errorf("setting --updates=true failed: %v", err)
+	}
+	if flag.Value.String() != "true" {
+		t.Errorf("--updates after Set('true') = %q, want %q", flag.Value.String(), "true")
+	}
+}
+
+// TestMergeStatusStats_UpdatesHydrated verifies presence in the updates map
+// sets UpdateAvailable to the corresponding pointer (&true or &false), while
+// absence leaves it nil — the tri-state contract.
+func TestMergeStatusStats_UpdatesHydrated(t *testing.T) {
+	services := []string{"web", "db", "build"}
+	status := map[string]runner.ServiceStatus{
+		"web":   {Running: true},
+		"db":    {Running: true},
+		"build": {Running: false},
+	}
+	updates := map[string]bool{
+		"web": true,
+		"db":  false,
+		// "build" absent: simulates a build-only service the dry-run path skipped.
+	}
+
+	got := mergeStatusStats(services, status, nil, false, updates)
+
+	// alphabetical sort
+	byName := make(map[string]serviceStatus, len(got))
+	for _, s := range got {
+		byName[s.Name] = s
+	}
+
+	if byName["web"].UpdateAvailable == nil || !*byName["web"].UpdateAvailable {
+		t.Errorf("web UpdateAvailable = %v, want &true", byName["web"].UpdateAvailable)
+	}
+	if byName["db"].UpdateAvailable == nil || *byName["db"].UpdateAvailable {
+		t.Errorf("db UpdateAvailable = %v, want &false", byName["db"].UpdateAvailable)
+	}
+	if byName["build"].UpdateAvailable != nil {
+		t.Errorf("build UpdateAvailable should be nil (absent from map), got %v", *byName["build"].UpdateAvailable)
+	}
+}
+
+// TestMergeStatusStats_UpdatesNilMapLeavesNil verifies that passing a nil
+// updates map skips hydration entirely — preserving wire-shape compatibility
+// for callers that did not opt into update detection.
+func TestMergeStatusStats_UpdatesNilMapLeavesNil(t *testing.T) {
+	services := []string{"web"}
+	status := map[string]runner.ServiceStatus{"web": {Running: true}}
+
+	got := mergeStatusStats(services, status, nil, false, nil)
+	if got[0].UpdateAvailable != nil {
+		t.Errorf("UpdateAvailable must remain nil when updates map is nil, got %v", *got[0].UpdateAvailable)
+	}
+}
+
+// TestListJSON_omitsUpdateAvailableWithoutCheck verifies that when CheckUpdates
+// is not invoked (the multi-project --updates=false path, or a stats-only
+// caller), the JSON output omits the update_available key.
+func TestListJSON_omitsUpdateAvailableWithoutCheck(t *testing.T) {
+	mock := &mockComposer{
+		services: []string{"web"},
+		status:   map[string]runner.ServiceStatus{"web": {Running: true}},
+		// updates would be returned if asked — assert that checkUpdates=false skips the call.
+		updates: map[string]bool{"web": true},
+	}
+
+	out := captureStdout(t, func() {
+		if err := listSingleProject(context.Background(), mock, true, false, false); err != nil {
+			t.Errorf("unexpected error: %v", err)
+		}
+	})
+
+	if strings.Contains(out, `"update_available"`) {
+		t.Errorf("JSON without update check must not contain update_available, got: %s", out)
+	}
+	if mock.updatesCalls != 0 {
+		t.Errorf("CheckUpdates called %d times when checkUpdates=false, want 0", mock.updatesCalls)
+	}
+}
+
+// TestListJSON_includesUpdateAvailableWithCheck verifies JSON contains
+// update_available with the correct value when CheckUpdates is invoked.
+// Includes both &true and &false to confirm the tri-state contract carries
+// all the way to the JSON wire shape (pointer + omitempty handles nil vs
+// either bool correctly).
+func TestListJSON_includesUpdateAvailableWithCheck(t *testing.T) {
+	mock := &mockComposer{
+		services: []string{"web", "db", "build"},
+		status: map[string]runner.ServiceStatus{
+			"web":   {Running: true},
+			"db":    {Running: true},
+			"build": {Running: false},
+		},
+		updates: map[string]bool{
+			"web": true,
+			"db":  false,
+		},
+	}
+
+	out := captureStdout(t, func() {
+		if err := listSingleProject(context.Background(), mock, true, false, true); err != nil {
+			t.Errorf("unexpected error: %v", err)
+		}
+	})
+
+	if !strings.Contains(out, `"update_available"`) {
+		t.Errorf("JSON with checkUpdates must contain update_available, got: %s", out)
+	}
+
+	var got []serviceStatus
+	if err := json.Unmarshal([]byte(strings.TrimSpace(out)), &got); err != nil {
+		t.Fatalf("invalid JSON output: %v\nraw: %q", err, out)
+	}
+
+	byName := make(map[string]serviceStatus, len(got))
+	for _, s := range got {
+		byName[s.Name] = s
+	}
+	if byName["web"].UpdateAvailable == nil || !*byName["web"].UpdateAvailable {
+		t.Errorf("JSON web.update_available = %v, want &true", byName["web"].UpdateAvailable)
+	}
+	if byName["db"].UpdateAvailable == nil || *byName["db"].UpdateAvailable {
+		t.Errorf("JSON db.update_available = %v, want &false", byName["db"].UpdateAvailable)
+	}
+	if byName["build"].UpdateAvailable != nil {
+		// build is absent from the updates map → field must be omitted entirely.
+		t.Errorf("build.update_available should be omitted from JSON, got %v", *byName["build"].UpdateAvailable)
+	}
+}
+
+// TestFormatDots_UpdateGlyphRendered verifies the ⇧ glyph appears next to a
+// service name whose UpdateAvailable is &true, and does NOT appear next to a
+// service whose flag is &false or nil. Mirrors the TUI rendering check.
+func TestFormatDots_UpdateGlyphRendered(t *testing.T) {
+	items := []serviceStatus{
+		{Name: "web", Running: true, UpdateAvailable: boolPtr(true)},
+		{Name: "db", Running: true, UpdateAvailable: boolPtr(false)},
+		{Name: "cache", Running: true}, // UpdateAvailable nil
+	}
+
+	out := formatDots(items)
+	if !strings.Contains(out, updateGlyph) {
+		t.Errorf("output should contain update glyph %q when a service has UpdateAvailable=&true; got:\n%s", updateGlyph, out)
+	}
+
+	lines := strings.Split(out, "\n")
+	for _, line := range lines {
+		// Only the "web" line should carry the glyph — db (&false) and cache (nil) must not.
+		if strings.Contains(line, "db") && strings.Contains(line, updateGlyph) {
+			t.Errorf("db (&false) must not show update glyph, got: %q", line)
+		}
+		if strings.Contains(line, "cache") && strings.Contains(line, updateGlyph) {
+			t.Errorf("cache (nil) must not show update glyph, got: %q", line)
+		}
+	}
+}
+
+// TestFormatDots_UpdateGlyphOnStoppedService verifies the glyph still appears
+// for stopped services whose image has updates — the deploy on the next start
+// would pull the newer image, so the indicator is useful regardless of state.
+func TestFormatDots_UpdateGlyphOnStoppedService(t *testing.T) {
+	items := []serviceStatus{
+		{Name: "web", Running: false, UpdateAvailable: boolPtr(true)},
+	}
+
+	out := formatDots(items)
+	if !strings.Contains(out, updateGlyph) {
+		t.Errorf("output should contain update glyph for stopped service with UpdateAvailable=&true; got:\n%s", out)
+	}
+}
+
+// TestFormatDots_UpdateAlignment_PreservesColumns verifies that when the +2
+// alignment reservation kicks in, all rows align on the next column. The
+// glyph is multi-byte (3 bytes) but renders in one terminal cell, so we
+// compare via display width (rune count) rather than byte length, and we
+// look for the position of the first following column ("Created" via the
+// 2-space separator) to confirm alignment.
+func TestFormatDots_UpdateAlignment_PreservesColumns(t *testing.T) {
+	items := []serviceStatus{
+		{Name: "web", Running: true, Created: "2024-01-15 09:30", UpdateAvailable: boolPtr(true)},
+		{Name: "db", Running: true, Created: "2024-01-15 09:30"}, // no update
+	}
+
+	out := formatDots(items)
+	lines := strings.Split(out, "\n")
+	if len(lines) != 2 {
+		t.Fatalf("lines = %d, want 2", len(lines))
+	}
+
+	// All Created cells should appear at the same display column — find the
+	// "2024" prefix in each line and compare its rune position.
+	pos := func(s, sub string) int {
+		idx := strings.Index(s, sub)
+		if idx < 0 {
+			return -1
+		}
+		return utf8.RuneCountInString(s[:idx])
+	}
+	p0 := pos(lines[0], "2024")
+	p1 := pos(lines[1], "2024")
+	if p0 < 0 || p1 < 0 {
+		t.Fatalf("Created column missing from one of the lines:\n[0]: %q\n[1]: %q", lines[0], lines[1])
+	}
+	if p0 != p1 {
+		t.Errorf("Created column not aligned across update / no-update rows: p0=%d, p1=%d\n[0]: %q\n[1]: %q", p0, p1, lines[0], lines[1])
+	}
+}
+
+// TestFormatDots_NoUpdateNoReservation verifies that when no service has the
+// update flag set (all nil or &false), maxName is not padded by +2 — the
+// reservation is conditional on at least one &true. This keeps single-project
+// output as tight as it was before the feature.
+func TestFormatDots_NoUpdateNoReservation(t *testing.T) {
+	items := []serviceStatus{
+		{Name: "web", Running: true, UpdateAvailable: boolPtr(false)},
+		{Name: "db", Running: true}, // nil
+	}
+
+	out := formatDots(items)
+	if strings.Contains(out, updateGlyph) {
+		t.Errorf("output must not contain update glyph when no service has UpdateAvailable=&true, got:\n%s", out)
+	}
+
+	// Sanity: the longest name is "web" (3 chars). With no reservation, the
+	// padded name column should be 3 chars wide; with reservation it would be
+	// 5. We can't observe maxName directly, so we observe the line-end of the
+	// name region: there should be no trailing spaces between "web" and EOL
+	// (no other columns are set).
+	lines := strings.Split(out, "\n")
+	for _, line := range lines {
+		// Each row ends with the padded name (no further columns). If +2
+		// reservation kicked in incorrectly, the line would have 2 extra
+		// trailing spaces. Trim trailing spaces and re-add only what we
+		// expect — if a difference appears the reservation leaked.
+		trimmed := strings.TrimRight(line, " ")
+		// The trimmed line should end at the service name (no extra padding).
+		if !strings.HasSuffix(trimmed, "web") && !strings.HasSuffix(trimmed, "db") {
+			t.Errorf("line ends with unexpected padding (reservation leaked?): %q", line)
+		}
+	}
+}
+
+// TestFormatDotsGrouped_UpdateGlyphRendered verifies the glyph renders in
+// the grouped (multi-project) layout.
+func TestFormatDotsGrouped_UpdateGlyphRendered(t *testing.T) {
+	projects := []projectServices{
+		{
+			Name: "app",
+			Services: []serviceStatus{
+				{Name: "web", Running: true, UpdateAvailable: boolPtr(true)},
+				{Name: "db", Running: true},
+			},
+		},
+	}
+
+	out := formatDotsGrouped(projects)
+	if !strings.Contains(out, updateGlyph) {
+		t.Errorf("grouped output should contain update glyph, got:\n%s", out)
+	}
+}
+
+// TestListCmd_singleProjectUpdatesFailure verifies that on CheckUpdates failure
+// in single-project mode, the command exits 0 with a stderr warning matching
+// the agreed phrasing, and the listing still renders without the update cell.
+func TestListCmd_singleProjectUpdatesFailure(t *testing.T) {
+	mock := &mockComposer{
+		services:   []string{"web"},
+		status:     map[string]runner.ServiceStatus{"web": {Running: true}},
+		updatesErr: fmt.Errorf("registry timeout"),
+	}
+
+	oldStderr := os.Stderr
+	rErr, wErr, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	os.Stderr = wErr
+	t.Cleanup(func() { os.Stderr = oldStderr })
+
+	stdout := captureStdout(t, func() {
+		if err := listSingleProject(context.Background(), mock, false, false, true); err != nil {
+			t.Errorf("listSingleProject must not return error on updates fail, got: %v", err)
+		}
+	})
+	wErr.Close()
+	os.Stderr = oldStderr
+
+	var stderrBuf strings.Builder
+	if _, err := io.Copy(&stderrBuf, rErr); err != nil {
+		t.Fatal(err)
+	}
+	stderr := stderrBuf.String()
+
+	// Exact phrasing required: "cdeploy: updates unavailable: <err>". Mirrors
+	// the existing "cdeploy: stats unavailable: <err>" precedent.
+	if !strings.Contains(stderr, "cdeploy: updates unavailable: ") {
+		t.Errorf("stderr missing 'cdeploy: updates unavailable: ' prefix, got: %q", stderr)
+	}
+	if !strings.Contains(stderr, "registry timeout") {
+		t.Errorf("stderr missing underlying error, got: %q", stderr)
+	}
+	// Service line still rendered.
+	if !strings.Contains(stdout, "web") {
+		t.Errorf("stdout missing service name on updates fail, got: %q", stdout)
+	}
+	// No glyph since update unknown.
+	if strings.Contains(stdout, updateGlyph) {
+		t.Errorf("stdout must not contain update glyph on updates fail, got: %q", stdout)
+	}
+}
+
+// TestCollectMultiProjectStats_PopulatesUpdates verifies the multi-project
+// path threads update verdicts through to each project's services when
+// checkUpdates=true.
+func TestCollectMultiProjectStats_PopulatesUpdates(t *testing.T) {
+	mocks := map[string]*mockComposer{
+		"/a": {
+			services: []string{"web"},
+			status:   map[string]runner.ServiceStatus{"web": {Running: true}},
+			updates:  map[string]bool{"web": true},
+		},
+	}
+	projects := []compose.Project{{Name: "a", ConfigDir: "/a"}}
+	factory := func(dir string) runner.Composer { return mocks[dir] }
+
+	result := collectMultiProjectStats(context.Background(), projects, factory, false, nil, true)
+	if len(result) != 1 || len(result[0].Services) != 1 {
+		t.Fatalf("unexpected result shape: %+v", result)
+	}
+	s := result[0].Services[0]
+	if s.UpdateAvailable == nil || !*s.UpdateAvailable {
+		t.Errorf("UpdateAvailable = %v, want &true", s.UpdateAvailable)
+	}
+	if mocks["/a"].updatesCalls != 1 {
+		t.Errorf("CheckUpdates called %d times, want 1", mocks["/a"].updatesCalls)
+	}
+}
+
+// TestCollectMultiProjectStats_UpdatesGatedByFlag verifies that when
+// checkUpdates=false, CheckUpdates is NOT invoked on any project — the
+// --updates flag is the gate that controls per-project registry probes.
+func TestCollectMultiProjectStats_UpdatesGatedByFlag(t *testing.T) {
+	mock := &mockComposer{
+		services:   []string{"web"},
+		status:     map[string]runner.ServiceStatus{"web": {Running: true}},
+		updatesErr: fmt.Errorf("CheckUpdates must not be called when checkUpdates=false"),
+	}
+	projects := []compose.Project{{Name: "a", ConfigDir: "/a"}}
+	factory := func(_ string) runner.Composer { return mock }
+
+	result := collectMultiProjectStats(context.Background(), projects, factory, false, nil, false)
+	if len(result) != 1 || len(result[0].Services) != 1 {
+		t.Fatalf("unexpected result shape: %+v", result)
+	}
+	if mock.updatesCalls != 0 {
+		t.Errorf("CheckUpdates called %d times, want 0 (flag-gated)", mock.updatesCalls)
+	}
+	if result[0].Services[0].UpdateAvailable != nil {
+		t.Errorf("UpdateAvailable must be nil without --updates, got %v", result[0].Services[0].UpdateAvailable)
+	}
+}
+
+// TestCollectMultiProjectStats_UpdatesFailureNonFatal verifies a per-project
+// update failure is non-fatal (mirrors stats failure handling): warning to
+// stderr with the agreed phrasing, project still present in the result,
+// other projects unaffected.
+func TestCollectMultiProjectStats_UpdatesFailureNonFatal(t *testing.T) {
+	mocks := map[string]*mockComposer{
+		"/app1": {
+			services:   []string{"web"},
+			status:     map[string]runner.ServiceStatus{"web": {Running: true}},
+			updatesErr: fmt.Errorf("registry down"),
+		},
+		"/app2": {
+			services: []string{"api"},
+			status:   map[string]runner.ServiceStatus{"api": {Running: true}},
+			updates:  map[string]bool{"api": true},
+		},
+	}
+	projects := []compose.Project{
+		{Name: "app1", ConfigDir: "/app1"},
+		{Name: "app2", ConfigDir: "/app2"},
+	}
+	factory := func(dir string) runner.Composer { return mocks[dir] }
+
+	oldStderr := os.Stderr
+	rErr, wErr, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	os.Stderr = wErr
+	t.Cleanup(func() { os.Stderr = oldStderr })
+
+	result := collectMultiProjectStats(context.Background(), projects, factory, false, nil, true)
+	wErr.Close()
+	os.Stderr = oldStderr
+
+	var stderrBuf strings.Builder
+	if _, err := io.Copy(&stderrBuf, rErr); err != nil {
+		t.Fatal(err)
+	}
+	stderr := stderrBuf.String()
+
+	if !strings.Contains(stderr, "cdeploy: updates unavailable for ") {
+		t.Errorf("stderr missing 'cdeploy: updates unavailable for ' prefix, got: %q", stderr)
+	}
+	if !strings.Contains(stderr, "app1") {
+		t.Errorf("stderr warning should name failing project app1, got: %q", stderr)
+	}
+	if len(result) != 2 {
+		t.Fatalf("got %d projects, want 2 (update failure must not drop a project)", len(result))
+	}
+
+	// app2's update came through.
+	for _, p := range result {
+		if p.Name == "app2" && len(p.Services) == 1 {
+			if p.Services[0].UpdateAvailable == nil || !*p.Services[0].UpdateAvailable {
+				t.Errorf("app2/api UpdateAvailable = %v, want &true", p.Services[0].UpdateAvailable)
+			}
+		}
+		// app1's UpdateAvailable should be nil (blank cell) — not fake &false.
+		if p.Name == "app1" && len(p.Services) == 1 {
+			if p.Services[0].UpdateAvailable != nil {
+				t.Errorf("app1/web UpdateAvailable should be nil on updates failure (blank cell), got %v", *p.Services[0].UpdateAvailable)
+			}
 		}
 	}
 }
