@@ -93,12 +93,12 @@ The CLI mirrors the TUI: single-project mode (`-C` specified) always checks; mul
 - Create: `internal/compose/updates_test.go`
 - Create: `internal/compose/testdata/dryrun_*.txt` (captured fixtures)
 
-- [ ] **Pre-flight**: capture actual stderr output from `docker compose pull --dry-run --quiet` against a known Compose v2 version (e.g. v2.27+) into `internal/compose/testdata/dryrun_*.txt` fixtures (clean update, all-current, mixed, build-only). Use these fixtures as the source of truth for parser strings instead of inventing them.
-- [ ] create `parseDryRunOutput(stderr string) map[string]bool` in `internal/compose/updates.go` — pure function. Unknown/unrecognised lines result in the service being **absent** from the map (tri-state preserved). Pin the Compose version targeted in a header comment so future changes are explicit.
-- [ ] create `detectDryRunFromHelp(help string) bool` — pure function, returns true when help text contains `--dry-run` flag mention
-- [ ] table-test `parseDryRunOutput` against the captured fixtures + synthetic edge cases (empty input, malformed lines, mixed-case)
-- [ ] table-test `detectDryRunFromHelp` against help-text samples with and without the flag
-- [ ] run `go test ./internal/compose/...` — must pass before Task 2
+- [x] **Pre-flight**: capture actual stderr output from `docker compose pull --dry-run --quiet` against a known Compose v2 version (e.g. v2.27+) into `internal/compose/testdata/dryrun_*.txt` fixtures (clean update, all-current, mixed, build-only). Use these fixtures as the source of truth for parser strings instead of inventing them. (Captured against Compose v2.40.3; fixtures: `dryrun_mixed.txt`, `dryrun_all_current.txt`, `dryrun_all_update.txt`, `dryrun_build_only.txt`. Confirmed: output is on stderr; the default `--policy=always` does NOT distinguish current images (everything → "Pulling"); only `--policy=missing` emits the "Skipped - Image is already present locally" verdict. Parser handles both; Tasks 2/3 will need to decide which policy to invoke for meaningful results.)
+- [x] create `parseDryRunOutput(stderr string) map[string]bool` in `internal/compose/updates.go` — pure function. Unknown/unrecognised lines result in the service being **absent** from the map (tri-state preserved). Pin the Compose version targeted in a header comment so future changes are explicit.
+- [x] create `detectDryRunFromHelp(help string) bool` — pure function, returns true when help text contains `--dry-run` flag mention
+- [x] table-test `parseDryRunOutput` against the captured fixtures + synthetic edge cases (empty input, malformed lines, mixed-case)
+- [x] table-test `detectDryRunFromHelp` against help-text samples with and without the flag
+- [x] run `go test ./internal/compose/...` — must pass before Task 2
 
 ### Task 2: Local `Compose.CheckUpdates`
 

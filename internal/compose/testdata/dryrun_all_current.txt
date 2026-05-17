@@ -1,0 +1,3 @@
+ DRY-RUN MODE -  needupdate Skipped - Image is already present locally
+ DRY-RUN MODE -  alpine Skipped - Image is already present locally
+ DRY-RUN MODE -  fakebuild Skipped - No image to be pulled
