@@ -26,6 +26,13 @@ import (
 // the per-project `docker compose ps` call.
 const statsRefreshInterval = 5 * time.Second
 
+// updatesCacheTTL controls how long a CheckUpdates result is kept fresh in
+// the in-memory TUI cache before a screen-entry triggers another fetch. The
+// `U` key force-refreshes regardless. 10 minutes balances "freshness while
+// the user is actively working" against "don't hammer the registry while the
+// user re-enters the container screen repeatedly during a deploy session".
+const updatesCacheTTL = 10 * time.Minute
+
 // ConfigProvider provides access to docker-compose configuration files.
 // Defined in the tui package (not runner) because it returns *exec.Cmd and
 // is TUI-only. Both Compose and RemoteCompose implement it.
@@ -195,6 +202,18 @@ type Model struct {
 	statsRequested  bool                           // true once refreshStats has been requested for the current container-screen entry; reserves CPU/Mem column widths so captions don't pop in when data arrives
 	refreshInFlight bool                           // true while a periodic-tick refreshStats fetch is pending; prevents the next tick from stacking another fetch on top of a slow docker stats / SSH call
 	tickCmdOverride func() tea.Cmd                 // test seam: when non-nil, replaces tea.Tick in refreshTick() with a non-blocking Cmd; production code never sets this
+
+	// Update-available indicator state. CheckUpdates is run on entry to
+	// screenSelectContainers (when the cache is stale) and explicitly via `U`.
+	// Cache is in-memory and process-local — not persisted across cdeploy
+	// runs. updateCache key is projectDir + "|" + serverName (empty serverName
+	// = local). projDir is empty for the local-fast-track entry (no project
+	// picker), giving the local-no-picker context a single cache slot of "".
+	updateCache    map[string]updateEntry
+	updatesSession uint64 // mirror of statsSession — bumped at the 7 context-change sites so a stale CheckUpdates response can't hydrate UpdateAvailable into a different project's svcStatus map
+	updateInFlight bool   // mirror of refreshInFlight for refreshUpdates — prevents a slow CheckUpdates from stacking on the next screen entry / `U` press
+	updatesErr     string // last error from CheckUpdates; rendered as soft warning below statsErr (priority: svcErr > statsErr > updatesErr)
+	projDir        string // active project's config dir; used for the updateCache key
 	selected  map[int]bool
 	svcCursor int
 	svcOffset int // index of first visible service in scroll window
@@ -288,6 +307,25 @@ type statusMsg struct {
 }
 type statsMsg struct {
 	stats   map[string]runner.ServiceStats
+	err     error
+	session uint64
+}
+
+// updateEntry holds one cached CheckUpdates result. err is captured so we can
+// re-surface the soft-warning slot when re-entering the screen within TTL
+// rather than silently hiding the prior failure. results is a partial map
+// (services with verdicts only) — absent services are tri-state "unknown".
+type updateEntry struct {
+	fetchedAt time.Time
+	results   map[string]bool
+	err       error
+}
+
+// updatesMsg carries the result of a refreshUpdates fetch. session is
+// captured at fetch time and compared against m.updatesSession in the
+// handler to drop stale responses from a previous project/server context.
+type updatesMsg struct {
+	results map[string]bool
 	err     error
 	session uint64
 }
@@ -410,6 +448,7 @@ func NewModel(composer runner.Composer, logWriter io.Writer, factory ComposerFac
 		m.screen = screenSelectContainers
 		m.statsRequested = true
 		m.refreshInFlight = true // Init() will fire refreshStats; statsMsg arrival clears the flag
+		m.updateInFlight = true  // Init() will fire refreshUpdates on the fast-path; updatesMsg arrival clears the flag
 	}
 
 	return m
@@ -431,7 +470,11 @@ func (m Model) Init() tea.Cmd {
 	if m.showPicker {
 		return tea.Batch(m.loadProjects(), tick)
 	}
-	return tea.Batch(m.loadServices(), m.refreshStats(), tick)
+	// Fast-path: standalone container screen on launch. updateInFlight was
+	// set by NewModel for the standalone case (mirrors refreshInFlight), so
+	// just fire the cmd directly. Cache is empty on first launch so no need
+	// for the maybe-fetch helper here.
+	return tea.Batch(m.loadServices(), m.refreshStats(), m.refreshUpdates(), tick)
 }
 
 func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
@@ -509,6 +552,12 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.selected = make(map[int]bool)
 		m.svcCursor = 0
 		m.svcOffset = 0
+		// Re-apply any cached update verdicts so cached glyphs survive the
+		// status-map overwrite. Race-safe regardless of whether the synthetic
+		// cache-hit updatesMsg arrives before or after this messsage.
+		if entry, fresh := m.updatesCacheLookup(); fresh && entry.results != nil {
+			m.hydrateUpdates(entry.results)
+		}
 		return m, nil
 
 	case statusMsg:
@@ -525,6 +574,11 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		m.svcErr = nil
 		m.svcStatus = msg.status
+		// Re-apply cached update verdicts (status fetch wipes UpdateAvailable
+		// fields when overwriting the map). Same rationale as servicesMsg.
+		if entry, fresh := m.updatesCacheLookup(); fresh && entry.results != nil {
+			m.hydrateUpdates(entry.results)
+		}
 		m.fixSvcOffset()
 		return m, nil
 
@@ -556,6 +610,41 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		m.statsErr = nil
 		m.stats = msg.stats
+		m.fixSvcOffset()
+		return m, nil
+
+	case updatesMsg:
+		// Stale-session responses are unconditionally dropped; the bump at
+		// the context-change site already reset updateInFlight.
+		if msg.session != m.updatesSession {
+			return m, nil
+		}
+		// Clear the in-flight guard FIRST, before the screen check — same
+		// reason as statsMsg / refreshInFlight: if the user opened logs/
+		// config/progress while the fetch was pending, the response arrives
+		// off-screen and the guard would otherwise be stuck on.
+		m.updateInFlight = false
+		// Always write to the cache (even on error) so the next screen entry
+		// within TTL doesn't immediately re-fetch. Errors propagate to the
+		// soft-warning slot when the user is on the container screen.
+		key := m.updatesCacheKey()
+		if m.updateCache == nil {
+			m.updateCache = make(map[string]updateEntry)
+		}
+		m.updateCache[key] = updateEntry{
+			fetchedAt: time.Now(),
+			results:   msg.results,
+			err:       msg.err,
+		}
+		if m.screen != screenSelectContainers {
+			return m, nil
+		}
+		if msg.err != nil {
+			m.updatesErr = msg.err.Error()
+			return m, nil
+		}
+		m.updatesErr = ""
+		m.hydrateUpdates(msg.results)
 		m.fixSvcOffset()
 		return m, nil
 
@@ -709,9 +798,14 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		m.statsSession++
 		m.statusSession++
+		m.updatesSession++
 		m.statsRequested = true
 		m.refreshInFlight = true
-		return m, tea.Batch(m.refreshStatus(), m.refreshStats())
+		cmds := []tea.Cmd{m.refreshStatus(), m.refreshStats()}
+		if c := m.maybeRefreshUpdatesCmd(); c != nil {
+			cmds = append(cmds, c)
+		}
+		return m, tea.Batch(cmds...)
 
 	case pipelineDoneMsg:
 		if !m.failed {
@@ -819,11 +913,16 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 					m.composer = m.localComposer
 					m.statsSession++
 					m.statusSession++
+					m.updatesSession++
 					m.statsRequested = true
 					m.refreshInFlight = true
 					m.showPicker = true
 					m.screen = screenSelectContainers
-					return m, tea.Batch(m.loadServices(), m.refreshStats())
+					cmds := []tea.Cmd{m.loadServices(), m.refreshStats()}
+					if c := m.maybeRefreshUpdatesCmd(); c != nil {
+						cmds = append(cmds, c)
+					}
+					return m, tea.Batch(cmds...)
 				}
 				m.showPicker = true
 				m.screen = screenSelectProject
@@ -872,9 +971,13 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 				m.composer = nil
 				m.statsSession++
 				m.statusSession++
+				m.updatesSession++
 				m.projectsSession++
 				m.refreshInFlight = false
+				m.updateInFlight = false
+				m.updatesErr = ""
 				m.projName = ""
+				m.projDir = ""
 				m.projects = nil
 				m.projCursor = 0
 				m.projErr = nil
@@ -901,13 +1004,19 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			}
 			proj := m.projects[m.projCursor]
 			m.projName = proj.Name
+			m.projDir = proj.ConfigDir
 			m.composer = m.composerFactory(proj.ConfigDir)
 			m.statsSession++
 			m.statusSession++
+			m.updatesSession++
 			m.statsRequested = true
 			m.refreshInFlight = true
 			m.screen = screenSelectContainers
-			return m, tea.Batch(m.loadServices(), m.refreshStats())
+			cmds := []tea.Cmd{m.loadServices(), m.refreshStats()}
+			if c := m.maybeRefreshUpdatesCmd(); c != nil {
+				cmds = append(cmds, c)
+			}
+			return m, tea.Batch(cmds...)
 		}
 
 	case screenSelectContainers:
@@ -941,8 +1050,12 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 				m.composer = nil
 				m.statsSession++
 				m.statusSession++
+				m.updatesSession++
 				m.refreshInFlight = false
+				m.updateInFlight = false
+				m.updatesErr = ""
 				m.projName = ""
+				m.projDir = ""
 				m.services = nil
 				m.svcStatus = nil
 				m.stats = nil
@@ -1024,6 +1137,17 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.confirming = true
 			m.pendingExec = true
 			m.fixSvcOffset()
+		case "U":
+			// Force-refresh CheckUpdates, bypassing the TTL cache. Matches
+			// the periodic-refresh UX of stats: no transient "checking…" —
+			// cells just blank until the result arrives. The session is NOT
+			// bumped here because the context (project + server) hasn't
+			// changed; we just want a fresh result for the same session.
+			if m.composer == nil {
+				return m, nil
+			}
+			m.updateInFlight = true
+			return m, m.refreshUpdates()
 		}
 
 	case screenLogs:
@@ -1048,9 +1172,14 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.screen = screenSelectContainers
 			m.statsSession++
 			m.statusSession++
+			m.updatesSession++
 			m.statsRequested = true
 			m.refreshInFlight = true
-			return m, tea.Batch(m.refreshStatus(), m.refreshStats())
+			cmds := []tea.Cmd{m.refreshStatus(), m.refreshStats()}
+			if c := m.maybeRefreshUpdatesCmd(); c != nil {
+				cmds = append(cmds, c)
+			}
+			return m, tea.Batch(cmds...)
 		case "w":
 			m.logsWrap = !m.logsWrap
 			if m.logsWrap {
@@ -1332,9 +1461,14 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 				m.logContent = ""
 				m.statsSession++
 				m.statusSession++
+				m.updatesSession++
 				m.statsRequested = true
 				m.refreshInFlight = true
-				return m, tea.Batch(m.refreshStatus(), m.refreshStats())
+				cmds := []tea.Cmd{m.refreshStatus(), m.refreshStats()}
+				if c := m.maybeRefreshUpdatesCmd(); c != nil {
+					cmds = append(cmds, c)
+				}
+				return m, tea.Batch(cmds...)
 			}
 			if m.cancel != nil {
 				m.cancel()
@@ -1633,6 +1767,82 @@ func (m Model) refreshStats() tea.Cmd {
 		stats, err := c.ContainerStats(ctx)
 		return statsMsg{stats: stats, err: err, session: session}
 	}
+}
+
+// refreshUpdates fires CheckUpdates for the active composer with an empty
+// services slice (= "all services"). The returned updatesMsg carries the
+// current updatesSession so a stale response from a previous project/server
+// context is dropped by the handler.
+func (m Model) refreshUpdates() tea.Cmd {
+	ctx := m.ctx
+	c := m.composer
+	session := m.updatesSession
+	return func() tea.Msg {
+		results, err := c.CheckUpdates(ctx, nil)
+		return updatesMsg{results: results, err: err, session: session}
+	}
+}
+
+// updatesCacheKey returns the cache key for the current context. The format
+// is projDir + "|" + serverName. Empty serverName means local. For the
+// local-fast-track entry (no project picker), projDir is empty too, so the
+// key is just "|".
+func (m Model) updatesCacheKey() string {
+	return m.projDir + "|" + m.serverName
+}
+
+// hydrateUpdates writes the verdicts from results into m.svcStatus, mutating
+// each entry's UpdateAvailable field. Services absent from results retain
+// the tri-state nil (unknown). Called only when results is non-nil and the
+// user is on screenSelectContainers.
+func (m *Model) hydrateUpdates(results map[string]bool) {
+	if m.svcStatus == nil {
+		m.svcStatus = make(map[string]runner.ServiceStatus)
+	}
+	for svc, avail := range results {
+		st := m.svcStatus[svc]
+		v := avail
+		st.UpdateAvailable = &v
+		m.svcStatus[svc] = st
+	}
+}
+
+// updatesCacheLookup returns the cached entry for the current context and a
+// freshness flag. Fresh means the entry exists and is within TTL.
+func (m Model) updatesCacheLookup() (updateEntry, bool) {
+	if m.updateCache == nil {
+		return updateEntry{}, false
+	}
+	entry, ok := m.updateCache[m.updatesCacheKey()]
+	if !ok {
+		return updateEntry{}, false
+	}
+	fresh := time.Since(entry.fetchedAt) < updatesCacheTTL
+	return entry, fresh
+}
+
+// maybeRefreshUpdatesCmd returns refreshUpdates() and marks updateInFlight
+// when the cache is stale or missing; otherwise returns nil. The caller is
+// expected to compose this into the screen-entry batch alongside refreshStatus
+// / refreshStats / loadServices. Cache hits surface via the post-overwrite
+// hydration in servicesMsg/statusMsg handlers — no synthetic msg needed.
+//
+// On cache hit the cached err is restored to updatesErr so a transient
+// failure stays visible across the screen leave/return cycle instead of
+// silently disappearing during the TTL window. (svcErr/statsErr win — see
+// the View() priority order.)
+func (m *Model) maybeRefreshUpdatesCmd() tea.Cmd {
+	entry, fresh := m.updatesCacheLookup()
+	if fresh {
+		if entry.err != nil {
+			m.updatesErr = entry.err.Error()
+		} else {
+			m.updatesErr = ""
+		}
+		return nil
+	}
+	m.updateInFlight = true
+	return m.refreshUpdates()
 }
 
 // refreshTick returns a Cmd that fires a refreshTickMsg after
