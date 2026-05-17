@@ -132,11 +132,11 @@ The CLI mirrors the TUI: single-project mode (`-C` specified) always checks; mul
 - Modify: `internal/tui/app_test.go` (extend `mockComposer`)
 - Modify: `cmd/deploy_test.go` (extend `opMockComposer`)
 
-- [ ] add `UpdateAvailable *bool` to `runner.ServiceStatus`
-- [ ] add `CheckUpdates(ctx context.Context, services []string) (map[string]bool, error)` to the `Composer` interface
-- [ ] **update ALL existing mock `Composer` implementations** with a no-op `CheckUpdates` (returns `nil, nil`): the in-package runner mock, `mockComposer` in `internal/tui/app_test.go`, and `opMockComposer` in `cmd/deploy_test.go`. Search for other implementers with `grep -rn "func.*Composer.*ListServices" ./...` to be exhaustive — adding to the interface without updating all mocks breaks every dependent test package.
-- [ ] add a compile-time interface assertion `var _ runner.Composer = (*compose.Compose)(nil)` (and the remote variant) in a test file if not already present
-- [ ] run `go build ./... && go test ./...` — interface must compile cleanly across all packages before Task 5
+- [x] add `UpdateAvailable *bool` to `runner.ServiceStatus`
+- [x] add `CheckUpdates(ctx context.Context, services []string) (map[string]bool, error)` to the `Composer` interface
+- [x] **update ALL existing mock `Composer` implementations** with a no-op `CheckUpdates` (returns `nil, nil`): the in-package runner mock, `mockComposer` in `internal/tui/app_test.go`, and `opMockComposer` in `cmd/deploy_test.go`. Search for other implementers with `grep -rn "func.*Composer.*ListServices" ./...` to be exhaustive — adding to the interface without updating all mocks breaks every dependent test package. (Exhaustive grep found 5 mocks across 4 files; the two in `cmd/list_test.go` — `mockComposer` and `mockComposerStatusErr` — were not enumerated in the plan but were updated for completeness.)
+- [x] add a compile-time interface assertion `var _ runner.Composer = (*compose.Compose)(nil)` (and the remote variant) in a test file if not already present (already present in `internal/compose/compose.go:44` and `internal/compose/remote.go:17` — no test-file additions needed)
+- [x] run `go build ./... && go test ./...` — interface must compile cleanly across all packages before Task 5
 
 ### Task 5: TUI state, refresh wiring, and message handling
 

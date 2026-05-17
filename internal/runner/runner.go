@@ -26,6 +26,12 @@ type ServiceStatus struct {
 	Created string // formatted creation time, e.g. "2024-01-15 09:30"
 	Uptime  string // compact uptime, e.g. "3h", "2d", or "" if not running
 	Ports   []Port // aggregated/deduped/sorted across replicas; see Port doc
+	// UpdateAvailable is a tri-state hint about whether a newer image exists in
+	// the registry for this service's image. nil = unknown (not checked, build-only,
+	// or an error occurred); &true = update available; &false = current. Populated
+	// by callers that invoke Composer.CheckUpdates; absent by default so existing
+	// status reads remain backward compatible.
+	UpdateAvailable *bool
 }
 
 // ServiceStats holds CPU and memory usage for a service, sourced from
@@ -66,6 +72,16 @@ type Composer interface {
 	// CPUPercent, MemoryUsed, and MemoryLimit are all summed across
 	// replicas — see the ServiceStats type doc for the full contract.
 	ContainerStats(ctx context.Context) (map[string]ServiceStats, error)
+	// CheckUpdates returns a map of service name to "update available" verdict.
+	// An empty services slice means "check every service in the project".
+	// Only services for which a verdict could be derived appear in the map;
+	// absent entries mean "unknown" (build-only services, registry errors,
+	// services skipped by the dry-run output, etc.) and the caller must
+	// treat that as the tri-state nil — same contract as
+	// ServiceStatus.UpdateAvailable. Errors are partial-friendly: a non-nil
+	// error may still be accompanied by a usable map of the services that
+	// were resolved before the failure.
+	CheckUpdates(ctx context.Context, services []string) (map[string]bool, error)
 	// Logs streams docker compose logs for a single service to w.
 	// When follow is true, it streams until ctx is cancelled.
 	// tail controls how many historical lines to show (0 = all).
