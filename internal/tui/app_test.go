@@ -14,11 +14,14 @@ import (
 	"time"
 	"unicode/utf8"
 
+	"github.com/charmbracelet/bubbles/textinput"
 	"github.com/charmbracelet/bubbles/viewport"
 	tea "github.com/charmbracelet/bubbletea"
+	"github.com/charmbracelet/lipgloss"
 	"github.com/lexxzar/compose-deploy/internal/compose"
 	"github.com/lexxzar/compose-deploy/internal/config"
 	"github.com/lexxzar/compose-deploy/internal/runner"
+	"github.com/muesli/termenv"
 )
 
 func mockFactory(mc *mockComposer) ComposerFactory {
@@ -471,6 +474,108 @@ func TestAllSelected(t *testing.T) {
 	m.selected[1] = false
 	if m.allSelected() {
 		t.Error("allSelected() = true, want false")
+	}
+}
+
+func TestComputeMatches(t *testing.T) {
+	services := []string{"web", "web-worker", "postgres", "redis", "Nginx"}
+
+	tests := []struct {
+		name     string
+		services []string
+		query    string
+		want     []int
+	}{
+		{
+			name:     "substring match",
+			services: services,
+			query:    "post",
+			want:     []int{2},
+		},
+		{
+			name:     "case-insensitive query matches lowercase name",
+			services: services,
+			query:    "Web",
+			want:     []int{0, 1},
+		},
+		{
+			name:     "case-insensitive name matches lowercase query",
+			services: services,
+			query:    "nginx",
+			want:     []int{4},
+		},
+		{
+			name:     "multiple matches preserve list order",
+			services: services,
+			query:    "e",
+			want:     []int{0, 1, 2, 3},
+		},
+		{
+			name:     "empty query returns nil",
+			services: services,
+			query:    "",
+			want:     nil,
+		},
+		{
+			name:     "no-match returns nil",
+			services: services,
+			query:    "zzz",
+			want:     nil,
+		},
+		{
+			name:     "empty services returns nil",
+			services: nil,
+			query:    "web",
+			want:     nil,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := computeMatches(tt.services, tt.query)
+			if len(got) != len(tt.want) {
+				t.Fatalf("computeMatches(%v, %q) = %v, want %v", tt.services, tt.query, got, tt.want)
+			}
+			for i := range got {
+				if got[i] != tt.want[i] {
+					t.Errorf("computeMatches(%v, %q) = %v, want %v", tt.services, tt.query, got, tt.want)
+					break
+				}
+			}
+		})
+	}
+}
+
+func TestClearSearch(t *testing.T) {
+	m := &Model{
+		searching:     true,
+		searchInput:   textinput.New(),
+		searchQuery:   "web",
+		searchMatches: []int{0, 1},
+		searchReturn:  3,
+	}
+	m.searchInput.SetValue("web")
+	m.searchInput.Focus()
+
+	m.clearSearch()
+
+	if m.searching {
+		t.Error("searching = true, want false")
+	}
+	if m.searchQuery != "" {
+		t.Errorf("searchQuery = %q, want empty", m.searchQuery)
+	}
+	if m.searchMatches != nil {
+		t.Errorf("searchMatches = %v, want nil", m.searchMatches)
+	}
+	if m.searchReturn != 0 {
+		t.Errorf("searchReturn = %d, want 0", m.searchReturn)
+	}
+	if m.searchInput.Value() != "" {
+		t.Errorf("searchInput value = %q, want empty", m.searchInput.Value())
+	}
+	if m.searchInput.Focused() {
+		t.Error("searchInput focused = true, want false (blurred)")
 	}
 }
 
@@ -3641,7 +3746,8 @@ func TestSvcVisibleCount_NormalHeight(t *testing.T) {
 	m.width = 160 // wide enough for one-line help
 	m.height = 10
 
-	// header=3, footer=3 (one-line help on wide terminal) → 10-3-3 = 4
+	// header=3, footer=3 (one-line help; reserved search bar merges onto the
+	// helpStyle MarginTop blank, so it adds no physical row) → 10-3-3 = 4
 	got := m.svcVisibleCount()
 	if got != 4 {
 		t.Errorf("svcVisibleCount() = %d, want 4", got)
@@ -3656,7 +3762,7 @@ func TestSvcVisibleCount_NarrowWidth(t *testing.T) {
 	m.width = 40 // too narrow for one-line help
 	m.height = 10
 
-	// header=3, footer=4 (two-line help) → 10-3-4 = 3
+	// header=3, footer=4 (two-line help; reserved bar merges onto MarginTop) → 10-3-4 = 3
 	got := m.svcVisibleCount()
 	if got != 3 {
 		t.Errorf("svcVisibleCount() narrow = %d, want 3", got)
@@ -3672,7 +3778,7 @@ func TestSvcVisibleCount_Confirming(t *testing.T) {
 	m.height = 10
 	m.confirming = true
 
-	// header=3, footer=3 (confirming) → 10-3-3 = 4
+	// header=3, footer=3 (confirming; reserved bar merges onto MarginTop) → 10-3-3 = 4
 	got := m.svcVisibleCount()
 	if got != 4 {
 		t.Errorf("svcVisibleCount() confirming = %d, want 4", got)
@@ -3688,7 +3794,7 @@ func TestSvcVisibleCount_Warning(t *testing.T) {
 	m.height = 10
 	m.warning = "something wrong"
 
-	// header=3, footer=3+1 (warning) → 10-3-4 = 3
+	// header=3, footer=3+1 (one-line help + warning; reserved bar merges) → 10-3-4 = 3
 	got := m.svcVisibleCount()
 	if got != 3 {
 		t.Errorf("svcVisibleCount() warning = %d, want 3", got)
@@ -3732,7 +3838,7 @@ func TestSvcVisibleCount_WithStatusColumns(t *testing.T) {
 		"a": {Running: true, Created: "2024-01-15 09:30", Uptime: "3h"},
 	}
 
-	// header=4 (3 + column captions), footer=3 → 10-4-3 = 3
+	// header=4 (3 + column captions), footer=3 (one-line help; reserved bar merges) → 10-4-3 = 3
 	got := m.svcVisibleCount()
 	if got != 3 {
 		t.Errorf("svcVisibleCount() with status columns = %d, want 3", got)
@@ -3849,7 +3955,7 @@ func TestFixSvcOffset_CursorAboveWindow(t *testing.T) {
 	m.statsRequested = false
 	m.services = []string{"a", "b", "c", "d", "e"}
 	m.width = 120
-	m.height = 9 // visible = 9-3-3 = 3
+	m.height = 9 // visible = 9-3-3 = 3 (one-line help; reserved bar merges onto MarginTop)
 	m.svcCursor = 1
 	m.svcOffset = 3
 
@@ -3966,7 +4072,7 @@ func TestConfirming_CallsFixSvcOffset(t *testing.T) {
 	m.screen = screenSelectContainers
 	m.services = mc.services
 	m.width = 120
-	m.height = 8 // visible normal = 4, confirming = 4
+	m.height = 8 // visible normal = confirming (constant with reserved search bar)
 
 	// Navigate to last item and select it
 	m.svcCursor = 7
@@ -4052,13 +4158,13 @@ func TestViewSelectContainers_DownIndicator(t *testing.T) {
 	m.services = mc.services
 	m.svcStatus = map[string]runner.ServiceStatus{}
 	m.width = 160
-	m.height = 9 // visible = 3
+	m.height = 8 // visible = 8-3-3 = 2
 	m.svcCursor = 0
 	m.svcOffset = 0
 
 	view := m.viewSelectContainers()
-	if !strings.Contains(view, "▼ 2 more") {
-		t.Errorf("expected down indicator '▼ 2 more' in view, got:\n%s", view)
+	if !strings.Contains(view, "▼ 3 more") {
+		t.Errorf("expected down indicator '▼ 3 more' in view, got:\n%s", view)
 	}
 }
 
@@ -4090,7 +4196,7 @@ func TestViewSelectContainers_BothIndicators(t *testing.T) {
 	m.services = mc.services
 	m.svcStatus = map[string]runner.ServiceStatus{}
 	m.width = 160
-	m.height = 9 // visible = 3
+	m.height = 8 // visible = 8-3-3 = 2
 	m.svcCursor = 2
 	m.svcOffset = 1
 
@@ -4098,7 +4204,7 @@ func TestViewSelectContainers_BothIndicators(t *testing.T) {
 	if !strings.Contains(view, "▲ 1 more") {
 		t.Errorf("expected up indicator in view, got:\n%s", view)
 	}
-	if !strings.Contains(view, "▼ 1 more") {
+	if !strings.Contains(view, "▼ 2 more") {
 		t.Errorf("expected down indicator in view, got:\n%s", view)
 	}
 }
@@ -4131,7 +4237,7 @@ func TestViewSelectContainers_WindowedOnlyShowsVisibleServices(t *testing.T) {
 	m.services = mc.services
 	m.svcStatus = map[string]runner.ServiceStatus{}
 	m.width = 160
-	m.height = 9 // visible = 3
+	m.height = 9 // visible = 9-3-3 = 3
 	m.svcCursor = 2
 	m.svcOffset = 1 // showing bbb, ccc, ddd
 
@@ -7798,7 +7904,7 @@ func TestSvcVisibleCount_withStatsColumns(t *testing.T) {
 		"a": {CPUPercent: 4.2, MemoryUsed: 100, MemoryLimit: 1000},
 	}
 
-	// header=4 (3 + captions row), footer=3 → 10-4-3 = 3
+	// header=4 (3 + captions row), footer=3 (one-line help; reserved bar merges) → 10-4-3 = 3
 	got := m.svcVisibleCount()
 	if got != 3 {
 		t.Errorf("svcVisibleCount() with stats columns = %d, want 3", got)
@@ -9239,10 +9345,11 @@ func TestUpdatesMsg_OffScreenErrorFixesOffset(t *testing.T) {
 	m.screen = screenConfig  // off-screen — user is in config viewer
 	m.updatesSession = 7
 	m.updateInFlight = true
-	// Geometry: width=160 (forces one-line help => footerLines=3 baseline),
-	// height=9 → visible = 9-3-3 = 3 when no updatesErr; visible = 9-3-4 = 2
-	// once updatesErr is set. Cursor=2 with offset=0 sits at the last
-	// visible row pre-error; post-error it falls outside the new window.
+	// Geometry: width=160 (forces one-line help => footerLines=3 baseline; the
+	// reserved search-bar line merges onto the helpStyle MarginTop blank and
+	// adds no physical row), height=9 → visible = 9-3-3 = 3 when no updatesErr;
+	// visible = 9-3-4 = 2 once updatesErr is set. Cursor=2 with offset=0 sits at
+	// the last visible row pre-error; post-error it falls outside the new window.
 	m.width = 160
 	m.height = 9
 	m.services = []string{"a", "b", "c", "d", "e"}
@@ -9270,4 +9377,1240 @@ func TestUpdatesMsg_OffScreenErrorFixesOffset(t *testing.T) {
 	if model.svcOffset != 1 {
 		t.Errorf("svcOffset = %d, want 1 (cursor=2 must stay visible after footer grew)", model.svcOffset)
 	}
+}
+
+// containerSearchModel builds a minimal container-screen Model for search tests.
+// Uses a literal (not NewModel) so the "/" handler is responsible for building
+// the textinput, matching the plan's "fresh input on every open" contract.
+func containerSearchModel(services []string) Model {
+	return Model{
+		screen:   screenSelectContainers,
+		services: services,
+		selected: make(map[int]bool),
+	}
+}
+
+func TestSearchOpen(t *testing.T) {
+	m := containerSearchModel([]string{"web", "worker", "db"})
+	m.svcCursor = 1
+
+	updated, cmd := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'/'}})
+	um := updated.(Model)
+
+	if !um.searching {
+		t.Error("searching = false, want true after /")
+	}
+	if um.searchReturn != 1 {
+		t.Errorf("searchReturn = %d, want 1 (svcCursor at open)", um.searchReturn)
+	}
+	if !um.searchInput.Focused() {
+		t.Error("searchInput not focused after /")
+	}
+	if cmd != nil {
+		t.Error("expected nil cmd after opening search")
+	}
+}
+
+func TestSearchOpenOverCommittedResetsState(t *testing.T) {
+	// Establish a committed search (query "w" matching web + web-worker).
+	m := containerSearchModel([]string{"api", "web", "web-worker"})
+	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'/'}})
+	m = updated.(Model)
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'w'}})
+	m = updated.(Model)
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyEnter}) // commit
+	m = updated.(Model)
+	if m.searchQuery != "w" || len(m.searchMatches) != 2 {
+		t.Fatalf("precondition: expected committed query 'w' with 2 matches, got %q %v", m.searchQuery, m.searchMatches)
+	}
+
+	// Reopen search with "/" — must start from a clean slate: empty query, no
+	// stale matches/highlights, no stale counter. Not a leftover of "w".
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'/'}})
+	m = updated.(Model)
+
+	if !m.searching {
+		t.Error("searching = false, want true after reopening /")
+	}
+	if m.searchQuery != "" {
+		t.Errorf("searchQuery = %q, want empty after reopen (stale query leaked)", m.searchQuery)
+	}
+	if m.searchMatches != nil {
+		t.Errorf("searchMatches = %v, want nil after reopen (stale highlights leaked)", m.searchMatches)
+	}
+	if m.searchInput.Value() != "" {
+		t.Errorf("searchInput value = %q, want empty after reopen", m.searchInput.Value())
+	}
+	if m.searchCounter() != "(no match)" {
+		t.Errorf("searchCounter = %q, want %q after reopen (stale counter leaked)", m.searchCounter(), "(no match)")
+	}
+
+	// An immediate enter must NOT re-commit the old query — searchMatches is empty
+	// so the no-match commit path clears everything.
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	m = updated.(Model)
+	if m.searchQuery != "" {
+		t.Errorf("searchQuery = %q, want empty after immediate enter (old query re-committed)", m.searchQuery)
+	}
+	if m.searchMatches != nil {
+		t.Errorf("searchMatches = %v, want nil after immediate enter", m.searchMatches)
+	}
+	if m.searching {
+		t.Error("searching = true, want false after enter")
+	}
+}
+
+func TestSearchOpenEmptyListNoop(t *testing.T) {
+	m := containerSearchModel(nil)
+
+	updated, cmd := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'/'}})
+	um := updated.(Model)
+
+	if um.searching {
+		t.Error("searching = true, want false on empty list (/ must be a no-op)")
+	}
+	if cmd != nil {
+		t.Error("expected nil cmd on empty-list /")
+	}
+}
+
+func TestSearchTypeLiveJump(t *testing.T) {
+	m := containerSearchModel([]string{"api", "web", "web-worker"})
+
+	// Open search.
+	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'/'}})
+	m = updated.(Model)
+
+	// Type "w" — should match web (idx 1) and web-worker (idx 2) and jump
+	// the cursor to the first match.
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'w'}})
+	um := updated.(Model)
+
+	if um.searchQuery != "w" {
+		t.Errorf("searchQuery = %q, want %q", um.searchQuery, "w")
+	}
+	if len(um.searchMatches) != 2 || um.searchMatches[0] != 1 || um.searchMatches[1] != 2 {
+		t.Errorf("searchMatches = %v, want [1 2]", um.searchMatches)
+	}
+	if um.svcCursor != 1 {
+		t.Errorf("svcCursor = %d, want 1 (first match)", um.svcCursor)
+	}
+	if um.searchInput.Value() != "w" {
+		t.Errorf("searchInput value = %q, want %q", um.searchInput.Value(), "w")
+	}
+}
+
+func TestSearchCommitKeepsQuery(t *testing.T) {
+	m := containerSearchModel([]string{"api", "web", "worker"})
+
+	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'/'}})
+	m = updated.(Model)
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'w'}})
+	m = updated.(Model)
+
+	// Commit with enter.
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	um := updated.(Model)
+
+	if um.searching {
+		t.Error("searching = true, want false after enter (bar closed)")
+	}
+	if um.searchQuery != "w" {
+		t.Errorf("searchQuery = %q, want %q (kept after commit)", um.searchQuery, "w")
+	}
+	if len(um.searchMatches) != 2 {
+		t.Errorf("searchMatches = %v, want 2 matches kept after commit", um.searchMatches)
+	}
+}
+
+func TestSearchCommitNoMatchClears(t *testing.T) {
+	m := containerSearchModel([]string{"api", "web", "worker"})
+
+	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'/'}})
+	m = updated.(Model)
+	// Type a query that matches nothing.
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'z'}})
+	m = updated.(Model)
+	if len(m.searchMatches) != 0 {
+		t.Fatalf("precondition: expected no matches for 'z', got %v", m.searchMatches)
+	}
+
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	um := updated.(Model)
+
+	if um.searching {
+		t.Error("searching = true, want false after enter")
+	}
+	if um.searchQuery != "" {
+		t.Errorf("searchQuery = %q, want empty (no-match commit clears)", um.searchQuery)
+	}
+	if um.searchMatches != nil {
+		t.Errorf("searchMatches = %v, want nil after no-match commit", um.searchMatches)
+	}
+}
+
+func TestSearchCancelRestoresCursor(t *testing.T) {
+	m := containerSearchModel([]string{"api", "web", "web-worker"})
+	m.svcCursor = 2 // open with cursor at "web-worker"
+
+	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'/'}})
+	m = updated.(Model)
+	// Type "a" → matches "api" (idx 0), cursor jumps there.
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'a'}})
+	m = updated.(Model)
+	if m.svcCursor != 0 {
+		t.Fatalf("precondition: svcCursor = %d, want 0 after typing a", m.svcCursor)
+	}
+
+	// esc while typing cancels and restores.
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyEsc})
+	um := updated.(Model)
+
+	if um.searching {
+		t.Error("searching = true, want false after esc")
+	}
+	if um.searchQuery != "" {
+		t.Errorf("searchQuery = %q, want empty after cancel", um.searchQuery)
+	}
+	if um.searchMatches != nil {
+		t.Errorf("searchMatches = %v, want nil after cancel", um.searchMatches)
+	}
+	if um.svcCursor != 2 {
+		t.Errorf("svcCursor = %d, want 2 (restored to searchReturn)", um.svcCursor)
+	}
+	if um.screen != screenSelectContainers {
+		t.Errorf("screen = %d, want screenSelectContainers (esc must not back-nav while typing)", um.screen)
+	}
+}
+
+// TestQTypedIntoSearchInput is the regression guard: while searching, a q
+// keystroke must land in searchInput and must NOT quit or navigate back.
+// Template: TestQTypedIntoSettingsFormInput.
+func TestQTypedIntoSearchInput(t *testing.T) {
+	m := containerSearchModel([]string{"qa-runner", "web"})
+
+	// Open search via the "/" key so the handler constructs a live input
+	// (per the plan: tests must not hand-set a zero-value textinput).
+	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'/'}})
+	m = updated.(Model)
+	if !m.searching {
+		t.Fatal("precondition: search must be open")
+	}
+
+	updated, cmd := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'q'}})
+	um := updated.(Model)
+
+	if um.screen != screenSelectContainers {
+		t.Errorf("screen = %d, want screenSelectContainers (q must not navigate)", um.screen)
+	}
+	if !um.searching {
+		t.Error("searching = false, want true (q must not close search)")
+	}
+	if um.searchInput.Value() != "q" {
+		t.Errorf("searchInput value = %q, want %q (q lands in input)", um.searchInput.Value(), "q")
+	}
+	if um.searchQuery != "q" {
+		t.Errorf("searchQuery = %q, want %q", um.searchQuery, "q")
+	}
+	// q while searching must not produce a quit command.
+	if cmd != nil {
+		if _, ok := cmd().(tea.QuitMsg); ok {
+			t.Error("q while searching produced a QuitMsg, want none")
+		}
+	}
+}
+
+// committedSearchModel builds a container-screen Model with a committed
+// (non-typing) search: the query is set, matches are computed, the bar is
+// closed. The cursor is placed on the first match, mirroring the state right
+// after enter. Uses a literal Model so the n/N handlers are exercised directly.
+func committedSearchModel(services []string, query string) Model {
+	m := containerSearchModel(services)
+	m.searchQuery = query
+	m.searchMatches = computeMatches(services, query)
+	if len(m.searchMatches) > 0 {
+		m.svcCursor = m.searchMatches[0]
+	}
+	return m
+}
+
+func sendKey(t *testing.T, m Model, r rune) Model {
+	t.Helper()
+	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{r}})
+	return updated.(Model)
+}
+
+// TestSearchCycleNextOnMatch: n advances through matches and wraps last→first.
+func TestSearchCycleNextOnMatch(t *testing.T) {
+	// "w" matches web (1) and web-worker (2).
+	m := committedSearchModel([]string{"api", "web", "web-worker"}, "w")
+	if len(m.searchMatches) != 2 || m.searchMatches[0] != 1 || m.searchMatches[1] != 2 {
+		t.Fatalf("precondition: searchMatches = %v, want [1 2]", m.searchMatches)
+	}
+	if m.svcCursor != 1 {
+		t.Fatalf("precondition: svcCursor = %d, want 1", m.svcCursor)
+	}
+
+	// n: 1 → 2.
+	m = sendKey(t, m, 'n')
+	if m.svcCursor != 2 {
+		t.Errorf("after 1st n: svcCursor = %d, want 2", m.svcCursor)
+	}
+	// n again: wrap 2 → 1.
+	m = sendKey(t, m, 'n')
+	if m.svcCursor != 1 {
+		t.Errorf("after wrap n: svcCursor = %d, want 1 (wrap last→first)", m.svcCursor)
+	}
+	// Search state must be untouched by cycling.
+	if m.searchQuery != "w" || len(m.searchMatches) != 2 {
+		t.Errorf("cycle mutated search state: query=%q matches=%v", m.searchQuery, m.searchMatches)
+	}
+}
+
+// TestSearchCyclePrevOnMatch: N goes previous and wraps first→last.
+func TestSearchCyclePrevOnMatch(t *testing.T) {
+	m := committedSearchModel([]string{"api", "web", "web-worker"}, "w")
+	if m.svcCursor != 1 {
+		t.Fatalf("precondition: svcCursor = %d, want 1", m.svcCursor)
+	}
+
+	// N from first match wraps to last: 1 → 2.
+	m = sendKey(t, m, 'N')
+	if m.svcCursor != 2 {
+		t.Errorf("after N wrap: svcCursor = %d, want 2 (wrap first→last)", m.svcCursor)
+	}
+	// N again: 2 → 1.
+	m = sendKey(t, m, 'N')
+	if m.svcCursor != 1 {
+		t.Errorf("after N: svcCursor = %d, want 1", m.svcCursor)
+	}
+}
+
+// TestSearchCyclePositionCounter verifies the cursor lands on exactly the
+// expected match indices across a longer cycle so the (i/N) counter that the
+// renderer derives from position stays correct.
+func TestSearchCyclePositionCounter(t *testing.T) {
+	// "s" matches svc-a (0), svc-b (1), other-s (3).
+	svcs := []string{"svc-a", "svc-b", "db", "other-s"}
+	m := committedSearchModel(svcs, "s")
+	want := []int{0, 1, 3}
+	if len(m.searchMatches) != 3 || m.searchMatches[0] != 0 || m.searchMatches[1] != 1 || m.searchMatches[2] != 3 {
+		t.Fatalf("precondition: searchMatches = %v, want %v", m.searchMatches, want)
+	}
+
+	// Full loop forward: 0 → 1 → 3 → wrap 0.
+	seq := []int{1, 3, 0}
+	for i, exp := range seq {
+		m = sendKey(t, m, 'n')
+		if m.svcCursor != exp {
+			t.Errorf("forward step %d: svcCursor = %d, want %d", i, m.svcCursor, exp)
+		}
+	}
+	// Full loop backward from 0: wrap 3 → 1 → 0.
+	backSeq := []int{3, 1, 0}
+	for i, exp := range backSeq {
+		m = sendKey(t, m, 'N')
+		if m.svcCursor != exp {
+			t.Errorf("backward step %d: svcCursor = %d, want %d", i, m.svcCursor, exp)
+		}
+	}
+}
+
+// TestSearchCycleNoQueryNoop: n/N do nothing without a committed search.
+func TestSearchCycleNoQueryNoop(t *testing.T) {
+	m := containerSearchModel([]string{"api", "web", "worker"})
+	m.svcCursor = 1
+
+	m = sendKey(t, m, 'n')
+	if m.svcCursor != 1 {
+		t.Errorf("n with no query moved cursor to %d, want 1 (no-op)", m.svcCursor)
+	}
+	m = sendKey(t, m, 'N')
+	if m.svcCursor != 1 {
+		t.Errorf("N with no query moved cursor to %d, want 1 (no-op)", m.svcCursor)
+	}
+	if m.searchQuery != "" || m.searchMatches != nil {
+		t.Errorf("n/N synthesised search state: query=%q matches=%v", m.searchQuery, m.searchMatches)
+	}
+}
+
+// TestSearchCycleOffMatchBetween: cursor manually moved between two matches;
+// n jumps to the first match strictly after, N to the first strictly before.
+func TestSearchCycleOffMatchBetween(t *testing.T) {
+	// "s" matches idx 0 and idx 3. Park the cursor at idx 2 (between them).
+	svcs := []string{"svc-a", "db", "cache", "svc-b"}
+	m := committedSearchModel(svcs, "s")
+	if len(m.searchMatches) != 2 || m.searchMatches[0] != 0 || m.searchMatches[1] != 3 {
+		t.Fatalf("precondition: searchMatches = %v, want [0 3]", m.searchMatches)
+	}
+	m.svcCursor = 2 // off-match, between 0 and 3
+
+	// n → first match strictly after 2 = 3.
+	mn := sendKey(t, m, 'n')
+	if mn.svcCursor != 3 {
+		t.Errorf("off-match n: svcCursor = %d, want 3 (first after)", mn.svcCursor)
+	}
+	// N → first match strictly before 2 = 0.
+	mN := sendKey(t, m, 'N')
+	if mN.svcCursor != 0 {
+		t.Errorf("off-match N: svcCursor = %d, want 0 (first before)", mN.svcCursor)
+	}
+}
+
+// TestSearchCycleOffMatchAboveAll: cursor before all matches; n → first match,
+// N → wraps to last.
+func TestSearchCycleOffMatchAboveAll(t *testing.T) {
+	// "s" matches idx 2 and idx 3. Park the cursor at idx 0 (above all).
+	svcs := []string{"db", "cache", "svc-a", "svc-b"}
+	m := committedSearchModel(svcs, "s")
+	if len(m.searchMatches) != 2 || m.searchMatches[0] != 2 || m.searchMatches[1] != 3 {
+		t.Fatalf("precondition: searchMatches = %v, want [2 3]", m.searchMatches)
+	}
+	m.svcCursor = 0 // above all matches
+
+	// n → first match after 0 = 2.
+	mn := sendKey(t, m, 'n')
+	if mn.svcCursor != 2 {
+		t.Errorf("above-all n: svcCursor = %d, want 2 (first match)", mn.svcCursor)
+	}
+	// N → nothing strictly before 0, wrap to last = 3.
+	mN := sendKey(t, m, 'N')
+	if mN.svcCursor != 3 {
+		t.Errorf("above-all N: svcCursor = %d, want 3 (wrap to last)", mN.svcCursor)
+	}
+}
+
+// TestSearchCycleOffMatchBelowAll: cursor after all matches; n → wraps to first,
+// N → last match.
+func TestSearchCycleOffMatchBelowAll(t *testing.T) {
+	// "s" matches idx 0 and idx 1. Park the cursor at idx 3 (below all).
+	svcs := []string{"svc-a", "svc-b", "db", "cache"}
+	m := committedSearchModel(svcs, "s")
+	if len(m.searchMatches) != 2 || m.searchMatches[0] != 0 || m.searchMatches[1] != 1 {
+		t.Fatalf("precondition: searchMatches = %v, want [0 1]", m.searchMatches)
+	}
+	m.svcCursor = 3 // below all matches
+
+	// n → nothing strictly after 3, wrap to first = 0.
+	mn := sendKey(t, m, 'n')
+	if mn.svcCursor != 0 {
+		t.Errorf("below-all n: svcCursor = %d, want 0 (wrap to first)", mn.svcCursor)
+	}
+	// N → first match before 3 = 1 (last match).
+	mN := sendKey(t, m, 'N')
+	if mN.svcCursor != 1 {
+		t.Errorf("below-all N: svcCursor = %d, want 1 (last match)", mN.svcCursor)
+	}
+}
+
+// TestSearchTwoStageEsc: first esc clears the committed search and stays on the
+// container screen; second esc navigates back to the project picker.
+func TestSearchTwoStageEsc(t *testing.T) {
+	m := committedSearchModel([]string{"api", "web", "worker"}, "w")
+	m.showPicker = true // so the second esc has a project picker to return to
+	if m.searchQuery == "" {
+		t.Fatal("precondition: committed search expected")
+	}
+
+	// First esc: clears search, stays on screen.
+	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyEsc})
+	m = updated.(Model)
+	if m.screen != screenSelectContainers {
+		t.Errorf("after 1st esc: screen = %d, want screenSelectContainers", m.screen)
+	}
+	if m.searchQuery != "" {
+		t.Errorf("after 1st esc: searchQuery = %q, want empty (search cleared)", m.searchQuery)
+	}
+	if m.searchMatches != nil {
+		t.Errorf("after 1st esc: searchMatches = %v, want nil", m.searchMatches)
+	}
+
+	// Second esc: no active search → back-nav to project picker.
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyEsc})
+	m = updated.(Model)
+	if m.screen != screenSelectProject {
+		t.Errorf("after 2nd esc: screen = %d, want screenSelectProject (back-nav)", m.screen)
+	}
+}
+
+// TestSearchLiveJumpScrollsOffScreenMatchIntoView: when the only match lives
+// below the fold, live-jumping to it (while typing) must scroll svcOffset so the
+// cursor is inside the visible window. Guards the fixSvcOffset() call in the
+// typing-mode handler. The existing search tests all use height==0 (everything
+// on screen), so this is the one exercising the off-screen scroll path.
+func TestSearchLiveJumpScrollsOffScreenMatchIntoView(t *testing.T) {
+	svcs := []string{
+		"a0", "a1", "a2", "a3", "a4", "a5", "a6", "a7", "a8", "a9", "target", "a11",
+	}
+	m := containerSearchModel(svcs)
+	m.width = 200 // one-line help so footer math is deterministic
+	m.height = 10 // visible = 10 - 3(header) - 3(footer) = 4
+	m.svcCursor = 0
+	m.svcOffset = 0
+
+	visible := m.svcVisibleCount()
+	if visible >= len(svcs) {
+		t.Fatalf("precondition: visible=%d must be < %d so a match can be off-screen", visible, len(svcs))
+	}
+
+	// Open search and type "target" — the sole match is at idx 10, far below
+	// the initial visible window [0, visible).
+	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'/'}})
+	m = updated.(Model)
+	for _, r := range "target" {
+		updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{r}})
+		m = updated.(Model)
+	}
+
+	if len(m.searchMatches) != 1 || m.searchMatches[0] != 10 {
+		t.Fatalf("searchMatches = %v, want [10]", m.searchMatches)
+	}
+	if m.svcCursor != 10 {
+		t.Fatalf("svcCursor = %d, want 10 (jumped to sole match)", m.svcCursor)
+	}
+	// The off-screen jump must have scrolled the window to keep the cursor visible.
+	visible = m.svcVisibleCount()
+	if m.svcCursor < m.svcOffset || m.svcCursor >= m.svcOffset+visible {
+		t.Errorf("cursor %d not in visible window [%d, %d) after off-screen live-jump",
+			m.svcCursor, m.svcOffset, m.svcOffset+visible)
+	}
+}
+
+// TestSearchCycleScrollsOffScreenMatchIntoView: cycling with n to a match below
+// the fold must scroll it into view. Guards the fixSvcOffset() call in the
+// committed n/N cycle handler on the off-screen branch.
+func TestSearchCycleScrollsOffScreenMatchIntoView(t *testing.T) {
+	// "m" matches idx 0 (match-a) and idx 11 (match-b) — far apart.
+	svcs := []string{
+		"match-a", "b1", "b2", "b3", "b4", "b5", "b6", "b7", "b8", "b9", "b10", "match-b",
+	}
+	m := committedSearchModel(svcs, "match")
+	m.width = 200
+	m.height = 10 // visible = 3
+	m.svcCursor = 0
+	m.svcOffset = 0
+	if len(m.searchMatches) != 2 || m.searchMatches[0] != 0 || m.searchMatches[1] != 11 {
+		t.Fatalf("precondition: searchMatches = %v, want [0 11]", m.searchMatches)
+	}
+
+	// n: 0 → 11 (the far, off-screen match).
+	m = sendKey(t, m, 'n')
+	if m.svcCursor != 11 {
+		t.Fatalf("svcCursor = %d, want 11 after n", m.svcCursor)
+	}
+	visible := m.svcVisibleCount()
+	if m.svcCursor < m.svcOffset || m.svcCursor >= m.svcOffset+visible {
+		t.Errorf("cursor %d not in visible window [%d, %d) after cycling to off-screen match",
+			m.svcCursor, m.svcOffset, m.svcOffset+visible)
+	}
+}
+
+// --- Task 5: rendering (row highlight, bottom bar, footer, visible-count) ---
+
+// TestSearchViewCommittedShowsCounter: a committed search renders the (i/N)
+// counter and the "↳ <name>" bar summary in the reserved footer line.
+func TestSearchViewCommittedShowsCounter(t *testing.T) {
+	m := committedSearchModel([]string{"api", "web", "web-worker"}, "w")
+	m.svcStatus = map[string]runner.ServiceStatus{}
+	if m.svcCursor != 1 {
+		t.Fatalf("precondition: svcCursor = %d, want 1 (first match)", m.svcCursor)
+	}
+
+	v := m.viewSelectContainers()
+
+	// Counter for cursor on first of two matches.
+	if !strings.Contains(v, "(1/2)") {
+		t.Errorf("view missing committed counter '(1/2)':\n%s", v)
+	}
+	// Committed bar summary points at the current match name.
+	if !strings.Contains(v, "↳") {
+		t.Errorf("view missing committed bar glyph '↳':\n%s", v)
+	}
+	if !strings.Contains(v, "web") {
+		t.Errorf("view missing current match name 'web':\n%s", v)
+	}
+	// Committed help hint tokens.
+	if !strings.Contains(v, "n/N cycle") {
+		t.Errorf("view missing 'n/N cycle' hint:\n%s", v)
+	}
+	if !strings.Contains(v, "esc clear") {
+		t.Errorf("view missing 'esc clear' hint:\n%s", v)
+	}
+}
+
+// TestSearchViewMatchedNameStyled: a matching row's name carries ANSI styling
+// (it differs from the plain name), while a non-matching row's name does not.
+// lipgloss emits no escape codes under the default (Ascii) test color profile,
+// so we force TrueColor for the duration of the test (restored via defer) so
+// the styled/unstyled distinction is observable in View() output.
+func TestSearchViewMatchedNameStyled(t *testing.T) {
+	prev := lipgloss.ColorProfile()
+	lipgloss.SetColorProfile(termenv.TrueColor)
+	defer lipgloss.SetColorProfile(prev)
+
+	m := committedSearchModel([]string{"api", "web"}, "web")
+	m.svcStatus = map[string]runner.ServiceStatus{}
+	// Cursor is on the sole match "web".
+
+	v := m.viewSelectContainers()
+	ansi := regexp.MustCompile(`\x1b\[[0-9;]*m`)
+
+	var webLine, apiLine string
+	for _, line := range strings.Split(v, "\n") {
+		clean := ansi.ReplaceAllString(line, "")
+		// Only the service ROWS carry the status dot; the committed bar summary
+		// line also contains "web" but no dot, so this filters it out.
+		if !strings.Contains(clean, "●") {
+			continue
+		}
+		switch {
+		case strings.Contains(clean, "web"):
+			webLine = line
+		case strings.Contains(clean, "api"):
+			apiLine = line
+		}
+	}
+	if webLine == "" || apiLine == "" {
+		t.Fatalf("could not find both service rows in view:\n%s", v)
+	}
+
+	// The matched row's name must carry an ANSI color escape (it differs from
+	// the plain name); the current match uses searchCurrentStyle whose escape
+	// sequence must appear in the styled row.
+	if !strings.Contains(webLine, "\x1b[") {
+		t.Errorf("matched 'web' row not styled (no ANSI escape): %q", webLine)
+	}
+	if !strings.Contains(webLine, searchCurrentStyle.Render("web")) {
+		t.Errorf("current match not rendered with searchCurrentStyle: %q", webLine)
+	}
+	// The unmatched "api" name region (from the name to end of line) must NOT
+	// be wrapped in a search style — no color escape appears around it.
+	apiNameRegion := apiLine[strings.Index(apiLine, "api"):]
+	if strings.Contains(apiNameRegion, "\x1b[") {
+		t.Errorf("unmatched 'api' name unexpectedly styled: %q", apiNameRegion)
+	}
+}
+
+// TestSearchViewIdleReservedLine: with no active search, the container view
+// still renders (the reserved bar line is present but blank) and the help
+// footer shows the '/' search token.
+func TestSearchViewIdleReservedLine(t *testing.T) {
+	m := containerSearchModel([]string{"api", "web"})
+	m.svcStatus = map[string]runner.ServiceStatus{}
+	m.width = 200 // one-line help
+
+	v := m.viewSelectContainers()
+
+	// Services still render.
+	if !strings.Contains(v, "api") || !strings.Contains(v, "web") {
+		t.Errorf("idle view missing services:\n%s", v)
+	}
+	// The '/' search token is present in the help footer.
+	if !strings.Contains(v, "/") {
+		t.Errorf("idle view missing '/' search token:\n%s", v)
+	}
+	// No committed bar glyph and no counter while idle.
+	if strings.Contains(v, "↳") {
+		t.Errorf("idle view should not render committed bar glyph:\n%s", v)
+	}
+	if strings.Contains(v, "n/N cycle") {
+		t.Errorf("idle view should not render committed hint:\n%s", v)
+	}
+}
+
+// TestSearchViewSearchingShowsInputAndCounter: while typing, the bar shows the
+// "/ " prefix + counter and the footer shows the "enter jump · esc cancel" hint.
+func TestSearchViewSearchingShowsInputAndCounter(t *testing.T) {
+	m := containerSearchModel([]string{"api", "web", "web-worker"})
+	m.svcStatus = map[string]runner.ServiceStatus{}
+	m.width = 200
+
+	// Open + type "w".
+	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'/'}})
+	m = updated.(Model)
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'w'}})
+	m = updated.(Model)
+
+	v := m.viewSelectContainers()
+
+	// Counter shows 2 matches, cursor on first.
+	if !strings.Contains(v, "(1/2)") {
+		t.Errorf("searching view missing counter '(1/2)':\n%s", v)
+	}
+	// Searching help hint.
+	if !strings.Contains(v, "enter jump") {
+		t.Errorf("searching view missing 'enter jump' hint:\n%s", v)
+	}
+	if !strings.Contains(v, "esc cancel") {
+		t.Errorf("searching view missing 'esc cancel' hint:\n%s", v)
+	}
+}
+
+// TestSearchViewNoMatchCounter: a searching query with zero matches renders
+// "(no match)" in the bar.
+func TestSearchViewNoMatchCounter(t *testing.T) {
+	m := containerSearchModel([]string{"api", "web"})
+	m.svcStatus = map[string]runner.ServiceStatus{}
+	m.width = 200
+
+	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'/'}})
+	m = updated.(Model)
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'z'}})
+	m = updated.(Model)
+
+	v := m.viewSelectContainers()
+	if !strings.Contains(v, "(no match)") {
+		t.Errorf("searching no-match view missing '(no match)':\n%s", v)
+	}
+}
+
+// TestSearchViewEqualWidthNameCells: a highlighted (matched) row and a
+// non-highlighted row must produce equal-width name cells — the styling wraps
+// only the raw name so ANSI escapes don't disturb the padding math. We force
+// TrueColor so the matched name actually carries escapes, then strip them and
+// assert the following column (Created) lands at the same VISIBLE offset on
+// both rows.
+func TestSearchViewEqualWidthNameCells(t *testing.T) {
+	prev := lipgloss.ColorProfile()
+	lipgloss.SetColorProfile(termenv.TrueColor)
+	defer lipgloss.SetColorProfile(prev)
+
+	// Same-length names so the padding is identical; "web" matches, "api" not.
+	m := committedSearchModel([]string{"api", "web"}, "web")
+	m.svcStatus = map[string]runner.ServiceStatus{
+		"api": {Running: true, Created: "2024-01-15 09:30"},
+		"web": {Running: true, Created: "2024-01-15 09:30"},
+	}
+
+	v := m.viewSelectContainers()
+	ansi := regexp.MustCompile(`\x1b\[[0-9;]*m`)
+
+	cols := map[string]int{}
+	for _, line := range strings.Split(v, "\n") {
+		clean := ansi.ReplaceAllString(line, "")
+		if !strings.Contains(clean, "●") || !strings.Contains(clean, "2024-01-15") {
+			continue
+		}
+		byteIdx := strings.Index(clean, "2024-01-15")
+		switch {
+		case strings.Contains(clean, "web"):
+			cols["web"] = utf8.RuneCountInString(clean[:byteIdx])
+		case strings.Contains(clean, "api"):
+			cols["api"] = utf8.RuneCountInString(clean[:byteIdx])
+		}
+	}
+	if cols["web"] == 0 || cols["api"] == 0 {
+		t.Fatalf("could not measure both rows' Created offsets: %v\n%s", cols, v)
+	}
+	if cols["web"] != cols["api"] {
+		t.Errorf("name-cell width mismatch: matched(web)=%d unmatched(api)=%d (styling must not shift columns)", cols["web"], cols["api"])
+	}
+}
+
+// TestSvcVisibleCount_ConstantAcrossConfirming: with an active search, toggling
+// m.confirming must NOT change svcVisibleCount() — the reserved bar line is
+// counted in both branches so the list height stays constant.
+func TestSvcVisibleCount_ConstantAcrossConfirming(t *testing.T) {
+	base := func() Model {
+		mc := &mockComposer{}
+		m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
+		m.statsRequested = false
+		m.services = []string{"api", "web", "web-worker", "db", "cache", "queue"}
+		m.width = 200 // one-line help in both branches
+		m.height = 12
+		m.searchQuery = "w"
+		m.searchMatches = computeMatches(m.services, "w")
+		m.svcCursor = m.searchMatches[0]
+		return m
+	}
+
+	m1 := base()
+	m1.confirming = false
+	m2 := base()
+	m2.confirming = true
+	m2.selected = map[int]bool{1: true}
+
+	c1 := m1.svcVisibleCount()
+	c2 := m2.svcVisibleCount()
+	if c1 != c2 {
+		t.Errorf("svcVisibleCount differs across confirming: non-confirming=%d confirming=%d (must be constant)", c1, c2)
+	}
+}
+
+// --- Task 6: cleanup wiring — clear search on every departure/reload ---
+
+// assertSearchCleared asserts the three-field ephemeral invariant: an active
+// committed search has been fully torn down.
+func assertSearchCleared(t *testing.T, m Model, where string) {
+	t.Helper()
+	if m.searchQuery != "" {
+		t.Errorf("%s: searchQuery = %q, want empty (search must be cleared on departure/reload)", where, m.searchQuery)
+	}
+	if m.searchMatches != nil {
+		t.Errorf("%s: searchMatches = %v, want nil", where, m.searchMatches)
+	}
+	if m.searching {
+		t.Errorf("%s: searching = true, want false", where)
+	}
+}
+
+// TestSearchClearedOnServicesReload: a full list reload (servicesMsg) invalidates
+// searchMatches (indices into the OLD services), so the committed search must be
+// cleared. Uses an incoming service set that would make the old indices invalid.
+func TestSearchClearedOnServicesReload(t *testing.T) {
+	mc := &mockComposer{services: []string{"api", "web", "web-worker"}}
+	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
+	installFakeTick(&m)
+	m.screen = screenSelectContainers
+	m.services = mc.services
+	m.searchQuery = "w"
+	m.searchMatches = computeMatches(m.services, "w") // [1 2]
+	m.svcCursor = 1
+	if len(m.searchMatches) != 2 {
+		t.Fatalf("precondition: expected 2 matches, got %v", m.searchMatches)
+	}
+
+	// Reload with a DIFFERENT, shorter list — old indices [1 2] would be invalid.
+	updated, _ := m.Update(servicesMsg{
+		services: []string{"db"},
+		status:   map[string]runner.ServiceStatus{},
+		session:  m.statusSession, // must match to be accepted
+	})
+	m = updated.(Model)
+
+	assertSearchCleared(t, m, "after servicesMsg reload")
+}
+
+// TestSearchClearedOnEscToProject: a context switch off the container screen
+// (esc → project picker) clears the committed search.
+func TestSearchClearedOnEscToProject(t *testing.T) {
+	m := committedSearchModel([]string{"api", "web", "worker"}, "w")
+	m.showPicker = true
+	if m.searchQuery == "" {
+		t.Fatal("precondition: committed search expected")
+	}
+
+	// First esc clears the search (two-stage guard); the SECOND esc back-navigates.
+	// After the second esc we're on the project picker AND search stays clear.
+	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyEsc})
+	m = updated.(Model)
+	assertSearchCleared(t, m, "after 1st esc (search clear)")
+
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyEsc})
+	m = updated.(Model)
+	if m.screen != screenSelectProject {
+		t.Errorf("after 2nd esc: screen = %d, want screenSelectProject", m.screen)
+	}
+	assertSearchCleared(t, m, "after esc→project back-nav")
+}
+
+// TestSearchClearedOnEscToProjectSingleEsc: even when a committed search is active
+// and the two-stage guard consumes the first esc, the container→project back-nav
+// site itself calls clearSearch() unconditionally, so arriving there with no
+// active search (e.g. via a direct second esc) still leaves search clear. This
+// asserts the unconditional (idempotent) clearSearch at the back-nav site.
+func TestSearchClearedOnEscToProjectNoActiveSearch(t *testing.T) {
+	m := containerSearchModel([]string{"api", "web", "worker"})
+	m.showPicker = true
+	// No active search — first (and only) esc back-navigates directly.
+	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyEsc})
+	m = updated.(Model)
+	if m.screen != screenSelectProject {
+		t.Errorf("screen = %d, want screenSelectProject (direct back-nav)", m.screen)
+	}
+	assertSearchCleared(t, m, "after direct esc→project (no active search)")
+}
+
+// TestSearchClearedOnEnterLogs: a read-only departure to the logs screen (l key)
+// clears the committed search — search is ephemeral, not carried into a log peek.
+func TestSearchClearedOnEnterLogs(t *testing.T) {
+	mc := &mockComposer{services: []string{"api", "web", "web-worker"}}
+	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
+	installFakeTick(&m)
+	m.screen = screenSelectContainers
+	m.services = mc.services
+	m.composer = mc
+	m.width = 80
+	m.height = 24
+	m.searchQuery = "w"
+	m.searchMatches = computeMatches(m.services, "w")
+	m.svcCursor = m.searchMatches[0]
+
+	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'l'}})
+	m = updated.(Model)
+
+	if m.screen != screenLogs {
+		t.Fatalf("screen = %d, want screenLogs (l should enter logs)", m.screen)
+	}
+	assertSearchCleared(t, m, "after enterLogs")
+}
+
+// TestSearchClearedOnEnterProgress: an operation start (enterProgress) clears the
+// committed search.
+func TestSearchClearedOnEnterProgress(t *testing.T) {
+	mc := &mockComposer{services: []string{"api", "web", "web-worker"}}
+	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
+	installFakeTick(&m)
+	m.screen = screenSelectContainers
+	m.services = mc.services
+	m.composer = mc
+	m.width = 80
+	m.height = 24
+	m.pendingOp = runner.Restart
+	m.searchQuery = "w"
+	m.searchMatches = computeMatches(m.services, "w")
+	m.svcCursor = m.searchMatches[0]
+
+	updated, _ := m.enterProgress([]string{"web"})
+	m = updated.(Model)
+
+	if m.screen != screenProgress {
+		t.Fatalf("screen = %d, want screenProgress", m.screen)
+	}
+	assertSearchCleared(t, m, "after enterProgress")
+}
+
+// TestSearchClearedEnterLogsThenEscBack: entering logs (which clears search on
+// departure) then esc back to the container screen lands with search still clear
+// — no stale highlight resurfaces because the return path adds no search state.
+func TestSearchClearedEnterLogsThenEscBack(t *testing.T) {
+	mc := &mockComposer{services: []string{"api", "web", "web-worker"}}
+	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
+	installFakeTick(&m)
+	m.screen = screenSelectContainers
+	m.services = mc.services
+	m.composer = mc
+	m.width = 80
+	m.height = 24
+	m.searchQuery = "w"
+	m.searchMatches = computeMatches(m.services, "w")
+	m.svcCursor = m.searchMatches[0]
+
+	// Enter logs (departure clears search).
+	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'l'}})
+	m = updated.(Model)
+	if m.screen != screenLogs {
+		t.Fatalf("precondition: screen = %d, want screenLogs", m.screen)
+	}
+	assertSearchCleared(t, m, "on entering logs")
+
+	// Esc back to the container screen.
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyEsc})
+	m = updated.(Model)
+	if m.screen != screenSelectContainers {
+		t.Fatalf("after esc from logs: screen = %d, want screenSelectContainers", m.screen)
+	}
+	assertSearchCleared(t, m, "back on container screen after logs peek")
+}
+
+// TestSelectedContainersUnaffectedBySearch is a regression guard: search is
+// search-and-jump, never a filter — it must NEVER touch m.selected. The set of
+// selected containers is identical with and without an active committed search.
+func TestSelectedContainersUnaffectedBySearch(t *testing.T) {
+	services := []string{"api", "web", "web-worker", "db"}
+
+	// Baseline: no search, select "api" (0) and "web-worker" (2).
+	base := containerSearchModel(services)
+	base.selected = map[int]bool{0: true, 2: true}
+	want := base.selectedContainers()
+	if len(want) != 2 || want[0] != "api" || want[1] != "web-worker" {
+		t.Fatalf("precondition: selectedContainers() = %v, want [api web-worker]", want)
+	}
+
+	// Same selection, but with an active committed search on "w" (matches web,
+	// web-worker) and the cursor jumped onto a match.
+	withSearch := containerSearchModel(services)
+	withSearch.selected = map[int]bool{0: true, 2: true}
+	withSearch.searchQuery = "w"
+	withSearch.searchMatches = computeMatches(services, "w")
+	withSearch.svcCursor = withSearch.searchMatches[0]
+
+	got := withSearch.selectedContainers()
+	if len(got) != len(want) {
+		t.Fatalf("selectedContainers() length differs with search: got %v, want %v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Errorf("selectedContainers()[%d] = %q with search, want %q (search must not touch m.selected)", i, got[i], want[i])
+		}
+	}
+}
+
+// --- Review phase 1: additional coverage ---
+
+// TestSearchCounterOffMatchMultiple: after committing a multi-match search and
+// parking the cursor OFF all matches (k moves onto a non-matching row), the bar
+// counter shows "(N matches)" instead of a bogus "(i/N)" position.
+func TestSearchCounterOffMatchMultiple(t *testing.T) {
+	// "w" matches web (1) and web-worker (2); cursor starts on the first match.
+	m := committedSearchModel([]string{"api", "web", "web-worker"}, "w")
+	if m.svcCursor != 1 {
+		t.Fatalf("precondition: svcCursor = %d, want 1 (first match)", m.svcCursor)
+	}
+
+	// k: move up to "api" (0) — a non-matching row, so the cursor is off-match.
+	m = sendKey(t, m, 'k')
+	if m.svcCursor != 0 {
+		t.Fatalf("after k: svcCursor = %d, want 0 (off-match)", m.svcCursor)
+	}
+	if got := m.searchCounter(); got != "(2 matches)" {
+		t.Errorf("searchCounter() = %q, want %q (off-match multi)", got, "(2 matches)")
+	}
+
+	// The bar must not label the non-matching row with the ↳ jump glyph.
+	bar := m.searchBarLine()
+	if strings.Contains(bar, "↳") {
+		t.Errorf("searchBarLine still shows ↳ glyph on a non-matching row: %q", bar)
+	}
+	if !strings.Contains(bar, "(2 matches)") {
+		t.Errorf("searchBarLine missing '(2 matches)': %q", bar)
+	}
+}
+
+// TestSearchCounterOffMatchSingle: same as above but with a single match, so the
+// counter reads "(1 match)".
+func TestSearchCounterOffMatchSingle(t *testing.T) {
+	// "web" matches only web (1); cursor starts on it.
+	m := committedSearchModel([]string{"api", "web", "db"}, "web")
+	if m.svcCursor != 1 {
+		t.Fatalf("precondition: svcCursor = %d, want 1", m.svcCursor)
+	}
+
+	// k: move up to "api" (0) — off-match.
+	m = sendKey(t, m, 'k')
+	if m.svcCursor != 0 {
+		t.Fatalf("after k: svcCursor = %d, want 0 (off-match)", m.svcCursor)
+	}
+	if got := m.searchCounter(); got != "(1 match)" {
+		t.Errorf("searchCounter() = %q, want %q (off-match single)", got, "(1 match)")
+	}
+}
+
+// TestSearchViewNonCurrentMatchStyled: with >=2 matches and the cursor on one,
+// the NON-current matched row is styled with searchMatchStyle (non-bold) and NOT
+// with searchCurrentStyle (bold). Forces TrueColor so escapes are observable.
+func TestSearchViewNonCurrentMatchStyled(t *testing.T) {
+	prev := lipgloss.ColorProfile()
+	lipgloss.SetColorProfile(termenv.TrueColor)
+	defer lipgloss.SetColorProfile(prev)
+
+	// "web" matches web (0) and web-worker (1); "api" (2) does not. Cursor on 0.
+	m := committedSearchModel([]string{"web", "web-worker", "api"}, "web")
+	m.svcStatus = map[string]runner.ServiceStatus{}
+	if m.svcCursor != 0 {
+		t.Fatalf("precondition: svcCursor = %d, want 0 (first match)", m.svcCursor)
+	}
+
+	v := m.viewSelectContainers()
+	ansi := regexp.MustCompile(`\x1b\[[0-9;]*m`)
+
+	var workerLine string
+	for _, line := range strings.Split(v, "\n") {
+		clean := ansi.ReplaceAllString(line, "")
+		if !strings.Contains(clean, "●") {
+			continue // skip the committed bar summary line
+		}
+		if strings.Contains(clean, "web-worker") {
+			workerLine = line
+		}
+	}
+	if workerLine == "" {
+		t.Fatalf("could not find 'web-worker' service row in view:\n%s", v)
+	}
+
+	// The non-current matched row must carry searchMatchStyle (the match name is
+	// wrapped in it) and must NOT be rendered with the bold searchCurrentStyle.
+	if !strings.Contains(workerLine, searchMatchStyle.Render("web-worker")) {
+		t.Errorf("non-current match not rendered with searchMatchStyle: %q", workerLine)
+	}
+	if strings.Contains(workerLine, searchCurrentStyle.Render("web-worker")) {
+		t.Errorf("non-current match wrongly rendered with (bold) searchCurrentStyle: %q", workerLine)
+	}
+}
+
+// TestSearchViewCommittedBarHint: the committed bar's own hint text
+// ("n next · N prev · esc clear") is rendered in the bar — assert the bar-unique
+// "n next" token so this isn't satisfied by the footer hint instead.
+func TestSearchViewCommittedBarHint(t *testing.T) {
+	m := committedSearchModel([]string{"api", "web", "web-worker"}, "w")
+	m.svcStatus = map[string]runner.ServiceStatus{}
+
+	v := m.viewSelectContainers()
+	if !strings.Contains(v, "n next") {
+		t.Errorf("committed view missing bar hint 'n next':\n%s", v)
+	}
+}
+
+// TestNTypedIntoSearchInput: while searching, "n" must land in the input as a
+// literal character (NOT trigger cycle-to-next-match, which is its committed-mode
+// meaning). A precedence bug would move the cursor instead of typing.
+func TestNTypedIntoSearchInput(t *testing.T) {
+	m := containerSearchModel([]string{"nginx", "web"})
+	m.svcCursor = 1
+
+	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'/'}})
+	m = updated.(Model)
+	if !m.searching {
+		t.Fatal("precondition: search must be open")
+	}
+
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'n'}})
+	um := updated.(Model)
+
+	if !um.searching {
+		t.Error("searching = false, want true (n must not close search)")
+	}
+	if um.searchInput.Value() != "n" {
+		t.Errorf("searchInput value = %q, want %q (n lands in input)", um.searchInput.Value(), "n")
+	}
+	if um.searchQuery != "n" {
+		t.Errorf("searchQuery = %q, want %q", um.searchQuery, "n")
+	}
+	// "n" matches nginx (0); the live-jump moves the cursor to the first match,
+	// NOT a cycle-driven move — the point is it typed rather than cycling.
+	if len(um.searchMatches) != 1 || um.searchMatches[0] != 0 {
+		t.Errorf("searchMatches = %v, want [0] (nginx), i.e. 'n' was typed not cycled", um.searchMatches)
+	}
+}
+
+// TestUpperNTypedIntoSearchInput: same as above for "N" (committed-mode "cycle to
+// previous"). It must land in the input as a literal, not cycle.
+func TestUpperNTypedIntoSearchInput(t *testing.T) {
+	m := containerSearchModel([]string{"Nginx", "web"})
+	m.svcCursor = 1
+
+	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'/'}})
+	m = updated.(Model)
+	if !m.searching {
+		t.Fatal("precondition: search must be open")
+	}
+
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'N'}})
+	um := updated.(Model)
+
+	if !um.searching {
+		t.Error("searching = false, want true (N must not close search)")
+	}
+	if um.searchInput.Value() != "N" {
+		t.Errorf("searchInput value = %q, want %q (N lands in input)", um.searchInput.Value(), "N")
+	}
+	if um.searchQuery != "N" {
+		t.Errorf("searchQuery = %q, want %q", um.searchQuery, "N")
+	}
+}
+
+// TestSearchClearedOnEntryLocal: selecting the "Local" entry on the server screen
+// swaps m.composer AND reloads the service list, so a committed search from a
+// previous session must be cleared (stale indices would point into a replaced
+// m.services). This exercises the entryLocal clearSearch() site.
+func TestSearchClearedOnEntryLocal(t *testing.T) {
+	mc := &mockComposer{services: []string{"api", "web", "web-worker"}}
+	m := NewModel(nil, io.Discard, mockFactory(mc), testServers, mockConnectCb(mc))
+	installFakeTick(&m)
+	m.screen = screenSelectServer
+	// Position the cursor on the "Local" entry.
+	for i, e := range m.serverEntries {
+		if e.kind == entryLocal {
+			m.serverCursor = i
+		}
+	}
+	// Seed a stale committed search as if left over from a prior container view.
+	m.searchQuery = "w"
+	m.searchMatches = []int{1, 2}
+	m.svcCursor = 1
+
+	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	m = updated.(Model)
+
+	assertSearchCleared(t, m, "after entryLocal")
+}
+
+// TestSearchClearedOnEscProjectToServer: esc from the project picker back to the
+// server screen clears any active search (defensive — search is container-scoped).
+func TestSearchClearedOnEscProjectToServer(t *testing.T) {
+	mc := &mockComposer{}
+	m := NewModel(nil, io.Discard, mockFactory(mc), testServers, mockConnectCb(mc))
+	installFakeTick(&m)
+	m.screen = screenSelectProject
+	m.showPicker = true
+	m.disconnectFunc = func() error { return nil }
+	// Seed a stale committed search.
+	m.searchQuery = "w"
+	m.searchMatches = []int{1, 2}
+
+	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyEsc})
+	m = updated.(Model)
+
+	if m.screen != screenSelectServer {
+		t.Fatalf("screen = %d, want screenSelectServer (esc project→server)", m.screen)
+	}
+	assertSearchCleared(t, m, "after esc project→server")
+}
+
+// TestSearchClearedOnConnectError: a failed remote connect swaps the projectLoader
+// and resets transient state; it must also clear a committed search (the error
+// path lands the user on the project picker with no valid service list).
+func TestSearchClearedOnConnectError(t *testing.T) {
+	mc := &mockComposer{}
+	m := NewModel(nil, io.Discard, mockFactory(mc), testServers, mockConnectCb(mc))
+	installFakeTick(&m)
+	m.screen = screenSelectServer
+	// Seed a stale committed search.
+	m.searchQuery = "w"
+	m.searchMatches = []int{1, 2}
+
+	updated, _ := m.Update(connectResultMsg{err: errors.New("connection refused")})
+	m = updated.(Model)
+
+	assertSearchCleared(t, m, "after connectResultMsg error")
+}
+
+// TestSearchClearedOnEnterConfig: opening the config screen (c key) is a read-only
+// departure from the container screen; it clears the committed search.
+func TestSearchClearedOnEnterConfig(t *testing.T) {
+	mc := &mockConfigComposer{
+		mockComposer: mockComposer{services: []string{"api", "web", "web-worker"}},
+		configFile:   []byte("services:\n  web: {}\n"),
+	}
+	m := NewModel(mc, io.Discard, mockConfigFactory(mc), nil, nil)
+	installFakeTick(&m)
+	m.screen = screenSelectContainers
+	m.services = mc.services
+	m.composer = mc
+	m.width = 80
+	m.height = 24
+	m.searchQuery = "w"
+	m.searchMatches = computeMatches(m.services, "w")
+	m.svcCursor = m.searchMatches[0]
+
+	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'c'}})
+	m = updated.(Model)
+
+	if m.screen != screenConfig {
+		t.Fatalf("screen = %d, want screenConfig (c should enter config)", m.screen)
+	}
+	assertSearchCleared(t, m, "after enterConfig")
+}
+
+// TestSearchClearedOnEnterExec: execing into a container (enterExec success path)
+// leaves the container screen and clears the committed search.
+func TestSearchClearedOnEnterExec(t *testing.T) {
+	mc := &mockExecComposer{
+		mockComposer: mockComposer{services: []string{"api", "web", "web-worker"}},
+	}
+	m := NewModel(mc, io.Discard, mockExecFactory(mc), nil, nil)
+	installFakeTick(&m)
+	m.screen = screenSelectContainers
+	m.services = mc.services
+	m.composer = mc
+	m.width = 80
+	m.height = 24
+	m.svcCursor = 1 // "web"
+	m.searchQuery = "w"
+	m.searchMatches = computeMatches(m.services, "w")
+
+	updated, _ := m.enterExec()
+	m = updated.(Model)
+
+	assertSearchCleared(t, m, "after enterExec")
 }
