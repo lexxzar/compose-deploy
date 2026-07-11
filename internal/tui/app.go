@@ -15,6 +15,7 @@ import (
 	"github.com/charmbracelet/bubbles/textinput"
 	"github.com/charmbracelet/bubbles/viewport"
 	tea "github.com/charmbracelet/bubbletea"
+	"github.com/charmbracelet/x/ansi"
 	"github.com/lexxzar/compose-deploy/internal/compose"
 	"github.com/lexxzar/compose-deploy/internal/config"
 	"github.com/lexxzar/compose-deploy/internal/runner"
@@ -286,6 +287,13 @@ type Model struct {
 	settingsColor   string // currently selected color value
 	settingsErr     string // validation / save error message
 
+	// Screen: container search (search & jump — see clearSearch/computeMatches)
+	searching     bool            // search bar open, capturing text
+	searchInput   textinput.Model // (re)constructed in the "/" open handler
+	searchQuery   string          // current query; != "" ⇒ highlights + n/N live
+	searchMatches []int           // indices into m.services that match (cached)
+	searchReturn  int             // svcCursor to restore on esc-while-typing
+
 	// Shared
 	ctx       context.Context
 	ctxCancel context.CancelFunc
@@ -538,6 +546,14 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		if m.screen == screenSelectContainers {
 			m.fixSvcOffset()
+			if m.searching {
+				// Refresh the search input's horizontal-scroll viewport for the
+				// new width — otherwise a narrower resize leaves a stale (right-
+				// clipped) viewport until the next keystroke. searchInputWidth()
+				// returns 0 when m.width<=0 (unbounded), so this is a safe no-op
+				// on a zero-size resize.
+				m.searchInput.Width = m.searchInputWidth()
+			}
 		}
 		if m.screen == screenLogs {
 			m.logsViewport.Width = msg.Width - 4
@@ -590,6 +606,10 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.selected = make(map[int]bool)
 		m.svcCursor = 0
 		m.svcOffset = 0
+		// Full reload: searchMatches holds indices into the OLD m.services, so a
+		// committed search is invalid once the list is replaced. Clear it (search
+		// is ephemeral and re-opened with `/` if the user still wants it).
+		m.clearSearch()
 		// Re-apply any cached update verdicts so cached glyphs survive the
 		// status-map overwrite. Race-safe regardless of whether the synthetic
 		// cache-hit updatesMsg arrives before or after this messsage. On a
@@ -840,6 +860,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.serverColor = ""
 			m.updatesErr = ""
 			m.updateInFlight = false
+			m.clearSearch()
 			return m, nil
 		}
 		m.serverErr = nil
@@ -1034,6 +1055,12 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			}
 			key = "esc"
 		case screenSelectContainers:
+			if m.searching {
+				// Search bar is capturing text — q is a literal character
+				// that must reach the searchInput (mirrors the settings-form
+				// field-4 textinput exception above). Leave key untouched.
+				break
+			}
 			if !m.showPicker && !m.confirming {
 				return m, tea.Quit
 			}
@@ -1083,6 +1110,7 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 				m.projDir = ""
 				m.projName = ""
 				m.updatesErr = ""
+				m.clearSearch()
 				if m.localComposer != nil {
 					m.composer = m.localComposer
 					m.statsSession++
@@ -1163,6 +1191,7 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 				m.projCursor = 0
 				m.projErr = nil
 				m.showPicker = false
+				m.clearSearch()
 				if disconnectFn != nil {
 					return m, func() tea.Msg {
 						_ = disconnectFn()
@@ -1225,12 +1254,65 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 
+		if m.searching {
+			switch key {
+			case "ctrl+c":
+				return m.tryQuit()
+			case "enter":
+				// Commit: keep the query/matches live (highlights + n/N),
+				// close the bar. If nothing matched, drop the query so we
+				// don't leave a dead highlight/counter behind.
+				m.searching = false
+				if len(m.searchMatches) == 0 {
+					m.clearSearch()
+				}
+				return m, nil
+			case "esc":
+				// Cancel: discard the query and restore the cursor to where
+				// the user opened search. No back-navigation. Capture the
+				// return cursor before clearSearch() (which resets
+				// searchReturn) and delegate the field reset so this stays in
+				// lockstep if clearSearch() gains a field.
+				ret := m.searchReturn
+				m.clearSearch()
+				m.svcCursor = ret
+				m.fixSvcOffset()
+				return m, nil
+			default:
+				// Set the value-area budget BEFORE Update() so bubbles computes
+				// this keystroke's horizontal-scroll offset with the correct width.
+				// searchInputWidth() is keystroke-stable (reserves the widest
+				// possible counter, not the live one), so the width is already
+				// right regardless of how the match count shifts below; setting it
+				// AFTER Update() would have bubbles compute the offset with the
+				// PREVIOUS width, clipping the newest char/cursor for one frame.
+				m.searchInput.Width = m.searchInputWidth()
+				var cmd tea.Cmd
+				m.searchInput, cmd = m.searchInput.Update(msg)
+				m.searchQuery = m.searchInput.Value()
+				m.searchMatches = computeMatches(m.services, m.searchQuery)
+				if len(m.searchMatches) > 0 {
+					m.svcCursor = m.searchMatches[0]
+					m.fixSvcOffset()
+				}
+				return m, cmd
+			}
+		}
+
 		m.warning = ""
 
 		switch key {
 		case "ctrl+c":
 			return m.tryQuit()
 		case "esc":
+			// Two-stage esc: the first esc on a committed search clears the
+			// search (highlights + n/N) and stays on the screen; a second esc
+			// (no active search) falls through to the existing back-nav.
+			if m.searchQuery != "" {
+				m.clearSearch()
+				m.fixSvcOffset()
+				return m, nil
+			}
 			if m.showPicker {
 				m.screen = screenSelectProject
 				m.composer = nil
@@ -1250,6 +1332,11 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 				m.svcCursor = 0
 				m.svcOffset = 0
 				m.svcErr = nil
+				// Leaving screenSelectContainers: search is ephemeral. The
+				// two-stage guard above already cleared any active search before
+				// we reach here, but call clearSearch() unconditionally so the
+				// ephemeral-on-departure invariant holds regardless of entry path.
+				m.clearSearch()
 				if m.projects == nil {
 					return m, m.loadProjects()
 				}
@@ -1298,6 +1385,35 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 				m.warning = warnNoSelection
 			}
 			m.fixSvcOffset()
+		case "n":
+			// Cycle to the next match (committed search only; no-op otherwise).
+			m.cycleMatch(true)
+		case "N":
+			// Cycle to the previous match (committed search only; no-op otherwise).
+			m.cycleMatch(false)
+		case "/":
+			// Open the search bar. Guard an empty list (mirrors l/x). A fresh
+			// textinput is constructed on every open so tests that build Model
+			// literals directly (bypassing NewModel) still get a live input.
+			if len(m.services) == 0 {
+				return m, nil
+			}
+			// Clear any prior committed search FIRST so reopening starts from a
+			// clean slate: without this, the fresh empty input would render
+			// alongside stale highlights + a stale counter, and an immediate
+			// enter would re-commit the OLD query (searchMatches still non-empty).
+			// clearSearch() zeroes searching/searchReturn, so set them AFTER it.
+			m.clearSearch()
+			m.searchInput = textinput.New()
+			m.searching = true
+			m.searchReturn = m.svcCursor
+			// Set Width on this PERSISTED model so bubbles scrolls the value
+			// horizontally to keep the cursor visible (a value-receiver set in
+			// searchBarLine would be discarded). Width 0 = unbounded when size
+			// is unknown (tests).
+			m.searchInput.Width = m.searchInputWidth()
+			m.searchInput.Focus()
+			return m, nil
 		case "l":
 			if len(m.services) == 0 {
 				return m, nil
@@ -1730,6 +1846,8 @@ func (m Model) handleStepEvent(event runner.StepEvent) (tea.Model, tea.Cmd) {
 func (m *Model) enterProgress(containers []string) (tea.Model, tea.Cmd) {
 	op := m.pendingOp
 	m.screen = screenProgress
+	// Leaving screenSelectContainers for an operation: search is ephemeral.
+	m.clearSearch()
 
 	stepNames := runner.Steps(op)
 	m.steps = make([]stepState, len(stepNames))
@@ -1795,6 +1913,8 @@ func (m *Model) enterConfig() (tea.Model, tea.Cmd) {
 	m.configViewport = viewport.New(w, vpHeight)
 
 	m.screen = screenConfig
+	// Leaving screenSelectContainers for the config screen: search is ephemeral.
+	m.clearSearch()
 	return *m, m.fetchConfigFile()
 }
 
@@ -1814,6 +1934,10 @@ func (m *Model) enterExec() (tea.Model, tea.Cmd) {
 		m.fixSvcOffset()
 		return *m, nil
 	}
+	// Leaving screenSelectContainers to exec into a container: search is
+	// ephemeral. Cleared only on the success path (the early-return failure
+	// paths above keep the user on the container screen).
+	m.clearSearch()
 	return *m, tea.ExecProcess(cmd, func(err error) tea.Msg {
 		return execDoneMsg{err: err}
 	})
@@ -1895,6 +2019,8 @@ func (m *Model) enterLogs() (tea.Model, tea.Cmd) {
 	}()
 
 	m.screen = screenLogs
+	// Leaving screenSelectContainers for the log viewer: search is ephemeral.
+	m.clearSearch()
 	return *m, m.readLogChunk()
 }
 
@@ -2188,6 +2314,121 @@ func (m Model) selectedCount() int {
 	return count
 }
 
+// clearSearch resets all container-search state back to its zero value. Called
+// on every transition that leaves screenSelectContainers or reloads m.services,
+// so a committed search can never carry stale indices into m.services.
+func (m *Model) clearSearch() {
+	m.searching = false
+	m.searchQuery = ""
+	m.searchMatches = nil
+	m.searchReturn = 0
+	m.searchInput.SetValue("")
+	m.searchInput.Blur()
+}
+
+// cycleMatch moves svcCursor to the next (forward) or previous (!forward) match
+// in m.searchMatches, wrapping around at the boundaries. It is a no-op when there
+// is no committed search (searchQuery == "" or no matches). searchMatches is kept
+// in ascending index order by computeMatches, which this relies on.
+//
+// Two cases:
+//   - on-match: the cursor currently sits on a match — step ±1 through the match
+//     list with wrap-around (last→first for forward, first→last for backward).
+//   - off-match: the cursor sits between matches (after a manual j/k) — forward
+//     jumps to the first match STRICTLY AFTER the cursor (wrapping to the first
+//     match when the cursor is past all matches), backward to the first match
+//     STRICTLY BEFORE (wrapping to the last match when the cursor is before all).
+func (m *Model) cycleMatch(forward bool) {
+	if m.searchQuery == "" || len(m.searchMatches) == 0 {
+		return
+	}
+
+	// Locate the cursor within the (ascending) match list.
+	pos := -1
+	for i, idx := range m.searchMatches {
+		if idx == m.svcCursor {
+			pos = i
+			break
+		}
+	}
+
+	n := len(m.searchMatches)
+	if pos >= 0 {
+		// On a match: step ±1 with wrap-around.
+		if forward {
+			pos = (pos + 1) % n
+		} else {
+			pos = (pos - 1 + n) % n
+		}
+		m.svcCursor = m.searchMatches[pos]
+		m.fixSvcOffset()
+		return
+	}
+
+	// Off-match: find the neighbouring match relative to the cursor.
+	if forward {
+		// First match strictly after the cursor; wrap to the first match.
+		for _, idx := range m.searchMatches {
+			if idx > m.svcCursor {
+				m.svcCursor = idx
+				m.fixSvcOffset()
+				return
+			}
+		}
+		m.svcCursor = m.searchMatches[0]
+	} else {
+		// First match strictly before the cursor; wrap to the last match.
+		for i := n - 1; i >= 0; i-- {
+			if m.searchMatches[i] < m.svcCursor {
+				m.svcCursor = m.searchMatches[i]
+				m.fixSvcOffset()
+				return
+			}
+		}
+		m.svcCursor = m.searchMatches[n-1]
+	}
+	m.fixSvcOffset()
+}
+
+// searchCounter renders the "(i/N)" match position for the search bar. When the
+// cursor sits on a match, i is its 1-based position within searchMatches; when
+// the cursor is off all matches (after a manual j/k), it shows "(N matches)"
+// (or the singular "(1 match)" when exactly one match exists) instead of a bogus
+// index. Returns "(no match)" when the query matched nothing.
+func (m Model) searchCounter() string {
+	n := len(m.searchMatches)
+	if n == 0 {
+		return "(no match)"
+	}
+	for pos, idx := range m.searchMatches {
+		if idx == m.svcCursor {
+			return fmt.Sprintf("(%d/%d)", pos+1, n)
+		}
+	}
+	if n == 1 {
+		return "(1 match)"
+	}
+	return fmt.Sprintf("(%d matches)", n)
+}
+
+// computeMatches returns the indices into services whose names contain query as
+// a case-insensitive substring, preserving list order. An empty query returns
+// nil so callers can treat "no query" and "no matches" distinctly. Pure — used
+// by the container-screen search (search & jump).
+func computeMatches(services []string, query string) []int {
+	if query == "" {
+		return nil
+	}
+	q := strings.ToLower(query)
+	var matches []int
+	for i, svc := range services {
+		if strings.Contains(strings.ToLower(svc), q) {
+			matches = append(matches, i)
+		}
+	}
+	return matches
+}
+
 // hasStatusColumns returns true if any service in m.services has non-empty Created, Uptime,
 // Ports, or stats data, OR if stats have been requested for the current container-screen
 // entry. The statsRequested short-circuit ensures CPU/Mem column captions render from the
@@ -2218,9 +2459,10 @@ func (m Model) hasStatusColumns() bool {
 }
 
 // svcVisibleCount returns the number of services that fit in the terminal.
-// Header: breadcrumb + blank line = 2 lines, plus 1 more when column captions are shown.
-// Footer varies by state: confirming = 2; normal = 2 (one-line help) or 3 (two-line help).
-// Warning adds 1 extra line.
+// Header: breadcrumb + titleStyle MarginBottom blank + gap/indicator = 3 lines,
+// plus 1 more when column captions are shown.
+// Footer varies by state: confirming = 3; normal = 3 (one-line help) or 4 (two-line help).
+// Warning adds 1 extra line; an active stats/updates soft-warning adds 1 more.
 // When m.height is 0 (no WindowSizeMsg received), returns len(m.services) for backward compat.
 func (m Model) svcVisibleCount() int {
 	if m.height == 0 {
@@ -2234,9 +2476,21 @@ func (m Model) svcVisibleCount() int {
 		headerLines++
 	}
 
+	// Footer layout (both branches): gap-or-indicator (1) + helpStyle MarginTop
+	// space-line (1) + footer text (1) = 3. The reserved search-bar line does
+	// NOT add a physical row: it is written as `gap + searchBarLine()` with no
+	// trailing newline immediately before `helpStyle.Render(...)`, and
+	// helpStyle's MarginTop(1) prepends a full-width blank — the bar content and
+	// that blank land on the SAME physical line (empirically verified against a
+	// windowed 30-service render; the footer occupies 3 rows: indicator, the
+	// merged bar+margin line, and the help text). Counting the bar separately
+	// over-reserved one row versus the pre-search baseline and left a blank line
+	// of slack at the bottom of the terminal. The list height stays constant
+	// across search-idle / searching / committed / confirming because the merged
+	// bar+margin line is present in every state (blank while confirming, with the
+	// confirm prompt taking the footer-text slot).
 	var footerLines int
 	if m.confirming {
-		// helpStyle MarginTop space-line (1) + gap-or-indicator (1) + confirm text (1) = 3
 		footerLines = 3
 	} else {
 		// Compute whether help fits on one line (same logic as viewSelectContainers)
@@ -2244,14 +2498,18 @@ func (m Model) svcVisibleCount() int {
 		if m.showPicker {
 			back = "q back"
 		}
-		line1 := fmt.Sprintf("  space toggle  •  a all  •  %s", back)
+		line1 := fmt.Sprintf("  space toggle  •  a all  •  / search  •  %s", back)
 		line2 := "  r restart  •  d deploy  •  s stop  •  l logs  •  c config  •  x exec  •  U updates"
+		if m.searching {
+			line2 = "  enter jump  •  esc cancel"
+		} else if m.searchQuery != "" {
+			line2 = "  n/N cycle  •  esc clear"
+		}
 		oneLine := line1 + "  •  " + line2[2:]
 		if m.width >= len(oneLine)+2 {
-			// helpStyle MarginTop (1) + gap-or-indicator (1) + one help line (1) = 3
 			footerLines = 3
 		} else {
-			// helpStyle MarginTop (1) + gap-or-indicator (1) + two help lines (2) = 4
+			// two-line help adds one more = 4.
 			footerLines = 4
 		}
 		if m.warning != "" {
@@ -2780,9 +3038,21 @@ func (m Model) viewSelectContainers() string {
 		// because it occupies one terminal cell (U+21E7) — matches the +2
 		// reservation logic above.
 		nameWidth := utf8.RuneCountInString(svc)
-		nameCell := svc
+		// Highlight matching rows during an active search. Only the RAW name is
+		// wrapped in the style so the ANSI escapes don't disturb the width math
+		// below (same rationale as the update glyph): the cursor's current match
+		// gets the brighter bold style, other matches the plain match style.
+		renderedName := svc
+		if m.searchQuery != "" && slices.Contains(m.searchMatches, i) {
+			if i == m.svcCursor {
+				renderedName = searchCurrentStyle.Render(svc)
+			} else {
+				renderedName = searchMatchStyle.Render(svc)
+			}
+		}
+		nameCell := renderedName
 		if st.UpdateAvailable != nil && *st.UpdateAvailable {
-			nameCell = svc + " " + updateGlyphStyle.Render(compose.UpdateGlyph)
+			nameCell = renderedName + " " + updateGlyphStyle.Render(compose.UpdateGlyph)
 			nameWidth += 2 // space + glyph cell
 		}
 		if pad := maxName - nameWidth; pad > 0 {
@@ -2820,67 +3090,231 @@ func (m Model) viewSelectContainers() string {
 		b.WriteString("\n")
 	}
 
+	// The gap slot between the list/indicator and the reserved bar line. When a
+	// "▼ N more" indicator was written it already occupies that slot, so skip the
+	// leading newline; otherwise emit a blank line (matching the pre-search gap).
+	gap := "\n"
+	if below > 0 {
+		gap = ""
+	}
+
+	// Reserved search-bar line — ALWAYS rendered (in both the confirming and
+	// non-confirming branches) so the list height never jumps between
+	// search-idle / searching / committed / confirming. While confirming the
+	// bar is suppressed (blank) because the confirm prompt takes precedence and
+	// is shown in the footer-text slot below; otherwise the bar shows the search
+	// input (typing), the compact committed summary, or a blank placeholder.
 	if m.confirming {
-		gap := "\n"
-		if below > 0 {
-			gap = ""
-		}
+		b.WriteString(gap + "  ")
+	} else {
+		b.WriteString(gap + m.searchBarLine())
+	}
+
+	// Confirming: the confirm prompt takes the footer-text slot (no help keys).
+	// The reserved bar line above is blank so the total line count (gap + bar +
+	// helpStyle MarginTop blank + confirm text) matches the non-confirming
+	// footer exactly.
+	if m.confirming {
 		if m.pendingExec {
 			service := m.services[m.svcCursor]
 			b.WriteString(helpStyle.Render(fmt.Sprintf(
-				"%s  Exec into %s?  enter confirm  •  esc cancel",
-				gap,
+				"  Exec into %s?  enter confirm  •  esc cancel",
 				service,
 			)))
 		} else {
 			containers := m.selectedContainers()
 			b.WriteString(helpStyle.Render(fmt.Sprintf(
-				"%s  %s %s?  enter confirm  •  esc cancel",
-				gap,
+				"  %s %s?  enter confirm  •  esc cancel",
 				m.pendingOp.String(),
 				strings.Join(containers, ", "),
 			)))
 		}
+		return b.String()
+	}
+
+	if m.warning != "" {
+		b.WriteString("\n  " + warningStyle.Render(m.warning))
+	}
+	// Soft-warning slot priority: svcErr > statsErr > updatesErr.
+	// svcErr early-returns from the renderer above, so when both are set
+	// svcErr always wins. statsErr and updatesErr are mutually exclusive
+	// here — at most one is shown so the line count stays predictable
+	// (svcVisibleCount accounts for at most one extra footer line).
+	switch {
+	case m.statsErr != nil:
+		b.WriteString("\n  " + warningStyle.Render(fmt.Sprintf("Stats unavailable: %v", m.statsErr)))
+	case m.updatesErr != "":
+		b.WriteString("\n  " + warningStyle.Render(fmt.Sprintf("updates: %s", m.updatesErr)))
+	}
+
+	back := "q quit"
+	if m.showPicker {
+		back = "q back"
+	}
+	line1 := fmt.Sprintf("  space toggle  •  a all  •  / search  •  %s", back)
+	line2 := "  r restart  •  d deploy  •  s stop  •  l logs  •  c config  •  x exec  •  U updates"
+	if m.searching {
+		line2 = "  enter jump  •  esc cancel"
+	} else if m.searchQuery != "" {
+		line2 = "  n/N cycle  •  esc clear"
+	}
+	oneLine := line1 + "  •  " + line2[2:]
+	// helpStyle's MarginTop supplies the single blank line between the reserved
+	// bar (or warning) line and the help text.
+	if m.width >= len(oneLine)+2 {
+		b.WriteString(helpStyle.Render(oneLine))
 	} else {
-		if m.warning != "" {
-			b.WriteString("\n  " + warningStyle.Render(m.warning))
-		}
-		// Soft-warning slot priority: svcErr > statsErr > updatesErr.
-		// svcErr early-returns from the renderer above, so when both are set
-		// svcErr always wins. statsErr and updatesErr are mutually exclusive
-		// here — at most one is shown so the line count stays predictable
-		// (svcVisibleCount accounts for at most one extra footer line).
-		warnRendered := false
-		switch {
-		case m.statsErr != nil:
-			b.WriteString("\n  " + warningStyle.Render(fmt.Sprintf("Stats unavailable: %v", m.statsErr)))
-			warnRendered = true
-		case m.updatesErr != "":
-			b.WriteString("\n  " + warningStyle.Render(fmt.Sprintf("updates: %s", m.updatesErr)))
-			warnRendered = true
-		}
-		back := "q quit"
-		if m.showPicker {
-			back = "q back"
-		}
-		line1 := fmt.Sprintf("  space toggle  •  a all  •  %s", back)
-		line2 := "  r restart  •  d deploy  •  s stop  •  l logs  •  c config  •  x exec  •  U updates"
-		oneLine := line1 + "  •  " + line2[2:]
-		gap := "\n"
-		// Skip the leading newline only when the "▼ N more" indicator is the
-		// last thing rendered — both the warning and statsErr branches above
-		// already prepend their own newline, so a "" gap there would glue the
-		// help text onto the warning line.
-		if below > 0 && m.warning == "" && !warnRendered {
-			gap = ""
-		}
-		if m.width >= len(oneLine)+2 {
-			b.WriteString(helpStyle.Render(gap + oneLine))
-		} else {
-			b.WriteString(helpStyle.Render(gap + line1 + "\n" + line2))
-		}
+		b.WriteString(helpStyle.Render(line1 + "\n" + line2))
 	}
 	return b.String()
+}
+
+// searchBarLine renders the reserved footer bar for container search. It ALWAYS
+// occupies exactly ONE physical line regardless of width or content — the
+// constant-height invariant that svcVisibleCount() relies on (it reserves a
+// single row for the bar; a wrapped bar would push the footer past its reserved
+// space and let the list overflow the terminal / the cursor scroll off).
+//
+// Typing mode shows the open input + counter; committed mode shows a compact
+// "↳ <name>  (i/N)" + hint when the cursor sits on a match, or
+// `search "<query>"  (N matches)` when the cursor has moved off all matches
+// (via j/k) so the non-matching row isn't labelled under the ↳ glyph; idle
+// renders whitespace so the line is present but empty. Every non-idle mode
+// assembles its line then applies ONE final clampToWidth(line, m.width) — the
+// unconditional hard guarantee — so a long query, a long service name, the
+// committed-mode hint, OR (at absurdly narrow widths) even the counter suffix
+// can never push the bar past m.width and wrap onto a second physical line.
+func (m Model) searchBarLine() string {
+	var line string
+	switch {
+	case m.searching:
+		// Budget the left (prefix + input) segment so the trailing counter stays
+		// visible in the common case — reserve exactly the counter's width and
+		// truncate the left part to the rest. bubbles' textinput scrolls its own
+		// value horizontally to keep the cursor visible; its Width is set on the
+		// PERSISTED model in the '/' open + typing-intercept paths (a value-
+		// receiver assignment here would be discarded), so this func only READS.
+		prefix := "  / "
+		suffix := "  " + m.searchCounter()
+		if m.width <= 0 {
+			// Unknown terminal size (tests): no bounding, full content.
+			line = prefix + m.searchInput.View() + suffix
+		} else {
+			leftBudget := m.width - ansi.StringWidth(suffix)
+			if leftBudget < 0 {
+				leftBudget = 0
+			}
+			left := ansi.Truncate(prefix+m.searchInput.View(), leftBudget, "")
+			line = left + suffix
+		}
+	case m.searchQuery != "":
+		var bar string
+		if name, ok := m.cursorMatchName(); ok {
+			// Cursor sits on a match — the ↳ glyph correctly implies "jumped to
+			// this match", so name it.
+			bar = fmt.Sprintf("  ↳ %s  %s", name, m.searchCounter())
+		} else {
+			// Cursor is off all matches (moved away with j/k): don't name the
+			// non-matching row under a ↳ glyph — show the query + count instead.
+			bar = fmt.Sprintf("  search %q  %s", m.searchQuery, m.searchCounter())
+		}
+		line = searchMatchStyle.Render(bar) + descStyle.Render("   n next · N prev · esc clear")
+	default:
+		return "  "
+	}
+	// UNCONDITIONAL final clamp: the per-mode budgeting above keeps the counter
+	// visible at normal widths, but at absurdly narrow widths (m.width smaller
+	// than the counter suffix, e.g. "  (no match)") the left segment truncates to
+	// nothing and the un-truncated suffix would still exceed m.width and WRAP.
+	// This last clamp is the hard guarantee of the one-physical-line invariant —
+	// if the terminal is that narrow it's acceptable for the counter itself to be
+	// clipped; what must NEVER happen is exceeding m.width. Mirrors clampToWidth's
+	// m.width<=0 no-op so unknown-size (test) paths return full content.
+	return clampToWidth(line, m.width)
+}
+
+// searchInputWidth returns the width budget for the search textinput's value
+// area — m.width minus the "  / " prefix, the textinput's own 2-col prompt, and
+// the trailing "  <counter>" suffix. Setting textinput.Width to this on the
+// PERSISTED model (in the '/' open + typing-intercept paths) lets bubbles scroll
+// the value horizontally to keep the cursor visible, instead of the outer clamp
+// hiding the most-recently-typed characters. Returns 0 (bubbles' "unbounded")
+// when m.width <= 0 (unknown terminal size, e.g. tests).
+//
+// STABLE budget: the suffix width is reserved for the WIDEST counter the bar can
+// show for the current service-set size (maxCounterWidth), NOT the volatile
+// current-match counter. If it tracked the live counter, the budget — and thus
+// the input's horizontal-scroll window — would shrink/grow as the counter
+// changed with each keystroke ("(1/1)" → "(no match)" → "(12/34)"), and bubbles
+// computes its overflow offset inside Update() using the PREVIOUS Width, so the
+// newest typed char/cursor could clip for one keystroke. A fixed budget lets
+// Width be set BEFORE Update() with a value that stays correct across keystrokes.
+// The render-time clamp in searchBarLine still holds regardless, so a slightly
+// conservative budget can never let the bar wrap.
+func (m Model) searchInputWidth() int {
+	if m.width <= 0 {
+		return 0
+	}
+	const prefixWidth = 4 // "  / "
+	const promptWidth = 2 // textinput default prompt "> "
+	suffixWidth := 2 + m.maxCounterWidth() // "  " + widest counter
+	budget := m.width - prefixWidth - promptWidth - suffixWidth
+	if budget < 1 {
+		budget = 1
+	}
+	return budget
+}
+
+// maxCounterWidth returns the display width of the WIDEST counter searchCounter()
+// can produce for the current service set — a keystroke-stable value used by
+// searchInputWidth() so the input's Width does not fluctuate as the live counter
+// changes. The candidates are: "(no match)" (empty query / zero matches), the
+// widest "(i/N)" position form (both i and N at their max of len(services), the
+// most matches possible), and the widest "(N matches)" off-match form. Whichever
+// renders widest wins. Uses len(services) rather than len(searchMatches) because
+// the match count varies per keystroke while len(services) is fixed for the
+// screen — reserving for the theoretical max keeps the budget stable.
+func (m Model) maxCounterWidth() int {
+	n := len(m.services)
+	w := ansi.StringWidth("(no match)")
+	if n > 0 {
+		if c := ansi.StringWidth(fmt.Sprintf("(%d/%d)", n, n)); c > w {
+			w = c
+		}
+		if c := ansi.StringWidth(fmt.Sprintf("(%d matches)", n)); c > w {
+			w = c
+		}
+	}
+	return w
+}
+
+// clampToWidth truncates s so its DISPLAY width does not exceed width, in an
+// ANSI-aware way (escape sequences are preserved and reset, wide runes counted
+// by cell). width <= 0 means "unknown terminal size" (e.g. tests that never set
+// m.width) and returns s unchanged, mirroring how svcVisibleCount treats
+// m.height == 0. The reserved search bar is the only footer line whose content
+// is user-controlled and unbounded, so this guards the constant-height invariant.
+func clampToWidth(s string, width int) string {
+	if width <= 0 {
+		return s
+	}
+	return ansi.Truncate(s, width, "")
+}
+
+// cursorMatchName returns the service name under the cursor and true when the
+// cursor sits on a search match; ("", false) when the cursor is off all matches
+// (or out of range). Used by searchBarLine to avoid labelling a non-matching row
+// with the ↳ "jumped to a match" glyph.
+func (m Model) cursorMatchName() (string, bool) {
+	if m.svcCursor < 0 || m.svcCursor >= len(m.services) {
+		return "", false
+	}
+	for _, idx := range m.searchMatches {
+		if idx == m.svcCursor {
+			return m.services[m.svcCursor], true
+		}
+	}
+	return "", false
 }
 
 func (m Model) viewLogs() string {

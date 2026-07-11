@@ -68,6 +68,17 @@ var (
 	updateGlyphStyle = lipgloss.NewStyle().
 				Foreground(lipgloss.Color("3"))
 
+	// searchMatchStyle paints service names that match the active container
+	// search in the same yellow as the update glyph — a soft highlight.
+	searchMatchStyle = lipgloss.NewStyle().
+				Foreground(lipgloss.Color("3"))
+
+	// searchCurrentStyle marks the current match (the row the cursor sits on)
+	// with the same yellow plus bold so it stands out among the matches.
+	searchCurrentStyle = lipgloss.NewStyle().
+				Foreground(lipgloss.Color("3")).
+				Bold(true)
+
 	helpStyle = lipgloss.NewStyle().
 			Foreground(lipgloss.Color("8")).
 			MarginTop(1)
