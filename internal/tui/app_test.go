@@ -2398,12 +2398,31 @@ func TestViewLogsIndicator(t *testing.T) {
 		return m
 	}
 
+	// headerLine returns the physical line that contains the "logs >" breadcrumb.
+	// The indicator must render on THIS line (not on titleStyle's margin line
+	// below it), so the follow/paused assertions target it directly.
+	headerLine := func(t *testing.T, out string) string {
+		t.Helper()
+		for _, line := range strings.Split(out, "\n") {
+			if strings.Contains(line, "logs >") {
+				return line
+			}
+		}
+		t.Fatalf("viewLogs() output has no line containing the \"logs >\" breadcrumb:\n%s", out)
+		return ""
+	}
+
 	t.Run("following at bottom", func(t *testing.T) {
 		m := newLogsModel()
 		m.logsViewport.GotoBottom()
 		out := m.viewLogs()
 		if !strings.Contains(out, "following") {
 			t.Errorf("viewLogs() output missing \"following\" indicator:\n%s", out)
+		}
+		// The indicator must sit on the SAME physical line as the breadcrumb,
+		// not on titleStyle's margin line below it.
+		if hl := headerLine(t, out); !strings.Contains(hl, "following") {
+			t.Errorf("\"following\" indicator not on the breadcrumb line, got header line %q\nfull output:\n%s", hl, out)
 		}
 		if strings.Contains(out, "paused") {
 			t.Errorf("viewLogs() output should not contain \"paused\" while following:\n%s", out)
@@ -2423,9 +2442,10 @@ func TestViewLogsIndicator(t *testing.T) {
 		}
 		// Scrolled up exactly 5 rows from the bottom, so the header must render
 		// the concrete distance-to-bottom count — asserting the number catches
-		// a formatting or wrong-value bug that a bare "▲" check would miss.
-		if !strings.Contains(out, "▲ 5 below") {
-			t.Errorf("viewLogs() output missing \"▲ 5 below\" count:\n%s", out)
+		// a formatting or wrong-value bug that a bare "▲" check would miss. It
+		// must also land on the breadcrumb line, not titleStyle's margin line.
+		if hl := headerLine(t, out); !strings.Contains(hl, "▲ 5 below") {
+			t.Errorf("\"▲ 5 below\" count not on the breadcrumb line, got header line %q\nfull output:\n%s", hl, out)
 		}
 		if strings.Contains(out, "following") {
 			t.Errorf("viewLogs() output should not contain \"following\" while paused:\n%s", out)

@@ -3354,7 +3354,12 @@ func logTailStatus(vp viewport.Model, done bool) (label string, below int) {
 
 func (m Model) viewLogs() string {
 	var b strings.Builder
-	header := titleStyle.Render(fmt.Sprintf("%s > logs > %s", m.breadcrumb(), m.logsService))
+	// Render the title with a margin-less copy of titleStyle so the indicator
+	// lands on the SAME physical line as the breadcrumb/title. titleStyle's own
+	// MarginBottom(1) would otherwise emit a trailing "\n<spaces>" line and push
+	// the appended indicator down onto that margin line. lipgloss styles are
+	// value types, so this copy does not mutate the shared titleStyle.
+	header := titleStyle.UnsetMarginBottom().Render(fmt.Sprintf("%s > logs > %s", m.breadcrumb(), m.logsService))
 	if label, below := logTailStatus(m.logsViewport, m.logsDone); label != "" {
 		var indicator string
 		if label == "following" {
@@ -3365,7 +3370,10 @@ func (m Model) viewLogs() string {
 		header += "  " + indicator
 	}
 	b.WriteString(header)
-	b.WriteString("\n\n")
+	// Reproduce the vertical spacing that titleStyle's MarginBottom(1) plus the
+	// old "\n\n" used to produce: one newline to close the title line, then two
+	// more for the margin-equivalent blank line and the separator blank line.
+	b.WriteString("\n\n\n")
 
 	b.WriteString(m.logsViewport.View())
 	b.WriteString("\n")
