@@ -2156,6 +2156,313 @@ func TestLogChunkMsg_AppendsContent(t *testing.T) {
 	}
 }
 
+// logChunkContent returns a string of n numbered lines (each newline-terminated),
+// enough to exceed a small viewport height so AtBottom()/scroll are meaningful.
+func logChunkContent(n int) string {
+	var b strings.Builder
+	for i := 0; i < n; i++ {
+		fmt.Fprintf(&b, "line %d\n", i)
+	}
+	return b.String()
+}
+
+// TestLogChunkMsg_ScrolledUpDoesNotSnap verifies that when the user has scrolled
+// up (viewport not at bottom), an incoming chunk does NOT yank the view to the
+// bottom — the tail is auto-paused.
+func TestLogChunkMsg_ScrolledUpDoesNotSnap(t *testing.T) {
+	mc := &mockComposer{services: []string{"nginx"}}
+	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
+	m.screen = screenLogs
+	m.logsService = "nginx"
+	m.height = 24
+	m.logsViewport = viewport.New(80, 10)
+	pr, _ := io.Pipe()
+	m.logsPipeR = pr
+
+	// Fill the viewport with more content than its height so scrolling is possible.
+	m.logsContent = logChunkContent(50)
+	m.applyLogFormat()
+	m.logsViewport.GotoBottom()
+	if !m.logsViewport.AtBottom() {
+		t.Fatal("precondition: viewport should be at bottom after GotoBottom")
+	}
+	if m.logsViewport.TotalLineCount() <= m.logsViewport.Height {
+		t.Fatalf("precondition: content must exceed viewport height (lines=%d, height=%d)",
+			m.logsViewport.TotalLineCount(), m.logsViewport.Height)
+	}
+
+	// Scroll up a few lines so we're no longer at the bottom.
+	m.logsViewport.SetYOffset(m.logsViewport.YOffset - 5)
+	if m.logsViewport.AtBottom() {
+		t.Fatal("precondition: viewport should NOT be at bottom after scrolling up")
+	}
+	offBefore := m.logsViewport.YOffset
+
+	// Incoming chunk while scrolled up must not snap us to the bottom.
+	updated, _ := m.Update(logChunkMsg{data: []byte("new tail line\n")})
+	m = updated.(Model)
+
+	if m.logsViewport.AtBottom() {
+		t.Error("viewport snapped to bottom while scrolled up; expected paused tail")
+	}
+	if m.logsViewport.YOffset != offBefore {
+		t.Errorf("YOffset changed from %d to %d; expected it to stay put while paused",
+			offBefore, m.logsViewport.YOffset)
+	}
+}
+
+// TestLogChunkMsg_AtBottomFollowsTail verifies that when the viewport is at the
+// bottom (following), an incoming chunk keeps it pinned to the tail.
+func TestLogChunkMsg_AtBottomFollowsTail(t *testing.T) {
+	mc := &mockComposer{services: []string{"nginx"}}
+	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
+	m.screen = screenLogs
+	m.logsService = "nginx"
+	m.height = 24
+	m.logsViewport = viewport.New(80, 10)
+	pr, _ := io.Pipe()
+	m.logsPipeR = pr
+
+	m.logsContent = logChunkContent(50)
+	m.applyLogFormat()
+	m.logsViewport.GotoBottom()
+	if !m.logsViewport.AtBottom() {
+		t.Fatal("precondition: viewport should be at bottom")
+	}
+
+	// Feed a chunk while following; the tail should stay pinned.
+	updated, _ := m.Update(logChunkMsg{data: []byte("new tail line\n")})
+	m = updated.(Model)
+
+	if !m.logsViewport.AtBottom() {
+		t.Error("viewport did not follow the tail; expected AtBottom() to remain true")
+	}
+}
+
+// TestLogsReformatWhileFollowingStaysPinned verifies that reformatting the log
+// content (wrap toggle) and resizing while the viewport is at the bottom keeps
+// the tail pinned — the follow intent survives fullReformat()'s line-count
+// changes instead of reading as an accidental pause.
+func TestLogsReformatWhileFollowingStaysPinned(t *testing.T) {
+	mc := &mockComposer{services: []string{"nginx"}}
+	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
+	m.screen = screenLogs
+	m.logsService = "nginx"
+	m.height = 24
+	m.logsViewport = viewport.New(80, 10)
+	pr, _ := io.Pipe()
+	m.logsPipeR = pr
+
+	// Fill with more content than the viewport height so AtBottom() is meaningful.
+	m.logsContent = logChunkContent(50)
+	m.applyLogFormat()
+	m.logsViewport.GotoBottom()
+	if !m.logsViewport.AtBottom() {
+		t.Fatal("precondition: viewport should be at bottom after GotoBottom")
+	}
+	if m.logsViewport.TotalLineCount() <= m.logsViewport.Height {
+		t.Fatalf("precondition: content must exceed viewport height (lines=%d, height=%d)",
+			m.logsViewport.TotalLineCount(), m.logsViewport.Height)
+	}
+
+	// Toggle wrap (w) — fullReformat() runs; the tail must stay pinned.
+	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("w")})
+	m = updated.(Model)
+	if !m.logsViewport.AtBottom() {
+		t.Error("wrap toggle while following dropped the tail; expected AtBottom() to remain true")
+	}
+
+	// Resize — fullReformat() runs again; still pinned.
+	updated, _ = m.Update(tea.WindowSizeMsg{Width: 60, Height: 16})
+	m = updated.(Model)
+	if !m.logsViewport.AtBottom() {
+		t.Error("resize while following dropped the tail; expected AtBottom() to remain true")
+	}
+}
+
+// TestLogsReformatWhilePausedStaysPaused verifies that reformatting (wrap
+// toggle) and resizing while the user is scrolled up (paused) does NOT snap the
+// view to the bottom — re-pinning only fires when previously following.
+func TestLogsReformatWhilePausedStaysPaused(t *testing.T) {
+	mc := &mockComposer{services: []string{"nginx"}}
+	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
+	m.screen = screenLogs
+	m.logsService = "nginx"
+	m.height = 24
+	m.logsViewport = viewport.New(80, 10)
+	pr, _ := io.Pipe()
+	m.logsPipeR = pr
+
+	m.logsContent = logChunkContent(50)
+	m.applyLogFormat()
+	m.logsViewport.GotoBottom()
+	if m.logsViewport.TotalLineCount() <= m.logsViewport.Height {
+		t.Fatalf("precondition: content must exceed viewport height (lines=%d, height=%d)",
+			m.logsViewport.TotalLineCount(), m.logsViewport.Height)
+	}
+
+	// Scroll up so we're paused, not following.
+	m.logsViewport.SetYOffset(m.logsViewport.YOffset - 5)
+	if m.logsViewport.AtBottom() {
+		t.Fatal("precondition: viewport should NOT be at bottom after scrolling up")
+	}
+
+	// Toggle wrap (w) while paused — must stay paused.
+	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("w")})
+	m = updated.(Model)
+	if m.logsViewport.AtBottom() {
+		t.Error("wrap toggle while paused snapped to bottom; expected the view to stay paused")
+	}
+
+	// Resize while paused — must still stay paused. Height 12 → viewport height
+	// 12-6 = 6 (shrinks from 10), so this genuinely changes the viewport
+	// geometry / AtBottom() boundary rather than exercising only a width change.
+	heightBefore := m.logsViewport.Height
+	updated, _ = m.Update(tea.WindowSizeMsg{Width: 60, Height: 12})
+	m = updated.(Model)
+	if m.logsViewport.Height == heightBefore {
+		t.Fatalf("precondition: resize should shrink viewport height (was %d, still %d)",
+			heightBefore, m.logsViewport.Height)
+	}
+	if m.logsViewport.AtBottom() {
+		t.Error("resize while paused snapped to bottom; expected the view to stay paused")
+	}
+}
+
+// TestLogTailStatus is a table test for the pure logTailStatus helper covering
+// the three states: streaming+at-bottom → ("following", 0), streaming+scrolled-up
+// → ("paused", N) where N is the distance to the bottom, and done → ("", 0).
+func TestLogTailStatus(t *testing.T) {
+	// Build a viewport with more content than its height so scroll is meaningful.
+	newVP := func() viewport.Model {
+		vp := viewport.New(80, 10)
+		vp.SetContent(logChunkContent(50))
+		return vp
+	}
+
+	t.Run("following at bottom", func(t *testing.T) {
+		vp := newVP()
+		vp.GotoBottom()
+		label, below := logTailStatus(vp, false)
+		if label != "following" || below != 0 {
+			t.Errorf("got (%q, %d); want (\"following\", 0)", label, below)
+		}
+	})
+
+	t.Run("paused scrolled up", func(t *testing.T) {
+		vp := newVP()
+		vp.GotoBottom()
+		// Scroll up exactly 5 rows from the bottom so the distance-to-bottom
+		// is a known constant. Asserting the concrete value (5) — rather than
+		// recomputing it with the impl's own formula — catches an off-by-one
+		// or wrong-sign bug in logTailStatus.
+		vp.SetYOffset(vp.YOffset - 5)
+		if vp.AtBottom() {
+			t.Fatal("precondition: viewport should NOT be at bottom after scrolling up")
+		}
+		label, below := logTailStatus(vp, false)
+		if label != "paused" {
+			t.Errorf("got label %q; want \"paused\"", label)
+		}
+		if below != 5 {
+			t.Errorf("got below=%d; want 5 (scrolled up 5 rows from bottom)", below)
+		}
+	})
+
+	t.Run("done shows nothing", func(t *testing.T) {
+		vp := newVP()
+		vp.GotoBottom()
+		// Even scrolled up, done wins and yields the empty indicator.
+		vp.SetYOffset(vp.YOffset - 5)
+		label, below := logTailStatus(vp, true)
+		if label != "" || below != 0 {
+			t.Errorf("got (%q, %d); want (\"\", 0)", label, below)
+		}
+	})
+}
+
+// TestViewLogsIndicator verifies viewLogs() renders the follow/paused indicator
+// on the header: "following" when live at bottom, "paused" + a "▲" count when
+// scrolled up, and neither token when the stream has ended (logsDone).
+func TestViewLogsIndicator(t *testing.T) {
+	newLogsModel := func() Model {
+		mc := &mockComposer{services: []string{"nginx"}}
+		m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
+		m.screen = screenLogs
+		m.logsService = "nginx"
+		m.height = 24
+		m.width = 80
+		m.logsViewport = viewport.New(80, 10)
+		m.logsContent = logChunkContent(50)
+		m.applyLogFormat()
+		return m
+	}
+
+	// headerLine returns the physical line that contains the "logs >" breadcrumb.
+	// The indicator must render on THIS line (not on titleStyle's margin line
+	// below it), so the follow/paused assertions target it directly.
+	headerLine := func(t *testing.T, out string) string {
+		t.Helper()
+		for _, line := range strings.Split(out, "\n") {
+			if strings.Contains(line, "logs >") {
+				return line
+			}
+		}
+		t.Fatalf("viewLogs() output has no line containing the \"logs >\" breadcrumb:\n%s", out)
+		return ""
+	}
+
+	t.Run("following at bottom", func(t *testing.T) {
+		m := newLogsModel()
+		m.logsViewport.GotoBottom()
+		out := m.viewLogs()
+		if !strings.Contains(out, "following") {
+			t.Errorf("viewLogs() output missing \"following\" indicator:\n%s", out)
+		}
+		// The indicator must sit on the SAME physical line as the breadcrumb,
+		// not on titleStyle's margin line below it.
+		if hl := headerLine(t, out); !strings.Contains(hl, "following") {
+			t.Errorf("\"following\" indicator not on the breadcrumb line, got header line %q\nfull output:\n%s", hl, out)
+		}
+		if strings.Contains(out, "paused") {
+			t.Errorf("viewLogs() output should not contain \"paused\" while following:\n%s", out)
+		}
+	})
+
+	t.Run("paused scrolled up", func(t *testing.T) {
+		m := newLogsModel()
+		m.logsViewport.GotoBottom()
+		m.logsViewport.SetYOffset(m.logsViewport.YOffset - 5)
+		if m.logsViewport.AtBottom() {
+			t.Fatal("precondition: viewport should NOT be at bottom after scrolling up")
+		}
+		out := m.viewLogs()
+		if !strings.Contains(out, "paused") {
+			t.Errorf("viewLogs() output missing \"paused\" indicator:\n%s", out)
+		}
+		// Scrolled up exactly 5 rows from the bottom, so the header must render
+		// the concrete distance-to-bottom count — asserting the number catches
+		// a formatting or wrong-value bug that a bare "▲" check would miss. It
+		// must also land on the breadcrumb line, not titleStyle's margin line.
+		if hl := headerLine(t, out); !strings.Contains(hl, "▲ 5 below") {
+			t.Errorf("\"▲ 5 below\" count not on the breadcrumb line, got header line %q\nfull output:\n%s", hl, out)
+		}
+		if strings.Contains(out, "following") {
+			t.Errorf("viewLogs() output should not contain \"following\" while paused:\n%s", out)
+		}
+	})
+
+	t.Run("done shows no indicator", func(t *testing.T) {
+		m := newLogsModel()
+		m.logsViewport.GotoBottom()
+		m.logsDone = true
+		out := m.viewLogs()
+		if strings.Contains(out, "following") || strings.Contains(out, "paused") {
+			t.Errorf("viewLogs() output should show no follow/paused indicator when done:\n%s", out)
+		}
+	})
+}
+
 func TestLogDoneMsg_WithError(t *testing.T) {
 	mc := &mockComposer{services: []string{"nginx"}}
 	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
@@ -2175,6 +2482,46 @@ func TestLogDoneMsg_WithError(t *testing.T) {
 	}
 	if m.logsErr.Error() != "connection lost" {
 		t.Errorf("logsErr = %q, want %q", m.logsErr.Error(), "connection lost")
+	}
+	if !strings.Contains(m.logsContent, "Error: connection lost") {
+		t.Errorf("logsContent should contain error, got %q", m.logsContent)
+	}
+}
+
+// TestLogDoneMsg_WithError_ForcesScrolledUpViewToBottom verifies that a terminal
+// error is forced into view even when the user has scrolled up (paused). With
+// content exceeding the viewport height and the view scrolled up, delivering an
+// error logDoneMsg must snap to the bottom so the appended error is visible —
+// this pins the deliberate error-path GotoBottom() (removing it would leave the
+// view paused and hide the error).
+func TestLogDoneMsg_WithError_ForcesScrolledUpViewToBottom(t *testing.T) {
+	mc := &mockComposer{services: []string{"nginx"}}
+	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
+	m.screen = screenLogs
+	m.logsService = "nginx"
+	m.logsViewport = viewport.New(80, 10)
+
+	// Fill with more content than the viewport height so scroll is meaningful.
+	m.logsContent = logChunkContent(50)
+	m.applyLogFormat()
+	m.logsViewport.GotoBottom()
+	if m.logsViewport.TotalLineCount() <= m.logsViewport.Height {
+		t.Fatalf("precondition: content must exceed viewport height (lines=%d, height=%d)",
+			m.logsViewport.TotalLineCount(), m.logsViewport.Height)
+	}
+
+	// Scroll up so we're paused, not at the bottom.
+	m.logsViewport.SetYOffset(m.logsViewport.YOffset - 5)
+	if m.logsViewport.AtBottom() {
+		t.Fatal("precondition: viewport should NOT be at bottom after scrolling up")
+	}
+
+	// A terminal error must force the appended error text into view.
+	updated, _ := m.Update(logDoneMsg{err: fmt.Errorf("connection lost")})
+	m = updated.(Model)
+
+	if !m.logsViewport.AtBottom() {
+		t.Error("error logDoneMsg did not force the view to the bottom; the error would be hidden while paused")
 	}
 	if !strings.Contains(m.logsContent, "Error: connection lost") {
 		t.Errorf("logsContent should contain error, got %q", m.logsContent)

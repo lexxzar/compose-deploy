@@ -556,6 +556,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 		}
 		if m.screen == screenLogs {
+			following := m.logsViewport.AtBottom()
 			m.logsViewport.Width = msg.Width - 4
 			h := msg.Height - 6
 			if h < 3 {
@@ -563,6 +564,9 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 			m.logsViewport.Height = h
 			m.fullReformat()
+			if following {
+				m.logsViewport.GotoBottom()
+			}
 		}
 		return m, nil
 
@@ -883,9 +887,12 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if m.screen != screenLogs || msg.session != m.logsSession {
 			return m, nil
 		}
+		following := m.logsViewport.AtBottom() // capture BEFORE appending
 		m.logsContent += string(msg.data)
-		m.applyLogFormat()
-		m.logsViewport.GotoBottom()
+		m.applyLogFormat() // SetContent preserves YOffset
+		if following {
+			m.logsViewport.GotoBottom()
+		}
 		return m, m.readLogChunk()
 
 	case logDoneMsg:
@@ -1495,6 +1502,7 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			}
 			return m, tea.Batch(cmds...)
 		case "w":
+			following := m.logsViewport.AtBottom()
 			m.logsWrap = !m.logsWrap
 			if m.logsWrap {
 				m.logsViewport.SetHorizontalStep(0)
@@ -1502,10 +1510,17 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 				m.logsViewport.SetHorizontalStep(4)
 			}
 			m.fullReformat()
+			if following {
+				m.logsViewport.GotoBottom()
+			}
 			return m, nil
 		case "p":
+			following := m.logsViewport.AtBottom()
 			m.logsPretty = !m.logsPretty
 			m.fullReformat()
+			if following {
+				m.logsViewport.GotoBottom()
+			}
 			return m, nil
 		case "G":
 			m.logsViewport.GotoBottom()
@@ -3317,10 +3332,48 @@ func (m Model) cursorMatchName() (string, bool) {
 	return "", false
 }
 
+// logTailStatus reports the follow state of the log viewport for the header
+// indicator. done (stream ended) → ("", 0): nothing to follow, no indicator.
+// At the live bottom → ("following", 0). Otherwise ("paused", N) where N is the
+// distance in display rows to the bottom (how far G will jump), clamped at 0.
+// Pure: derives everything from viewport geometry, so it needs no Model field
+// and stays correct through resize / wrap / pretty reformats.
+func logTailStatus(vp viewport.Model, done bool) (label string, below int) {
+	if done {
+		return "", 0
+	}
+	if vp.AtBottom() {
+		return "following", 0
+	}
+	below = vp.TotalLineCount() - vp.YOffset - vp.Height
+	if below < 0 {
+		below = 0
+	}
+	return "paused", below
+}
+
 func (m Model) viewLogs() string {
 	var b strings.Builder
-	b.WriteString(titleStyle.Render(fmt.Sprintf("%s > logs > %s", m.breadcrumb(), m.logsService)))
-	b.WriteString("\n\n")
+	// Render the title with a margin-less copy of titleStyle so the indicator
+	// lands on the SAME physical line as the breadcrumb/title. titleStyle's own
+	// MarginBottom(1) would otherwise emit a trailing "\n<spaces>" line and push
+	// the appended indicator down onto that margin line. lipgloss styles are
+	// value types, so this copy does not mutate the shared titleStyle.
+	header := titleStyle.UnsetMarginBottom().Render(fmt.Sprintf("%s > logs > %s", m.breadcrumb(), m.logsService))
+	if label, below := logTailStatus(m.logsViewport, m.logsDone); label != "" {
+		var indicator string
+		if label == "following" {
+			indicator = logFollowStyle.Render("● following")
+		} else {
+			indicator = logPauseStyle.Render(fmt.Sprintf("⏸ paused ▲ %d below", below))
+		}
+		header += "  " + indicator
+	}
+	b.WriteString(header)
+	// Reproduce the vertical spacing that titleStyle's MarginBottom(1) plus the
+	// old "\n\n" used to produce: one newline to close the title line, then two
+	// more for the margin-equivalent blank line and the separator blank line.
+	b.WriteString("\n\n\n")
 
 	b.WriteString(m.logsViewport.View())
 	b.WriteString("\n")
