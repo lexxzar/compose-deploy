@@ -135,12 +135,12 @@ This change makes the tail *follow-aware*: scrolling up pauses auto-scroll (you 
 - Modify: `internal/tui/styles.go` (add `logFollowStyle`, `logPauseStyle`)
 - Modify: `internal/tui/app_test.go`
 
-- [ ] Add the pure `logTailStatus(vp viewport.Model, done bool) (label string, below int)` helper (per Technical Details).
-- [ ] Add `logFollowStyle` (green `Color("2")`) and `logPauseStyle` (yellow `Color("3")`) to `styles.go`.
-- [ ] In `viewLogs()`, call `logTailStatus(m.logsViewport, m.logsDone)` and, when `label != ""`, append the styled indicator (`● following` / `⏸ paused ▲ N below`) to the header line.
-- [ ] Write table test for `logTailStatus`: `{done:false, at bottom}` → `("following", 0)`; `{done:false, scrolled up N}` → `("paused", N)`; `{done:true}` → `("", 0)`.
-- [ ] Write test: `viewLogs()` output contains `following` when live at bottom, `paused` + a `▲` count when scrolled up, and neither token when `logsDone` is true. (The done-case must set `m.logsDone = true` on the Model before calling `viewLogs()` — that field is otherwise only set by the `logDoneMsg` handler.)
-- [ ] Run `go test ./internal/tui/ -v` — must pass before Task 4.
+- [x] Add the pure `logTailStatus(vp viewport.Model, done bool) (label string, below int)` helper (per Technical Details).
+- [x] Add `logFollowStyle` (green `Color("2")`) and `logPauseStyle` (yellow `Color("3")`) to `styles.go`.
+- [x] In `viewLogs()`, call `logTailStatus(m.logsViewport, m.logsDone)` and, when `label != ""`, append the styled indicator (`● following` / `⏸ paused ▲ N below`) to the header line.
+- [x] Write table test for `logTailStatus`: `{done:false, at bottom}` → `("following", 0)`; `{done:false, scrolled up N}` → `("paused", N)`; `{done:true}` → `("", 0)`.
+- [x] Write test: `viewLogs()` output contains `following` when live at bottom, `paused` + a `▲` count when scrolled up, and neither token when `logsDone` is true. (The done-case must set `m.logsDone = true` on the Model before calling `viewLogs()` — that field is otherwise only set by the `logDoneMsg` handler.)
+- [x] Run `go test ./internal/tui/ -v` — must pass before Task 4.
 
 ### Task 4: Verify acceptance criteria
 - [ ] Verify all Overview requirements: scroll-up pauses tail, scroll-to-bottom resumes, `G` jumps-and-resumes, indicator reflects state, no indicator when done.

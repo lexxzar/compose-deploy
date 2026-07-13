@@ -2322,6 +2322,117 @@ func TestLogsReformatWhilePausedStaysPaused(t *testing.T) {
 	}
 }
 
+// TestLogTailStatus is a table test for the pure logTailStatus helper covering
+// the three states: streaming+at-bottom → ("following", 0), streaming+scrolled-up
+// → ("paused", N) where N is the distance to the bottom, and done → ("", 0).
+func TestLogTailStatus(t *testing.T) {
+	// Build a viewport with more content than its height so scroll is meaningful.
+	newVP := func() viewport.Model {
+		vp := viewport.New(80, 10)
+		vp.SetContent(logChunkContent(50))
+		return vp
+	}
+
+	t.Run("following at bottom", func(t *testing.T) {
+		vp := newVP()
+		vp.GotoBottom()
+		label, below := logTailStatus(vp, false)
+		if label != "following" || below != 0 {
+			t.Errorf("got (%q, %d); want (\"following\", 0)", label, below)
+		}
+	})
+
+	t.Run("paused scrolled up", func(t *testing.T) {
+		vp := newVP()
+		vp.GotoBottom()
+		vp.SetYOffset(vp.YOffset - 5)
+		if vp.AtBottom() {
+			t.Fatal("precondition: viewport should NOT be at bottom after scrolling up")
+		}
+		wantBelow := vp.TotalLineCount() - vp.YOffset - vp.Height
+		label, below := logTailStatus(vp, false)
+		if label != "paused" {
+			t.Errorf("got label %q; want \"paused\"", label)
+		}
+		if below != wantBelow {
+			t.Errorf("got below=%d; want %d (distance to bottom)", below, wantBelow)
+		}
+		if below <= 0 {
+			t.Errorf("expected a positive distance to bottom, got %d", below)
+		}
+	})
+
+	t.Run("done shows nothing", func(t *testing.T) {
+		vp := newVP()
+		vp.GotoBottom()
+		// Even scrolled up, done wins and yields the empty indicator.
+		vp.SetYOffset(vp.YOffset - 5)
+		label, below := logTailStatus(vp, true)
+		if label != "" || below != 0 {
+			t.Errorf("got (%q, %d); want (\"\", 0)", label, below)
+		}
+	})
+}
+
+// TestViewLogsIndicator verifies viewLogs() renders the follow/paused indicator
+// on the header: "following" when live at bottom, "paused" + a "▲" count when
+// scrolled up, and neither token when the stream has ended (logsDone).
+func TestViewLogsIndicator(t *testing.T) {
+	newLogsModel := func() Model {
+		mc := &mockComposer{services: []string{"nginx"}}
+		m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
+		m.screen = screenLogs
+		m.logsService = "nginx"
+		m.height = 24
+		m.width = 80
+		m.logsViewport = viewport.New(80, 10)
+		m.logsContent = logChunkContent(50)
+		m.applyLogFormat()
+		return m
+	}
+
+	t.Run("following at bottom", func(t *testing.T) {
+		m := newLogsModel()
+		m.logsViewport.GotoBottom()
+		out := m.viewLogs()
+		if !strings.Contains(out, "following") {
+			t.Errorf("viewLogs() output missing \"following\" indicator:\n%s", out)
+		}
+		if strings.Contains(out, "paused") {
+			t.Errorf("viewLogs() output should not contain \"paused\" while following:\n%s", out)
+		}
+	})
+
+	t.Run("paused scrolled up", func(t *testing.T) {
+		m := newLogsModel()
+		m.logsViewport.GotoBottom()
+		m.logsViewport.SetYOffset(m.logsViewport.YOffset - 5)
+		if m.logsViewport.AtBottom() {
+			t.Fatal("precondition: viewport should NOT be at bottom after scrolling up")
+		}
+		out := m.viewLogs()
+		if !strings.Contains(out, "paused") {
+			t.Errorf("viewLogs() output missing \"paused\" indicator:\n%s", out)
+		}
+		if !strings.Contains(out, "▲") {
+			t.Errorf("viewLogs() output missing \"▲\" below-count glyph:\n%s", out)
+		}
+		if strings.Contains(out, "following") {
+			t.Errorf("viewLogs() output should not contain \"following\" while paused:\n%s", out)
+		}
+	})
+
+	t.Run("done shows no indicator", func(t *testing.T) {
+		m := newLogsModel()
+		m.logsViewport.GotoBottom()
+		m.logsDone = true
+		out := m.viewLogs()
+		if strings.Contains(out, "following") || strings.Contains(out, "paused") {
+			t.Errorf("viewLogs() output should show no follow/paused indicator when done:\n%s", out)
+		}
+	})
+}
+
 func TestLogDoneMsg_WithError(t *testing.T) {
 	mc := &mockComposer{services: []string{"nginx"}}
 	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)

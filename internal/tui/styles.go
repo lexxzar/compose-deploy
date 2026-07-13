@@ -79,6 +79,17 @@ var (
 				Foreground(lipgloss.Color("3")).
 				Bold(true)
 
+	// logFollowStyle paints the "● following" indicator in the log view header
+	// green — the tail is live and auto-scrolling with the stream.
+	logFollowStyle = lipgloss.NewStyle().
+			Foreground(lipgloss.Color("2"))
+
+	// logPauseStyle paints the "⏸ paused ▲ N below" indicator in the log view
+	// header yellow (same as updateGlyphStyle) — the user has scrolled up and
+	// auto-scroll is paused; N is the distance in rows to the live bottom.
+	logPauseStyle = lipgloss.NewStyle().
+			Foreground(lipgloss.Color("3"))
+
 	helpStyle = lipgloss.NewStyle().
 			Foreground(lipgloss.Color("8")).
 			MarginTop(1)
