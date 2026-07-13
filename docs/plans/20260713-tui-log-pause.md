@@ -149,9 +149,9 @@ This change makes the tail *follow-aware*: scrolling up pauses auto-scroll (you 
 - [x] Run full suite: `go build -o cdeploy .` and `go test ./... -count=1`.
 
 ### Task 5: Update documentation
-- [ ] Update the **Log streaming** section of `CLAUDE.md` to note follow-aware auto-scroll: chunks only `GotoBottom()` when `AtBottom()`; the 3 reformat sites (`w`/`p`/resize) re-pin when following; `logTailStatus` drives the `following`/`paused ▲ N below` header indicator; `G` resumes follow; zero new Model fields.
-- [ ] Update the `viewLogs`/footer note if the `G` help hint wording changes (optional).
-- [ ] Move this plan to `docs/plans/completed/`.
+- [x] Update the **Log streaming** section of `CLAUDE.md` to note follow-aware auto-scroll: chunks only `GotoBottom()` when `AtBottom()`; the 3 reformat sites (`w`/`p`/resize) re-pin when following; `logTailStatus` drives the `following`/`paused ▲ N below` header indicator; `G` resumes follow; zero new Model fields.
+- [x] Update the `viewLogs`/footer note if the `G` help hint wording changes (optional). (no wording change needed) — footer already shows `G bottom`; the header indicator conveys follow/resume semantics, so no footer edit was required.
+- [x] deferred to exec finalize (orchestrator moves via move-plan.sh)
 
 ## Post-Completion
 *Items requiring manual intervention — no checkboxes, informational only.*
