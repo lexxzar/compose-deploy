@@ -143,10 +143,10 @@ This change makes the tail *follow-aware*: scrolling up pauses auto-scroll (you 
 - [x] Run `go test ./internal/tui/ -v` — must pass before Task 4.
 
 ### Task 4: Verify acceptance criteria
-- [ ] Verify all Overview requirements: scroll-up pauses tail, scroll-to-bottom resumes, `G` jumps-and-resumes, indicator reflects state, no indicator when done.
-- [ ] Verify edge cases: reformat/resize while following keeps the tail pinned; while paused stays paused; `logDoneMsg` error path still forces the error into view (unchanged).
-- [ ] Confirm zero new Model fields were added and no CLI/runner/compose/`esc`-cleanup/session code changed.
-- [ ] Run full suite: `go build -o cdeploy .` and `go test ./... -count=1`.
+- [x] Verify all Overview requirements: scroll-up pauses tail, scroll-to-bottom resumes, `G` jumps-and-resumes, indicator reflects state, no indicator when done.
+- [x] Verify edge cases: reformat/resize while following keeps the tail pinned; while paused stays paused; `logDoneMsg` error path still forces the error into view (unchanged).
+- [x] Confirm zero new Model fields were added and no CLI/runner/compose/`esc`-cleanup/session code changed.
+- [x] Run full suite: `go build -o cdeploy .` and `go test ./... -count=1`.
 
 ### Task 5: Update documentation
 - [ ] Update the **Log streaming** section of `CLAUDE.md` to note follow-aware auto-scroll: chunks only `GotoBottom()` when `AtBottom()`; the 3 reformat sites (`w`/`p`/resize) re-pin when following; `logTailStatus` drives the `following`/`paused ▲ N below` header indicator; `G` resumes follow; zero new Model fields.
