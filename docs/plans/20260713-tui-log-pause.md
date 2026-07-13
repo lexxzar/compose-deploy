@@ -107,11 +107,11 @@ This change makes the tail *follow-aware*: scrolling up pauses auto-scroll (you 
 - Modify: `internal/tui/app.go` (`logChunkMsg` handler, ~line 882)
 - Modify: `internal/tui/app_test.go`
 
-- [ ] In the `logChunkMsg` handler, capture `following := m.logsViewport.AtBottom()` **before** `m.logsContent += string(msg.data)`.
-- [ ] After `m.applyLogFormat()`, replace the unconditional `m.logsViewport.GotoBottom()` with `if following { m.logsViewport.GotoBottom() }`. Keep the top screen+session guard and the trailing `return m, m.readLogChunk()` unchanged.
-- [ ] Write test: build a `Model` in `screenLogs` with `m.height` set and enough content that `TotalLineCount() > Height`; scroll up (feed `tea.KeyMsg` "up" a few times, or `SetYOffset`), feed a `logChunkMsg`, assert `YOffset` unchanged and `!m.logsViewport.AtBottom()` (did NOT snap).
-- [ ] Write test: with the viewport at the bottom, feed a `logChunkMsg`, assert `m.logsViewport.AtBottom()` is still true (followed the tail).
-- [ ] Run `go test ./internal/tui/ -v` — must pass before Task 2.
+- [x] In the `logChunkMsg` handler, capture `following := m.logsViewport.AtBottom()` **before** `m.logsContent += string(msg.data)`.
+- [x] After `m.applyLogFormat()`, replace the unconditional `m.logsViewport.GotoBottom()` with `if following { m.logsViewport.GotoBottom() }`. Keep the top screen+session guard and the trailing `return m, m.readLogChunk()` unchanged.
+- [x] Write test: build a `Model` in `screenLogs` with `m.height` set and enough content that `TotalLineCount() > Height`; scroll up (feed `tea.KeyMsg` "up" a few times, or `SetYOffset`), feed a `logChunkMsg`, assert `YOffset` unchanged and `!m.logsViewport.AtBottom()` (did NOT snap).
+- [x] Write test: with the viewport at the bottom, feed a `logChunkMsg`, assert `m.logsViewport.AtBottom()` is still true (followed the tail).
+- [x] Run `go test ./internal/tui/ -v` — must pass before Task 2.
 
 > Note (backward compat): a fresh `viewport.New(w, h)` and any content shorter than the height report `AtBottom() == true`, so the first chunk still snaps and existing tests (`TestLogChunkMsg_AppendsContent`, `TestLogsScreen_LogChunkAppliesFormat`, which use 80×20 viewports with tiny content) stay green **with no edits**. Do not expect to touch them.
 

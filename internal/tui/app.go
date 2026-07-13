@@ -883,9 +883,12 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if m.screen != screenLogs || msg.session != m.logsSession {
 			return m, nil
 		}
+		following := m.logsViewport.AtBottom() // capture BEFORE appending
 		m.logsContent += string(msg.data)
-		m.applyLogFormat()
-		m.logsViewport.GotoBottom()
+		m.applyLogFormat() // SetContent preserves YOffset
+		if following {
+			m.logsViewport.GotoBottom()
+		}
 		return m, m.readLogChunk()
 
 	case logDoneMsg:

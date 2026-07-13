@@ -2156,6 +2156,89 @@ func TestLogChunkMsg_AppendsContent(t *testing.T) {
 	}
 }
 
+// logChunkContent returns a string of n numbered lines (each newline-terminated),
+// enough to exceed a small viewport height so AtBottom()/scroll are meaningful.
+func logChunkContent(n int) string {
+	var b strings.Builder
+	for i := 0; i < n; i++ {
+		fmt.Fprintf(&b, "line %d\n", i)
+	}
+	return b.String()
+}
+
+// TestLogChunkMsg_ScrolledUpDoesNotSnap verifies that when the user has scrolled
+// up (viewport not at bottom), an incoming chunk does NOT yank the view to the
+// bottom — the tail is auto-paused.
+func TestLogChunkMsg_ScrolledUpDoesNotSnap(t *testing.T) {
+	mc := &mockComposer{services: []string{"nginx"}}
+	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
+	m.screen = screenLogs
+	m.logsService = "nginx"
+	m.height = 24
+	m.logsViewport = viewport.New(80, 10)
+	pr, _ := io.Pipe()
+	m.logsPipeR = pr
+
+	// Fill the viewport with more content than its height so scrolling is possible.
+	m.logsContent = logChunkContent(50)
+	m.applyLogFormat()
+	m.logsViewport.GotoBottom()
+	if !m.logsViewport.AtBottom() {
+		t.Fatal("precondition: viewport should be at bottom after GotoBottom")
+	}
+	if m.logsViewport.TotalLineCount() <= m.logsViewport.Height {
+		t.Fatalf("precondition: content must exceed viewport height (lines=%d, height=%d)",
+			m.logsViewport.TotalLineCount(), m.logsViewport.Height)
+	}
+
+	// Scroll up a few lines so we're no longer at the bottom.
+	m.logsViewport.SetYOffset(m.logsViewport.YOffset - 5)
+	if m.logsViewport.AtBottom() {
+		t.Fatal("precondition: viewport should NOT be at bottom after scrolling up")
+	}
+	offBefore := m.logsViewport.YOffset
+
+	// Incoming chunk while scrolled up must not snap us to the bottom.
+	updated, _ := m.Update(logChunkMsg{data: []byte("new tail line\n")})
+	m = updated.(Model)
+
+	if m.logsViewport.AtBottom() {
+		t.Error("viewport snapped to bottom while scrolled up; expected paused tail")
+	}
+	if m.logsViewport.YOffset != offBefore {
+		t.Errorf("YOffset changed from %d to %d; expected it to stay put while paused",
+			offBefore, m.logsViewport.YOffset)
+	}
+}
+
+// TestLogChunkMsg_AtBottomFollowsTail verifies that when the viewport is at the
+// bottom (following), an incoming chunk keeps it pinned to the tail.
+func TestLogChunkMsg_AtBottomFollowsTail(t *testing.T) {
+	mc := &mockComposer{services: []string{"nginx"}}
+	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
+	m.screen = screenLogs
+	m.logsService = "nginx"
+	m.height = 24
+	m.logsViewport = viewport.New(80, 10)
+	pr, _ := io.Pipe()
+	m.logsPipeR = pr
+
+	m.logsContent = logChunkContent(50)
+	m.applyLogFormat()
+	m.logsViewport.GotoBottom()
+	if !m.logsViewport.AtBottom() {
+		t.Fatal("precondition: viewport should be at bottom")
+	}
+
+	// Feed a chunk while following; the tail should stay pinned.
+	updated, _ := m.Update(logChunkMsg{data: []byte("new tail line\n")})
+	m = updated.(Model)
+
+	if !m.logsViewport.AtBottom() {
+		t.Error("viewport did not follow the tail; expected AtBottom() to remain true")
+	}
+}
+
 func TestLogDoneMsg_WithError(t *testing.T) {
 	mc := &mockComposer{services: []string{"nginx"}}
 	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
