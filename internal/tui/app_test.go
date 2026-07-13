@@ -2314,9 +2314,16 @@ func TestLogsReformatWhilePausedStaysPaused(t *testing.T) {
 		t.Error("wrap toggle while paused snapped to bottom; expected the view to stay paused")
 	}
 
-	// Resize while paused — must still stay paused.
-	updated, _ = m.Update(tea.WindowSizeMsg{Width: 60, Height: 16})
+	// Resize while paused — must still stay paused. Height 12 → viewport height
+	// 12-6 = 6 (shrinks from 10), so this genuinely changes the viewport
+	// geometry / AtBottom() boundary rather than exercising only a width change.
+	heightBefore := m.logsViewport.Height
+	updated, _ = m.Update(tea.WindowSizeMsg{Width: 60, Height: 12})
 	m = updated.(Model)
+	if m.logsViewport.Height == heightBefore {
+		t.Fatalf("precondition: resize should shrink viewport height (was %d, still %d)",
+			heightBefore, m.logsViewport.Height)
+	}
 	if m.logsViewport.AtBottom() {
 		t.Error("resize while paused snapped to bottom; expected the view to stay paused")
 	}
@@ -2345,20 +2352,20 @@ func TestLogTailStatus(t *testing.T) {
 	t.Run("paused scrolled up", func(t *testing.T) {
 		vp := newVP()
 		vp.GotoBottom()
+		// Scroll up exactly 5 rows from the bottom so the distance-to-bottom
+		// is a known constant. Asserting the concrete value (5) — rather than
+		// recomputing it with the impl's own formula — catches an off-by-one
+		// or wrong-sign bug in logTailStatus.
 		vp.SetYOffset(vp.YOffset - 5)
 		if vp.AtBottom() {
 			t.Fatal("precondition: viewport should NOT be at bottom after scrolling up")
 		}
-		wantBelow := vp.TotalLineCount() - vp.YOffset - vp.Height
 		label, below := logTailStatus(vp, false)
 		if label != "paused" {
 			t.Errorf("got label %q; want \"paused\"", label)
 		}
-		if below != wantBelow {
-			t.Errorf("got below=%d; want %d (distance to bottom)", below, wantBelow)
-		}
-		if below <= 0 {
-			t.Errorf("expected a positive distance to bottom, got %d", below)
+		if below != 5 {
+			t.Errorf("got below=%d; want 5 (scrolled up 5 rows from bottom)", below)
 		}
 	})
 
@@ -2414,8 +2421,11 @@ func TestViewLogsIndicator(t *testing.T) {
 		if !strings.Contains(out, "paused") {
 			t.Errorf("viewLogs() output missing \"paused\" indicator:\n%s", out)
 		}
-		if !strings.Contains(out, "▲") {
-			t.Errorf("viewLogs() output missing \"▲\" below-count glyph:\n%s", out)
+		// Scrolled up exactly 5 rows from the bottom, so the header must render
+		// the concrete distance-to-bottom count — asserting the number catches
+		// a formatting or wrong-value bug that a bare "▲" check would miss.
+		if !strings.Contains(out, "▲ 5 below") {
+			t.Errorf("viewLogs() output missing \"▲ 5 below\" count:\n%s", out)
 		}
 		if strings.Contains(out, "following") {
 			t.Errorf("viewLogs() output should not contain \"following\" while paused:\n%s", out)
@@ -2452,6 +2462,46 @@ func TestLogDoneMsg_WithError(t *testing.T) {
 	}
 	if m.logsErr.Error() != "connection lost" {
 		t.Errorf("logsErr = %q, want %q", m.logsErr.Error(), "connection lost")
+	}
+	if !strings.Contains(m.logsContent, "Error: connection lost") {
+		t.Errorf("logsContent should contain error, got %q", m.logsContent)
+	}
+}
+
+// TestLogDoneMsg_WithError_ForcesScrolledUpViewToBottom verifies that a terminal
+// error is forced into view even when the user has scrolled up (paused). With
+// content exceeding the viewport height and the view scrolled up, delivering an
+// error logDoneMsg must snap to the bottom so the appended error is visible —
+// this pins the deliberate error-path GotoBottom() (removing it would leave the
+// view paused and hide the error).
+func TestLogDoneMsg_WithError_ForcesScrolledUpViewToBottom(t *testing.T) {
+	mc := &mockComposer{services: []string{"nginx"}}
+	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
+	m.screen = screenLogs
+	m.logsService = "nginx"
+	m.logsViewport = viewport.New(80, 10)
+
+	// Fill with more content than the viewport height so scroll is meaningful.
+	m.logsContent = logChunkContent(50)
+	m.applyLogFormat()
+	m.logsViewport.GotoBottom()
+	if m.logsViewport.TotalLineCount() <= m.logsViewport.Height {
+		t.Fatalf("precondition: content must exceed viewport height (lines=%d, height=%d)",
+			m.logsViewport.TotalLineCount(), m.logsViewport.Height)
+	}
+
+	// Scroll up so we're paused, not at the bottom.
+	m.logsViewport.SetYOffset(m.logsViewport.YOffset - 5)
+	if m.logsViewport.AtBottom() {
+		t.Fatal("precondition: viewport should NOT be at bottom after scrolling up")
+	}
+
+	// A terminal error must force the appended error text into view.
+	updated, _ := m.Update(logDoneMsg{err: fmt.Errorf("connection lost")})
+	m = updated.(Model)
+
+	if !m.logsViewport.AtBottom() {
+		t.Error("error logDoneMsg did not force the view to the bottom; the error would be hidden while paused")
 	}
 	if !strings.Contains(m.logsContent, "Error: connection lost") {
 		t.Errorf("logsContent should contain error, got %q", m.logsContent)
