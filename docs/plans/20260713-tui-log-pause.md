@@ -121,12 +121,12 @@ This change makes the tail *follow-aware*: scrolling up pauses auto-scroll (you 
 - Modify: `internal/tui/app.go` (`w` handler ~1497, `p` handler ~1506, `WindowSizeMsg` block ~558-565)
 - Modify: `internal/tui/app_test.go`
 
-- [ ] `w` handler: capture `following := m.logsViewport.AtBottom()` before flipping `m.logsWrap`; after `m.fullReformat()`, add `if following { m.logsViewport.GotoBottom() }`.
-- [ ] `p` handler: same capture-before / re-snap-after around `m.fullReformat()`.
-- [ ] `WindowSizeMsg` `screenLogs` branch: capture `following` before setting `Width`/`Height`; after `m.fullReformat()`, add `if following { m.logsViewport.GotoBottom() }`.
-- [ ] Write test: viewport at bottom (following) → send a `w` (wrap toggle) `tea.KeyMsg`, then a `WindowSizeMsg` resize; assert `m.logsViewport.AtBottom()` remains true (did NOT accidentally pause).
-- [ ] Write test: viewport scrolled up (paused) → send `w` toggle + resize; assert it stays paused (`!AtBottom()`), i.e. re-snap only fires when previously following.
-- [ ] Run `go test ./internal/tui/ -v` — must pass before Task 3.
+- [x] `w` handler: capture `following := m.logsViewport.AtBottom()` before flipping `m.logsWrap`; after `m.fullReformat()`, add `if following { m.logsViewport.GotoBottom() }`.
+- [x] `p` handler: same capture-before / re-snap-after around `m.fullReformat()`.
+- [x] `WindowSizeMsg` `screenLogs` branch: capture `following` before setting `Width`/`Height`; after `m.fullReformat()`, add `if following { m.logsViewport.GotoBottom() }`.
+- [x] Write test: viewport at bottom (following) → send a `w` (wrap toggle) `tea.KeyMsg`, then a `WindowSizeMsg` resize; assert `m.logsViewport.AtBottom()` remains true (did NOT accidentally pause).
+- [x] Write test: viewport scrolled up (paused) → send `w` toggle + resize; assert it stays paused (`!AtBottom()`), i.e. re-snap only fires when previously following.
+- [x] Run `go test ./internal/tui/ -v` — must pass before Task 3.
 
 ### Task 3: Follow/paused indicator (helper + styles + view)
 

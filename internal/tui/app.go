@@ -556,6 +556,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 		}
 		if m.screen == screenLogs {
+			following := m.logsViewport.AtBottom()
 			m.logsViewport.Width = msg.Width - 4
 			h := msg.Height - 6
 			if h < 3 {
@@ -563,6 +564,9 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 			m.logsViewport.Height = h
 			m.fullReformat()
+			if following {
+				m.logsViewport.GotoBottom()
+			}
 		}
 		return m, nil
 
@@ -1498,6 +1502,7 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			}
 			return m, tea.Batch(cmds...)
 		case "w":
+			following := m.logsViewport.AtBottom()
 			m.logsWrap = !m.logsWrap
 			if m.logsWrap {
 				m.logsViewport.SetHorizontalStep(0)
@@ -1505,10 +1510,17 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 				m.logsViewport.SetHorizontalStep(4)
 			}
 			m.fullReformat()
+			if following {
+				m.logsViewport.GotoBottom()
+			}
 			return m, nil
 		case "p":
+			following := m.logsViewport.AtBottom()
 			m.logsPretty = !m.logsPretty
 			m.fullReformat()
+			if following {
+				m.logsViewport.GotoBottom()
+			}
 			return m, nil
 		case "G":
 			m.logsViewport.GotoBottom()

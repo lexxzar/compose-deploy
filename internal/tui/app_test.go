@@ -2239,6 +2239,89 @@ func TestLogChunkMsg_AtBottomFollowsTail(t *testing.T) {
 	}
 }
 
+// TestLogsReformatWhileFollowingStaysPinned verifies that reformatting the log
+// content (wrap toggle) and resizing while the viewport is at the bottom keeps
+// the tail pinned — the follow intent survives fullReformat()'s line-count
+// changes instead of reading as an accidental pause.
+func TestLogsReformatWhileFollowingStaysPinned(t *testing.T) {
+	mc := &mockComposer{services: []string{"nginx"}}
+	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
+	m.screen = screenLogs
+	m.logsService = "nginx"
+	m.height = 24
+	m.logsViewport = viewport.New(80, 10)
+	pr, _ := io.Pipe()
+	m.logsPipeR = pr
+
+	// Fill with more content than the viewport height so AtBottom() is meaningful.
+	m.logsContent = logChunkContent(50)
+	m.applyLogFormat()
+	m.logsViewport.GotoBottom()
+	if !m.logsViewport.AtBottom() {
+		t.Fatal("precondition: viewport should be at bottom after GotoBottom")
+	}
+	if m.logsViewport.TotalLineCount() <= m.logsViewport.Height {
+		t.Fatalf("precondition: content must exceed viewport height (lines=%d, height=%d)",
+			m.logsViewport.TotalLineCount(), m.logsViewport.Height)
+	}
+
+	// Toggle wrap (w) — fullReformat() runs; the tail must stay pinned.
+	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("w")})
+	m = updated.(Model)
+	if !m.logsViewport.AtBottom() {
+		t.Error("wrap toggle while following dropped the tail; expected AtBottom() to remain true")
+	}
+
+	// Resize — fullReformat() runs again; still pinned.
+	updated, _ = m.Update(tea.WindowSizeMsg{Width: 60, Height: 16})
+	m = updated.(Model)
+	if !m.logsViewport.AtBottom() {
+		t.Error("resize while following dropped the tail; expected AtBottom() to remain true")
+	}
+}
+
+// TestLogsReformatWhilePausedStaysPaused verifies that reformatting (wrap
+// toggle) and resizing while the user is scrolled up (paused) does NOT snap the
+// view to the bottom — re-pinning only fires when previously following.
+func TestLogsReformatWhilePausedStaysPaused(t *testing.T) {
+	mc := &mockComposer{services: []string{"nginx"}}
+	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
+	m.screen = screenLogs
+	m.logsService = "nginx"
+	m.height = 24
+	m.logsViewport = viewport.New(80, 10)
+	pr, _ := io.Pipe()
+	m.logsPipeR = pr
+
+	m.logsContent = logChunkContent(50)
+	m.applyLogFormat()
+	m.logsViewport.GotoBottom()
+	if m.logsViewport.TotalLineCount() <= m.logsViewport.Height {
+		t.Fatalf("precondition: content must exceed viewport height (lines=%d, height=%d)",
+			m.logsViewport.TotalLineCount(), m.logsViewport.Height)
+	}
+
+	// Scroll up so we're paused, not following.
+	m.logsViewport.SetYOffset(m.logsViewport.YOffset - 5)
+	if m.logsViewport.AtBottom() {
+		t.Fatal("precondition: viewport should NOT be at bottom after scrolling up")
+	}
+
+	// Toggle wrap (w) while paused — must stay paused.
+	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("w")})
+	m = updated.(Model)
+	if m.logsViewport.AtBottom() {
+		t.Error("wrap toggle while paused snapped to bottom; expected the view to stay paused")
+	}
+
+	// Resize while paused — must still stay paused.
+	updated, _ = m.Update(tea.WindowSizeMsg{Width: 60, Height: 16})
+	m = updated.(Model)
+	if m.logsViewport.AtBottom() {
+		t.Error("resize while paused snapped to bottom; expected the view to stay paused")
+	}
+}
+
 func TestLogDoneMsg_WithError(t *testing.T) {
 	mc := &mockComposer{services: []string{"nginx"}}
 	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
