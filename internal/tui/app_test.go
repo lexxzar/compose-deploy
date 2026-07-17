@@ -2217,6 +2217,88 @@ func TestDerivedLogContentMatchesPreRefactor(t *testing.T) {
 	}
 }
 
+// streamBlankTest builds a fresh log model with the given committed filter/search
+// state, then either streams the chunks incrementally (appendRawChunk +
+// applyLogFormat per chunk, the production streaming path) or, when full is true,
+// appends everything and runs a single fullReformat. It returns the derived
+// viewport content and the committed search matches so callers can assert the
+// incremental result equals the full reformat.
+func streamBlankTest(chunks []string, filterQuery, searchQuery string, full bool) (string, []int) {
+	var m Model
+	m.logsViewport = viewport.New(80, 20)
+	m.logFilterQuery = filterQuery
+	m.logSearchQuery = searchQuery
+	for _, ch := range chunks {
+		m.appendRawChunk([]byte(ch))
+		if !full {
+			m.applyLogFormat()
+		}
+	}
+	if full {
+		m.fullReformat()
+	}
+	m.setLogViewportContent() // recompute search matches over the final content
+	return m.derivedLogContent(), m.logSearchMatches
+}
+
+// TestApplyLogFormat_BlankSurvivorRoundTripsAcrossChunkSplittings pins the core
+// invariant that a KEPT blank line round-trips through the incremental append
+// path identically no matter how the byte stream was chunked, and that the
+// incremental result is byte-identical to a full reformat. Before the fix,
+// applyLogFormat gated the append on delta != "", so a blank survivor line
+// (which formats to an empty delta) arriving in its own chunk was dropped and the
+// "\n" separator elided — merging the next non-blank line onto its physical row
+// and making both the rendered content and the search physical-line indices
+// depend on chunk boundaries.
+func TestApplyLogFormat_BlankSurvivorRoundTripsAcrossChunkSplittings(t *testing.T) {
+	// A raw stream with a leading-adjacent, an interior, and consecutive blank
+	// lines. Every splitting below yields the same six logical raw lines
+	// (["alpha","","beta","","","gamma"]) but delivers the bytes on different chunk
+	// boundaries — including a blank line alone in its own chunk and blank lines
+	// straddling chunk edges.
+	const stream = "alpha\n\nbeta\n\n\ngamma\n"
+
+	byteByByte := make([]string, len(stream))
+	for i := 0; i < len(stream); i++ {
+		byteByByte[i] = string(stream[i])
+	}
+	splittings := map[string][]string{
+		"all-at-once":          {stream},
+		"one-line-per-chunk":   {"alpha\n", "\n", "beta\n", "\n", "\n", "gamma\n"},
+		"blank-alone":          {"alpha\n\nbeta\n", "\n", "\ngamma\n"},
+		"blank-straddles-edge": {"alpha\n\nbe", "ta\n\n", "\ngamma\n"},
+		"byte-by-byte":         byteByByte,
+	}
+
+	variants := []struct {
+		name        string
+		filterQuery string // committed filter query ("" = none)
+		searchQuery string // committed search query ("" = none)
+	}{
+		{name: "no-filter-no-search"},
+		{name: "committed-search", searchQuery: "a"},        // matches alpha, beta, gamma
+		{name: "filter-keeps-blanks", filterQuery: "!beta"}, // drops beta; blanks pass the negated filter
+	}
+
+	for _, v := range variants {
+		v := v
+		t.Run(v.name, func(t *testing.T) {
+			// Reference: a single full reformat over the whole stream.
+			wantContent, wantMatches := streamBlankTest([]string{stream}, v.filterQuery, v.searchQuery, true)
+
+			for split, chunks := range splittings {
+				gotContent, gotMatches := streamBlankTest(chunks, v.filterQuery, v.searchQuery, false)
+				if gotContent != wantContent {
+					t.Errorf("[%s] incremental content differs from full reformat:\n got: %q\nwant: %q", split, gotContent, wantContent)
+				}
+				if !intSliceEq(gotMatches, wantMatches) {
+					t.Errorf("[%s] incremental search matches differ from full reformat: got %v, want %v", split, gotMatches, wantMatches)
+				}
+			}
+		})
+	}
+}
+
 // TestLogChunkMsg_SplitLineFoldsToOneRawLine verifies a single logical line
 // delivered across two chunks (the newline arriving only in the second) folds
 // into exactly one entry in logsRawLines.

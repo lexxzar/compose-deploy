@@ -276,7 +276,7 @@ type Model struct {
 	logFilterQuery          string          // last-good committed query; != "" ⇒ filter active
 	logFilterIsRegex        bool            // live/desired mode; ctrl+r toggles (regex vs. substring)
 	logFilterCommittedRegex bool            // whether the last-good committed query is a regex; source of truth for regex-ness in logFilterPred (NOT the live logFilterIsRegex)
-	logFilterShown          int             // cached survivor count for the committed filter; maintained incrementally by applyLogFormat/fullReformat, read by logFilterCounts (O(1) per frame, only meaningful when logFilterQuery != "")
+	logFilterShown          int             // running count of survivor lines folded into logsFormatted; maintained incrementally by applyLogFormat/fullReformat. Read by logFilterCounts as the committed-filter survivor count (O(1) per frame, display-meaningful only when logFilterQuery != ""), AND by applyLogFormat as the seed-vs-append gate (== 0 means logsFormatted holds no survivor yet — a delta, even an empty blank-line delta, seeds it; else it joins with "\n"). logsFormatted == "" is ambiguous (empty when only blank survivors folded), so this count is the authoritative "have we folded any line" signal.
 
 	// Screen: logs — search-within-highlight (see clearLogSearch/logSearchPred/recomputeLogSearch)
 	logSearching            bool            // search bar open, capturing text
@@ -2319,8 +2319,19 @@ func (m *Model) appendRawChunk(data []byte) {
 // width change.
 func (m *Model) applyLogFormat() {
 	delta, newScanned, survivors := foldNewRawLines(m.logsRawLines, m.logsScanned, m.logsViewport.Width, m.logsWrap, m.logsPretty, m.logFilterPred())
-	if delta != "" {
-		if m.logsFormatted == "" {
+	if survivors > 0 {
+		// Gate the append on the survivor COUNT, not on delta != "": a KEPT blank
+		// raw line (empty / whitespace-only line that passes the filter) formats to
+		// an empty delta yet is still a real physical line that must round-trip.
+		// Deciding on delta != "" would drop it AND elide the "\n" separator, so the
+		// next non-blank line would merge onto its row — making the rendered output
+		// (and the search physical-line indices) depend on how the byte stream was
+		// chunked. The seed-vs-append choice also can't use logsFormatted == ""
+		// (ambiguous: empty both before the first fold and after only blank
+		// survivors); logFilterShown — the count of survivors already folded into
+		// logsFormatted, read here before the increment below — is the authoritative
+		// "have we folded any line yet" signal.
+		if m.logFilterShown == 0 {
 			m.logsFormatted = delta
 		} else {
 			m.logsFormatted += "\n" + delta
