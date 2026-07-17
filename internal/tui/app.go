@@ -6,6 +6,7 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"regexp"
 	"slices"
 	"strings"
 	"time"
@@ -269,6 +270,13 @@ type Model struct {
 	logsScanned   int      // raw-line scan cursor: count of logsRawLines already folded into logsFormatted (a resume point, NOT a survivor count)
 	logsFormatted string   // cached formatted output for the scanned raw lines
 	logsErrLine   string   // filter-exempt terminal error text; always rendered regardless of an active filter
+
+	// Screen: logs — filter (live grep; see clearLogFilter/logFilterPred/recomputeLogFilter)
+	logFiltering     bool            // filter bar open, capturing text
+	logFilterInput   textinput.Model // (re)constructed lazily in the "f" open handler
+	logFilterQuery   string          // last-good committed query; != "" ⇒ filter active
+	logFilterIsRegex bool            // live/desired mode; ctrl+r toggles (regex vs. substring)
+	logFilterRe      *regexp.Regexp  // compiled matcher when the last-good query is a valid regex; nil ⇒ substring (source of truth for regex-ness in logFilterPred)
 
 	// Screen: config
 	configContent  []byte         // raw compose file content
@@ -1089,6 +1097,16 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 				return m, nil
 			}
 			key = "esc"
+		case screenLogs:
+			if m.logFiltering {
+				// Filter bar is capturing text — q is a literal character that
+				// must reach the logFilterInput (mirrors the container-search
+				// and settings-form field-4 exceptions above). Leave key
+				// untouched so it falls through to the typing intercept.
+				// (Task 4 extends this to `|| m.logSearching`.)
+				break
+			}
+			key = "esc"
 		case screenSettingsForm:
 			if m.settingsField == 4 {
 				key = "esc"
@@ -1479,6 +1497,46 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 
 	case screenLogs:
+		// Typing intercept — MUST be the first statement so that while an input
+		// bar is open every keystroke routes to it (mirrors the container-screen
+		// `if m.searching` intercept). Without this, typing `w`/`p`/`G`/`f`/`q`
+		// into the filter query would fire wrap/pretty/gotobottom/filter/back.
+		// (Task 4 extends the condition to `|| m.logSearching`.)
+		if m.logFiltering {
+			switch key {
+			case "ctrl+c":
+				return m.tryQuit()
+			case "enter":
+				// Commit: close the bar, keep the last-good query live. If no
+				// valid query was entered, fully clear so no dead filter state
+				// (an in-progress bad regex, say) lingers.
+				if m.logFilterQuery == "" {
+					m.clearLogFilter()
+				} else {
+					m.logFiltering = false
+					m.logFilterInput.Blur()
+				}
+				return m, nil
+			case "esc":
+				// Cancel (provisional — Task 5 folds this into the esc ladder):
+				// discard the query and restore the full unfiltered view.
+				m.clearLogFilter()
+				m.rederiveLogs()
+				return m, nil
+			case "ctrl+r":
+				// Toggle regex vs. substring matching, then re-evaluate the live
+				// query under the new mode.
+				m.logFilterIsRegex = !m.logFilterIsRegex
+				m.recomputeLogFilter()
+				return m, nil
+			default:
+				var cmd tea.Cmd
+				m.logFilterInput, cmd = m.logFilterInput.Update(msg)
+				m.recomputeLogFilter()
+				return m, cmd
+			}
+		}
+
 		switch key {
 		case "ctrl+c":
 			return m.tryQuit()
@@ -1499,6 +1557,7 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.logsScanned = 0
 			m.logsFormatted = ""
 			m.logsErrLine = ""
+			m.clearLogFilter()
 			m.screen = screenSelectContainers
 			m.statsSession++
 			m.statusSession++
@@ -1538,6 +1597,18 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			return m, nil
 		case "G":
 			m.logsViewport.GotoBottom()
+			return m, nil
+		case "f":
+			// Open the live filter. Early-return on an empty raw buffer (mirrors
+			// the l/x empty-list guards on the container screen). The input is
+			// built lazily here — NOT in NewModel — so Model{} test literals stay
+			// valid (a zero-value textinput is never rendered while closed).
+			if len(m.logsRawLines) == 0 {
+				return m, nil
+			}
+			m.logFilterInput = textinput.New()
+			m.logFiltering = true
+			m.logFilterInput.Focus()
 			return m, nil
 		default:
 			var cmd tea.Cmd
@@ -2024,6 +2095,7 @@ func (m *Model) enterLogs() (tea.Model, tea.Cmd) {
 	m.logsScanned = 0
 	m.logsFormatted = ""
 	m.logsErrLine = ""
+	m.clearLogFilter()
 
 	vpHeight := m.height - 6
 	if vpHeight < 3 {
@@ -2081,7 +2153,7 @@ func (m *Model) appendRawChunk(data []byte) {
 // pre-refactor pipeline. Call fullReformat() when the filter, toggles, or width
 // change.
 func (m *Model) applyLogFormat() {
-	delta, newScanned := foldNewRawLines(m.logsRawLines, m.logsScanned, m.logsViewport.Width, m.logsWrap, m.logsPretty, nil)
+	delta, newScanned := foldNewRawLines(m.logsRawLines, m.logsScanned, m.logsViewport.Width, m.logsWrap, m.logsPretty, m.logFilterPred())
 	if delta != "" {
 		if m.logsFormatted == "" {
 			m.logsFormatted = delta
@@ -2124,6 +2196,79 @@ func (m *Model) fullReformat() {
 	m.logsScanned = 0
 	m.logsFormatted = ""
 	m.applyLogFormat()
+}
+
+// logFilterPred reconstructs the last-good filter predicate from the committed
+// state. logFilterQuery and logFilterRe are only ever set together (by
+// recomputeLogFilter, when buildMatcher succeeded), so this always reproduces a
+// valid predicate. Regex-ness is derived from logFilterRe (nil ⇒ substring),
+// NOT from the live logFilterIsRegex — so a mid-type ctrl+r into a *bad* regex
+// keeps the last-good matcher rather than silently dropping the filter. Returns
+// nil (all-pass) when no filter is committed, degrading the derivation pipeline
+// to the Task 2 pass-through. The regex is recompiled once per call (reused
+// across every line inside deriveFiltered), never per line.
+func (m Model) logFilterPred() func(string) bool {
+	if m.logFilterQuery == "" {
+		return nil
+	}
+	pred, _, _ := buildMatcher(m.logFilterQuery, m.logFilterRe != nil, true)
+	return pred
+}
+
+// rederiveLogs re-derives the entire viewport content from the full raw buffer
+// through the current filter predicate. It is the filter-change analogue of the
+// w/p toggle path: capture AtBottom() before and re-pin to the bottom after when
+// following, so a live tail stays pinned to the filtered tail across a filter
+// change. The raw buffer is never touched — only the derived content narrows.
+func (m *Model) rederiveLogs() {
+	following := m.logsViewport.AtBottom()
+	m.fullReformat()
+	if following {
+		m.logsViewport.GotoBottom()
+	}
+}
+
+// recomputeLogFilter rebuilds the committed filter from the live input value and
+// the live regex mode, then re-derives. An empty query (or a lone "!") clears the
+// filter so every line shows again. A non-empty query that fails to compile as a
+// regex is a mid-type error: keep the last-good query/predicate (no thrash) and
+// skip the re-derive so the view holds steady. logFilterRe carries the compiled
+// regex (nil for substring) so logFilterPred can reproduce the exact last-good.
+func (m *Model) recomputeLogFilter() {
+	newQuery := m.logFilterInput.Value()
+	stripped := newQuery
+	if strings.HasPrefix(stripped, "!") {
+		stripped = stripped[1:]
+	}
+	if stripped == "" {
+		// Empty (or lone "!") query — clear the filter, reveal everything.
+		if m.logFilterQuery != "" {
+			m.logFilterQuery = ""
+			m.logFilterRe = nil
+			m.rederiveLogs()
+		}
+		return
+	}
+	_, re, valid := buildMatcher(newQuery, m.logFilterIsRegex, true)
+	if !valid {
+		// Bad regex mid-type: keep the last-good predicate, no re-derive.
+		return
+	}
+	m.logFilterQuery = newQuery
+	m.logFilterRe = re // nil for substring, non-nil for a valid regex
+	m.rederiveLogs()
+}
+
+// clearLogFilter resets every filter field to the no-filter default. Called on
+// entry to the log screen and on the esc-to-containers cleanup, and used by the
+// typing-cancel path to discard an in-progress query.
+func (m *Model) clearLogFilter() {
+	m.logFiltering = false
+	m.logFilterQuery = ""
+	m.logFilterIsRegex = false
+	m.logFilterRe = nil
+	m.logFilterInput.SetValue("")
+	m.logFilterInput.Blur()
 }
 
 func (m Model) readLogChunk() tea.Cmd {

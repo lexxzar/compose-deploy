@@ -3205,6 +3205,339 @@ func TestLogsScreen_IncrementalOffsetAdvances(t *testing.T) {
 	}
 }
 
+// --- Task 3: log viewer live filter (f key) -------------------------------
+
+// runeKey builds a single-rune key message (the common typing case in the
+// filter tests). Multi-rune keys (ctrl+r, enter, esc) are sent explicitly.
+func runeKey(r rune) tea.KeyMsg {
+	return tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{r}}
+}
+
+// typeInto feeds each rune of s to the model as a separate keystroke, returning
+// the updated model — mirrors how the TUI receives one KeyMsg per character.
+func typeInto(m Model, s string) Model {
+	for _, r := range s {
+		updated, _ := m.Update(runeKey(r))
+		m = updated.(Model)
+	}
+	return m
+}
+
+// setupFilterableLogsModel returns a log-screen Model seeded with a mix of
+// INFO/ERROR/WARN raw lines so filter narrowing is observable.
+func setupFilterableLogsModel() Model {
+	mc := &mockComposer{services: []string{"app"}}
+	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
+	m.screen = screenLogs
+	m.services = mc.services
+	m.composer = mc
+	m.logsService = "app"
+	m.logsWrap = true
+	m.logsPretty = false
+	m.logsViewport = viewport.New(80, 20)
+	m.logsViewport.SetHorizontalStep(0)
+	m.width = 84
+	m.height = 26
+	m.logsRawLines = []string{
+		"app | INFO starting up",
+		"app | ERROR disk full",
+		"app | INFO healthcheck ok",
+		"app | WARN retrying",
+		"app | ERROR timeout",
+	}
+	m.applyLogFormat()
+	return m
+}
+
+func TestLogFilter_FOpensInput(t *testing.T) {
+	m := setupFilterableLogsModel()
+	updated, _ := m.Update(runeKey('f'))
+	m = updated.(Model)
+	if !m.logFiltering {
+		t.Fatal("logFiltering should be true after pressing f")
+	}
+	if !m.logFilterInput.Focused() {
+		t.Error("filter input should be focused after opening")
+	}
+}
+
+func TestLogFilter_FNoopOnEmptyBuffer(t *testing.T) {
+	m := setupFilterableLogsModel()
+	m.logsRawLines = nil
+	m.logsPartial = ""
+	m.logsScanned = 0
+	m.logsFormatted = ""
+	updated, _ := m.Update(runeKey('f'))
+	m = updated.(Model)
+	if m.logFiltering {
+		t.Error("f must be a no-op when the raw buffer is empty (mirrors l/x guards)")
+	}
+}
+
+// TestLogFilter_TypingActionKeysLandInInput pins the typing intercept: while the
+// filter bar is open, q/w/p are literal characters, NOT the back/wrap/pretty
+// actions they would otherwise fire.
+func TestLogFilter_TypingActionKeysLandInInput(t *testing.T) {
+	m := setupFilterableLogsModel()
+	wrapBefore, prettyBefore := m.logsWrap, m.logsPretty
+
+	updated, _ := m.Update(runeKey('f'))
+	m = updated.(Model)
+	m = typeInto(m, "qwp")
+
+	if m.logFilterInput.Value() != "qwp" {
+		t.Errorf("input value = %q, want %q", m.logFilterInput.Value(), "qwp")
+	}
+	if m.logsWrap != wrapBefore {
+		t.Error("w must not toggle wrap while typing a filter")
+	}
+	if m.logsPretty != prettyBefore {
+		t.Error("p must not toggle pretty while typing a filter")
+	}
+	if m.screen != screenLogs {
+		t.Error("q must not navigate away while typing a filter")
+	}
+	if !m.logFiltering {
+		t.Error("should still be filtering after typing")
+	}
+}
+
+func TestLogFilter_LiveNarrowing(t *testing.T) {
+	m := setupFilterableLogsModel()
+	updated, _ := m.Update(runeKey('f'))
+	m = updated.(Model)
+	m = typeInto(m, "ERROR")
+
+	got := m.derivedLogContent()
+	if !strings.Contains(got, "disk full") || !strings.Contains(got, "timeout") {
+		t.Errorf("both ERROR lines should survive, got:\n%s", got)
+	}
+	if strings.Contains(got, "starting up") ||
+		strings.Contains(got, "healthcheck") ||
+		strings.Contains(got, "retrying") {
+		t.Errorf("non-ERROR lines should be filtered out, got:\n%s", got)
+	}
+}
+
+func TestLogFilter_CtrlRTogglesRegex(t *testing.T) {
+	m := setupFilterableLogsModel()
+	updated, _ := m.Update(runeKey('f'))
+	m = updated.(Model)
+	if m.logFilterIsRegex {
+		t.Fatal("regex mode should be off by default")
+	}
+
+	// As a substring, "ERROR|WARN" is a literal that matches no line.
+	m = typeInto(m, "ERROR|WARN")
+	if got := strings.TrimSpace(m.derivedLogContent()); got != "" {
+		t.Errorf("substring mode: literal ERROR|WARN matches nothing, got %q", got)
+	}
+
+	// Toggle to regex — the alternation now matches ERROR and WARN lines.
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyCtrlR})
+	m = updated.(Model)
+	if !m.logFilterIsRegex {
+		t.Fatal("ctrl+r should enable regex mode")
+	}
+	got := m.derivedLogContent()
+	if !strings.Contains(got, "disk full") ||
+		!strings.Contains(got, "timeout") ||
+		!strings.Contains(got, "retrying") {
+		t.Errorf("regex ERROR|WARN should match ERROR and WARN lines, got:\n%s", got)
+	}
+	if strings.Contains(got, "starting up") || strings.Contains(got, "healthcheck") {
+		t.Errorf("INFO lines should not match ERROR|WARN, got:\n%s", got)
+	}
+}
+
+// TestLogFilter_BadRegexKeepsLastGood proves a mid-type invalid regex does not
+// thrash the view: the last-good query/predicate and derived content hold.
+func TestLogFilter_BadRegexKeepsLastGood(t *testing.T) {
+	m := setupFilterableLogsModel()
+	updated, _ := m.Update(runeKey('f'))
+	m = updated.(Model)
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyCtrlR}) // regex mode
+	m = updated.(Model)
+	m = typeInto(m, "ERROR")
+
+	goodContent := m.derivedLogContent()
+	goodQuery := m.logFilterQuery
+	if goodQuery != "ERROR" {
+		t.Fatalf("precondition: query = %q, want ERROR", goodQuery)
+	}
+
+	// "[" makes the regex invalid ("ERROR[").
+	m = typeInto(m, "[")
+
+	if m.logFilterQuery != goodQuery {
+		t.Errorf("bad regex must not update logFilterQuery: got %q, want %q", m.logFilterQuery, goodQuery)
+	}
+	if m.derivedLogContent() != goodContent {
+		t.Error("bad regex must keep the last-good derived content (no thrash)")
+	}
+	if m.logFilterInput.Value() != "ERROR[" {
+		t.Errorf("input should still echo the typed text: got %q, want %q", m.logFilterInput.Value(), "ERROR[")
+	}
+}
+
+func TestLogFilter_EnterCommitsKeepsFilter(t *testing.T) {
+	m := setupFilterableLogsModel()
+	updated, _ := m.Update(runeKey('f'))
+	m = updated.(Model)
+	m = typeInto(m, "ERROR")
+
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	m = updated.(Model)
+
+	if m.logFiltering {
+		t.Error("the bar should close on enter (commit)")
+	}
+	if m.logFilterQuery != "ERROR" {
+		t.Errorf("committed query should persist, got %q", m.logFilterQuery)
+	}
+	if m.logFilterInput.Focused() {
+		t.Error("input should be blurred after commit")
+	}
+	got := m.derivedLogContent()
+	if !strings.Contains(got, "disk full") || strings.Contains(got, "starting up") {
+		t.Errorf("committed filter should still narrow the view, got:\n%s", got)
+	}
+}
+
+func TestLogFilter_EscCancelRestoresFullView(t *testing.T) {
+	m := setupFilterableLogsModel()
+	fullContent := m.derivedLogContent()
+
+	updated, _ := m.Update(runeKey('f'))
+	m = updated.(Model)
+	m = typeInto(m, "ERROR")
+	if m.derivedLogContent() == fullContent {
+		t.Fatal("precondition: the filter should have narrowed the view")
+	}
+
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyEsc})
+	m = updated.(Model)
+
+	if m.logFiltering {
+		t.Error("esc should close the filter bar")
+	}
+	if m.logFilterQuery != "" {
+		t.Errorf("esc should clear the query, got %q", m.logFilterQuery)
+	}
+	if m.screen != screenLogs {
+		t.Error("esc while typing a filter must not leave the log screen")
+	}
+	if m.derivedLogContent() != fullContent {
+		t.Errorf("esc should restore the full view:\n got %q\nwant %q", m.derivedLogContent(), fullContent)
+	}
+}
+
+func TestLogFilter_NegationExcludes(t *testing.T) {
+	m := setupFilterableLogsModel()
+	updated, _ := m.Update(runeKey('f'))
+	m = updated.(Model)
+	m = typeInto(m, "!healthcheck")
+
+	got := m.derivedLogContent()
+	if strings.Contains(got, "healthcheck") {
+		t.Errorf("!-negation should exclude the healthcheck line, got:\n%s", got)
+	}
+	if !strings.Contains(got, "starting up") ||
+		!strings.Contains(got, "disk full") ||
+		!strings.Contains(got, "retrying") ||
+		!strings.Contains(got, "timeout") {
+		t.Errorf("all non-matching lines should remain, got:\n%s", got)
+	}
+}
+
+// TestLogFilter_MatchesRawNotPrettyExpanded pins that the filter predicate runs
+// against the RAW line, before pretty-expansion. The compact JSON substring
+// `"level":"info"` exists only in the raw line — pretty-print inserts a space
+// after the colon — yet the whole pretty block still renders because the raw
+// line matched.
+func TestLogFilter_MatchesRawNotPrettyExpanded(t *testing.T) {
+	m := setupFilterableLogsModel()
+	m.logsRawLines = []string{
+		`app | {"level":"info","msg":"hello"}`,
+		`app | {"level":"debug","msg":"other"}`,
+	}
+	m.logsPretty = true // JSON expands into multiple indented physical lines
+	m.fullReformat()
+
+	updated, _ := m.Update(runeKey('f'))
+	m = updated.(Model)
+	m = typeInto(m, `"level":"info"`) // compact form: only present in the raw line
+
+	got := m.derivedLogContent()
+	if !strings.Contains(got, `"level": "info"`) || !strings.Contains(got, `"msg": "hello"`) {
+		t.Errorf("the matching raw line's full pretty block should render, got:\n%s", got)
+	}
+	if strings.Contains(got, "debug") || strings.Contains(got, "other") {
+		t.Errorf("the non-matching raw line must be filtered out, got:\n%s", got)
+	}
+}
+
+// TestLogFilter_ClearRevealsLinesStreamedWhileFiltered pins that the raw buffer
+// stays complete under an active filter: a non-matching line that streams in
+// while filtered is hidden, then revealed when the filter is cleared.
+func TestLogFilter_ClearRevealsLinesStreamedWhileFiltered(t *testing.T) {
+	m := setupFilterableLogsModel()
+	pr, _ := io.Pipe()
+	m.logsPipeR = pr
+
+	// Commit a filter that hides everything but the ERROR lines.
+	updated, _ := m.Update(runeKey('f'))
+	m = updated.(Model)
+	m = typeInto(m, "ERROR")
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	m = updated.(Model)
+	if m.logFiltering {
+		t.Fatal("precondition: filter should be committed")
+	}
+
+	// A non-matching line streams in while the filter is active.
+	updated, _ = m.Update(logChunkMsg{data: []byte("app | INFO late arrival\n")})
+	m = updated.(Model)
+	if strings.Contains(m.derivedLogContent(), "late arrival") {
+		t.Fatal("a non-matching streamed line must be hidden while filtered")
+	}
+	found := false
+	for _, l := range m.logsRawLines {
+		if strings.Contains(l, "late arrival") {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatal("the streamed line must still be present in the raw buffer")
+	}
+
+	// Clear the filter (re-open with f, then esc-cancel) — the hidden line appears.
+	updated, _ = m.Update(runeKey('f'))
+	m = updated.(Model)
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyEsc})
+	m = updated.(Model)
+	if m.logFilterQuery != "" {
+		t.Fatalf("filter should be cleared, got %q", m.logFilterQuery)
+	}
+	if !strings.Contains(m.derivedLogContent(), "late arrival") {
+		t.Errorf("clearing the filter must reveal the line streamed in while filtered, got:\n%s", m.derivedLogContent())
+	}
+}
+
+// TestLogFilter_QActsAsBackWhenNotFiltering pins the q→esc rewrite sub-case:
+// with no filter bar open, q leaves the log screen (back-nav) as before.
+func TestLogFilter_QActsAsBackWhenNotFiltering(t *testing.T) {
+	m := setupFilterableLogsModel()
+	if m.logFiltering {
+		t.Fatal("precondition: not filtering")
+	}
+	updated, _ := m.Update(runeKey('q'))
+	m = updated.(Model)
+	if m.screen != screenSelectContainers {
+		t.Errorf("q should navigate back to the container screen, got screen %d", m.screen)
+	}
+}
+
 func TestShortenPath_HomeDir(t *testing.T) {
 	home, err := os.UserHomeDir()
 	if err != nil {
