@@ -1505,12 +1505,21 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 
 	case screenLogs:
+		// Layered esc ladder (peel inner → outer): (1) typing-search cancel,
+		// (2) typing-filter cancel, (3) committed-search clear-only, (4)
+		// committed-filter clear-only, (5) leave the screen. Rungs 1–2 live in
+		// the two typing intercepts below (they own esc while an input is open);
+		// rungs 3–5 live in the main switch's `esc` case (reached only when no
+		// input is open). Because filter and search bars are mutually exclusive
+		// (only one input can be open at a time), the two intercepts never both
+		// run, and by the time control reaches the main switch both logFiltering
+		// and logSearching are false — so rungs 3/4 need only test the committed
+		// query strings.
+		//
 		// Typing intercept — MUST be the first statement so that while an input
 		// bar is open every keystroke routes to it (mirrors the container-screen
 		// `if m.searching` intercept). Without this, typing `w`/`p`/`G`/`f`/`q`
 		// into the filter query would fire wrap/pretty/gotobottom/filter/back.
-		// The filter and search bars are mutually exclusive (only one input can
-		// be open at a time), so the two blocks below never both run.
 		if m.logFiltering {
 			switch key {
 			case "ctrl+c":
@@ -1527,8 +1536,9 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 				}
 				return m, nil
 			case "esc":
-				// Cancel (provisional — Task 5 folds this into the esc ladder):
-				// discard the query and restore the full unfiltered view.
+				// Ladder rung 2 (typing-filter cancel): discard the in-progress
+				// query and restore the full unfiltered view, staying on the
+				// screen (no back-nav).
 				m.clearLogFilter()
 				m.rederiveLogs()
 				return m, nil
@@ -1565,8 +1575,11 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 				}
 				return m, nil
 			case "esc":
-				// Cancel (provisional — Task 5 folds this into the esc ladder):
-				// discard the query and clear the highlight.
+				// Ladder rung 1 (typing-search cancel): discard the in-progress
+				// query and clear the highlight, staying on the screen. Mirrors
+				// the container search's esc-while-typing, which discards without
+				// leaving; the log view has no cursor to restore (searchReturn),
+				// so this simply cancels typing and stays.
 				m.clearLogSearch()
 				m.setLogViewportContent()
 				return m, nil
@@ -1586,6 +1599,27 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		case "ctrl+c":
 			return m.tryQuit()
 		case "esc":
+			// Ladder rungs 3–4 (no input open — both intercepts above returned
+			// early, so logFiltering/logSearching are false here). Peel the
+			// committed search before the committed filter so that with BOTH
+			// live, the first esc clears search only, the second clears filter
+			// only, and only the third (rung 5) leaves the screen.
+			if m.logSearchQuery != "" {
+				// Rung 3 (committed-search clear-only): drop the highlight +
+				// n/N, stay on the screen.
+				m.clearLogSearch()
+				m.setLogViewportContent()
+				return m, nil
+			}
+			if m.logFilterQuery != "" {
+				// Rung 4 (committed-filter clear-only): drop the filter,
+				// re-derive the full view, stay on the screen.
+				m.clearLogFilter()
+				m.rederiveLogs()
+				return m, nil
+			}
+			// Rung 5 (leave screen): neither active — cancel the log context,
+			// clear all log state, and return to the container screen.
 			if m.logsCancel != nil {
 				m.logsCancel()
 			}

@@ -189,11 +189,11 @@ idle           → "" (blank, but the line is still reserved)
 - Modify: `internal/tui/app.go` (`screenLogs` `esc` case — replace the provisional Task 3/4 handling)
 - Modify: `internal/tui/app_test.go`
 
-- [ ] replace the provisional filter-cancel / search-cancel `esc` from Tasks 3–4 with the single 5-step precedence in the `screenLogs` handler: (1) typing-search cancel, (2) typing-filter cancel, (3) committed-search clear-only (stay), (4) committed-filter clear-only (stay), (5) existing leave-screen (cancel ctx, `clearLogFilter()`/`clearLogSearch()`, back to `screenSelectContainers`)
-- [ ] verify the `q`-exception already added in Tasks 3–4 (`while logFiltering || logSearching`, `q` types literally) is consistent with the finalized ladder — no change expected, just confirm
-- [ ] write tests for each rung of the ladder (search-typing, filter-typing, committed-search, committed-filter, and the final leave-screen), asserting screen + field state after each `esc`; include the peel-order case: committed filter **and** search both active → first `esc` clears search only, second clears filter only, third leaves the screen
-- [ ] write tests: `q` types literally into an open filter/search input; `q` acts as back/`esc` when no input is open
-- [ ] run tests — must pass before Task 6
+- [x] replace the provisional filter-cancel / search-cancel `esc` from Tasks 3–4 with the single 5-step precedence in the `screenLogs` handler: (1) typing-search cancel, (2) typing-filter cancel, (3) committed-search clear-only (stay), (4) committed-filter clear-only (stay), (5) existing leave-screen (cancel ctx, `clearLogFilter()`/`clearLogSearch()`, back to `screenSelectContainers`)
+- [x] verify the `q`-exception already added in Tasks 3–4 (`while logFiltering || logSearching`, `q` types literally) is consistent with the finalized ladder — no change expected, just confirm
+- [x] write tests for each rung of the ladder (search-typing, filter-typing, committed-search, committed-filter, and the final leave-screen), asserting screen + field state after each `esc`; include the peel-order case: committed filter **and** search both active → first `esc` clears search only, second clears filter only, third leaves the screen
+- [x] write tests: `q` types literally into an open filter/search input; `q` acts as back/`esc` when no input is open
+- [x] run tests — must pass before Task 6
 
 ### Task 6: Bottom bar + layout height + never-wrap invariant
 

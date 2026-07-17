@@ -3860,9 +3860,10 @@ func TestLogSearch_EscCancelClearsSearch(t *testing.T) {
 	}
 }
 
-// TestLogSearch_EscToContainersClearsSearch pins the cleanup wiring: a committed
-// search does not (yet, pre-Task 5) intercept esc, so esc leaves the screen and
-// the container-cleanup path must reset all search state.
+// TestLogSearch_EscToContainersClearsSearch pins the cleanup wiring: after the
+// Task 5 ladder, a committed search's first esc clears the search (rung 3, stays
+// on the screen) and a second esc leaves; the container-cleanup path (rung 5)
+// must reset all search state.
 func TestLogSearch_EscToContainersClearsSearch(t *testing.T) {
 	m := setupFilterableLogsModel()
 	updated, _ := m.Update(runeKey('/'))
@@ -3871,15 +3872,283 @@ func TestLogSearch_EscToContainersClearsSearch(t *testing.T) {
 	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyEnter}) // commit
 	m = updated.(Model)
 
-	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyEsc}) // leaves the screen
+	// First esc: rung 3 clears the committed search but stays on the screen.
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyEsc})
 	m = updated.(Model)
+	if m.screen != screenLogs {
+		t.Fatalf("first esc on a committed search must stay on the log screen, got screen %d", m.screen)
+	}
+	if m.logSearching || m.logSearchQuery != "" || m.logSearchMatches != nil {
+		t.Errorf("first esc must clear search state: searching=%v query=%q matches=%v",
+			m.logSearching, m.logSearchQuery, m.logSearchMatches)
+	}
 
+	// Second esc: rung 5 leaves the screen (no search/filter left to peel).
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyEsc})
+	m = updated.(Model)
 	if m.screen != screenSelectContainers {
-		t.Fatalf("esc should return to the container screen, got screen %d", m.screen)
+		t.Fatalf("second esc should return to the container screen, got screen %d", m.screen)
 	}
 	if m.logSearching || m.logSearchQuery != "" || m.logSearchMatches != nil {
 		t.Errorf("esc-to-containers must clear search state: searching=%v query=%q matches=%v",
 			m.logSearching, m.logSearchQuery, m.logSearchMatches)
+	}
+}
+
+// --- Task 5: layered esc ladder ---
+//
+// The five rungs, peeled inner → outer: (1) typing-search cancel, (2)
+// typing-filter cancel, (3) committed-search clear-only, (4) committed-filter
+// clear-only, (5) leave the screen. Each test drives one rung in isolation and
+// asserts the post-esc screen + field state; the peel-order test drives all
+// three of rungs 3/4/5 in sequence with both a filter and a search committed.
+
+// TestLogLadder_Rung1_SearchTypingEscCancels: esc while the search bar is open
+// discards the in-progress query and clears the highlight, staying on-screen.
+func TestLogLadder_Rung1_SearchTypingEscCancels(t *testing.T) {
+	m := setupFilterableLogsModel()
+	updated, _ := m.Update(runeKey('/'))
+	m = updated.(Model)
+	m = typeInto(m, "ERROR")
+	if !m.logSearching || m.logSearchQuery != "ERROR" {
+		t.Fatalf("precondition: searching=%v query=%q", m.logSearching, m.logSearchQuery)
+	}
+
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyEsc})
+	m = updated.(Model)
+
+	if m.screen != screenLogs {
+		t.Errorf("rung 1 esc must stay on the log screen, got screen %d", m.screen)
+	}
+	if m.logSearching {
+		t.Error("rung 1 esc should close the search bar")
+	}
+	if m.logSearchQuery != "" || m.logSearchMatches != nil {
+		t.Errorf("rung 1 esc should clear the search: query=%q matches=%v", m.logSearchQuery, m.logSearchMatches)
+	}
+}
+
+// TestLogLadder_Rung2_FilterTypingEscCancels: esc while the filter bar is open
+// discards the in-progress query and restores the full unfiltered view.
+func TestLogLadder_Rung2_FilterTypingEscCancels(t *testing.T) {
+	m := setupFilterableLogsModel()
+	fullContent := m.derivedLogContent()
+	updated, _ := m.Update(runeKey('f'))
+	m = updated.(Model)
+	m = typeInto(m, "ERROR")
+	if !m.logFiltering || m.derivedLogContent() == fullContent {
+		t.Fatalf("precondition: filtering=%v (view should be narrowed)", m.logFiltering)
+	}
+
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyEsc})
+	m = updated.(Model)
+
+	if m.screen != screenLogs {
+		t.Errorf("rung 2 esc must stay on the log screen, got screen %d", m.screen)
+	}
+	if m.logFiltering {
+		t.Error("rung 2 esc should close the filter bar")
+	}
+	if m.logFilterQuery != "" {
+		t.Errorf("rung 2 esc should clear the filter query, got %q", m.logFilterQuery)
+	}
+	if m.derivedLogContent() != fullContent {
+		t.Errorf("rung 2 esc should restore the full view:\n got %q\nwant %q", m.derivedLogContent(), fullContent)
+	}
+}
+
+// TestLogLadder_Rung3_CommittedSearchEscClearsOnly: with a committed search (bar
+// closed, highlights live), esc clears the search only and stays on-screen.
+func TestLogLadder_Rung3_CommittedSearchEscClearsOnly(t *testing.T) {
+	m := setupFilterableLogsModel()
+	updated, _ := m.Update(runeKey('/'))
+	m = updated.(Model)
+	m = typeInto(m, "ERROR")
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyEnter}) // commit
+	m = updated.(Model)
+	if m.logSearching || m.logSearchQuery != "ERROR" || len(m.logSearchMatches) == 0 {
+		t.Fatalf("precondition: committed search searching=%v query=%q matches=%v",
+			m.logSearching, m.logSearchQuery, m.logSearchMatches)
+	}
+
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyEsc})
+	m = updated.(Model)
+
+	if m.screen != screenLogs {
+		t.Errorf("rung 3 esc must stay on the log screen, got screen %d", m.screen)
+	}
+	if m.logSearchQuery != "" || m.logSearchMatches != nil {
+		t.Errorf("rung 3 esc should clear the committed search: query=%q matches=%v", m.logSearchQuery, m.logSearchMatches)
+	}
+}
+
+// TestLogLadder_Rung4_CommittedFilterEscClearsOnly: with a committed filter (bar
+// closed, view narrowed), esc clears the filter only, re-derives, and stays.
+func TestLogLadder_Rung4_CommittedFilterEscClearsOnly(t *testing.T) {
+	m := setupFilterableLogsModel()
+	fullContent := m.derivedLogContent()
+	updated, _ := m.Update(runeKey('f'))
+	m = updated.(Model)
+	m = typeInto(m, "ERROR")
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyEnter}) // commit
+	m = updated.(Model)
+	if m.logFiltering || m.logFilterQuery != "ERROR" || m.derivedLogContent() == fullContent {
+		t.Fatalf("precondition: committed filter filtering=%v query=%q", m.logFiltering, m.logFilterQuery)
+	}
+
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyEsc})
+	m = updated.(Model)
+
+	if m.screen != screenLogs {
+		t.Errorf("rung 4 esc must stay on the log screen, got screen %d", m.screen)
+	}
+	if m.logFilterQuery != "" {
+		t.Errorf("rung 4 esc should clear the committed filter, got %q", m.logFilterQuery)
+	}
+	if m.derivedLogContent() != fullContent {
+		t.Errorf("rung 4 esc should restore the full view:\n got %q\nwant %q", m.derivedLogContent(), fullContent)
+	}
+}
+
+// TestLogLadder_Rung5_LeaveScreen: with neither a filter nor a search active,
+// esc leaves the log screen back to the container screen (rung 5).
+func TestLogLadder_Rung5_LeaveScreen(t *testing.T) {
+	m := setupFilterableLogsModel()
+	if m.logFiltering || m.logSearching || m.logFilterQuery != "" || m.logSearchQuery != "" {
+		t.Fatal("precondition: no filter or search active")
+	}
+
+	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyEsc})
+	m = updated.(Model)
+
+	if m.screen != screenSelectContainers {
+		t.Errorf("rung 5 esc should return to the container screen, got screen %d", m.screen)
+	}
+	if m.logsRawLines != nil || m.logsService != "" {
+		t.Errorf("rung 5 esc should clear log state: rawLines=%v service=%q", m.logsRawLines, m.logsService)
+	}
+}
+
+// TestLogLadder_PeelOrder_SearchFilterLeave pins the full peel order with BOTH a
+// filter and a search committed: the first esc clears search only (filter still
+// narrows), the second clears filter only (full view restored), and only the
+// third leaves the screen.
+func TestLogLadder_PeelOrder_SearchFilterLeave(t *testing.T) {
+	m := setupFilterableLogsModel()
+	fullContent := m.derivedLogContent()
+
+	// Commit a filter that keeps only the two ERROR lines.
+	updated, _ := m.Update(runeKey('f'))
+	m = updated.(Model)
+	m = typeInto(m, "ERROR")
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	m = updated.(Model)
+	filteredContent := m.derivedLogContent()
+	if m.logFilterQuery != "ERROR" || filteredContent == fullContent {
+		t.Fatalf("precondition: filter should be committed and narrowing, query=%q", m.logFilterQuery)
+	}
+
+	// Commit a search within the filtered survivors.
+	updated, _ = m.Update(runeKey('/'))
+	m = updated.(Model)
+	m = typeInto(m, "timeout")
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	m = updated.(Model)
+	if m.logSearchQuery != "timeout" || len(m.logSearchMatches) == 0 {
+		t.Fatalf("precondition: search should be committed with matches, query=%q matches=%v",
+			m.logSearchQuery, m.logSearchMatches)
+	}
+
+	// First esc: rung 3 clears the search only; the filter still narrows.
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyEsc})
+	m = updated.(Model)
+	if m.screen != screenLogs {
+		t.Fatalf("first esc must stay on the log screen, got screen %d", m.screen)
+	}
+	if m.logSearchQuery != "" || m.logSearchMatches != nil {
+		t.Errorf("first esc must clear search: query=%q matches=%v", m.logSearchQuery, m.logSearchMatches)
+	}
+	if m.logFilterQuery != "ERROR" {
+		t.Errorf("first esc must leave the filter committed, got %q", m.logFilterQuery)
+	}
+	if m.derivedLogContent() != filteredContent {
+		t.Errorf("first esc must keep the filtered view:\n got %q\nwant %q", m.derivedLogContent(), filteredContent)
+	}
+
+	// Second esc: rung 4 clears the filter only; the full view returns.
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyEsc})
+	m = updated.(Model)
+	if m.screen != screenLogs {
+		t.Fatalf("second esc must stay on the log screen, got screen %d", m.screen)
+	}
+	if m.logFilterQuery != "" {
+		t.Errorf("second esc must clear the filter, got %q", m.logFilterQuery)
+	}
+	if m.derivedLogContent() != fullContent {
+		t.Errorf("second esc must restore the full view:\n got %q\nwant %q", m.derivedLogContent(), fullContent)
+	}
+
+	// Third esc: rung 5 leaves the screen.
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyEsc})
+	m = updated.(Model)
+	if m.screen != screenSelectContainers {
+		t.Errorf("third esc should return to the container screen, got screen %d", m.screen)
+	}
+}
+
+// TestLogLadder_QTypesLiterallyIntoFilterInput pins the q-exception in the
+// q→esc rewrite block: while the filter bar is open, q is a literal character.
+func TestLogLadder_QTypesLiterallyIntoFilterInput(t *testing.T) {
+	m := setupFilterableLogsModel()
+	updated, _ := m.Update(runeKey('f'))
+	m = updated.(Model)
+	updated, _ = m.Update(runeKey('q'))
+	m = updated.(Model)
+
+	if m.screen != screenLogs {
+		t.Errorf("q must not navigate away while the filter bar is open, got screen %d", m.screen)
+	}
+	if !m.logFiltering {
+		t.Error("q should not close the filter bar")
+	}
+	if m.logFilterInput.Value() != "q" {
+		t.Errorf("q should land in the filter input, got %q", m.logFilterInput.Value())
+	}
+}
+
+// TestLogLadder_QTypesLiterallyIntoSearchInput pins the q-exception for the
+// search bar: while the search bar is open, q is a literal character.
+func TestLogLadder_QTypesLiterallyIntoSearchInput(t *testing.T) {
+	m := setupFilterableLogsModel()
+	updated, _ := m.Update(runeKey('/'))
+	m = updated.(Model)
+	updated, _ = m.Update(runeKey('q'))
+	m = updated.(Model)
+
+	if m.screen != screenLogs {
+		t.Errorf("q must not navigate away while the search bar is open, got screen %d", m.screen)
+	}
+	if !m.logSearching {
+		t.Error("q should not close the search bar")
+	}
+	if m.logSearchInput.Value() != "q" {
+		t.Errorf("q should land in the search input, got %q", m.logSearchInput.Value())
+	}
+}
+
+// TestLogLadder_QActsAsBackWhenNoInputOpen pins that with no filter/search bar
+// open, q is rewritten to esc and leaves the log screen (rung 5, back-nav).
+func TestLogLadder_QActsAsBackWhenNoInputOpen(t *testing.T) {
+	m := setupFilterableLogsModel()
+	if m.logFiltering || m.logSearching {
+		t.Fatal("precondition: no input bar open")
+	}
+
+	updated, _ := m.Update(runeKey('q'))
+	m = updated.(Model)
+
+	if m.screen != screenSelectContainers {
+		t.Errorf("q with no input open should navigate back, got screen %d", m.screen)
 	}
 }
 
