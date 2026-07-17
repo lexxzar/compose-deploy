@@ -3895,6 +3895,48 @@ func TestLogSearch_EscToContainersClearsSearch(t *testing.T) {
 	}
 }
 
+// TestLogFilterSearch_StillWorkAfterStreamEnded pins that once the stream ends
+// (logsDone == true), the log view is still fully filterable and searchable:
+// the f and / guards key off buffer content, not the done flag, so a finished
+// (but non-empty) buffer keeps both features live.
+func TestLogFilterSearch_StillWorkAfterStreamEnded(t *testing.T) {
+	m := setupFilterableLogsModel()
+	m.logsDone = true // stream has terminated; no more chunks will arrive
+
+	// Filter still opens and narrows after the stream ended.
+	updated, _ := m.Update(runeKey('f'))
+	m = updated.(Model)
+	if !m.logFiltering {
+		t.Fatal("f must still open the filter after the stream ended")
+	}
+	m = typeInto(m, "ERROR")
+	got := m.derivedLogContent()
+	if !strings.Contains(got, "disk full") || !strings.Contains(got, "timeout") {
+		t.Errorf("filter should still narrow to ERROR lines after stream end, got:\n%s", got)
+	}
+	if strings.Contains(got, "starting up") {
+		t.Errorf("non-ERROR lines should be filtered out after stream end, got:\n%s", got)
+	}
+
+	// Clear the filter (esc while typing) so the search runs over the full view.
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyEsc})
+	m = updated.(Model)
+	if m.logFiltering || m.logFilterQuery != "" {
+		t.Fatalf("esc should cancel the filter: filtering=%v query=%q", m.logFiltering, m.logFilterQuery)
+	}
+
+	// Search still opens and matches after the stream ended.
+	updated, _ = m.Update(runeKey('/'))
+	m = updated.(Model)
+	if !m.logSearching {
+		t.Fatal("/ must still open the search after the stream ended")
+	}
+	m = typeInto(m, "ERROR")
+	if len(m.logSearchMatches) == 0 {
+		t.Error("search should still find matches after the stream ended")
+	}
+}
+
 // --- Task 5: layered esc ladder ---
 //
 // The five rungs, peeled inner → outer: (1) typing-search cancel, (2)

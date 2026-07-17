@@ -212,11 +212,11 @@ idle           → "" (blank, but the line is still reserved)
 
 ### Task 7: Verify acceptance criteria
 
-- [ ] verify all Overview requirements are implemented (filter live-narrow, search highlight/jump, coexistence, smart matching + `ctrl+r`, `!`-negation, layered `esc`, reserved bar)
-- [ ] verify edge cases: zero matches, stream-ended (`logsDone`) still searchable/filterable, terminal-error line renders even under an active filter, per-physical-line search semantics (occurrence fully within a row highlights; occurrence split by a soft-wrap boundary is not matched — accepted), clearing filter reveals lines streamed while filtered
-- [ ] run `gofmt -l internal/tui` (expect no output) and `go vet ./...`
-- [ ] run the full suite: `go build -o cdeploy . && go test ./... -count=1`
-- [ ] confirm no CLI/runner/compose files changed (`git diff --stat` scoped to `internal/tui/` + docs only)
+- [x] verify all Overview requirements are implemented (filter live-narrow, search highlight/jump, coexistence, smart matching + `ctrl+r`, `!`-negation, layered `esc`, reserved bar)
+- [x] verify edge cases: zero matches, stream-ended (`logsDone`) still searchable/filterable, terminal-error line renders even under an active filter, per-physical-line search semantics (occurrence fully within a row highlights; occurrence split by a soft-wrap boundary is not matched — accepted), clearing filter reveals lines streamed while filtered
+- [x] run `gofmt -l internal/tui` (expect no output) and `go vet ./...`
+- [x] run the full suite: `go build -o cdeploy . && go test ./... -count=1`
+- [x] confirm no CLI/runner/compose files changed (`git diff --stat` scoped to `internal/tui/` + docs only)
 
 ### Task 8: Update documentation
 
