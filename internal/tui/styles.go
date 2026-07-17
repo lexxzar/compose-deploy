@@ -90,6 +90,19 @@ var (
 	logPauseStyle = lipgloss.NewStyle().
 			Foreground(lipgloss.Color("3"))
 
+	// logSearchMatchStyle paints log lines that match the active log-view search
+	// in the same yellow as the container search — a soft highlight overlaid at
+	// SetContent time (mirrors searchMatchStyle).
+	logSearchMatchStyle = lipgloss.NewStyle().
+				Foreground(lipgloss.Color("3"))
+
+	// logSearchCurrentStyle marks the current match (the line n/N last jumped to)
+	// with the same yellow plus bold so it stands out among the matches (mirrors
+	// searchCurrentStyle).
+	logSearchCurrentStyle = lipgloss.NewStyle().
+				Foreground(lipgloss.Color("3")).
+				Bold(true)
+
 	helpStyle = lipgloss.NewStyle().
 			Foreground(lipgloss.Color("8")).
 			MarginTop(1)

@@ -207,15 +207,15 @@ type Model struct {
 	projectsSession uint64 // bumped at every transition that swaps the projectLoader (server pick, server disconnect, local fast-track, etc.) so a stale loadProjects from server A can't overwrite server B's list
 
 	// Screen 1: service select
-	services     []string
-	svcStatus    map[string]runner.ServiceStatus // service name → status
-	stats           map[string]runner.ServiceStats // service name → resource usage; populated asynchronously by refreshStats
-	statsErr        error                          // last error from ContainerStats; rendered in the same slot as svcErr (svcErr wins)
-	statsSession    uint64                         // bumped before every refreshStats() and on context change so older in-flight responses are filtered out
-	statusSession   uint64                         // mirror of statsSession for refreshStatus(); without it, periodic-tick statusMsg from project A could overwrite the svcStatus map after the user has navigated to project B
-	statsRequested  bool                           // true once refreshStats has been requested for the current container-screen entry; reserves CPU/Mem column widths so captions don't pop in when data arrives
-	refreshInFlight bool                           // true while a periodic-tick refreshStats fetch is pending; prevents the next tick from stacking another fetch on top of a slow docker stats / SSH call
-	tickCmdOverride func() tea.Cmd                 // test seam: when non-nil, replaces tea.Tick in refreshTick() with a non-blocking Cmd; production code never sets this
+	services        []string
+	svcStatus       map[string]runner.ServiceStatus // service name → status
+	stats           map[string]runner.ServiceStats  // service name → resource usage; populated asynchronously by refreshStats
+	statsErr        error                           // last error from ContainerStats; rendered in the same slot as svcErr (svcErr wins)
+	statsSession    uint64                          // bumped before every refreshStats() and on context change so older in-flight responses are filtered out
+	statusSession   uint64                          // mirror of statsSession for refreshStatus(); without it, periodic-tick statusMsg from project A could overwrite the svcStatus map after the user has navigated to project B
+	statsRequested  bool                            // true once refreshStats has been requested for the current container-screen entry; reserves CPU/Mem column widths so captions don't pop in when data arrives
+	refreshInFlight bool                            // true while a periodic-tick refreshStats fetch is pending; prevents the next tick from stacking another fetch on top of a slow docker stats / SSH call
+	tickCmdOverride func() tea.Cmd                  // test seam: when non-nil, replaces tea.Tick in refreshTick() with a non-blocking Cmd; production code never sets this
 
 	// Update-available indicator state. CheckUpdates is run on entry to
 	// screenSelectContainers (when the cache is stale) and explicitly via `U`.
@@ -228,10 +228,10 @@ type Model struct {
 	updateInFlight bool   // mirror of refreshInFlight for refreshUpdates — prevents a slow CheckUpdates from stacking on the next screen entry / `U` press
 	updatesErr     string // last error from CheckUpdates; rendered as soft warning below statsErr (priority: svcErr > statsErr > updatesErr)
 	projDir        string // active project's config dir; used for the updateCache key
-	selected  map[int]bool
-	svcCursor int
-	svcOffset int // index of first visible service in scroll window
-	svcErr    error
+	selected       map[int]bool
+	svcCursor      int
+	svcOffset      int // index of first visible service in scroll window
+	svcErr         error
 
 	// Confirmation state (within container screen)
 	confirming  bool
@@ -253,18 +253,39 @@ type Model struct {
 	cancel      context.CancelFunc
 
 	// Screen: logs
-	logsService   string             // service being viewed
-	logsContent   string             // accumulated log output
-	logsViewport  viewport.Model     // dedicated viewport for log screen
-	logsCancel    context.CancelFunc // cancels the log goroutine; derived from m.ctx
-	logsDone      bool               // true when streaming finished
-	logsErr       error              // error from Logs() call
-	logsPipeR     io.Reader          // pipe reader for log streaming
-	logsSession   uint64             // monotonic counter to discard stale messages from prior sessions
-	logsWrap      bool               // soft-wrap long lines at viewport width
-	logsPretty    bool               // pretty-print JSON log bodies
-	logsFormatted string             // formatted output for complete raw lines (up to logsRawOff)
-	logsRawOff    int                // byte offset into logsContent: everything before this is in logsFormatted
+	logsService  string             // service being viewed
+	logsViewport viewport.Model     // dedicated viewport for log screen
+	logsCancel   context.CancelFunc // cancels the log goroutine; derived from m.ctx
+	logsDone     bool               // true when streaming finished
+	logsErr      error              // error from Logs() call
+	logsPipeR    io.Reader          // pipe reader for log streaming
+	logsSession  uint64             // monotonic counter to discard stale messages from prior sessions
+	logsWrap     bool               // soft-wrap long lines at viewport width
+	logsPretty   bool               // pretty-print JSON log bodies
+
+	// Screen: logs — raw-line buffer (source of truth for the viewport derivation)
+	logsRawLines  []string // complete logical lines, unfiltered
+	logsPartial   string   // trailing incomplete line (no newline yet)
+	logsScanned   int      // raw-line scan cursor: count of logsRawLines already folded into logsFormatted (a resume point, NOT a survivor count)
+	logsFormatted string   // cached formatted output for the scanned raw lines
+	logsErrLine   string   // filter-exempt terminal error text; always rendered regardless of an active filter
+
+	// Screen: logs — filter (live grep; see clearLogFilter/logFilterPred/recomputeLogFilter)
+	logFiltering            bool            // filter bar open, capturing text
+	logFilterInput          textinput.Model // (re)constructed lazily in the "f" open handler
+	logFilterQuery          string          // last-good committed query; != "" ⇒ filter active
+	logFilterIsRegex        bool            // live/desired mode; ctrl+r toggles (regex vs. substring)
+	logFilterCommittedRegex bool            // whether the last-good committed query is a regex; source of truth for regex-ness in logFilterPred (NOT the live logFilterIsRegex)
+	logFilterShown          int             // running count of survivor lines folded into logsFormatted; maintained incrementally by applyLogFormat/fullReformat. Read by logFilterCounts as the committed-filter survivor count (O(1) per frame, display-meaningful only when logFilterQuery != ""), AND by applyLogFormat as the seed-vs-append gate (== 0 means logsFormatted holds no survivor yet — a delta, even an empty blank-line delta, seeds it; else it joins with "\n"). logsFormatted == "" is ambiguous (empty when only blank survivors folded), so this count is the authoritative "have we folded any line" signal.
+
+	// Screen: logs — search-within-highlight (see clearLogSearch/logSearchPred/recomputeLogSearch)
+	logSearching            bool            // search bar open, capturing text
+	logSearchInput          textinput.Model // (re)constructed lazily in the "/" open handler
+	logSearchQuery          string          // live/committed query; != "" ⇒ highlights + n/N active
+	logSearchIsRegex        bool            // live/desired mode; ctrl+r toggles (regex vs. substring)
+	logSearchCommittedRegex bool            // whether the committed query is a regex; source of truth for regex-ness in logSearchPred (NOT the live logSearchIsRegex)
+	logSearchMatches        []int           // PHYSICAL line indices of matches, ascending (recomputed at SetContent time)
+	logSearchCur            int             // index into logSearchMatches (the current match)
 
 	// Screen: config
 	configContent  []byte         // raw compose file content
@@ -558,7 +579,9 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if m.screen == screenLogs {
 			following := m.logsViewport.AtBottom()
 			m.logsViewport.Width = msg.Width - 4
-			h := msg.Height - 6
+			// -7 (not -6): one row reserved for the log bar line. The config
+			// branch above keeps -6 — do NOT unify these.
+			h := msg.Height - 7
 			if h < 3 {
 				h = 3
 			}
@@ -566,6 +589,15 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.fullReformat()
 			if following {
 				m.logsViewport.GotoBottom()
+			}
+			// Refresh an open input's horizontal-scroll window for the new width —
+			// otherwise a narrower resize leaves a stale (right-clipped) viewport
+			// until the next keystroke (mirrors the screenSelectContainers branch).
+			if m.logFiltering {
+				m.logFilterInput.Width = m.logFilterInputWidth()
+			}
+			if m.logSearching {
+				m.logSearchInput.Width = m.logSearchInputWidth()
 			}
 		}
 		return m, nil
@@ -888,7 +920,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 		following := m.logsViewport.AtBottom() // capture BEFORE appending
-		m.logsContent += string(msg.data)
+		m.appendRawChunk(msg.data)
 		m.applyLogFormat() // SetContent preserves YOffset
 		if following {
 			m.logsViewport.GotoBottom()
@@ -900,11 +932,35 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 		m.logsDone = true
+		// Flush any in-flight partial line (a final line with no trailing newline)
+		// into the raw buffer on BOTH clean and error EOF. Without this, the last
+		// unterminated line would render (via derivedLogContent's unfiltered
+		// partial slot) but permanently bypass the filter; and if it were the sole
+		// content, logsRawLines would stay empty and the `f`/`/` open handlers'
+		// empty-buffer guard would refuse to open. Capture the follow state before
+		// re-deriving so a live tail stays pinned to the (now filtered) bottom.
+		following := m.logsViewport.AtBottom()
+		flushed := false
+		if m.logsPartial != "" {
+			m.logsRawLines = append(m.logsRawLines, m.logsPartial)
+			m.logsPartial = ""
+			flushed = true
+		}
 		if msg.err != nil {
 			m.logsErr = msg.err
-			m.logsContent += fmt.Sprintf("\n\nError: %v", msg.err)
+			// The terminal error is filter-exempt: it must render regardless of an
+			// active filter, so it lives in a dedicated slot outside the filterable
+			// raw-line buffer.
+			m.logsErrLine = fmt.Sprintf("Error: %v", msg.err)
 			m.applyLogFormat()
-			m.logsViewport.GotoBottom()
+			m.logsViewport.GotoBottom() // force the error into view even if paused
+			return m, nil
+		}
+		if flushed {
+			m.applyLogFormat() // subject the flushed line to the filter
+			if following {
+				m.logsViewport.GotoBottom()
+			}
 		}
 		return m, nil
 
@@ -1075,6 +1131,15 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		case screenProgress:
 			if !m.done && !m.failed {
 				return m, nil
+			}
+			key = "esc"
+		case screenLogs:
+			if m.logFiltering || m.logSearching {
+				// A filter or search bar is capturing text — q is a literal
+				// character that must reach the open input (mirrors the
+				// container-search and settings-form field-4 exceptions above).
+				// Leave key untouched so it falls through to the typing intercept.
+				break
 			}
 			key = "esc"
 		case screenSettingsForm:
@@ -1467,15 +1532,136 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 
 	case screenLogs:
+		// Layered esc ladder (peel inner → outer): (1) typing-search cancel,
+		// (2) typing-filter cancel, (3) committed-search clear-only, (4)
+		// committed-filter clear-only, (5) leave the screen. Rungs 1–2 live in
+		// the two typing intercepts below (they own esc while an input is open);
+		// rungs 3–5 live in the main switch's `esc` case (reached only when no
+		// input is open). Because filter and search bars are mutually exclusive
+		// (only one input can be open at a time), the two intercepts never both
+		// run, and by the time control reaches the main switch both logFiltering
+		// and logSearching are false — so rungs 3/4 need only test the committed
+		// query strings.
+		//
+		// Typing intercept — MUST be the first statement so that while an input
+		// bar is open every keystroke routes to it (mirrors the container-screen
+		// `if m.searching` intercept). Without this, typing `w`/`p`/`G`/`f`/`q`
+		// into the filter query would fire wrap/pretty/gotobottom/filter/back.
+		if m.logFiltering {
+			switch key {
+			case "ctrl+c":
+				return m.tryQuit()
+			case "enter":
+				// Commit: close the bar, keep the last-good query live. If no
+				// valid query was entered, fully clear so no dead filter state
+				// (an in-progress bad regex, say) lingers.
+				if m.logFilterQuery == "" {
+					m.clearLogFilter()
+				} else {
+					m.logFiltering = false
+					m.logFilterInput.Blur()
+				}
+				return m, nil
+			case "esc":
+				// Ladder rung 2 (typing-filter cancel): discard the in-progress
+				// query and restore the full unfiltered view, staying on the
+				// screen (no back-nav).
+				m.clearLogFilter()
+				m.rederiveLogs()
+				return m, nil
+			case "ctrl+r":
+				// Toggle regex vs. substring matching, then re-evaluate the live
+				// query under the new mode.
+				m.logFilterIsRegex = !m.logFilterIsRegex
+				m.recomputeLogFilter()
+				return m, nil
+			default:
+				// Set the value-area budget BEFORE Update() so bubbles computes
+				// this keystroke's horizontal-scroll offset with the correct width
+				// (setting it after would use the previous width, clipping the
+				// newest char/cursor for one frame). logFilterInputWidth() is
+				// keystroke-stable, so it's already right regardless of the count.
+				m.logFilterInput.Width = m.logFilterInputWidth()
+				var cmd tea.Cmd
+				m.logFilterInput, cmd = m.logFilterInput.Update(msg)
+				m.recomputeLogFilter()
+				return m, cmd
+			}
+		}
+
+		// Search typing intercept — the filter intercept above has an exact
+		// companion here. While the search bar is open every keystroke routes to
+		// logSearchInput so q/n/N type literally instead of firing back/cycle.
+		if m.logSearching {
+			switch key {
+			case "ctrl+c":
+				return m.tryQuit()
+			case "enter":
+				// Commit: close the bar, keep highlights + n/N live. An empty
+				// query — OR a valid-but-non-matching one — fully clears so no
+				// dead search state (a live "(no match)" counter with inert n/N)
+				// lingers. Mirrors the container search's zero-match drop.
+				if m.logSearchQuery == "" || len(m.logSearchMatches) == 0 {
+					m.clearLogSearch()
+					m.setLogViewportContent()
+				} else {
+					m.logSearching = false
+					m.logSearchInput.Blur()
+				}
+				return m, nil
+			case "esc":
+				// Ladder rung 1 (typing-search cancel): discard the in-progress
+				// query and clear the highlight, staying on the screen. Mirrors
+				// the container search's esc-while-typing, which discards without
+				// leaving; the log view has no cursor to restore (searchReturn),
+				// so this simply cancels typing and stays.
+				m.clearLogSearch()
+				m.setLogViewportContent()
+				return m, nil
+			case "ctrl+r":
+				m.logSearchIsRegex = !m.logSearchIsRegex
+				m.recomputeLogSearch()
+				return m, nil
+			default:
+				// Set the value-area budget BEFORE Update() (see the filter
+				// intercept above for the ordering rationale).
+				m.logSearchInput.Width = m.logSearchInputWidth()
+				var cmd tea.Cmd
+				m.logSearchInput, cmd = m.logSearchInput.Update(msg)
+				m.recomputeLogSearch()
+				return m, cmd
+			}
+		}
+
 		switch key {
 		case "ctrl+c":
 			return m.tryQuit()
 		case "esc":
+			// Ladder rungs 3–4 (no input open — both intercepts above returned
+			// early, so logFiltering/logSearching are false here). Peel the
+			// committed search before the committed filter so that with BOTH
+			// live, the first esc clears search only, the second clears filter
+			// only, and only the third (rung 5) leaves the screen.
+			if m.logSearchQuery != "" {
+				// Rung 3 (committed-search clear-only): drop the highlight +
+				// n/N, stay on the screen.
+				m.clearLogSearch()
+				m.setLogViewportContent()
+				return m, nil
+			}
+			if m.logFilterQuery != "" {
+				// Rung 4 (committed-filter clear-only): drop the filter,
+				// re-derive the full view, stay on the screen.
+				m.clearLogFilter()
+				m.rederiveLogs()
+				return m, nil
+			}
+			// Rung 5 (leave screen): neither active — cancel the log context,
+			// clear all log state, and return to the container screen.
 			if m.logsCancel != nil {
 				m.logsCancel()
 			}
 			m.logsService = ""
-			m.logsContent = ""
 			m.logsCancel = nil
 			m.logsDone = false
 			m.logsErr = nil
@@ -1483,8 +1669,14 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.logsViewport = viewport.Model{}
 			m.logsWrap = false
 			m.logsPretty = false
+			m.logsRawLines = nil
+			m.logsPartial = ""
+			m.logsScanned = 0
 			m.logsFormatted = ""
-			m.logsRawOff = 0
+			m.logFilterShown = 0
+			m.logsErrLine = ""
+			m.clearLogFilter()
+			m.clearLogSearch()
 			m.screen = screenSelectContainers
 			m.statsSession++
 			m.statusSession++
@@ -1524,6 +1716,64 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			return m, nil
 		case "G":
 			m.logsViewport.GotoBottom()
+			return m, nil
+		case "f":
+			// Open the live filter. Early-return on an empty raw buffer (mirrors
+			// the l/x empty-list guards on the container screen). The input is
+			// built lazily here — NOT in NewModel — so Model{} test literals stay
+			// valid (a zero-value textinput is never rendered while closed).
+			if len(m.logsRawLines) == 0 {
+				return m, nil
+			}
+			// Reset any prior committed filter FIRST so reopening starts from a
+			// clean slate (mirrors the container `/` clearSearch guard): without
+			// this the fresh empty input would render while the view stays
+			// narrowed and the bar shows the stale N/M, and an immediate enter
+			// would re-commit the OLD query. rederiveLogs restores the full view.
+			m.clearLogFilter()
+			m.rederiveLogs()
+			m.logFilterInput = textinput.New()
+			m.logFiltering = true
+			// Set Width on this PERSISTED model so bubbles scrolls the value to
+			// keep the cursor visible (a value-receiver set in logBarLine would be
+			// discarded). Width 0 = unbounded when size is unknown (tests).
+			m.logFilterInput.Width = m.logFilterInputWidth()
+			m.logFilterInput.Focus()
+			return m, nil
+		case "/":
+			// Open search-within-highlight. Early-return when there is genuinely
+			// nothing to search: no folded survivor (logFilterShown == 0), no
+			// in-flight partial, and no terminal error. Testing derivedLogContent()
+			// == "" instead would wrongly refuse to open over a single kept BLANK
+			// survivor (logFilterShown == 1) — an empty rendered string that is
+			// still a real searchable physical line. The input is built lazily
+			// here — NOT in NewModel — so Model{} test literals stay valid; it is
+			// only rendered while logSearching.
+			if m.logFilterShown == 0 && m.logsPartial == "" && m.logsErrLine == "" {
+				return m, nil
+			}
+			// Reset any prior committed search FIRST so reopening starts from a
+			// clean slate (mirrors the container `/` clearSearch guard): stale
+			// highlights + counter would otherwise persist and an immediate enter
+			// would re-commit the OLD query. setLogViewportContent drops the stale
+			// highlights immediately.
+			m.clearLogSearch()
+			m.setLogViewportContent()
+			m.logSearchInput = textinput.New()
+			m.logSearching = true
+			// Set Width on the PERSISTED model so bubbles scrolls the value to keep
+			// the cursor visible (see the filter-open comment above).
+			m.logSearchInput.Width = m.logSearchInputWidth()
+			m.logSearchInput.Focus()
+			return m, nil
+		case "n":
+			// Cycle to the next match. No-op without a committed search; the
+			// viewport does not bind n/N, so swallowing them when idle is a
+			// no-op either way.
+			m.cycleLogMatch(true)
+			return m, nil
+		case "N":
+			m.cycleLogMatch(false)
 			return m, nil
 		default:
 			var cmd tea.Cmd
@@ -2000,16 +2250,23 @@ func (m Model) fetchConfigValidate() tea.Cmd {
 func (m *Model) enterLogs() (tea.Model, tea.Cmd) {
 	service := m.services[m.svcCursor]
 	m.logsService = service
-	m.logsContent = ""
 	m.logsDone = false
 	m.logsErr = nil
 	m.logsSession++
 	m.logsWrap = true
 	m.logsPretty = false
+	m.logsRawLines = nil
+	m.logsPartial = ""
+	m.logsScanned = 0
 	m.logsFormatted = ""
-	m.logsRawOff = 0
+	m.logFilterShown = 0
+	m.logsErrLine = ""
+	m.clearLogFilter()
+	m.clearLogSearch()
 
-	vpHeight := m.height - 6
+	// -7 (not -6): one row is reserved below the viewport for the log bar line
+	// (blank when idle). The two config sites keep -6 — do NOT unify these.
+	vpHeight := m.height - 7
 	if vpHeight < 3 {
 		vpHeight = 3
 	}
@@ -2039,46 +2296,481 @@ func (m *Model) enterLogs() (tea.Model, tea.Cmd) {
 	return *m, m.readLogChunk()
 }
 
-// applyLogFormat incrementally formats only new data since the last call.
-// It scans only m.logsContent[m.logsRawOff:] for new complete lines, formats
-// them, and appends to the cached logsFormatted. The trailing incomplete line
-// is formatted fresh each time. Call fullReformat() when toggles or width change.
+// appendRawChunk splits streamed bytes into complete logical lines — appending
+// them to logsRawLines — and retains any trailing bytes with no newline yet in
+// logsPartial until a later chunk completes them. Splitting on '\n' only (a
+// trailing '\r' stays on the line) preserves the pre-refactor line semantics.
+func (m *Model) appendRawChunk(data []byte) {
+	s := m.logsPartial + string(data)
+	for {
+		idx := strings.IndexByte(s, '\n')
+		if idx < 0 {
+			break
+		}
+		m.logsRawLines = append(m.logsRawLines, s[:idx])
+		s = s[idx+1:]
+	}
+	m.logsPartial = s
+}
+
+// applyLogFormat derives the viewport content from the raw-line buffer. It folds
+// only the not-yet-processed tail of logsRawLines (via foldNewRawLines) through
+// the filter predicate and the wrap/pretty formatter, appends the result to the
+// cached logsFormatted, and advances logsScanned per raw line scanned (NOT per
+// survivor — see the survivor-cursor trap in foldNewRawLines). With no filter
+// committed a nil (all-pass) predicate is passed, so the behaviour is identical
+// to the unfiltered pipeline. Call fullReformat() when the filter, toggles, or
+// width change.
 func (m *Model) applyLogFormat() {
-	remaining := m.logsContent[m.logsRawOff:]
-
-	// Find new complete lines (everything up to the last \n in remaining)
-	if lastNL := strings.LastIndex(remaining, "\n"); lastNL >= 0 {
-		completePart := remaining[:lastNL]
-		newLines := strings.Split(completePart, "\n")
-		formatted := formatLogLines(newLines, m.logsViewport.Width, m.logsWrap, m.logsPretty)
-		if m.logsFormatted == "" {
-			m.logsFormatted = formatted
+	delta, newScanned, survivors := foldNewRawLines(m.logsRawLines, m.logsScanned, m.logsViewport.Width, m.logsWrap, m.logsPretty, m.logFilterPred())
+	if survivors > 0 {
+		// Gate the append on the survivor COUNT, not on delta != "": a KEPT blank
+		// raw line (empty / whitespace-only line that passes the filter) formats to
+		// an empty delta yet is still a real physical line that must round-trip.
+		// Deciding on delta != "" would drop it AND elide the "\n" separator, so the
+		// next non-blank line would merge onto its row — making the rendered output
+		// (and the search physical-line indices) depend on how the byte stream was
+		// chunked. The seed-vs-append choice also can't use logsFormatted == ""
+		// (ambiguous: empty both before the first fold and after only blank
+		// survivors); logFilterShown — the count of survivors already folded into
+		// logsFormatted, read here before the increment below — is the authoritative
+		// "have we folded any line yet" signal.
+		if m.logFilterShown == 0 {
+			m.logsFormatted = delta
 		} else {
-			m.logsFormatted += "\n" + formatted
+			m.logsFormatted += "\n" + delta
 		}
-		m.logsRawOff += lastNL + 1
-		remaining = remaining[lastNL+1:]
 	}
+	m.logsScanned = newScanned
+	// Accumulate the survivor count incrementally so logFilterCounts is O(1) per
+	// render frame instead of rescanning the whole buffer. fullReformat resets
+	// this to 0 before re-accumulating over the full buffer.
+	m.logFilterShown += survivors
+	m.setLogViewportContent()
+}
 
-	// Format the trailing incomplete line (if any) and combine with cache
-	if len(remaining) > 0 {
-		tail := formatLogLines([]string{remaining}, m.logsViewport.Width, m.logsWrap, m.logsPretty)
-		if m.logsFormatted == "" {
-			m.logsViewport.SetContent(tail)
+// derivedLogContent assembles the exact string handed to the log viewport:
+// the cached formatted survivors, then the unfiltered in-flight partial line,
+// then the filter-exempt terminal error. It is pure over the current Model
+// state so tests can assert on the derived content directly.
+func (m *Model) derivedLogContent() string {
+	content := m.logsFormatted
+	// hasContent tracks whether a real physical line already sits in `content`.
+	// It CANNOT be derived from content != "": a single kept BLANK survivor folds
+	// to logsFormatted == "" yet is a real physical line (logFilterShown == 1), so
+	// an empty string is ambiguous. logFilterShown > 0 is the authoritative
+	// "have we folded any line" signal; the flag then flips true once the partial
+	// is appended so a later error still separates from it correctly (though in
+	// practice logDoneMsg flushes logsPartial before setting logsErrLine, so a
+	// partial and an error never coexist — the accumulator is the safe superset).
+	hasContent := m.logFilterShown > 0
+	if m.logsPartial != "" {
+		tail := formatLogLines([]string{m.logsPartial}, m.logsViewport.Width, m.logsWrap, m.logsPretty)
+		if hasContent {
+			content += "\n" + tail
 		} else {
-			m.logsViewport.SetContent(m.logsFormatted + "\n" + tail)
+			content = tail
 		}
-	} else {
-		m.logsViewport.SetContent(m.logsFormatted)
+		hasContent = true
 	}
+	if m.logsErrLine != "" {
+		errFmt := formatLogLines([]string{m.logsErrLine}, m.logsViewport.Width, m.logsWrap, m.logsPretty)
+		if hasContent {
+			content += "\n\n" + errFmt // blank line before the terminal error
+		} else {
+			content = errFmt
+		}
+	}
+	return content
 }
 
 // fullReformat re-processes all content from scratch. Used when toggles change
 // or the viewport is resized, since width/mode changes affect every line.
 func (m *Model) fullReformat() {
-	m.logsRawOff = 0
+	m.logsScanned = 0
 	m.logsFormatted = ""
+	m.logFilterShown = 0
 	m.applyLogFormat()
+}
+
+// logFilterPred reconstructs the last-good filter predicate from the committed
+// state. logFilterQuery and logFilterCommittedRegex are only ever set together
+// (by recomputeLogFilter, when buildMatcher succeeded), so this always
+// reproduces a valid predicate. Regex-ness is read from logFilterCommittedRegex,
+// NOT from the live logFilterIsRegex — so a mid-type ctrl+r into a *bad* regex
+// keeps the last-good matcher rather than silently dropping the filter. Returns
+// nil (all-pass) when no filter is committed, degrading the derivation pipeline
+// to an unfiltered pass-through. buildMatcher recompiles the regex once per call
+// and the returned closure reuses it across every line inside deriveFiltered.
+func (m Model) logFilterPred() func(string) bool {
+	if m.logFilterQuery == "" {
+		return nil
+	}
+	pred, _, _ := buildMatcher(m.logFilterQuery, m.logFilterCommittedRegex, true)
+	return pred
+}
+
+// rederiveLogs re-derives the entire viewport content from the full raw buffer
+// through the current filter predicate. It is the filter-change analogue of the
+// w/p toggle path: capture AtBottom() before and re-pin to the bottom after when
+// following, so a live tail stays pinned to the filtered tail across a filter
+// change. The raw buffer is never touched — only the derived content narrows.
+func (m *Model) rederiveLogs() {
+	following := m.logsViewport.AtBottom()
+	m.fullReformat()
+	if following {
+		m.logsViewport.GotoBottom()
+	}
+}
+
+// recomputeLogFilter rebuilds the committed filter from the live input value and
+// the live regex mode, then re-derives. An empty query (or a lone "!") clears the
+// filter so every line shows again. A non-empty query that fails to compile as a
+// regex is a mid-type error: keep the last-good query/predicate (no thrash) and
+// skip the re-derive so the view holds steady. logFilterCommittedRegex records
+// whether the last-good query is a regex so logFilterPred can reproduce it.
+func (m *Model) recomputeLogFilter() {
+	newQuery := m.logFilterInput.Value()
+	stripped := newQuery
+	if strings.HasPrefix(stripped, "!") {
+		stripped = stripped[1:]
+	}
+	if stripped == "" {
+		// Empty (or lone "!") query — clear the filter, reveal everything.
+		if m.logFilterQuery != "" {
+			m.logFilterQuery = ""
+			m.logFilterCommittedRegex = false
+			m.rederiveLogs()
+		}
+		return
+	}
+	_, re, valid := buildMatcher(newQuery, m.logFilterIsRegex, true)
+	if !valid {
+		// Bad regex mid-type: keep the last-good predicate, no re-derive.
+		return
+	}
+	m.logFilterQuery = newQuery
+	m.logFilterCommittedRegex = re != nil // re non-nil only for a valid regex
+	m.rederiveLogs()
+}
+
+// clearLogFilter resets every filter field to the no-filter default. Called on
+// entry to the log screen and on the esc-to-containers cleanup, and used by the
+// typing-cancel path to discard an in-progress query.
+func (m *Model) clearLogFilter() {
+	m.logFiltering = false
+	m.logFilterQuery = ""
+	m.logFilterIsRegex = false
+	m.logFilterCommittedRegex = false
+	m.logFilterInput.SetValue("")
+	m.logFilterInput.Blur()
+}
+
+// logSearchPred reconstructs the live search predicate from the committed search
+// state. It mirrors logFilterPred but with allowNegate=false — search has no "!"
+// exclusion (that is a filter-only affordance). Regex-ness is read from
+// logSearchCommittedRegex, so a mid-type ctrl+r into a *bad* regex keeps the
+// last-good matcher. Returns nil (no highlight) when no query is active.
+func (m Model) logSearchPred() func(string) bool {
+	if m.logSearchQuery == "" {
+		return nil
+	}
+	pred, _, _ := buildMatcher(m.logSearchQuery, m.logSearchCommittedRegex, false)
+	return pred
+}
+
+// setLogViewportContent is the single SetContent chokepoint for the log screen.
+// It assembles the derived (filtered) content and — when a search is active —
+// recomputes logSearchMatches over the PHYSICAL lines and overlays the highlight
+// as a SetContent-TIME pass (logsFormatted itself stays UNSTYLED). Routing every
+// content write through here means live streaming (applyLogFormat), filter
+// re-derivation (rederiveLogs), and w/p/resize reformats all pick up the search
+// highlight and fresh match set without duplicating the split/compute/highlight
+// logic. Search runs over the filtered survivors: a line hidden by the filter
+// is absent from derivedLogContent, so it can never be a match.
+func (m *Model) setLogViewportContent() {
+	content := m.derivedLogContent()
+	// Zero-match placeholder: a committed filter with ZERO survivors
+	// (logFilterShown == 0) and no in-flight partial / terminal error to show
+	// would otherwise leave a blank viewport. Gate on the survivor COUNT, not on
+	// content == "": a filter that keeps exactly one BLANK line has an empty
+	// rendered string yet a real searchable physical line (logFilterShown == 1),
+	// so content == "" would wrongly show the placeholder and suppress search over
+	// that blank line. When zero survivors there is nothing to search, so skip the
+	// highlight pass.
+	if m.logFilterShown == 0 && m.logFilterQuery != "" && m.logsPartial == "" && m.logsErrLine == "" {
+		m.logSearchMatches = nil
+		m.logsViewport.SetContent(descStyle.Render("  (no lines match filter)"))
+		return
+	}
+	pred := m.logSearchPred()
+	if pred == nil {
+		m.logSearchMatches = nil
+		m.logsViewport.SetContent(content)
+		return
+	}
+	physical := strings.Split(content, "\n")
+	m.logSearchMatches = logComputeMatches(physical, pred)
+	// Keep the current-match cursor in range. Append-only streaming preserves
+	// existing indices (the prefix is stable), so a committed cursor holds; a
+	// filter/toggle/resize that shrinks the set clamps back to the first match.
+	if m.logSearchCur >= len(m.logSearchMatches) {
+		m.logSearchCur = 0
+	}
+	cur := -1
+	if len(m.logSearchMatches) > 0 {
+		cur = m.logSearchMatches[m.logSearchCur]
+	}
+	m.logsViewport.SetContent(strings.Join(highlightMatches(physical, m.logSearchMatches, cur), "\n"))
+}
+
+// recomputeLogSearch rebuilds the live search from the input value and regex
+// mode, re-highlights, and live-jumps to the first match. An empty query clears
+// the highlight; a bad regex mid-type keeps the last-good matcher (no thrash),
+// mirroring recomputeLogFilter. Called on every keystroke while the search bar
+// is open and on ctrl+r.
+func (m *Model) recomputeLogSearch() {
+	newQuery := m.logSearchInput.Value()
+	if newQuery == "" {
+		m.logSearchQuery = ""
+		m.logSearchCommittedRegex = false
+		m.logSearchCur = 0
+		m.setLogViewportContent() // clears matches + highlight
+		return
+	}
+	_, re, valid := buildMatcher(newQuery, m.logSearchIsRegex, false)
+	if !valid {
+		return // bad regex mid-type: keep last-good, no re-highlight
+	}
+	m.logSearchQuery = newQuery
+	m.logSearchCommittedRegex = re != nil // re non-nil only for a valid regex
+	m.logSearchCur = 0
+	m.setLogViewportContent() // recomputes logSearchMatches
+	if len(m.logSearchMatches) > 0 {
+		m.scrollLogMatchIntoView(m.logSearchMatches[0])
+	}
+}
+
+// cycleLogMatch moves the current match forward (n) or backward (N) through
+// logSearchMatches with wrap-around, scrolls the new match into view, and
+// re-highlights so the bold "current" style follows. No-op when no search is
+// committed or there are no matches. Mirrors cycleMatch (container search) but
+// over physical log-line indices with a dedicated logSearchCur cursor.
+func (m *Model) cycleLogMatch(forward bool) {
+	n := len(m.logSearchMatches)
+	if m.logSearchQuery == "" || n == 0 {
+		return
+	}
+	if forward {
+		m.logSearchCur = (m.logSearchCur + 1) % n
+	} else {
+		m.logSearchCur = (m.logSearchCur - 1 + n) % n
+	}
+	m.scrollLogMatchIntoView(m.logSearchMatches[m.logSearchCur])
+	m.setLogViewportContent()
+}
+
+// scrollLogMatchIntoView scrolls the log viewport so the given physical line is
+// visible: a no-op when it already sits within the visible window, otherwise it
+// pins the line to the top. Scrolling up off the bottom auto-pauses follow (the
+// AtBottom heuristic); G resumes. SetYOffset clamps into range, so a match near
+// the bottom lands visible without over-scrolling.
+func (m *Model) scrollLogMatchIntoView(line int) {
+	top := m.logsViewport.YOffset
+	h := m.logsViewport.Height
+	if line < top || line >= top+h {
+		m.logsViewport.SetYOffset(line)
+	}
+}
+
+// logSearchCounter renders the "(i/N)" position indicator for the search bar
+// (logBarLine renders the bar; this keeps the counter logic beside the state).
+// "(no match)" when the query matched nothing; i is 1-based (logSearchCur+1).
+func (m Model) logSearchCounter() string {
+	n := len(m.logSearchMatches)
+	if n == 0 {
+		return "(no match)"
+	}
+	return fmt.Sprintf("(%d/%d)", m.logSearchCur+1, n)
+}
+
+// logModeTag renders the active match-mode tag for the log bar: "[rx]" for regex,
+// "[literal]" for substring. Shown while an input is open so ctrl+r's toggle is
+// visible; the committed summary uses a compact "[rx]"-only form (omitted for
+// literal) instead.
+func logModeTag(isRegex bool) string {
+	if isRegex {
+		return "[rx]"
+	}
+	return "[literal]"
+}
+
+// logModeTagMaxWidth is the display width of the widest mode tag ("[literal]"),
+// reserved by the log-input width budgets so a ctrl+r toggle never shrinks the
+// input's horizontal-scroll window (mirrors searchInputWidth reserving the widest
+// counter, not the live one).
+var logModeTagMaxWidth = ansi.StringWidth(logModeTag(false))
+
+// logInputWidth is the arithmetic core of the log-bar input width budgets — the
+// analogue of searchInputWidth. It returns m.width minus the 4-col bar prefix
+// ("  / " or "  f "), the textinput's own 2-col prompt ("> "), and a
+// keystroke-stable reservation for everything the bar renders AFTER the value
+// (suffixWidth). Setting the returned value as textinput.Width on the PERSISTED
+// model lets bubbles scroll the value horizontally to keep the cursor visible.
+// Returns 0 (bubbles' "unbounded") when m.width <= 0 (unknown size, e.g. tests).
+func (m Model) logInputWidth(suffixWidth int) int {
+	if m.width <= 0 {
+		return 0
+	}
+	const prefixWidth = 4 // "  / " or "  f "
+	const promptWidth = 2 // textinput default prompt "> "
+	budget := m.width - prefixWidth - promptWidth - suffixWidth
+	if budget < 1 {
+		budget = 1
+	}
+	return budget
+}
+
+// logSearchInputWidth returns the horizontal-scroll budget for the open log
+// SEARCH input. The suffix reserves " <modeTag> <counter>" at its WIDEST stable
+// form — the widest mode tag plus the widest counter for the current raw-line
+// count. Magnitudes use len(logsRawLines) (stable per keystroke) rather than the
+// live match count so the budget — and thus bubbles' scroll offset — doesn't
+// fluctuate as matches change while typing (same rationale as maxCounterWidth).
+func (m Model) logSearchInputWidth() int {
+	n := len(m.logsRawLines)
+	counter := ansi.StringWidth("(no match)")
+	if c := ansi.StringWidth(fmt.Sprintf("(%d/%d)", n, n)); c > counter {
+		counter = c
+	}
+	suffix := 1 + logModeTagMaxWidth + 1 + counter // " " modeTag " " counter
+	return m.logInputWidth(suffix)
+}
+
+// logFilterInputWidth mirrors logSearchInputWidth for the open log FILTER input.
+// The suffix reserves the widest of " <modeTag> · N/M shown" (counts at their
+// len(logsRawLines) maximum) and " <modeTag> (bad regex)".
+func (m Model) logFilterInputWidth() int {
+	n := len(m.logsRawLines)
+	trailing := ansi.StringWidth(fmt.Sprintf(" · %d/%d shown", n, n))
+	if b := ansi.StringWidth(" (bad regex)"); b > trailing {
+		trailing = b
+	}
+	suffix := 1 + logModeTagMaxWidth + trailing // " " modeTag <trailing>
+	return m.logInputWidth(suffix)
+}
+
+// logFilterCounts returns the survivor and total RAW-line counts for the current
+// committed filter predicate. Drives the "N/M shown" segment of the log bar. It
+// counts raw logical lines (not pretty-expanded physical lines), matching how
+// the filter runs (before pretty-expansion). The survivor count is read from the
+// logFilterShown cache (maintained incrementally by applyLogFormat/fullReformat)
+// so this is O(1) per render frame rather than an O(buffered lines) rescan. With
+// no filter committed every line passes, so survivors == total (and the possibly
+// stale cache is never read).
+func (m Model) logFilterCounts() (survivors, total int) {
+	total = len(m.logsRawLines)
+	if m.logFilterQuery == "" {
+		return total, total
+	}
+	return m.logFilterShown, total
+}
+
+// logFilterBadRegex reports whether the LIVE filter input is in regex mode with a
+// non-empty query that fails to compile — the "(bad regex)" state the typing bar
+// surfaces while recomputeLogFilter holds the last-good predicate. A lone "!" (or
+// empty input) is not "bad", just incomplete.
+func (m Model) logFilterBadRegex() bool {
+	if !m.logFilterIsRegex {
+		return false
+	}
+	q := m.logFilterInput.Value()
+	if strings.TrimPrefix(q, "!") == "" {
+		return false
+	}
+	_, _, ok := buildMatcher(q, true, true)
+	return !ok
+}
+
+// logBarLine renders the reserved one-physical-line bar shown below the log
+// viewport (the log analogue of the container searchBarLine). Content precedence:
+//
+//	typing search  → "/ <q> [mode] (i/N)"                (or "(no match)")
+//	typing filter  → "f <q> [mode] · N/M shown"          (or "(bad regex)")
+//	committed      → "filter: <q> [rx] · N/M · search: <q> (i/N)"  (whichever active)
+//	idle           → "  "                                 (blank, line still reserved)
+//
+// Filter and search inputs are mutually exclusive (only one open at a time), so
+// the two typing cases never both apply. Both typing cases render the input's
+// .View() so bubbles scrolls a long query within the input (keeping the cursor +
+// newest chars visible) rather than right-clipping them; the input's Width is set
+// on the persisted model at the open/typing/resize sites (see logSearchInputWidth
+// / logFilterInputWidth), mirroring searchBarLine's two mechanisms. The
+// unconditional final clampToWidth is the hard guarantee of the one-physical-line
+// invariant at any width — a long query, long service name, or dual summary is
+// right-truncated rather than wrapped. clampToWidth is a no-op at m.width <= 0
+// (unknown test size).
+func (m Model) logBarLine() string {
+	var line string
+	switch {
+	case m.logSearching:
+		// Typing search — show the live query + mode + live (i/N) counter. Render
+		// the input's .View() (not .Value()) so bubbles scrolls the value to keep
+		// the cursor + newest chars visible; its Width is set on the PERSISTED
+		// model in the '/' open + typing-intercept + resize paths (mirrors
+		// searchBarLine — a value-receiver set here would be discarded).
+		line = fmt.Sprintf("  / %s %s %s",
+			m.logSearchInput.View(), logModeTag(m.logSearchIsRegex), m.logSearchCounter())
+	case m.logFiltering:
+		// Render .View() for the same reason as the search branch above.
+		q := m.logFilterInput.View()
+		if m.logFilterBadRegex() {
+			line = fmt.Sprintf("  f %s %s (bad regex)", q, logModeTag(true))
+		} else {
+			survivors, total := m.logFilterCounts()
+			line = fmt.Sprintf("  f %s %s · %d/%d shown",
+				q, logModeTag(m.logFilterIsRegex), survivors, total)
+		}
+	case m.logFilterQuery != "" || m.logSearchQuery != "":
+		// Committed summary — a compact recap of whichever is active. "[rx]" is
+		// appended only in regex mode (omitted for the common literal case).
+		var parts []string
+		if m.logFilterQuery != "" {
+			survivors, total := m.logFilterCounts()
+			seg := "filter: " + m.logFilterQuery
+			if m.logFilterCommittedRegex {
+				seg += " [rx]"
+			}
+			seg += fmt.Sprintf(" · %d/%d", survivors, total)
+			parts = append(parts, seg)
+		}
+		if m.logSearchQuery != "" {
+			seg := "search: " + m.logSearchQuery
+			if m.logSearchCommittedRegex {
+				seg += " [rx]"
+			}
+			seg += " " + m.logSearchCounter()
+			parts = append(parts, seg)
+		}
+		line = "  " + strings.Join(parts, " · ")
+	default:
+		line = "  "
+	}
+	return clampToWidth(line, m.width)
+}
+
+// clearLogSearch resets every search field to the no-search default. Called on
+// entry to the log screen and on the esc-to-containers cleanup, and used by the
+// typing-cancel path to discard an in-progress query.
+func (m *Model) clearLogSearch() {
+	m.logSearching = false
+	m.logSearchQuery = ""
+	m.logSearchIsRegex = false
+	m.logSearchCommittedRegex = false
+	m.logSearchMatches = nil
+	m.logSearchCur = 0
+	m.logSearchInput.SetValue("")
+	m.logSearchInput.Blur()
 }
 
 func (m Model) readLogChunk() tea.Cmd {
@@ -3270,8 +3962,8 @@ func (m Model) searchInputWidth() int {
 	if m.width <= 0 {
 		return 0
 	}
-	const prefixWidth = 4 // "  / "
-	const promptWidth = 2 // textinput default prompt "> "
+	const prefixWidth = 4                  // "  / "
+	const promptWidth = 2                  // textinput default prompt "> "
 	suffixWidth := 2 + m.maxCounterWidth() // "  " + widest counter
 	budget := m.width - prefixWidth - promptWidth - suffixWidth
 	if budget < 1 {
@@ -3377,23 +4069,41 @@ func (m Model) viewLogs() string {
 
 	b.WriteString(m.logsViewport.View())
 	b.WriteString("\n")
+	// Reserved one-physical-line bar directly under the viewport (blank when idle
+	// so the list height never jumps). The extra "\n" restores the blank
+	// separator before the help footer that helpStyle's MarginTop(1) alone used to
+	// provide — the net effect is +1 physical line, matching vpHeight's -6→-7.
+	b.WriteString(m.logBarLine())
+	b.WriteString("\n")
 
-	help := "  up/down scroll"
-	if !m.logsWrap {
-		help += "  •  <-/-> scroll"
+	var help string
+	switch {
+	case m.logSearching, m.logFiltering:
+		// While an input is open, q/n/N type literally — surface only the
+		// commit/cancel/regex affordances instead of the action-key legend.
+		help = "  enter commit  •  esc cancel  •  ctrl+r regex"
+	default:
+		help = "  up/down scroll"
+		if !m.logsWrap {
+			help += "  •  <-/-> scroll"
+		}
+		help += "  •  G bottom"
+		if m.logsWrap {
+			help += "  •  w unwrap"
+		} else {
+			help += "  •  w wrap"
+		}
+		if m.logsPretty {
+			help += "  •  p raw"
+		} else {
+			help += "  •  p pretty"
+		}
+		help += "  •  / search  •  f filter"
+		if m.logSearchQuery != "" {
+			help += "  •  n/N cycle"
+		}
+		help += "  •  q back"
 	}
-	help += "  •  G bottom"
-	if m.logsWrap {
-		help += "  •  w unwrap"
-	} else {
-		help += "  •  w wrap"
-	}
-	if m.logsPretty {
-		help += "  •  p raw"
-	} else {
-		help += "  •  p pretty"
-	}
-	help += "  •  q back"
 	b.WriteString(helpStyle.Render(help))
 	return b.String()
 }

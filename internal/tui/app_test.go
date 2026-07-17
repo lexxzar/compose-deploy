@@ -18,6 +18,7 @@ import (
 	"github.com/charmbracelet/bubbles/viewport"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
+	"github.com/charmbracelet/x/ansi"
 	"github.com/lexxzar/compose-deploy/internal/compose"
 	"github.com/lexxzar/compose-deploy/internal/config"
 	"github.com/lexxzar/compose-deploy/internal/runner"
@@ -29,12 +30,12 @@ func mockFactory(mc *mockComposer) ComposerFactory {
 }
 
 type mockComposer struct {
-	services  []string
-	status    map[string]runner.ServiceStatus
-	err       error
-	statusErr error
-	stats     map[string]runner.ServiceStats
-	statsErr  error
+	services   []string
+	status     map[string]runner.ServiceStatus
+	err        error
+	statusErr  error
+	stats      map[string]runner.ServiceStats
+	statsErr   error
 	updates    map[string]bool
 	updatesErr error
 
@@ -2144,15 +2145,21 @@ func TestLogChunkMsg_AppendsContent(t *testing.T) {
 	updated, _ := m.Update(logChunkMsg{data: []byte("line 1\n")})
 	m = updated.(Model)
 
-	if m.logsContent != "line 1\n" {
-		t.Errorf("logsContent = %q, want %q", m.logsContent, "line 1\n")
+	if got := m.logsRawLines; len(got) != 1 || got[0] != "line 1" {
+		t.Errorf("logsRawLines = %q, want [line 1]", got)
+	}
+	if m.logsPartial != "" {
+		t.Errorf("logsPartial = %q, want empty", m.logsPartial)
 	}
 
 	updated, _ = m.Update(logChunkMsg{data: []byte("line 2\n")})
 	m = updated.(Model)
 
-	if m.logsContent != "line 1\nline 2\n" {
-		t.Errorf("logsContent = %q, want %q", m.logsContent, "line 1\nline 2\n")
+	if got := m.logsRawLines; len(got) != 2 || got[0] != "line 1" || got[1] != "line 2" {
+		t.Errorf("logsRawLines = %q, want [line 1 line 2]", got)
+	}
+	if m.logsPartial != "" {
+		t.Errorf("logsPartial = %q, want empty", m.logsPartial)
 	}
 }
 
@@ -2164,6 +2171,309 @@ func logChunkContent(n int) string {
 		fmt.Fprintf(&b, "line %d\n", i)
 	}
 	return b.String()
+}
+
+// logChunkLines returns n numbered raw log lines (no trailing-newline element),
+// used to seed logsRawLines directly in tests — the raw-line-buffer equivalent
+// of logChunkContent.
+func logChunkLines(n int) []string {
+	lines := make([]string, n)
+	for i := 0; i < n; i++ {
+		lines[i] = fmt.Sprintf("line %d", i)
+	}
+	return lines
+}
+
+// TestDerivedLogContentMatchesPreRefactor pins backward compatibility: with no
+// filter, the derived viewport content is byte-identical to the pre-refactor
+// formatLogContent output across the four wrap×pretty combinations. The fixture
+// ends WITHOUT a trailing newline (partial-line parity) and includes a JSON line
+// (pretty-print parity).
+func TestDerivedLogContentMatchesPreRefactor(t *testing.T) {
+	const width = 20
+	fixture := "plain line one\n" +
+		`svc | {"level":"info","msg":"hello world","n":42}` + "\n" +
+		"another somewhat long plain line\n" +
+		"trailing partial with no newline"
+
+	for _, wrap := range []bool{false, true} {
+		for _, pretty := range []bool{false, true} {
+			wrap, pretty := wrap, pretty
+			t.Run(fmt.Sprintf("wrap=%v/pretty=%v", wrap, pretty), func(t *testing.T) {
+				var m Model
+				m.logsViewport = viewport.New(width, 20)
+				m.logsWrap = wrap
+				m.logsPretty = pretty
+				m.appendRawChunk([]byte(fixture))
+				m.applyLogFormat()
+
+				got := m.derivedLogContent()
+				want := formatLogContent(fixture, width, wrap, pretty)
+				if got != want {
+					t.Errorf("derived content mismatch\n got: %q\nwant: %q", got, want)
+				}
+			})
+		}
+	}
+}
+
+// streamBlankTest builds a fresh log model with the given committed filter/search
+// state, then either streams the chunks incrementally (appendRawChunk +
+// applyLogFormat per chunk, the production streaming path) or, when full is true,
+// appends everything and runs a single fullReformat. It returns the derived
+// viewport content and the committed search matches so callers can assert the
+// incremental result equals the full reformat.
+func streamBlankTest(chunks []string, filterQuery, searchQuery string, full bool) (string, []int) {
+	var m Model
+	m.logsViewport = viewport.New(80, 20)
+	m.logFilterQuery = filterQuery
+	m.logSearchQuery = searchQuery
+	for _, ch := range chunks {
+		m.appendRawChunk([]byte(ch))
+		if !full {
+			m.applyLogFormat()
+		}
+	}
+	if full {
+		m.fullReformat()
+	}
+	m.setLogViewportContent() // recompute search matches over the final content
+	return m.derivedLogContent(), m.logSearchMatches
+}
+
+// TestApplyLogFormat_BlankSurvivorRoundTripsAcrossChunkSplittings pins the core
+// invariant that a KEPT blank line round-trips through the incremental append
+// path identically no matter how the byte stream was chunked, and that the
+// incremental result is byte-identical to a full reformat. Before the fix,
+// applyLogFormat gated the append on delta != "", so a blank survivor line
+// (which formats to an empty delta) arriving in its own chunk was dropped and the
+// "\n" separator elided — merging the next non-blank line onto its physical row
+// and making both the rendered content and the search physical-line indices
+// depend on chunk boundaries.
+func TestApplyLogFormat_BlankSurvivorRoundTripsAcrossChunkSplittings(t *testing.T) {
+	// A raw stream with a leading-adjacent, an interior, and consecutive blank
+	// lines. Every splitting below yields the same six logical raw lines
+	// (["alpha","","beta","","","gamma"]) but delivers the bytes on different chunk
+	// boundaries — including a blank line alone in its own chunk and blank lines
+	// straddling chunk edges.
+	const stream = "alpha\n\nbeta\n\n\ngamma\n"
+
+	byteByByte := make([]string, len(stream))
+	for i := 0; i < len(stream); i++ {
+		byteByByte[i] = string(stream[i])
+	}
+	splittings := map[string][]string{
+		"all-at-once":          {stream},
+		"one-line-per-chunk":   {"alpha\n", "\n", "beta\n", "\n", "\n", "gamma\n"},
+		"blank-alone":          {"alpha\n\nbeta\n", "\n", "\ngamma\n"},
+		"blank-straddles-edge": {"alpha\n\nbe", "ta\n\n", "\ngamma\n"},
+		"byte-by-byte":         byteByByte,
+	}
+
+	variants := []struct {
+		name        string
+		filterQuery string // committed filter query ("" = none)
+		searchQuery string // committed search query ("" = none)
+	}{
+		{name: "no-filter-no-search"},
+		{name: "committed-search", searchQuery: "a"},        // matches alpha, beta, gamma
+		{name: "filter-keeps-blanks", filterQuery: "!beta"}, // drops beta; blanks pass the negated filter
+	}
+
+	for _, v := range variants {
+		v := v
+		t.Run(v.name, func(t *testing.T) {
+			// Reference: a single full reformat over the whole stream.
+			wantContent, wantMatches := streamBlankTest([]string{stream}, v.filterQuery, v.searchQuery, true)
+
+			for split, chunks := range splittings {
+				gotContent, gotMatches := streamBlankTest(chunks, v.filterQuery, v.searchQuery, false)
+				if gotContent != wantContent {
+					t.Errorf("[%s] incremental content differs from full reformat:\n got: %q\nwant: %q", split, gotContent, wantContent)
+				}
+				if !intSliceEq(gotMatches, wantMatches) {
+					t.Errorf("[%s] incremental search matches differ from full reformat: got %v, want %v", split, gotMatches, wantMatches)
+				}
+			}
+		})
+	}
+}
+
+// TestDerivedLogContent_BlankSurvivorThenPartial pins that a KEPT blank survivor
+// line followed by a trailing in-flight partial renders with the separating
+// newline preserved, identical across chunk splittings and equal to a full
+// reformat. Before the fix, derivedLogContent tested content == "" to decide the
+// partial join; a lone blank survivor has logsFormatted == "" yet logFilterShown
+// == 1, so the partial was rendered WITHOUT its leading "\n" — collapsing the
+// blank line and the partial onto one physical row.
+func TestDerivedLogContent_BlankSurvivorThenPartial(t *testing.T) {
+	const stream = "\ntail" // one blank complete line, then a partial with no newline
+
+	// Reference: single full reformat over the whole stream.
+	wantContent, _ := streamBlankTest([]string{stream}, "", "", true)
+	if wantContent != "\ntail" {
+		t.Fatalf("blank survivor + partial should render with a separating newline, got %q", wantContent)
+	}
+	physical := strings.Split(wantContent, "\n")
+	if len(physical) != 2 || physical[0] != "" || physical[1] != "tail" {
+		t.Fatalf("expected physical lines [\"\", \"tail\"], got %q", physical)
+	}
+
+	splittings := map[string][]string{
+		"all-at-once":  {stream},
+		"blank-alone":  {"\n", "tail"},
+		"byte-by-byte": {"\n", "t", "a", "i", "l"},
+	}
+	for split, chunks := range splittings {
+		gotContent, _ := streamBlankTest(chunks, "", "", false)
+		if gotContent != wantContent {
+			t.Errorf("[%s] incremental content differs from full reformat:\n got: %q\nwant: %q", split, gotContent, wantContent)
+		}
+	}
+}
+
+// TestDerivedLogContent_ErrorAfterBlankSurvivor pins that a terminal error
+// (logDoneMsg) arriving after a single KEPT blank survivor keeps the blank line
+// and the "\n\n" separator before the error. Before the fix, derivedLogContent
+// tested content == "" for the error join; a lone blank survivor has logsFormatted
+// == "" yet logFilterShown == 1, so the error rendered standalone and the blank
+// survivor plus its separator were dropped.
+func TestDerivedLogContent_ErrorAfterBlankSurvivor(t *testing.T) {
+	m := setupFilterableLogsModel()
+	// Replace the buffer with a single blank line: logsFormatted == "" but
+	// logFilterShown == 1 (a real folded survivor).
+	m.logsRawLines = []string{""}
+	m.logsPartial = ""
+	m.logsScanned = 0
+	m.logsFormatted = ""
+	m.logFilterShown = 0
+	m.logsErrLine = ""
+	m.applyLogFormat()
+
+	if m.logFilterShown != 1 {
+		t.Fatalf("precondition: expected 1 folded blank survivor, got logFilterShown=%d", m.logFilterShown)
+	}
+	if m.derivedLogContent() != "" {
+		t.Fatalf("precondition: blank survivor renders as an empty string, got %q", m.derivedLogContent())
+	}
+
+	updated, _ := m.Update(logDoneMsg{err: errors.New("connection lost"), session: m.logsSession})
+	m = updated.(Model)
+
+	content := m.derivedLogContent()
+	if !strings.HasPrefix(content, "\n\n") {
+		t.Errorf("blank survivor + separator lost before the terminal error, content = %q", content)
+	}
+	physical := strings.Split(content, "\n")
+	// Expect three physical lines: blank survivor, blank separator, error.
+	if len(physical) != 3 {
+		t.Fatalf("expected 3 physical lines (blank survivor, separator, error), got %d: %q", len(physical), physical)
+	}
+	if physical[0] != "" {
+		t.Errorf("line 0 should be the blank survivor, got %q", physical[0])
+	}
+	if !strings.Contains(physical[len(physical)-1], "connection lost") {
+		t.Errorf("last line should be the terminal error, got %q", physical[len(physical)-1])
+	}
+}
+
+// TestLogFilter_SingleBlankSurvivorNotZeroMatch pins that a committed filter which
+// keeps exactly one BLANK line is NOT treated as a zero-match: the placeholder is
+// suppressed and the blank line is a searchable physical line (`/` opens). Before
+// the fix, both the placeholder guard and the `/`-open guard tested content == "",
+// which a lone blank survivor (logFilterShown == 1) satisfies, so the UI wrongly
+// showed "(no lines match filter)" and refused to open search.
+func TestLogFilter_SingleBlankSurvivorNotZeroMatch(t *testing.T) {
+	m := setupFilterableLogsModel()
+	m.logsRawLines = []string{"noise", ""}
+	m.logsPartial = ""
+	m.logsScanned = 0
+	m.logsFormatted = ""
+	m.logFilterShown = 0
+	m.logsErrLine = ""
+	m.logFilterQuery = "!noise" // negated: drops "noise", keeps the blank line
+	m.logFilterCommittedRegex = false
+	m.applyLogFormat()
+
+	if m.logFilterShown != 1 {
+		t.Fatalf("precondition: filter should keep exactly one blank survivor, got logFilterShown=%d", m.logFilterShown)
+	}
+	if m.derivedLogContent() != "" {
+		t.Fatalf("precondition: the single blank survivor renders as an empty string, got %q", m.derivedLogContent())
+	}
+
+	// The zero-match placeholder must NOT be shown — there IS a survivor (blank).
+	m.setLogViewportContent()
+	if strings.Contains(m.logsViewport.View(), "no lines match filter") {
+		t.Error("placeholder shown for a filter that keeps one blank line; it must render the blank line instead")
+	}
+
+	// The blank line must be a searchable physical line: `/` opens the search.
+	updated, _ := m.Update(runeKey('/'))
+	m = updated.(Model)
+	if !m.logSearching {
+		t.Error("/ must open search over the single blank survivor (a real physical line)")
+	}
+}
+
+// TestLogChunkMsg_SplitLineFoldsToOneRawLine verifies a single logical line
+// delivered across two chunks (the newline arriving only in the second) folds
+// into exactly one entry in logsRawLines.
+func TestLogChunkMsg_SplitLineFoldsToOneRawLine(t *testing.T) {
+	mc := &mockComposer{services: []string{"nginx"}}
+	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
+	m.screen = screenLogs
+	m.logsService = "nginx"
+	m.logsViewport = viewport.New(80, 20)
+	pr, _ := io.Pipe()
+	m.logsPipeR = pr
+
+	// First chunk: no newline yet — retained as the partial.
+	updated, _ := m.Update(logChunkMsg{data: []byte("hello ")})
+	m = updated.(Model)
+	if len(m.logsRawLines) != 0 {
+		t.Errorf("no complete line yet, logsRawLines = %q", m.logsRawLines)
+	}
+	if m.logsPartial != "hello " {
+		t.Errorf("logsPartial = %q, want %q", m.logsPartial, "hello ")
+	}
+
+	// Second chunk completes the line — folds into exactly one raw line.
+	updated, _ = m.Update(logChunkMsg{data: []byte("world\n")})
+	m = updated.(Model)
+	if len(m.logsRawLines) != 1 || m.logsRawLines[0] != "hello world" {
+		t.Errorf("logsRawLines = %q, want [hello world]", m.logsRawLines)
+	}
+	if m.logsPartial != "" {
+		t.Errorf("logsPartial = %q, want empty", m.logsPartial)
+	}
+}
+
+// TestLogDoneErrorIsFilterExempt proves the terminal error renders even when a
+// filter hides every raw line. Task 2 has no filter wiring yet, so we stand in
+// for the Task 3 filter by folding with a reject-all predicate (leaving
+// logsFormatted empty) and assert the error, held in the dedicated exempt slot,
+// still appears in the derived content.
+func TestLogDoneErrorIsFilterExempt(t *testing.T) {
+	var m Model
+	m.logsViewport = viewport.New(80, 20)
+	m.logsRawLines = []string{"noise one", "noise two"}
+
+	reject := func(string) bool { return false }
+	delta, scanned, _ := foldNewRawLines(m.logsRawLines, m.logsScanned, m.logsViewport.Width, m.logsWrap, m.logsPretty, reject)
+	m.logsFormatted = delta
+	m.logsScanned = scanned
+	if m.logsFormatted != "" {
+		t.Fatalf("precondition: reject-all filter should leave logsFormatted empty, got %q", m.logsFormatted)
+	}
+
+	// The terminal error lands in the filter-exempt slot.
+	m.logsErrLine = "Error: connection lost"
+
+	got := m.derivedLogContent()
+	if !strings.Contains(got, "Error: connection lost") {
+		t.Errorf("terminal error must render even when the filter hides every line, got %q", got)
+	}
 }
 
 // TestLogChunkMsg_ScrolledUpDoesNotSnap verifies that when the user has scrolled
@@ -2180,7 +2490,7 @@ func TestLogChunkMsg_ScrolledUpDoesNotSnap(t *testing.T) {
 	m.logsPipeR = pr
 
 	// Fill the viewport with more content than its height so scrolling is possible.
-	m.logsContent = logChunkContent(50)
+	m.logsRawLines = logChunkLines(50)
 	m.applyLogFormat()
 	m.logsViewport.GotoBottom()
 	if !m.logsViewport.AtBottom() {
@@ -2223,7 +2533,7 @@ func TestLogChunkMsg_AtBottomFollowsTail(t *testing.T) {
 	pr, _ := io.Pipe()
 	m.logsPipeR = pr
 
-	m.logsContent = logChunkContent(50)
+	m.logsRawLines = logChunkLines(50)
 	m.applyLogFormat()
 	m.logsViewport.GotoBottom()
 	if !m.logsViewport.AtBottom() {
@@ -2254,7 +2564,7 @@ func TestLogsReformatWhileFollowingStaysPinned(t *testing.T) {
 	m.logsPipeR = pr
 
 	// Fill with more content than the viewport height so AtBottom() is meaningful.
-	m.logsContent = logChunkContent(50)
+	m.logsRawLines = logChunkLines(50)
 	m.applyLogFormat()
 	m.logsViewport.GotoBottom()
 	if !m.logsViewport.AtBottom() {
@@ -2293,7 +2603,7 @@ func TestLogsReformatWhilePausedStaysPaused(t *testing.T) {
 	pr, _ := io.Pipe()
 	m.logsPipeR = pr
 
-	m.logsContent = logChunkContent(50)
+	m.logsRawLines = logChunkLines(50)
 	m.applyLogFormat()
 	m.logsViewport.GotoBottom()
 	if m.logsViewport.TotalLineCount() <= m.logsViewport.Height {
@@ -2393,7 +2703,7 @@ func TestViewLogsIndicator(t *testing.T) {
 		m.height = 24
 		m.width = 80
 		m.logsViewport = viewport.New(80, 10)
-		m.logsContent = logChunkContent(50)
+		m.logsRawLines = logChunkLines(50)
 		m.applyLogFormat()
 		return m
 	}
@@ -2483,8 +2793,11 @@ func TestLogDoneMsg_WithError(t *testing.T) {
 	if m.logsErr.Error() != "connection lost" {
 		t.Errorf("logsErr = %q, want %q", m.logsErr.Error(), "connection lost")
 	}
-	if !strings.Contains(m.logsContent, "Error: connection lost") {
-		t.Errorf("logsContent should contain error, got %q", m.logsContent)
+	if m.logsErrLine != "Error: connection lost" {
+		t.Errorf("logsErrLine = %q, want %q", m.logsErrLine, "Error: connection lost")
+	}
+	if !strings.Contains(m.derivedLogContent(), "Error: connection lost") {
+		t.Errorf("derived content should contain error, got %q", m.derivedLogContent())
 	}
 }
 
@@ -2502,7 +2815,7 @@ func TestLogDoneMsg_WithError_ForcesScrolledUpViewToBottom(t *testing.T) {
 	m.logsViewport = viewport.New(80, 10)
 
 	// Fill with more content than the viewport height so scroll is meaningful.
-	m.logsContent = logChunkContent(50)
+	m.logsRawLines = logChunkLines(50)
 	m.applyLogFormat()
 	m.logsViewport.GotoBottom()
 	if m.logsViewport.TotalLineCount() <= m.logsViewport.Height {
@@ -2523,8 +2836,8 @@ func TestLogDoneMsg_WithError_ForcesScrolledUpViewToBottom(t *testing.T) {
 	if !m.logsViewport.AtBottom() {
 		t.Error("error logDoneMsg did not force the view to the bottom; the error would be hidden while paused")
 	}
-	if !strings.Contains(m.logsContent, "Error: connection lost") {
-		t.Errorf("logsContent should contain error, got %q", m.logsContent)
+	if !strings.Contains(m.derivedLogContent(), "Error: connection lost") {
+		t.Errorf("derived content should contain error, got %q", m.derivedLogContent())
 	}
 }
 
@@ -2551,7 +2864,7 @@ func TestLogsEsc_ReturnsToContainerScreen(t *testing.T) {
 	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
 	m.screen = screenLogs
 	m.logsService = "nginx"
-	m.logsContent = "some logs"
+	m.logsRawLines = []string{"some logs"}
 	m.logsCancel = func() {} // no-op cancel
 	m.logsDone = false
 	m.logsViewport = viewport.New(80, 20)
@@ -2565,8 +2878,8 @@ func TestLogsEsc_ReturnsToContainerScreen(t *testing.T) {
 	if m.logsService != "" {
 		t.Errorf("logsService should be cleared, got %q", m.logsService)
 	}
-	if m.logsContent != "" {
-		t.Errorf("logsContent should be cleared, got %q", m.logsContent)
+	if m.logsRawLines != nil {
+		t.Errorf("logsRawLines should be cleared, got %q", m.logsRawLines)
 	}
 	if m.logsCancel != nil {
 		t.Error("logsCancel should be nil")
@@ -2643,8 +2956,8 @@ func TestLogChunkMsg_IgnoredWhenNotOnLogScreen(t *testing.T) {
 	updated, cmd := m.Update(logChunkMsg{data: []byte("stale data")})
 	m = updated.(Model)
 
-	if m.logsContent != "" {
-		t.Errorf("logsContent should remain empty, got %q", m.logsContent)
+	if m.logsRawLines != nil || m.logsPartial != "" {
+		t.Errorf("raw buffer should remain empty, got lines=%q partial=%q", m.logsRawLines, m.logsPartial)
 	}
 	if cmd != nil {
 		t.Error("should not return a command for stale logChunkMsg")
@@ -2693,12 +3006,12 @@ func setupLogsModel() Model {
 	m.services = mc.services
 	m.composer = mc
 	m.logsService = "app"
-	m.logsContent = `app | {"level":"info","msg":"hello"}`
+	m.logsRawLines = []string{`app | {"level":"info","msg":"hello"}`}
 	m.logsWrap = true
 	m.logsPretty = false
 	m.logsViewport = viewport.New(80, 20)
 	m.logsViewport.SetHorizontalStep(0)
-	m.logsViewport.SetContent(m.logsContent)
+	m.applyLogFormat()
 	m.width = 84
 	m.height = 26
 	return m
@@ -2788,7 +3101,10 @@ func TestLogsScreen_WindowResizeReformats(t *testing.T) {
 
 func TestLogsScreen_LogChunkAppliesFormat(t *testing.T) {
 	m := setupLogsModel()
-	m.logsContent = ""
+	m.logsRawLines = nil
+	m.logsPartial = ""
+	m.logsScanned = 0
+	m.logsFormatted = ""
 	m.logsPretty = true
 	m.logsSession = 42
 
@@ -3003,36 +3319,42 @@ func TestLogsScreen_EscClearsWrapPretty(t *testing.T) {
 }
 
 // Regression: a wrapped partial line extended by the next chunk must not
-// duplicate the earlier wrapped segments (P1 corruption bug).
+// duplicate the earlier wrapped segments (P1 corruption bug). Chunk splitting
+// now happens in appendRawChunk (partial retained in logsPartial until a later
+// chunk's newline completes it).
 func TestLogsScreen_IncrementalWrapNoDuplication(t *testing.T) {
 	m := setupLogsModel()
-	m.logsContent = ""
+	m.logsRawLines = nil
+	m.logsPartial = ""
+	m.logsScanned = 0
 	m.logsFormatted = ""
-	m.logsRawOff = 0
 	m.logsWrap = true
 	m.logsPretty = false
 	m.logsViewport = viewport.New(5, 20) // width=5 to force wrapping
 	m.logsViewport.SetHorizontalStep(0)
 	m.logsSession = 1
 
-	pr, pw := io.Pipe()
-	m.logsPipeR = pr
-
-	// Chunk 1: partial line, no newline — 10 chars wraps to 2 segments
-	m.logsContent = strings.Repeat("a", 10)
+	// Chunk 1: partial line, no newline — retained in logsPartial.
+	m.appendRawChunk([]byte(strings.Repeat("a", 10)))
 	m.applyLogFormat()
-	content1 := m.logsFormatted
-	// logsFormatted should be empty (no complete lines yet)
-	if content1 != "" {
-		t.Errorf("no complete lines yet, logsFormatted should be empty, got %q", content1)
+	// No complete lines yet: the cached logsFormatted must be empty and the raw
+	// buffer must hold nothing (the 10 chars live in logsPartial).
+	if m.logsFormatted != "" {
+		t.Errorf("no complete lines yet, logsFormatted should be empty, got %q", m.logsFormatted)
+	}
+	if len(m.logsRawLines) != 0 {
+		t.Errorf("no complete lines yet, logsRawLines should be empty, got %q", m.logsRawLines)
+	}
+	if m.logsPartial != strings.Repeat("a", 10) {
+		t.Errorf("logsPartial = %q, want 10 a's", m.logsPartial)
 	}
 
-	// Chunk 2: extend the same line and complete it
-	m.logsContent = strings.Repeat("a", 10) + "bbbb\n"
+	// Chunk 2: extend the same line and complete it with a newline.
+	m.appendRawChunk([]byte("bbbb\n"))
 	m.applyLogFormat()
 
-	// The raw line "aaaaaaaaaabbbb" (14 chars) should wrap to: "aaaaa", "aaaaa", "aaaa", "bbbb"
-	// No duplicated segments
+	// The raw line "aaaaaaaaaabbbb" (14 chars) should wrap to: "aaaaa", "aaaaa",
+	// "aaaa", "bbbb" — no duplicated segments (exactly 10 'a' chars total).
 	viewContent := m.logsFormatted
 	lines := strings.Split(viewContent, "\n")
 	aCount := 0
@@ -3042,35 +3364,37 @@ func TestLogsScreen_IncrementalWrapNoDuplication(t *testing.T) {
 	if aCount != 10 {
 		t.Errorf("expected 10 'a' chars total, got %d in formatted output: %q", aCount, viewContent)
 	}
-
-	pw.Close()
-	pr.Close()
+	if m.logsPartial != "" {
+		t.Errorf("logsPartial should be empty after the newline, got %q", m.logsPartial)
+	}
 }
 
-// Verify that incremental formatting only scans new data, not the full buffer.
+// Verify that incremental formatting only scans new raw lines, advancing the
+// logsScanned raw-line cursor by the number of raw lines scanned.
 func TestLogsScreen_IncrementalOffsetAdvances(t *testing.T) {
 	m := setupLogsModel()
-	m.logsContent = ""
+	m.logsRawLines = nil
+	m.logsPartial = ""
+	m.logsScanned = 0
 	m.logsFormatted = ""
-	m.logsRawOff = 0
 	m.logsWrap = false
 	m.logsPretty = false
 	m.logsViewport = viewport.New(80, 20)
 
 	// Add two complete lines
-	m.logsContent = "line1\nline2\n"
+	m.appendRawChunk([]byte("line1\nline2\n"))
 	m.applyLogFormat()
 
-	if m.logsRawOff != 12 { // len("line1\nline2\n")
-		t.Errorf("logsRawOff = %d, want 12", m.logsRawOff)
+	if m.logsScanned != 2 {
+		t.Errorf("logsScanned = %d, want 2", m.logsScanned)
 	}
 
-	// Add a third line — offset should advance past it
-	m.logsContent += "line3\n"
+	// Add a third line — the cursor should advance past it
+	m.appendRawChunk([]byte("line3\n"))
 	m.applyLogFormat()
 
-	if m.logsRawOff != 18 { // 12 + len("line3\n")
-		t.Errorf("logsRawOff = %d, want 18", m.logsRawOff)
+	if m.logsScanned != 3 {
+		t.Errorf("logsScanned = %d, want 3", m.logsScanned)
 	}
 
 	// logsFormatted should contain all three lines
@@ -3079,6 +3403,1537 @@ func TestLogsScreen_IncrementalOffsetAdvances(t *testing.T) {
 		!strings.Contains(m.logsFormatted, "line3") {
 		t.Errorf("logsFormatted should contain all lines, got: %q", m.logsFormatted)
 	}
+}
+
+// --- Task 3: log viewer live filter (f key) -------------------------------
+
+// runeKey builds a single-rune key message (the common typing case in the
+// filter tests). Multi-rune keys (ctrl+r, enter, esc) are sent explicitly.
+func runeKey(r rune) tea.KeyMsg {
+	return tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{r}}
+}
+
+// typeInto feeds each rune of s to the model as a separate keystroke, returning
+// the updated model — mirrors how the TUI receives one KeyMsg per character.
+func typeInto(m Model, s string) Model {
+	for _, r := range s {
+		updated, _ := m.Update(runeKey(r))
+		m = updated.(Model)
+	}
+	return m
+}
+
+// setupFilterableLogsModel returns a log-screen Model seeded with a mix of
+// INFO/ERROR/WARN raw lines so filter narrowing is observable.
+func setupFilterableLogsModel() Model {
+	mc := &mockComposer{services: []string{"app"}}
+	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
+	m.screen = screenLogs
+	m.services = mc.services
+	m.composer = mc
+	m.logsService = "app"
+	m.logsWrap = true
+	m.logsPretty = false
+	m.logsViewport = viewport.New(80, 20)
+	m.logsViewport.SetHorizontalStep(0)
+	m.width = 84
+	m.height = 26
+	m.logsRawLines = []string{
+		"app | INFO starting up",
+		"app | ERROR disk full",
+		"app | INFO healthcheck ok",
+		"app | WARN retrying",
+		"app | ERROR timeout",
+	}
+	m.applyLogFormat()
+	return m
+}
+
+func TestLogFilter_FOpensInput(t *testing.T) {
+	m := setupFilterableLogsModel()
+	updated, _ := m.Update(runeKey('f'))
+	m = updated.(Model)
+	if !m.logFiltering {
+		t.Fatal("logFiltering should be true after pressing f")
+	}
+	if !m.logFilterInput.Focused() {
+		t.Error("filter input should be focused after opening")
+	}
+}
+
+func TestLogFilter_FNoopOnEmptyBuffer(t *testing.T) {
+	m := setupFilterableLogsModel()
+	m.logsRawLines = nil
+	m.logsPartial = ""
+	m.logsScanned = 0
+	m.logsFormatted = ""
+	updated, _ := m.Update(runeKey('f'))
+	m = updated.(Model)
+	if m.logFiltering {
+		t.Error("f must be a no-op when the raw buffer is empty (mirrors l/x guards)")
+	}
+}
+
+// TestLogFilter_TypingActionKeysLandInInput pins the typing intercept: while the
+// filter bar is open, q/w/p are literal characters, NOT the back/wrap/pretty
+// actions they would otherwise fire.
+func TestLogFilter_TypingActionKeysLandInInput(t *testing.T) {
+	m := setupFilterableLogsModel()
+	wrapBefore, prettyBefore := m.logsWrap, m.logsPretty
+
+	updated, _ := m.Update(runeKey('f'))
+	m = updated.(Model)
+	m = typeInto(m, "qwp")
+
+	if m.logFilterInput.Value() != "qwp" {
+		t.Errorf("input value = %q, want %q", m.logFilterInput.Value(), "qwp")
+	}
+	if m.logsWrap != wrapBefore {
+		t.Error("w must not toggle wrap while typing a filter")
+	}
+	if m.logsPretty != prettyBefore {
+		t.Error("p must not toggle pretty while typing a filter")
+	}
+	if m.screen != screenLogs {
+		t.Error("q must not navigate away while typing a filter")
+	}
+	if !m.logFiltering {
+		t.Error("should still be filtering after typing")
+	}
+}
+
+func TestLogFilter_LiveNarrowing(t *testing.T) {
+	m := setupFilterableLogsModel()
+	updated, _ := m.Update(runeKey('f'))
+	m = updated.(Model)
+	m = typeInto(m, "ERROR")
+
+	got := m.derivedLogContent()
+	if !strings.Contains(got, "disk full") || !strings.Contains(got, "timeout") {
+		t.Errorf("both ERROR lines should survive, got:\n%s", got)
+	}
+	if strings.Contains(got, "starting up") ||
+		strings.Contains(got, "healthcheck") ||
+		strings.Contains(got, "retrying") {
+		t.Errorf("non-ERROR lines should be filtered out, got:\n%s", got)
+	}
+}
+
+func TestLogFilter_CtrlRTogglesRegex(t *testing.T) {
+	m := setupFilterableLogsModel()
+	updated, _ := m.Update(runeKey('f'))
+	m = updated.(Model)
+	if m.logFilterIsRegex {
+		t.Fatal("regex mode should be off by default")
+	}
+
+	// As a substring, "ERROR|WARN" is a literal that matches no line.
+	m = typeInto(m, "ERROR|WARN")
+	if got := strings.TrimSpace(m.derivedLogContent()); got != "" {
+		t.Errorf("substring mode: literal ERROR|WARN matches nothing, got %q", got)
+	}
+
+	// Toggle to regex — the alternation now matches ERROR and WARN lines.
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyCtrlR})
+	m = updated.(Model)
+	if !m.logFilterIsRegex {
+		t.Fatal("ctrl+r should enable regex mode")
+	}
+	got := m.derivedLogContent()
+	if !strings.Contains(got, "disk full") ||
+		!strings.Contains(got, "timeout") ||
+		!strings.Contains(got, "retrying") {
+		t.Errorf("regex ERROR|WARN should match ERROR and WARN lines, got:\n%s", got)
+	}
+	if strings.Contains(got, "starting up") || strings.Contains(got, "healthcheck") {
+		t.Errorf("INFO lines should not match ERROR|WARN, got:\n%s", got)
+	}
+}
+
+// TestLogFilter_BadRegexKeepsLastGood proves a mid-type invalid regex does not
+// thrash the view: the last-good query/predicate and derived content hold.
+func TestLogFilter_BadRegexKeepsLastGood(t *testing.T) {
+	m := setupFilterableLogsModel()
+	updated, _ := m.Update(runeKey('f'))
+	m = updated.(Model)
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyCtrlR}) // regex mode
+	m = updated.(Model)
+	m = typeInto(m, "ERROR")
+
+	goodContent := m.derivedLogContent()
+	goodQuery := m.logFilterQuery
+	if goodQuery != "ERROR" {
+		t.Fatalf("precondition: query = %q, want ERROR", goodQuery)
+	}
+
+	// "[" makes the regex invalid ("ERROR[").
+	m = typeInto(m, "[")
+
+	if m.logFilterQuery != goodQuery {
+		t.Errorf("bad regex must not update logFilterQuery: got %q, want %q", m.logFilterQuery, goodQuery)
+	}
+	if m.derivedLogContent() != goodContent {
+		t.Error("bad regex must keep the last-good derived content (no thrash)")
+	}
+	if m.logFilterInput.Value() != "ERROR[" {
+		t.Errorf("input should still echo the typed text: got %q, want %q", m.logFilterInput.Value(), "ERROR[")
+	}
+}
+
+func TestLogFilter_EnterCommitsKeepsFilter(t *testing.T) {
+	m := setupFilterableLogsModel()
+	updated, _ := m.Update(runeKey('f'))
+	m = updated.(Model)
+	m = typeInto(m, "ERROR")
+
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	m = updated.(Model)
+
+	if m.logFiltering {
+		t.Error("the bar should close on enter (commit)")
+	}
+	if m.logFilterQuery != "ERROR" {
+		t.Errorf("committed query should persist, got %q", m.logFilterQuery)
+	}
+	if m.logFilterInput.Focused() {
+		t.Error("input should be blurred after commit")
+	}
+	got := m.derivedLogContent()
+	if !strings.Contains(got, "disk full") || strings.Contains(got, "starting up") {
+		t.Errorf("committed filter should still narrow the view, got:\n%s", got)
+	}
+}
+
+func TestLogFilter_EscCancelRestoresFullView(t *testing.T) {
+	m := setupFilterableLogsModel()
+	fullContent := m.derivedLogContent()
+
+	updated, _ := m.Update(runeKey('f'))
+	m = updated.(Model)
+	m = typeInto(m, "ERROR")
+	if m.derivedLogContent() == fullContent {
+		t.Fatal("precondition: the filter should have narrowed the view")
+	}
+
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyEsc})
+	m = updated.(Model)
+
+	if m.logFiltering {
+		t.Error("esc should close the filter bar")
+	}
+	if m.logFilterQuery != "" {
+		t.Errorf("esc should clear the query, got %q", m.logFilterQuery)
+	}
+	if m.screen != screenLogs {
+		t.Error("esc while typing a filter must not leave the log screen")
+	}
+	if m.derivedLogContent() != fullContent {
+		t.Errorf("esc should restore the full view:\n got %q\nwant %q", m.derivedLogContent(), fullContent)
+	}
+}
+
+func TestLogFilter_NegationExcludes(t *testing.T) {
+	m := setupFilterableLogsModel()
+	updated, _ := m.Update(runeKey('f'))
+	m = updated.(Model)
+	m = typeInto(m, "!healthcheck")
+
+	got := m.derivedLogContent()
+	if strings.Contains(got, "healthcheck") {
+		t.Errorf("!-negation should exclude the healthcheck line, got:\n%s", got)
+	}
+	if !strings.Contains(got, "starting up") ||
+		!strings.Contains(got, "disk full") ||
+		!strings.Contains(got, "retrying") ||
+		!strings.Contains(got, "timeout") {
+		t.Errorf("all non-matching lines should remain, got:\n%s", got)
+	}
+}
+
+// TestLogFilter_MatchesRawNotPrettyExpanded pins that the filter predicate runs
+// against the RAW line, before pretty-expansion. The compact JSON substring
+// `"level":"info"` exists only in the raw line — pretty-print inserts a space
+// after the colon — yet the whole pretty block still renders because the raw
+// line matched.
+func TestLogFilter_MatchesRawNotPrettyExpanded(t *testing.T) {
+	m := setupFilterableLogsModel()
+	m.logsRawLines = []string{
+		`app | {"level":"info","msg":"hello"}`,
+		`app | {"level":"debug","msg":"other"}`,
+	}
+	m.logsPretty = true // JSON expands into multiple indented physical lines
+	m.fullReformat()
+
+	updated, _ := m.Update(runeKey('f'))
+	m = updated.(Model)
+	m = typeInto(m, `"level":"info"`) // compact form: only present in the raw line
+
+	got := m.derivedLogContent()
+	if !strings.Contains(got, `"level": "info"`) || !strings.Contains(got, `"msg": "hello"`) {
+		t.Errorf("the matching raw line's full pretty block should render, got:\n%s", got)
+	}
+	if strings.Contains(got, "debug") || strings.Contains(got, "other") {
+		t.Errorf("the non-matching raw line must be filtered out, got:\n%s", got)
+	}
+}
+
+// TestLogFilter_ClearRevealsLinesStreamedWhileFiltered pins that the raw buffer
+// stays complete under an active filter: a non-matching line that streams in
+// while filtered is hidden, then revealed when the filter is cleared.
+func TestLogFilter_ClearRevealsLinesStreamedWhileFiltered(t *testing.T) {
+	m := setupFilterableLogsModel()
+	pr, _ := io.Pipe()
+	m.logsPipeR = pr
+
+	// Commit a filter that hides everything but the ERROR lines.
+	updated, _ := m.Update(runeKey('f'))
+	m = updated.(Model)
+	m = typeInto(m, "ERROR")
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	m = updated.(Model)
+	if m.logFiltering {
+		t.Fatal("precondition: filter should be committed")
+	}
+
+	// A non-matching line streams in while the filter is active.
+	updated, _ = m.Update(logChunkMsg{data: []byte("app | INFO late arrival\n")})
+	m = updated.(Model)
+	if strings.Contains(m.derivedLogContent(), "late arrival") {
+		t.Fatal("a non-matching streamed line must be hidden while filtered")
+	}
+	found := false
+	for _, l := range m.logsRawLines {
+		if strings.Contains(l, "late arrival") {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatal("the streamed line must still be present in the raw buffer")
+	}
+
+	// Clear the filter (re-open with f, then esc-cancel) — the hidden line appears.
+	updated, _ = m.Update(runeKey('f'))
+	m = updated.(Model)
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyEsc})
+	m = updated.(Model)
+	if m.logFilterQuery != "" {
+		t.Fatalf("filter should be cleared, got %q", m.logFilterQuery)
+	}
+	if !strings.Contains(m.derivedLogContent(), "late arrival") {
+		t.Errorf("clearing the filter must reveal the line streamed in while filtered, got:\n%s", m.derivedLogContent())
+	}
+}
+
+// TestLogFilter_QActsAsBackWhenNotFiltering pins the q→esc rewrite sub-case:
+// with no filter bar open, q leaves the log screen (back-nav) as before.
+func TestLogFilter_QActsAsBackWhenNotFiltering(t *testing.T) {
+	m := setupFilterableLogsModel()
+	if m.logFiltering {
+		t.Fatal("precondition: not filtering")
+	}
+	updated, _ := m.Update(runeKey('q'))
+	m = updated.(Model)
+	if m.screen != screenSelectContainers {
+		t.Errorf("q should navigate back to the container screen, got screen %d", m.screen)
+	}
+}
+
+// --- Task 4: log-view search-within-highlight ---
+
+func TestLogSearch_SlashOpensInput(t *testing.T) {
+	m := setupFilterableLogsModel()
+	updated, _ := m.Update(runeKey('/'))
+	m = updated.(Model)
+	if !m.logSearching {
+		t.Fatal("logSearching should be true after pressing /")
+	}
+	if !m.logSearchInput.Focused() {
+		t.Error("search input should be focused after opening")
+	}
+}
+
+func TestLogSearch_SlashNoopOnEmptyBuffer(t *testing.T) {
+	m := setupFilterableLogsModel()
+	m.logsRawLines = nil
+	m.logsPartial = ""
+	m.logsScanned = 0
+	m.logsFormatted = ""
+	m.logFilterShown = 0 // pairs with logsFormatted at every real reset site
+	m.logsErrLine = ""
+	if m.derivedLogContent() != "" {
+		t.Fatalf("precondition: rendered buffer should be empty, got %q", m.derivedLogContent())
+	}
+	updated, _ := m.Update(runeKey('/'))
+	m = updated.(Model)
+	if m.logSearching {
+		t.Error("/ must be a no-op when the rendered buffer is empty")
+	}
+}
+
+// TestLogSearch_TypingActionKeysLandInInput pins the typing intercept: while the
+// search bar is open, q/n/N are literal characters, NOT the back/cycle actions.
+func TestLogSearch_TypingActionKeysLandInInput(t *testing.T) {
+	m := setupFilterableLogsModel()
+	wrapBefore := m.logsWrap
+
+	updated, _ := m.Update(runeKey('/'))
+	m = updated.(Model)
+	m = typeInto(m, "qnN")
+
+	if m.logSearchInput.Value() != "qnN" {
+		t.Errorf("input value = %q, want %q", m.logSearchInput.Value(), "qnN")
+	}
+	if m.screen != screenLogs {
+		t.Error("q must not navigate away while typing a search")
+	}
+	if !m.logSearching {
+		t.Error("should still be searching after typing")
+	}
+	if m.logsWrap != wrapBefore {
+		t.Error("wrap should be unchanged while typing a search")
+	}
+}
+
+// TestLogSearch_HighlightAppliedWidthPreserved pins that a live search overlays
+// the highlight (ANSI style bytes present in the render) yet leaves each line's
+// display width unchanged (ansi.StringWidth is escape-blind).
+func TestLogSearch_HighlightAppliedWidthPreserved(t *testing.T) {
+	prev := lipgloss.ColorProfile()
+	lipgloss.SetColorProfile(termenv.TrueColor)
+	defer lipgloss.SetColorProfile(prev)
+
+	m := setupFilterableLogsModel()
+	updated, _ := m.Update(runeKey('/'))
+	m = updated.(Model)
+	m = typeInto(m, "ERROR")
+
+	if m.logSearchQuery != "ERROR" {
+		t.Fatalf("logSearchQuery = %q, want ERROR", m.logSearchQuery)
+	}
+	if !intSliceEq(m.logSearchMatches, []int{1, 4}) {
+		t.Fatalf("logSearchMatches = %v, want [1 4]", m.logSearchMatches)
+	}
+
+	if !strings.Contains(m.logsViewport.View(), "\x1b[") {
+		t.Error("expected ANSI style escapes in the highlighted viewport render")
+	}
+
+	physical := strings.Split(m.derivedLogContent(), "\n")
+	styled := highlightMatches(physical, m.logSearchMatches, m.logSearchMatches[m.logSearchCur])
+	for i := range physical {
+		if a, b := ansi.StringWidth(styled[i]), ansi.StringWidth(physical[i]); a != b {
+			t.Errorf("line %d display width changed by highlight: %d vs %d", i, a, b)
+		}
+	}
+	if styled[1] == physical[1] {
+		t.Error("a matched line should be styled (differ from its raw form)")
+	}
+}
+
+// TestLogSearch_NCyclesWithWrapAround pins n/N cycle with wrap-around over the
+// committed match set.
+func TestLogSearch_NCyclesWithWrapAround(t *testing.T) {
+	m := setupFilterableLogsModel()
+	updated, _ := m.Update(runeKey('/'))
+	m = updated.(Model)
+	m = typeInto(m, "ERROR")
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyEnter}) // commit
+	m = updated.(Model)
+
+	if len(m.logSearchMatches) != 2 {
+		t.Fatalf("want 2 matches, got %v", m.logSearchMatches)
+	}
+	if m.logSearchCur != 0 {
+		t.Fatalf("cur should start at 0 (first match), got %d", m.logSearchCur)
+	}
+
+	updated, _ = m.Update(runeKey('n')) // → second match
+	m = updated.(Model)
+	if m.logSearchCur != 1 {
+		t.Errorf("after n, cur = %d, want 1", m.logSearchCur)
+	}
+	updated, _ = m.Update(runeKey('n')) // wrap → first match
+	m = updated.(Model)
+	if m.logSearchCur != 0 {
+		t.Errorf("after n wrap, cur = %d, want 0", m.logSearchCur)
+	}
+	updated, _ = m.Update(runeKey('N')) // wrap backward → last match
+	m = updated.(Model)
+	if m.logSearchCur != 1 {
+		t.Errorf("after N from first, cur = %d, want 1 (wrap to last)", m.logSearchCur)
+	}
+}
+
+// TestLogSearch_CtrlRTogglesRegex pins the substring→regex toggle: "ERROR|WARN"
+// is a literal that matches nothing as a substring, but matches the ERROR and
+// WARN lines once regex mode is on.
+func TestLogSearch_CtrlRTogglesRegex(t *testing.T) {
+	m := setupFilterableLogsModel()
+	updated, _ := m.Update(runeKey('/'))
+	m = updated.(Model)
+	if m.logSearchIsRegex {
+		t.Fatal("regex mode should be off by default")
+	}
+
+	m = typeInto(m, "ERROR|WARN")
+	if len(m.logSearchMatches) != 0 {
+		t.Errorf("substring mode: literal ERROR|WARN matches nothing, got %v", m.logSearchMatches)
+	}
+
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyCtrlR})
+	m = updated.(Model)
+	if !m.logSearchIsRegex {
+		t.Fatal("ctrl+r should enable regex mode")
+	}
+	// ERROR lines (idx 1, 4) and the WARN line (idx 3) → 3 matches, ascending.
+	if !intSliceEq(m.logSearchMatches, []int{1, 3, 4}) {
+		t.Errorf("regex ERROR|WARN should match [1 3 4], got %v", m.logSearchMatches)
+	}
+}
+
+// TestLogSearch_BadRegexKeepsLastGood pins that a mid-type invalid regex keeps
+// the last-good query/matches (no thrash), mirroring the filter behavior.
+func TestLogSearch_BadRegexKeepsLastGood(t *testing.T) {
+	m := setupFilterableLogsModel()
+	updated, _ := m.Update(runeKey('/'))
+	m = updated.(Model)
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyCtrlR}) // regex mode
+	m = updated.(Model)
+	m = typeInto(m, "ERROR")
+
+	goodMatches := append([]int(nil), m.logSearchMatches...)
+	if m.logSearchQuery != "ERROR" {
+		t.Fatalf("precondition: query = %q, want ERROR", m.logSearchQuery)
+	}
+
+	m = typeInto(m, "[") // "ERROR[" is an invalid regex
+
+	if m.logSearchQuery != "ERROR" {
+		t.Errorf("bad regex must not update logSearchQuery: got %q", m.logSearchQuery)
+	}
+	if !intSliceEq(m.logSearchMatches, goodMatches) {
+		t.Errorf("bad regex must keep last-good matches: got %v, want %v", m.logSearchMatches, goodMatches)
+	}
+	if m.logSearchInput.Value() != "ERROR[" {
+		t.Errorf("input should still echo the typed text: got %q", m.logSearchInput.Value())
+	}
+}
+
+// TestLogSearch_RecomputesAfterFilterChange pins that committing a filter
+// re-derives the survivors AND recomputes the search match indices over them.
+func TestLogSearch_RecomputesAfterFilterChange(t *testing.T) {
+	m := setupFilterableLogsModel()
+
+	// Commit a search for "timeout" (only the last raw line, physical idx 4).
+	updated, _ := m.Update(runeKey('/'))
+	m = updated.(Model)
+	m = typeInto(m, "timeout")
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	m = updated.(Model)
+	if !intSliceEq(m.logSearchMatches, []int{4}) {
+		t.Fatalf("before filter: matches = %v, want [4]", m.logSearchMatches)
+	}
+
+	// Apply a filter for "ERROR": survivors are the two ERROR lines; "timeout"
+	// is now physical index 1 among the survivors.
+	updated, _ = m.Update(runeKey('f'))
+	m = updated.(Model)
+	m = typeInto(m, "ERROR")
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	m = updated.(Model)
+	if !intSliceEq(m.logSearchMatches, []int{1}) {
+		t.Errorf("after filter: matches = %v, want [1] (recomputed over survivors)", m.logSearchMatches)
+	}
+}
+
+// TestLogSearch_OperatesOverFilteredSurvivors pins that search runs over the
+// filtered survivors only: a term present solely on a filtered-out line yields
+// zero matches.
+func TestLogSearch_OperatesOverFilteredSurvivors(t *testing.T) {
+	m := setupFilterableLogsModel()
+
+	// Filter to ERROR lines only — this hides the "healthcheck" line.
+	updated, _ := m.Update(runeKey('f'))
+	m = updated.(Model)
+	m = typeInto(m, "ERROR")
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	m = updated.(Model)
+	if strings.Contains(m.derivedLogContent(), "healthcheck") {
+		t.Fatal("precondition: the healthcheck line should be hidden by the filter")
+	}
+
+	// Search for a term only present on the filtered-out line.
+	updated, _ = m.Update(runeKey('/'))
+	m = updated.(Model)
+	m = typeInto(m, "healthcheck")
+	if len(m.logSearchMatches) != 0 {
+		t.Errorf("a line hidden by the filter must not be a search match, got %v", m.logSearchMatches)
+	}
+}
+
+// TestLogSearch_PerPhysicalLineMatchSemantics pins the accepted per-physical-line
+// semantics: two occurrences that each fall fully within a wrapped row both
+// count; an occurrence split across a soft-wrap boundary is NOT matched.
+func TestLogSearch_PerPhysicalLineMatchSemantics(t *testing.T) {
+	t.Run("two occurrences on two wrapped rows both match", func(t *testing.T) {
+		m := setupFilterableLogsModel()
+		m.logsViewport = viewport.New(6, 20) // wrap every 6 runes
+		m.logsViewport.SetHorizontalStep(0)
+		m.logsWrap = true
+		m.logsRawLines = []string{"XYZ000XYZ"} // → "XYZ000" + "XYZ", each holds a full XYZ
+		m.fullReformat()
+
+		updated, _ := m.Update(runeKey('/'))
+		m = updated.(Model)
+		m = typeInto(m, "XYZ")
+
+		if len(m.logSearchMatches) != 2 {
+			t.Errorf("want 2 matches (one per wrapped row), got %v; physical=%q",
+				m.logSearchMatches, strings.Split(m.derivedLogContent(), "\n"))
+		}
+	})
+
+	t.Run("occurrence split across a wrap boundary is not matched", func(t *testing.T) {
+		m := setupFilterableLogsModel()
+		m.logsViewport = viewport.New(6, 20)
+		m.logsViewport.SetHorizontalStep(0)
+		m.logsWrap = true
+		m.logsRawLines = []string{"0000XYZ00"} // → "0000XY" + "Z00", XYZ straddles the split
+		m.fullReformat()
+
+		updated, _ := m.Update(runeKey('/'))
+		m = updated.(Model)
+		m = typeInto(m, "XYZ")
+
+		if len(m.logSearchMatches) != 0 {
+			t.Errorf("an occurrence split across a wrap boundary must not match, got %v; physical=%q",
+				m.logSearchMatches, strings.Split(m.derivedLogContent(), "\n"))
+		}
+	})
+}
+
+func TestLogSearch_EnterCommitsKeepsSearch(t *testing.T) {
+	m := setupFilterableLogsModel()
+	updated, _ := m.Update(runeKey('/'))
+	m = updated.(Model)
+	m = typeInto(m, "ERROR")
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	m = updated.(Model)
+
+	if m.logSearching {
+		t.Error("the bar should close on enter (commit)")
+	}
+	if m.logSearchQuery != "ERROR" {
+		t.Errorf("committed query should persist, got %q", m.logSearchQuery)
+	}
+	if m.logSearchInput.Focused() {
+		t.Error("input should be blurred after commit")
+	}
+	if len(m.logSearchMatches) != 2 {
+		t.Errorf("committed search should keep matches, got %v", m.logSearchMatches)
+	}
+}
+
+func TestLogSearch_EscCancelClearsSearch(t *testing.T) {
+	m := setupFilterableLogsModel()
+	updated, _ := m.Update(runeKey('/'))
+	m = updated.(Model)
+	m = typeInto(m, "ERROR")
+	if m.logSearchQuery != "ERROR" {
+		t.Fatal("precondition: query should be set while typing")
+	}
+
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyEsc})
+	m = updated.(Model)
+
+	if m.logSearching {
+		t.Error("esc should close the search bar")
+	}
+	if m.logSearchQuery != "" {
+		t.Errorf("esc should clear the query, got %q", m.logSearchQuery)
+	}
+	if m.logSearchMatches != nil {
+		t.Errorf("esc should clear matches, got %v", m.logSearchMatches)
+	}
+	if m.screen != screenLogs {
+		t.Error("esc while typing a search must not leave the log screen")
+	}
+}
+
+// TestLogSearch_EscToContainersClearsSearch pins the cleanup wiring: after the
+// Task 5 ladder, a committed search's first esc clears the search (rung 3, stays
+// on the screen) and a second esc leaves; the container-cleanup path (rung 5)
+// must reset all search state.
+func TestLogSearch_EscToContainersClearsSearch(t *testing.T) {
+	m := setupFilterableLogsModel()
+	updated, _ := m.Update(runeKey('/'))
+	m = updated.(Model)
+	m = typeInto(m, "ERROR")
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyEnter}) // commit
+	m = updated.(Model)
+
+	// First esc: rung 3 clears the committed search but stays on the screen.
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyEsc})
+	m = updated.(Model)
+	if m.screen != screenLogs {
+		t.Fatalf("first esc on a committed search must stay on the log screen, got screen %d", m.screen)
+	}
+	if m.logSearching || m.logSearchQuery != "" || m.logSearchMatches != nil {
+		t.Errorf("first esc must clear search state: searching=%v query=%q matches=%v",
+			m.logSearching, m.logSearchQuery, m.logSearchMatches)
+	}
+
+	// Second esc: rung 5 leaves the screen (no search/filter left to peel).
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyEsc})
+	m = updated.(Model)
+	if m.screen != screenSelectContainers {
+		t.Fatalf("second esc should return to the container screen, got screen %d", m.screen)
+	}
+	if m.logSearching || m.logSearchQuery != "" || m.logSearchMatches != nil {
+		t.Errorf("esc-to-containers must clear search state: searching=%v query=%q matches=%v",
+			m.logSearching, m.logSearchQuery, m.logSearchMatches)
+	}
+}
+
+// TestLogFilterSearch_StillWorkAfterStreamEnded pins that once the stream ends
+// (logsDone == true), the log view is still fully filterable and searchable:
+// the f and / guards key off buffer content, not the done flag, so a finished
+// (but non-empty) buffer keeps both features live.
+func TestLogFilterSearch_StillWorkAfterStreamEnded(t *testing.T) {
+	m := setupFilterableLogsModel()
+	m.logsDone = true // stream has terminated; no more chunks will arrive
+
+	// Filter still opens and narrows after the stream ended.
+	updated, _ := m.Update(runeKey('f'))
+	m = updated.(Model)
+	if !m.logFiltering {
+		t.Fatal("f must still open the filter after the stream ended")
+	}
+	m = typeInto(m, "ERROR")
+	got := m.derivedLogContent()
+	if !strings.Contains(got, "disk full") || !strings.Contains(got, "timeout") {
+		t.Errorf("filter should still narrow to ERROR lines after stream end, got:\n%s", got)
+	}
+	if strings.Contains(got, "starting up") {
+		t.Errorf("non-ERROR lines should be filtered out after stream end, got:\n%s", got)
+	}
+
+	// Clear the filter (esc while typing) so the search runs over the full view.
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyEsc})
+	m = updated.(Model)
+	if m.logFiltering || m.logFilterQuery != "" {
+		t.Fatalf("esc should cancel the filter: filtering=%v query=%q", m.logFiltering, m.logFilterQuery)
+	}
+
+	// Search still opens and matches after the stream ended.
+	updated, _ = m.Update(runeKey('/'))
+	m = updated.(Model)
+	if !m.logSearching {
+		t.Fatal("/ must still open the search after the stream ended")
+	}
+	m = typeInto(m, "ERROR")
+	if len(m.logSearchMatches) == 0 {
+		t.Error("search should still find matches after the stream ended")
+	}
+}
+
+// --- Task 5: layered esc ladder ---
+//
+// The five rungs, peeled inner → outer: (1) typing-search cancel, (2)
+// typing-filter cancel, (3) committed-search clear-only, (4) committed-filter
+// clear-only, (5) leave the screen. Each test drives one rung in isolation and
+// asserts the post-esc screen + field state; the peel-order test drives all
+// three of rungs 3/4/5 in sequence with both a filter and a search committed.
+
+// TestLogLadder_Rung1_SearchTypingEscCancels: esc while the search bar is open
+// discards the in-progress query and clears the highlight, staying on-screen.
+func TestLogLadder_Rung1_SearchTypingEscCancels(t *testing.T) {
+	m := setupFilterableLogsModel()
+	updated, _ := m.Update(runeKey('/'))
+	m = updated.(Model)
+	m = typeInto(m, "ERROR")
+	if !m.logSearching || m.logSearchQuery != "ERROR" {
+		t.Fatalf("precondition: searching=%v query=%q", m.logSearching, m.logSearchQuery)
+	}
+
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyEsc})
+	m = updated.(Model)
+
+	if m.screen != screenLogs {
+		t.Errorf("rung 1 esc must stay on the log screen, got screen %d", m.screen)
+	}
+	if m.logSearching {
+		t.Error("rung 1 esc should close the search bar")
+	}
+	if m.logSearchQuery != "" || m.logSearchMatches != nil {
+		t.Errorf("rung 1 esc should clear the search: query=%q matches=%v", m.logSearchQuery, m.logSearchMatches)
+	}
+}
+
+// TestLogLadder_Rung2_FilterTypingEscCancels: esc while the filter bar is open
+// discards the in-progress query and restores the full unfiltered view.
+func TestLogLadder_Rung2_FilterTypingEscCancels(t *testing.T) {
+	m := setupFilterableLogsModel()
+	fullContent := m.derivedLogContent()
+	updated, _ := m.Update(runeKey('f'))
+	m = updated.(Model)
+	m = typeInto(m, "ERROR")
+	if !m.logFiltering || m.derivedLogContent() == fullContent {
+		t.Fatalf("precondition: filtering=%v (view should be narrowed)", m.logFiltering)
+	}
+
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyEsc})
+	m = updated.(Model)
+
+	if m.screen != screenLogs {
+		t.Errorf("rung 2 esc must stay on the log screen, got screen %d", m.screen)
+	}
+	if m.logFiltering {
+		t.Error("rung 2 esc should close the filter bar")
+	}
+	if m.logFilterQuery != "" {
+		t.Errorf("rung 2 esc should clear the filter query, got %q", m.logFilterQuery)
+	}
+	if m.derivedLogContent() != fullContent {
+		t.Errorf("rung 2 esc should restore the full view:\n got %q\nwant %q", m.derivedLogContent(), fullContent)
+	}
+}
+
+// TestLogLadder_Rung3_CommittedSearchEscClearsOnly: with a committed search (bar
+// closed, highlights live), esc clears the search only and stays on-screen.
+func TestLogLadder_Rung3_CommittedSearchEscClearsOnly(t *testing.T) {
+	m := setupFilterableLogsModel()
+	updated, _ := m.Update(runeKey('/'))
+	m = updated.(Model)
+	m = typeInto(m, "ERROR")
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyEnter}) // commit
+	m = updated.(Model)
+	if m.logSearching || m.logSearchQuery != "ERROR" || len(m.logSearchMatches) == 0 {
+		t.Fatalf("precondition: committed search searching=%v query=%q matches=%v",
+			m.logSearching, m.logSearchQuery, m.logSearchMatches)
+	}
+
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyEsc})
+	m = updated.(Model)
+
+	if m.screen != screenLogs {
+		t.Errorf("rung 3 esc must stay on the log screen, got screen %d", m.screen)
+	}
+	if m.logSearchQuery != "" || m.logSearchMatches != nil {
+		t.Errorf("rung 3 esc should clear the committed search: query=%q matches=%v", m.logSearchQuery, m.logSearchMatches)
+	}
+}
+
+// TestLogLadder_Rung4_CommittedFilterEscClearsOnly: with a committed filter (bar
+// closed, view narrowed), esc clears the filter only, re-derives, and stays.
+func TestLogLadder_Rung4_CommittedFilterEscClearsOnly(t *testing.T) {
+	m := setupFilterableLogsModel()
+	fullContent := m.derivedLogContent()
+	updated, _ := m.Update(runeKey('f'))
+	m = updated.(Model)
+	m = typeInto(m, "ERROR")
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyEnter}) // commit
+	m = updated.(Model)
+	if m.logFiltering || m.logFilterQuery != "ERROR" || m.derivedLogContent() == fullContent {
+		t.Fatalf("precondition: committed filter filtering=%v query=%q", m.logFiltering, m.logFilterQuery)
+	}
+
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyEsc})
+	m = updated.(Model)
+
+	if m.screen != screenLogs {
+		t.Errorf("rung 4 esc must stay on the log screen, got screen %d", m.screen)
+	}
+	if m.logFilterQuery != "" {
+		t.Errorf("rung 4 esc should clear the committed filter, got %q", m.logFilterQuery)
+	}
+	if m.derivedLogContent() != fullContent {
+		t.Errorf("rung 4 esc should restore the full view:\n got %q\nwant %q", m.derivedLogContent(), fullContent)
+	}
+}
+
+// TestLogLadder_Rung5_LeaveScreen: with neither a filter nor a search active,
+// esc leaves the log screen back to the container screen (rung 5).
+func TestLogLadder_Rung5_LeaveScreen(t *testing.T) {
+	m := setupFilterableLogsModel()
+	if m.logFiltering || m.logSearching || m.logFilterQuery != "" || m.logSearchQuery != "" {
+		t.Fatal("precondition: no filter or search active")
+	}
+
+	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyEsc})
+	m = updated.(Model)
+
+	if m.screen != screenSelectContainers {
+		t.Errorf("rung 5 esc should return to the container screen, got screen %d", m.screen)
+	}
+	if m.logsRawLines != nil || m.logsService != "" {
+		t.Errorf("rung 5 esc should clear log state: rawLines=%v service=%q", m.logsRawLines, m.logsService)
+	}
+}
+
+// TestLogLadder_PeelOrder_SearchFilterLeave pins the full peel order with BOTH a
+// filter and a search committed: the first esc clears search only (filter still
+// narrows), the second clears filter only (full view restored), and only the
+// third leaves the screen.
+func TestLogLadder_PeelOrder_SearchFilterLeave(t *testing.T) {
+	m := setupFilterableLogsModel()
+	fullContent := m.derivedLogContent()
+
+	// Commit a filter that keeps only the two ERROR lines.
+	updated, _ := m.Update(runeKey('f'))
+	m = updated.(Model)
+	m = typeInto(m, "ERROR")
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	m = updated.(Model)
+	filteredContent := m.derivedLogContent()
+	if m.logFilterQuery != "ERROR" || filteredContent == fullContent {
+		t.Fatalf("precondition: filter should be committed and narrowing, query=%q", m.logFilterQuery)
+	}
+
+	// Commit a search within the filtered survivors.
+	updated, _ = m.Update(runeKey('/'))
+	m = updated.(Model)
+	m = typeInto(m, "timeout")
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	m = updated.(Model)
+	if m.logSearchQuery != "timeout" || len(m.logSearchMatches) == 0 {
+		t.Fatalf("precondition: search should be committed with matches, query=%q matches=%v",
+			m.logSearchQuery, m.logSearchMatches)
+	}
+
+	// First esc: rung 3 clears the search only; the filter still narrows.
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyEsc})
+	m = updated.(Model)
+	if m.screen != screenLogs {
+		t.Fatalf("first esc must stay on the log screen, got screen %d", m.screen)
+	}
+	if m.logSearchQuery != "" || m.logSearchMatches != nil {
+		t.Errorf("first esc must clear search: query=%q matches=%v", m.logSearchQuery, m.logSearchMatches)
+	}
+	if m.logFilterQuery != "ERROR" {
+		t.Errorf("first esc must leave the filter committed, got %q", m.logFilterQuery)
+	}
+	if m.derivedLogContent() != filteredContent {
+		t.Errorf("first esc must keep the filtered view:\n got %q\nwant %q", m.derivedLogContent(), filteredContent)
+	}
+
+	// Second esc: rung 4 clears the filter only; the full view returns.
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyEsc})
+	m = updated.(Model)
+	if m.screen != screenLogs {
+		t.Fatalf("second esc must stay on the log screen, got screen %d", m.screen)
+	}
+	if m.logFilterQuery != "" {
+		t.Errorf("second esc must clear the filter, got %q", m.logFilterQuery)
+	}
+	if m.derivedLogContent() != fullContent {
+		t.Errorf("second esc must restore the full view:\n got %q\nwant %q", m.derivedLogContent(), fullContent)
+	}
+
+	// Third esc: rung 5 leaves the screen.
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyEsc})
+	m = updated.(Model)
+	if m.screen != screenSelectContainers {
+		t.Errorf("third esc should return to the container screen, got screen %d", m.screen)
+	}
+}
+
+// TestLogLadder_QTypesLiterallyIntoFilterInput pins the q-exception in the
+// q→esc rewrite block: while the filter bar is open, q is a literal character.
+func TestLogLadder_QTypesLiterallyIntoFilterInput(t *testing.T) {
+	m := setupFilterableLogsModel()
+	updated, _ := m.Update(runeKey('f'))
+	m = updated.(Model)
+	updated, _ = m.Update(runeKey('q'))
+	m = updated.(Model)
+
+	if m.screen != screenLogs {
+		t.Errorf("q must not navigate away while the filter bar is open, got screen %d", m.screen)
+	}
+	if !m.logFiltering {
+		t.Error("q should not close the filter bar")
+	}
+	if m.logFilterInput.Value() != "q" {
+		t.Errorf("q should land in the filter input, got %q", m.logFilterInput.Value())
+	}
+}
+
+// TestLogLadder_QTypesLiterallyIntoSearchInput pins the q-exception for the
+// search bar: while the search bar is open, q is a literal character.
+func TestLogLadder_QTypesLiterallyIntoSearchInput(t *testing.T) {
+	m := setupFilterableLogsModel()
+	updated, _ := m.Update(runeKey('/'))
+	m = updated.(Model)
+	updated, _ = m.Update(runeKey('q'))
+	m = updated.(Model)
+
+	if m.screen != screenLogs {
+		t.Errorf("q must not navigate away while the search bar is open, got screen %d", m.screen)
+	}
+	if !m.logSearching {
+		t.Error("q should not close the search bar")
+	}
+	if m.logSearchInput.Value() != "q" {
+		t.Errorf("q should land in the search input, got %q", m.logSearchInput.Value())
+	}
+}
+
+// TestLogLadder_QActsAsBackWhenNoInputOpen pins that with no filter/search bar
+// open, q is rewritten to esc and leaves the log screen (rung 5, back-nav).
+func TestLogLadder_QActsAsBackWhenNoInputOpen(t *testing.T) {
+	m := setupFilterableLogsModel()
+	if m.logFiltering || m.logSearching {
+		t.Fatal("precondition: no input bar open")
+	}
+
+	updated, _ := m.Update(runeKey('q'))
+	m = updated.(Model)
+
+	if m.screen != screenSelectContainers {
+		t.Errorf("q with no input open should navigate back, got screen %d", m.screen)
+	}
+}
+
+// --- Code-review follow-ups: reopen-resets, scroll-into-view, streaming append,
+// follow-pinning, backspace/empty-enter clears, terminal-error partial flush ---
+
+// TestLogSearch_OpenOverCommittedResetsState pins that reopening `/` over a
+// committed search starts from a clean slate (empty query, no stale matches or
+// counter) and that an immediate enter cannot re-commit the old query. Mirrors
+// the container-screen TestSearchOpenOverCommittedResetsState.
+func TestLogSearch_OpenOverCommittedResetsState(t *testing.T) {
+	m := setupFilterableLogsModel()
+	updated, _ := m.Update(runeKey('/'))
+	m = updated.(Model)
+	m = typeInto(m, "ERROR")
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyEnter}) // commit
+	m = updated.(Model)
+	if m.logSearchQuery != "ERROR" || len(m.logSearchMatches) != 2 {
+		t.Fatalf("precondition: committed ERROR with 2 matches, got %q %v", m.logSearchQuery, m.logSearchMatches)
+	}
+
+	updated, _ = m.Update(runeKey('/')) // reopen
+	m = updated.(Model)
+	if !m.logSearching {
+		t.Error("logSearching should be true after reopening /")
+	}
+	if m.logSearchQuery != "" {
+		t.Errorf("query should be empty after reopen, got %q (stale leaked)", m.logSearchQuery)
+	}
+	if m.logSearchMatches != nil {
+		t.Errorf("matches should be nil after reopen, got %v (stale highlights leaked)", m.logSearchMatches)
+	}
+	if m.logSearchInput.Value() != "" {
+		t.Errorf("input should be empty after reopen, got %q", m.logSearchInput.Value())
+	}
+	if m.logSearchCounter() != "(no match)" {
+		t.Errorf("counter should reset after reopen, got %q (stale counter leaked)", m.logSearchCounter())
+	}
+
+	// An immediate enter must NOT re-commit the old query (matches empty ⇒ cleared).
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	m = updated.(Model)
+	if m.logSearchQuery != "" {
+		t.Errorf("immediate enter must not re-commit the old query, got %q", m.logSearchQuery)
+	}
+	if m.logSearching {
+		t.Error("empty enter should close the bar")
+	}
+}
+
+// TestLogFilter_OpenOverCommittedResetsState pins that reopening `f` over a
+// committed filter resets the query AND restores the full view (not a stale
+// narrowing), and that an immediate enter cannot re-commit the old filter.
+func TestLogFilter_OpenOverCommittedResetsState(t *testing.T) {
+	m := setupFilterableLogsModel()
+	fullContent := m.derivedLogContent()
+
+	updated, _ := m.Update(runeKey('f'))
+	m = updated.(Model)
+	m = typeInto(m, "ERROR")
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyEnter}) // commit
+	m = updated.(Model)
+	if m.logFilterQuery != "ERROR" {
+		t.Fatalf("precondition: committed filter ERROR, got %q", m.logFilterQuery)
+	}
+	if m.derivedLogContent() == fullContent {
+		t.Fatal("precondition: filter should have narrowed the view")
+	}
+
+	updated, _ = m.Update(runeKey('f')) // reopen
+	m = updated.(Model)
+	if !m.logFiltering {
+		t.Error("logFiltering should be true after reopening f")
+	}
+	if m.logFilterQuery != "" {
+		t.Errorf("query should be empty after reopen, got %q (stale leaked)", m.logFilterQuery)
+	}
+	if m.logFilterInput.Value() != "" {
+		t.Errorf("input should be empty after reopen, got %q", m.logFilterInput.Value())
+	}
+	if m.derivedLogContent() != fullContent {
+		t.Errorf("reopening f should restore the full view (not stay narrowed):\n got %q\nwant %q",
+			m.derivedLogContent(), fullContent)
+	}
+
+	// An immediate enter must NOT re-commit the old filter.
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	m = updated.(Model)
+	if m.logFilterQuery != "" {
+		t.Errorf("immediate enter must not re-commit the old filter, got %q", m.logFilterQuery)
+	}
+	if m.logFiltering {
+		t.Error("empty enter should close the filter bar")
+	}
+	if m.derivedLogContent() != fullContent {
+		t.Errorf("after empty commit the full view should remain, got %q", m.derivedLogContent())
+	}
+}
+
+// TestLogSearch_ScrollOffscreenMatchAutoPausesThenGResumes pins scrollLogMatchIntoView
+// and the auto-pause-on-jump behavior: with a short viewport, cycling to a match
+// below the fold scrolls it into view and pauses follow (AtBottom false); G then
+// resumes the live tail (AtBottom true).
+func TestLogSearch_ScrollOffscreenMatchAutoPausesThenGResumes(t *testing.T) {
+	m := setupFilterableLogsModel()
+	m.logsViewport = viewport.New(80, 3) // short: 3 rows visible
+	m.logsViewport.SetHorizontalStep(0)
+	lines := make([]string, 10)
+	for i := range lines {
+		lines[i] = fmt.Sprintf("app | plain row %02d", i)
+	}
+	lines[0] = "app | NEEDLE row 00" // visible at the top
+	lines[6] = "app | NEEDLE row 06" // below the fold
+	m.logsRawLines = lines
+	m.fullReformat()
+	m.logsViewport.SetYOffset(0)
+
+	updated, _ := m.Update(runeKey('/'))
+	m = updated.(Model)
+	m = typeInto(m, "NEEDLE")
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyEnter}) // commit
+	m = updated.(Model)
+	if !intSliceEq(m.logSearchMatches, []int{0, 6}) {
+		t.Fatalf("precondition: matches = %v, want [0 6]", m.logSearchMatches)
+	}
+	m.logsViewport.SetYOffset(0) // current match (0) visible at top
+	if m.logSearchCur != 0 {
+		t.Fatalf("precondition: cur = %d, want 0", m.logSearchCur)
+	}
+
+	// n → jump to the off-screen match at physical line 6.
+	updated, _ = m.Update(runeKey('n'))
+	m = updated.(Model)
+	if m.logSearchCur != 1 {
+		t.Fatalf("after n, cur = %d, want 1", m.logSearchCur)
+	}
+	if m.logsViewport.YOffset != 6 {
+		t.Errorf("YOffset = %d, want 6 (off-screen match scrolled into view / pinned to top)",
+			m.logsViewport.YOffset)
+	}
+	if m.logsViewport.AtBottom() {
+		t.Error("jumping to a mid-buffer match must auto-pause follow (AtBottom should be false)")
+	}
+
+	// G resumes follow.
+	updated, _ = m.Update(runeKey('G'))
+	m = updated.(Model)
+	if !m.logsViewport.AtBottom() {
+		t.Error("G should resume follow (AtBottom true again)")
+	}
+}
+
+// TestLogSearch_StreamingAppendGrowsMatches pins that a committed search picks up
+// a matching line that streams in after the commit: the match set grows and the
+// current-match cursor holds.
+func TestLogSearch_StreamingAppendGrowsMatches(t *testing.T) {
+	m := setupFilterableLogsModel()
+	pr, _ := io.Pipe()
+	m.logsPipeR = pr
+
+	updated, _ := m.Update(runeKey('/'))
+	m = updated.(Model)
+	m = typeInto(m, "ERROR")
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyEnter}) // commit
+	m = updated.(Model)
+	if !intSliceEq(m.logSearchMatches, []int{1, 4}) {
+		t.Fatalf("precondition: matches = %v, want [1 4]", m.logSearchMatches)
+	}
+	curBefore := m.logSearchCur
+
+	// A new ERROR line streams in — the committed search must include it.
+	updated, _ = m.Update(logChunkMsg{data: []byte("app | ERROR another failure\n")})
+	m = updated.(Model)
+	if !intSliceEq(m.logSearchMatches, []int{1, 4, 5}) {
+		t.Errorf("streamed matching line should grow matches to [1 4 5], got %v", m.logSearchMatches)
+	}
+	if m.logSearchCur != curBefore {
+		t.Errorf("current-match cursor should hold across an append, got %d want %d", m.logSearchCur, curBefore)
+	}
+}
+
+// TestLogRederive_FilterChangeFollowPinning pins the follow-aware re-pinning of
+// rederiveLogs across a filter commit and clear: a following view stays pinned to
+// the bottom, a paused view holds its YOffset (never yanked to the tail).
+func TestLogRederive_FilterChangeFollowPinning(t *testing.T) {
+	newModel := func() Model {
+		mc := &mockComposer{services: []string{"nginx"}}
+		m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
+		m.screen = screenLogs
+		m.logsService = "nginx"
+		m.height = 24
+		m.width = 84
+		m.logsViewport = viewport.New(80, 10)
+		m.logsViewport.SetHorizontalStep(0)
+		m.logsWrap = true
+		pr, _ := io.Pipe()
+		m.logsPipeR = pr
+		m.logsRawLines = logChunkLines(50) // every line contains "line"
+		m.applyLogFormat()
+		if m.logsViewport.TotalLineCount() <= m.logsViewport.Height {
+			t.Fatalf("precondition: content must exceed viewport height (lines=%d, height=%d)",
+				m.logsViewport.TotalLineCount(), m.logsViewport.Height)
+		}
+		return m
+	}
+
+	// commitFilter opens the filter, types q (kept as a no-narrowing "line" here so
+	// the survivor set == the full buffer and no YOffset clamping muddies the test),
+	// and commits.
+	commitFilter := func(m Model, q string) Model {
+		updated, _ := m.Update(runeKey('f'))
+		m = updated.(Model)
+		m = typeInto(m, q)
+		updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+		return updated.(Model)
+	}
+
+	t.Run("following stays pinned across filter commit and clear", func(t *testing.T) {
+		m := newModel()
+		m.logsViewport.GotoBottom()
+		if !m.logsViewport.AtBottom() {
+			t.Fatal("precondition: should be following (at bottom)")
+		}
+		m = commitFilter(m, "line")
+		if !m.logsViewport.AtBottom() {
+			t.Error("following view should stay pinned to the bottom across a filter commit")
+		}
+		updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyEsc}) // clear committed filter (rung 4)
+		m = updated.(Model)
+		if m.logFilterQuery != "" {
+			t.Fatalf("filter should be cleared, got %q", m.logFilterQuery)
+		}
+		if !m.logsViewport.AtBottom() {
+			t.Error("following view should stay pinned to the bottom across a filter clear")
+		}
+	})
+
+	t.Run("paused view holds YOffset across filter commit and clear", func(t *testing.T) {
+		m := newModel()
+		m.logsViewport.GotoBottom()
+		m.logsViewport.SetYOffset(m.logsViewport.YOffset - 5) // scroll up → paused
+		if m.logsViewport.AtBottom() {
+			t.Fatal("precondition: should be paused (not at bottom)")
+		}
+		off := m.logsViewport.YOffset
+
+		m = commitFilter(m, "line")
+		if m.logsViewport.AtBottom() {
+			t.Error("paused view must not snap to bottom on a filter commit")
+		}
+		if m.logsViewport.YOffset != off {
+			t.Errorf("paused YOffset should hold across a filter commit: got %d want %d",
+				m.logsViewport.YOffset, off)
+		}
+
+		updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyEsc}) // clear committed filter
+		m = updated.(Model)
+		if m.logsViewport.AtBottom() {
+			t.Error("paused view must not snap to bottom on a filter clear")
+		}
+		if m.logsViewport.YOffset != off {
+			t.Errorf("paused YOffset should hold across a filter clear: got %d want %d",
+				m.logsViewport.YOffset, off)
+		}
+	})
+}
+
+// TestLogFilter_BackspaceToEmptyRevealsFull pins the recomputeLogFilter
+// backspace-to-empty reveal branch: deleting the query back to empty clears the
+// committed filter and restores the full view (distinct from the esc-cancel path).
+func TestLogFilter_BackspaceToEmptyRevealsFull(t *testing.T) {
+	m := setupFilterableLogsModel()
+	fullContent := m.derivedLogContent()
+
+	updated, _ := m.Update(runeKey('f'))
+	m = updated.(Model)
+	m = typeInto(m, "ERROR")
+	if m.derivedLogContent() == fullContent {
+		t.Fatal("precondition: filter should have narrowed the view")
+	}
+
+	for i := 0; i < len("ERROR"); i++ {
+		updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyBackspace})
+		m = updated.(Model)
+	}
+
+	if m.logFilterInput.Value() != "" {
+		t.Errorf("input should be empty after backspacing, got %q", m.logFilterInput.Value())
+	}
+	if m.logFilterQuery != "" {
+		t.Errorf("query should clear when backspaced to empty, got %q", m.logFilterQuery)
+	}
+	if !m.logFiltering {
+		t.Error("still typing — the bar should remain open (empty, not committed)")
+	}
+	if m.derivedLogContent() != fullContent {
+		t.Errorf("backspacing to empty should restore the full view:\n got %q\nwant %q",
+			m.derivedLogContent(), fullContent)
+	}
+}
+
+// TestLogSearch_BackspaceToEmptyClearsHighlight pins the recomputeLogSearch
+// empty-query branch reached by backspacing the query away one rune at a time.
+func TestLogSearch_BackspaceToEmptyClearsHighlight(t *testing.T) {
+	m := setupFilterableLogsModel()
+	updated, _ := m.Update(runeKey('/'))
+	m = updated.(Model)
+	m = typeInto(m, "ERROR")
+	if len(m.logSearchMatches) == 0 {
+		t.Fatal("precondition: search should have matches")
+	}
+
+	for i := 0; i < len("ERROR"); i++ {
+		updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyBackspace})
+		m = updated.(Model)
+	}
+
+	if m.logSearchInput.Value() != "" {
+		t.Errorf("input should be empty after backspacing, got %q", m.logSearchInput.Value())
+	}
+	if m.logSearchQuery != "" {
+		t.Errorf("query should clear when backspaced to empty, got %q", m.logSearchQuery)
+	}
+	if m.logSearchMatches != nil {
+		t.Errorf("matches should clear when backspaced to empty, got %v", m.logSearchMatches)
+	}
+	if !m.logSearching {
+		t.Error("still typing — the bar should remain open")
+	}
+}
+
+// TestLogFilter_EmptyEnterCommitClears pins that pressing enter on an untouched
+// (empty) filter bar closes it with no filter lingering.
+func TestLogFilter_EmptyEnterCommitClears(t *testing.T) {
+	m := setupFilterableLogsModel()
+	updated, _ := m.Update(runeKey('f'))
+	m = updated.(Model)
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	m = updated.(Model)
+	if m.logFiltering {
+		t.Error("empty enter should close the filter bar")
+	}
+	if m.logFilterQuery != "" {
+		t.Errorf("no filter should linger after empty enter, got %q", m.logFilterQuery)
+	}
+	if m.logFilterInput.Value() != "" {
+		t.Errorf("input should be reset after empty enter, got %q", m.logFilterInput.Value())
+	}
+}
+
+// TestLogSearch_EmptyEnterCommitClears pins that pressing enter on an untouched
+// (empty) search bar closes it with no search state lingering.
+func TestLogSearch_EmptyEnterCommitClears(t *testing.T) {
+	m := setupFilterableLogsModel()
+	updated, _ := m.Update(runeKey('/'))
+	m = updated.(Model)
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	m = updated.(Model)
+	if m.logSearching {
+		t.Error("empty enter should close the search bar")
+	}
+	if m.logSearchQuery != "" {
+		t.Errorf("no search should linger after empty enter, got %q", m.logSearchQuery)
+	}
+	if m.logSearchMatches != nil {
+		t.Errorf("no matches should linger after empty enter, got %v", m.logSearchMatches)
+	}
+}
+
+// TestLogSearch_EnterOnNonMatchingQueryClears pins the F4 fix: committing a
+// valid-but-non-matching search drops the dead search (no lingering "(no match)"
+// counter with inert n/N), mirroring the container search's zero-match drop.
+func TestLogSearch_EnterOnNonMatchingQueryClears(t *testing.T) {
+	m := setupFilterableLogsModel()
+	updated, _ := m.Update(runeKey('/'))
+	m = updated.(Model)
+	m = typeInto(m, "zzz-no-such-term")
+	if m.logSearchQuery != "zzz-no-such-term" {
+		t.Fatalf("precondition: query set while typing, got %q", m.logSearchQuery)
+	}
+	if len(m.logSearchMatches) != 0 {
+		t.Fatalf("precondition: query should match nothing, got %v", m.logSearchMatches)
+	}
+
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyEnter}) // commit
+	m = updated.(Model)
+	if m.logSearching {
+		t.Error("bar should close on enter")
+	}
+	if m.logSearchQuery != "" {
+		t.Errorf("a non-matching search must be cleared on commit, got %q", m.logSearchQuery)
+	}
+	if m.logSearchMatches != nil {
+		t.Errorf("matches should be nil after clearing a dead search, got %v", m.logSearchMatches)
+	}
+}
+
+// TestLogDoneMsg_ErrorFlushesPartialLine pins that a terminal error flushes the
+// in-flight partial line into the raw buffer (so it is not lost) and that both the
+// flushed line and the terminal error render.
+func TestLogDoneMsg_ErrorFlushesPartialLine(t *testing.T) {
+	mc := &mockComposer{services: []string{"nginx"}}
+	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
+	m.screen = screenLogs
+	m.logsService = "nginx"
+	m.logsViewport = viewport.New(80, 20)
+
+	// A chunk with no trailing newline leaves an in-flight partial line.
+	updated, _ := m.Update(logChunkMsg{data: []byte("app | INFO partial without newline")})
+	m = updated.(Model)
+	if m.logsPartial != "app | INFO partial without newline" {
+		t.Fatalf("precondition: partial should hold the newline-less tail, got %q", m.logsPartial)
+	}
+	if len(m.logsRawLines) != 0 {
+		t.Fatalf("precondition: no complete raw line yet, got %v", m.logsRawLines)
+	}
+
+	updated, _ = m.Update(logDoneMsg{err: fmt.Errorf("stream closed")})
+	m = updated.(Model)
+	if m.logsPartial != "" {
+		t.Errorf("partial should be flushed on terminal error, got %q", m.logsPartial)
+	}
+	if len(m.logsRawLines) != 1 || m.logsRawLines[0] != "app | INFO partial without newline" {
+		t.Errorf("flushed partial should become a raw line, got %v", m.logsRawLines)
+	}
+	got := m.derivedLogContent()
+	if !strings.Contains(got, "partial without newline") {
+		t.Errorf("flushed partial should render, got %q", got)
+	}
+	if !strings.Contains(got, "Error: stream closed") {
+		t.Errorf("terminal error should render, got %q", got)
+	}
+}
+
+// TestLogDoneMsg_CleanEOFFlushesPartialLine pins that a CLEAN EOF (err == nil)
+// also folds the final unterminated line into the raw buffer, so it becomes
+// subject to the filter and the `f`/`/` open handlers are no longer blocked by
+// the empty-buffer guard when the partial is the sole content.
+func TestLogDoneMsg_CleanEOFFlushesPartialLine(t *testing.T) {
+	mc := &mockComposer{services: []string{"nginx"}}
+	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
+	m.screen = screenLogs
+	m.logsService = "nginx"
+	m.logsViewport = viewport.New(80, 20)
+
+	// A chunk with no trailing newline leaves an in-flight partial line and, as
+	// the sole content, an empty raw buffer.
+	updated, _ := m.Update(logChunkMsg{data: []byte("app | INFO final line no newline")})
+	m = updated.(Model)
+	if m.logsPartial != "app | INFO final line no newline" {
+		t.Fatalf("precondition: partial should hold the newline-less tail, got %q", m.logsPartial)
+	}
+	if len(m.logsRawLines) != 0 {
+		t.Fatalf("precondition: no complete raw line yet, got %v", m.logsRawLines)
+	}
+	// Precondition: `f` is a no-op while the raw buffer is empty (nothing to filter).
+	guard, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'f'}})
+	if guard.(Model).logFiltering {
+		t.Fatalf("precondition: `f` must not open while the raw buffer is empty")
+	}
+
+	// Clean EOF: err == nil.
+	updated, _ = m.Update(logDoneMsg{err: nil})
+	m = updated.(Model)
+	if m.logsErr != nil {
+		t.Errorf("clean EOF should not set logsErr, got %v", m.logsErr)
+	}
+	if m.logsErrLine != "" {
+		t.Errorf("clean EOF should not set logsErrLine, got %q", m.logsErrLine)
+	}
+	if m.logsPartial != "" {
+		t.Errorf("partial should be flushed on clean EOF, got %q", m.logsPartial)
+	}
+	if len(m.logsRawLines) != 1 || m.logsRawLines[0] != "app | INFO final line no newline" {
+		t.Errorf("flushed partial should become a raw line, got %v", m.logsRawLines)
+	}
+
+	// The flushed line is now filterable: `f` opens.
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'f'}})
+	m = updated.(Model)
+	if !m.logFiltering {
+		t.Errorf("`f` should open now that the flushed line populates the raw buffer")
+	}
+}
+
+// TestLogFilterCounts_IncrementalCache verifies logFilterCounts reads the
+// logFilterShown cache maintained by applyLogFormat/fullReformat: fullReformat
+// recomputes it over the whole buffer on a filter change, and a streaming append
+// grows it incrementally without a full rescan (the C2 fix). It drives the real
+// derivation path, not the cache field directly.
+func TestLogFilterCounts_IncrementalCache(t *testing.T) {
+	mc := &mockComposer{services: []string{"nginx"}}
+	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
+	m.screen = screenLogs
+	m.logsService = "nginx"
+	m.width = 80
+	m.logsViewport = viewport.New(80, 10)
+	m.logsRawLines = []string{"INFO a", "ERROR b", "INFO c", "ERROR d"}
+	m.applyLogFormat() // no filter yet
+
+	// No filter committed: survivors == total (cache not read).
+	if s, tot := m.logFilterCounts(); s != 4 || tot != 4 {
+		t.Fatalf("no-filter counts = %d/%d, want 4/4", s, tot)
+	}
+
+	// Commit an "ERROR" filter through the real path (fullReformat recomputes
+	// logFilterShown over the whole buffer).
+	m.logFilterInput = textinput.New()
+	m.logFilterInput.SetValue("ERROR")
+	m.recomputeLogFilter()
+	if s, tot := m.logFilterCounts(); s != 2 || tot != 4 {
+		t.Fatalf("committed-filter counts = %d/%d, want 2/4", s, tot)
+	}
+
+	// Stream two more raw lines (one match, one not) — the cache grows
+	// incrementally via applyLogFormat, no full rescan.
+	updated, _ := m.Update(logChunkMsg{data: []byte("ERROR e\nINFO f\n")})
+	m = updated.(Model)
+	if s, tot := m.logFilterCounts(); s != 3 || tot != 6 {
+		t.Fatalf("post-stream counts = %d/%d, want 3/6", s, tot)
+	}
+
+	// Clearing the filter reveals everything again (cache is bypassed when the
+	// query is empty).
+	m.logFilterInput.SetValue("")
+	m.recomputeLogFilter()
+	if s, tot := m.logFilterCounts(); s != 6 || tot != 6 {
+		t.Fatalf("cleared-filter counts = %d/%d, want 6/6", s, tot)
+	}
+}
+
+// intSliceEq reports whether two int slices are element-wise equal (nil and
+// empty are treated as equal).
+func intSliceEq(a, b []int) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
 }
 
 func TestShortenPath_HomeDir(t *testing.T) {
