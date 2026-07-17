@@ -296,6 +296,7 @@ func TestLogBarLineContent(t *testing.T) {
 		m.logFilterInput.SetValue("ERROR")
 		m.logFiltering = true
 		m.logFilterQuery = "ERROR" // committed last-good drives the count
+		m.logFilterShown = 2       // survivor cache (maintained by applyLogFormat in production)
 		bar := m.logBarLine()
 		for _, want := range []string{"f", "ERROR", "2/3 shown"} {
 			if !strings.Contains(bar, want) {
@@ -318,6 +319,7 @@ func TestLogBarLineContent(t *testing.T) {
 	t.Run("committed dual summary", func(t *testing.T) {
 		m := base()
 		m.logFilterQuery = "ERROR"
+		m.logFilterShown = 2 // survivor cache (maintained by applyLogFormat in production)
 		m.logSearchQuery = "timeout"
 		m.logSearchMatches = []int{0}
 		m.logSearchCur = 0

@@ -75,23 +75,25 @@ func deriveFiltered(raw []string, pred func(string) bool) []string {
 
 // foldNewRawLines folds the not-yet-processed tail of the raw buffer
 // (raw[scanned:]) through the filter predicate and the wrap/pretty formatter,
-// returning the formatted delta to append to the cached content and the new
-// scan cursor.
+// returning the formatted delta to append to the cached content, the new scan
+// cursor, and the number of survivors folded in this delta (so the caller can
+// maintain a running survivor count incrementally rather than rescanning the
+// whole buffer per render frame).
 //
 // The cursor ALWAYS advances to len(raw): it counts raw lines scanned, not
 // survivors folded. This is the survivor-cursor trap — if L0(pass), L1(fail),
 // L2(pass) arrive, advancing by survivor count (2) instead of raw count (3)
 // would re-scan the already-filtered L1 on the next call and duplicate output.
 // A nil pred (no active filter) passes every line.
-func foldNewRawLines(raw []string, scanned, width int, wrap, pretty bool, pred func(string) bool) (delta string, newScanned int) {
+func foldNewRawLines(raw []string, scanned, width int, wrap, pretty bool, pred func(string) bool) (delta string, newScanned, survivors int) {
 	if scanned >= len(raw) {
-		return "", scanned
+		return "", scanned, 0
 	}
-	survivors := deriveFiltered(raw[scanned:], pred)
-	if len(survivors) == 0 {
-		return "", len(raw)
+	kept := deriveFiltered(raw[scanned:], pred)
+	if len(kept) == 0 {
+		return "", len(raw), 0
 	}
-	return formatLogLines(survivors, width, wrap, pretty), len(raw)
+	return formatLogLines(kept, width, wrap, pretty), len(raw), len(kept)
 }
 
 // logComputeMatches returns the ascending indices of physical lines matched by

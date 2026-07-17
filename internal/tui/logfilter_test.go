@@ -323,7 +323,7 @@ func TestFoldNewRawLines_CursorAdvancesByRawCount(t *testing.T) {
 	raw := []string{"keep0", "drop1", "keep2"}
 	pred := func(s string) bool { return !strings.Contains(s, "drop") }
 
-	delta, scanned := foldNewRawLines(raw, 0, 80, false, false, pred)
+	delta, scanned, survivors := foldNewRawLines(raw, 0, 80, false, false, pred)
 	// Survivors: keep0, keep2 (2 lines). The cursor MUST advance to 3 (raw
 	// count), not 2 (survivor count).
 	if scanned != 3 {
@@ -332,26 +332,37 @@ func TestFoldNewRawLines_CursorAdvancesByRawCount(t *testing.T) {
 	if delta != "keep0\nkeep2" {
 		t.Errorf("delta = %q, want %q", delta, "keep0\nkeep2")
 	}
+	// The survivor count is the incremental signal the caller accumulates into
+	// logFilterShown — it MUST report folded survivors (2), not raw scanned (3).
+	if survivors != 2 {
+		t.Errorf("survivors = %d, want 2 (folded survivors, not raw count)", survivors)
+	}
 
 	// A second fold from the advanced cursor sees no new lines — empty delta,
-	// cursor unchanged. This is the anti-duplication guarantee.
-	delta2, scanned2 := foldNewRawLines(raw, scanned, 80, false, false, pred)
+	// cursor unchanged, zero survivors. This is the anti-duplication guarantee.
+	delta2, scanned2, survivors2 := foldNewRawLines(raw, scanned, 80, false, false, pred)
 	if delta2 != "" {
 		t.Errorf("second fold delta = %q, want empty (no new raw lines)", delta2)
 	}
 	if scanned2 != 3 {
 		t.Errorf("second fold newScanned = %d, want 3", scanned2)
 	}
+	if survivors2 != 0 {
+		t.Errorf("second fold survivors = %d, want 0 (no new raw lines)", survivors2)
+	}
 }
 
 func TestFoldNewRawLines_NilPredPassesAll(t *testing.T) {
 	raw := []string{"a", "b", "c"}
-	delta, scanned := foldNewRawLines(raw, 0, 80, false, false, nil)
+	delta, scanned, survivors := foldNewRawLines(raw, 0, 80, false, false, nil)
 	if delta != "a\nb\nc" {
 		t.Errorf("delta = %q, want %q", delta, "a\nb\nc")
 	}
 	if scanned != 3 {
 		t.Errorf("newScanned = %d, want 3", scanned)
+	}
+	if survivors != 3 {
+		t.Errorf("survivors = %d, want 3 (nil pred passes all)", survivors)
 	}
 }
 
@@ -361,19 +372,22 @@ func TestFoldNewRawLines_NilPredPassesAll(t *testing.T) {
 func TestFoldNewRawLines_AllFilteredStillAdvances(t *testing.T) {
 	raw := []string{"x", "y"}
 	reject := func(string) bool { return false }
-	delta, scanned := foldNewRawLines(raw, 0, 80, false, false, reject)
+	delta, scanned, survivors := foldNewRawLines(raw, 0, 80, false, false, reject)
 	if delta != "" {
 		t.Errorf("delta = %q, want empty (all filtered)", delta)
 	}
 	if scanned != 2 {
 		t.Errorf("newScanned = %d, want 2 (cursor advances even when all lines filtered)", scanned)
 	}
+	if survivors != 0 {
+		t.Errorf("survivors = %d, want 0 (all filtered)", survivors)
+	}
 }
 
 func TestFoldNewRawLines_NothingNewIsNoop(t *testing.T) {
 	raw := []string{"a", "b"}
-	delta, scanned := foldNewRawLines(raw, 2, 80, false, false, nil)
-	if delta != "" || scanned != 2 {
-		t.Errorf("fold with scanned==len should be a no-op, got delta=%q scanned=%d", delta, scanned)
+	delta, scanned, survivors := foldNewRawLines(raw, 2, 80, false, false, nil)
+	if delta != "" || scanned != 2 || survivors != 0 {
+		t.Errorf("fold with scanned==len should be a no-op, got delta=%q scanned=%d survivors=%d", delta, scanned, survivors)
 	}
 }

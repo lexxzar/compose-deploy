@@ -2261,7 +2261,7 @@ func TestLogDoneErrorIsFilterExempt(t *testing.T) {
 	m.logsRawLines = []string{"noise one", "noise two"}
 
 	reject := func(string) bool { return false }
-	delta, scanned := foldNewRawLines(m.logsRawLines, m.logsScanned, m.logsViewport.Width, m.logsWrap, m.logsPretty, reject)
+	delta, scanned, _ := foldNewRawLines(m.logsRawLines, m.logsScanned, m.logsViewport.Width, m.logsWrap, m.logsPretty, reject)
 	m.logsFormatted = delta
 	m.logsScanned = scanned
 	if m.logsFormatted != "" {
@@ -4622,6 +4622,103 @@ func TestLogDoneMsg_ErrorFlushesPartialLine(t *testing.T) {
 	}
 	if !strings.Contains(got, "Error: stream closed") {
 		t.Errorf("terminal error should render, got %q", got)
+	}
+}
+
+// TestLogDoneMsg_CleanEOFFlushesPartialLine pins that a CLEAN EOF (err == nil)
+// also folds the final unterminated line into the raw buffer, so it becomes
+// subject to the filter and the `f`/`/` open handlers are no longer blocked by
+// the empty-buffer guard when the partial is the sole content.
+func TestLogDoneMsg_CleanEOFFlushesPartialLine(t *testing.T) {
+	mc := &mockComposer{services: []string{"nginx"}}
+	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
+	m.screen = screenLogs
+	m.logsService = "nginx"
+	m.logsViewport = viewport.New(80, 20)
+
+	// A chunk with no trailing newline leaves an in-flight partial line and, as
+	// the sole content, an empty raw buffer.
+	updated, _ := m.Update(logChunkMsg{data: []byte("app | INFO final line no newline")})
+	m = updated.(Model)
+	if m.logsPartial != "app | INFO final line no newline" {
+		t.Fatalf("precondition: partial should hold the newline-less tail, got %q", m.logsPartial)
+	}
+	if len(m.logsRawLines) != 0 {
+		t.Fatalf("precondition: no complete raw line yet, got %v", m.logsRawLines)
+	}
+	// Precondition: `f` is a no-op while the raw buffer is empty (nothing to filter).
+	guard, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'f'}})
+	if guard.(Model).logFiltering {
+		t.Fatalf("precondition: `f` must not open while the raw buffer is empty")
+	}
+
+	// Clean EOF: err == nil.
+	updated, _ = m.Update(logDoneMsg{err: nil})
+	m = updated.(Model)
+	if m.logsErr != nil {
+		t.Errorf("clean EOF should not set logsErr, got %v", m.logsErr)
+	}
+	if m.logsErrLine != "" {
+		t.Errorf("clean EOF should not set logsErrLine, got %q", m.logsErrLine)
+	}
+	if m.logsPartial != "" {
+		t.Errorf("partial should be flushed on clean EOF, got %q", m.logsPartial)
+	}
+	if len(m.logsRawLines) != 1 || m.logsRawLines[0] != "app | INFO final line no newline" {
+		t.Errorf("flushed partial should become a raw line, got %v", m.logsRawLines)
+	}
+
+	// The flushed line is now filterable: `f` opens.
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'f'}})
+	m = updated.(Model)
+	if !m.logFiltering {
+		t.Errorf("`f` should open now that the flushed line populates the raw buffer")
+	}
+}
+
+// TestLogFilterCounts_IncrementalCache verifies logFilterCounts reads the
+// logFilterShown cache maintained by applyLogFormat/fullReformat: fullReformat
+// recomputes it over the whole buffer on a filter change, and a streaming append
+// grows it incrementally without a full rescan (the C2 fix). It drives the real
+// derivation path, not the cache field directly.
+func TestLogFilterCounts_IncrementalCache(t *testing.T) {
+	mc := &mockComposer{services: []string{"nginx"}}
+	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
+	m.screen = screenLogs
+	m.logsService = "nginx"
+	m.width = 80
+	m.logsViewport = viewport.New(80, 10)
+	m.logsRawLines = []string{"INFO a", "ERROR b", "INFO c", "ERROR d"}
+	m.applyLogFormat() // no filter yet
+
+	// No filter committed: survivors == total (cache not read).
+	if s, tot := m.logFilterCounts(); s != 4 || tot != 4 {
+		t.Fatalf("no-filter counts = %d/%d, want 4/4", s, tot)
+	}
+
+	// Commit an "ERROR" filter through the real path (fullReformat recomputes
+	// logFilterShown over the whole buffer).
+	m.logFilterInput = textinput.New()
+	m.logFilterInput.SetValue("ERROR")
+	m.recomputeLogFilter()
+	if s, tot := m.logFilterCounts(); s != 2 || tot != 4 {
+		t.Fatalf("committed-filter counts = %d/%d, want 2/4", s, tot)
+	}
+
+	// Stream two more raw lines (one match, one not) — the cache grows
+	// incrementally via applyLogFormat, no full rescan.
+	updated, _ := m.Update(logChunkMsg{data: []byte("ERROR e\nINFO f\n")})
+	m = updated.(Model)
+	if s, tot := m.logFilterCounts(); s != 3 || tot != 6 {
+		t.Fatalf("post-stream counts = %d/%d, want 3/6", s, tot)
+	}
+
+	// Clearing the filter reveals everything again (cache is bypassed when the
+	// query is empty).
+	m.logFilterInput.SetValue("")
+	m.recomputeLogFilter()
+	if s, tot := m.logFilterCounts(); s != 6 || tot != 6 {
+		t.Fatalf("cleared-filter counts = %d/%d, want 6/6", s, tot)
 	}
 }
 

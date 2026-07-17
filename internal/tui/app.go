@@ -276,6 +276,7 @@ type Model struct {
 	logFilterQuery          string          // last-good committed query; != "" ⇒ filter active
 	logFilterIsRegex        bool            // live/desired mode; ctrl+r toggles (regex vs. substring)
 	logFilterCommittedRegex bool            // whether the last-good committed query is a regex; source of truth for regex-ness in logFilterPred (NOT the live logFilterIsRegex)
+	logFilterShown          int             // cached survivor count for the committed filter; maintained incrementally by applyLogFormat/fullReformat, read by logFilterCounts (O(1) per frame, only meaningful when logFilterQuery != "")
 
 	// Screen: logs — search-within-highlight (see clearLogSearch/logSearchPred/recomputeLogSearch)
 	logSearching            bool            // search bar open, capturing text
@@ -931,19 +932,35 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 		m.logsDone = true
+		// Flush any in-flight partial line (a final line with no trailing newline)
+		// into the raw buffer on BOTH clean and error EOF. Without this, the last
+		// unterminated line would render (via derivedLogContent's unfiltered
+		// partial slot) but permanently bypass the filter; and if it were the sole
+		// content, logsRawLines would stay empty and the `f`/`/` open handlers'
+		// empty-buffer guard would refuse to open. Capture the follow state before
+		// re-deriving so a live tail stays pinned to the (now filtered) bottom.
+		following := m.logsViewport.AtBottom()
+		flushed := false
+		if m.logsPartial != "" {
+			m.logsRawLines = append(m.logsRawLines, m.logsPartial)
+			m.logsPartial = ""
+			flushed = true
+		}
 		if msg.err != nil {
 			m.logsErr = msg.err
-			// Flush any in-flight partial line into the buffer so it is not lost.
-			if m.logsPartial != "" {
-				m.logsRawLines = append(m.logsRawLines, m.logsPartial)
-				m.logsPartial = ""
-			}
 			// The terminal error is filter-exempt: it must render regardless of an
 			// active filter, so it lives in a dedicated slot outside the filterable
 			// raw-line buffer.
 			m.logsErrLine = fmt.Sprintf("Error: %v", msg.err)
 			m.applyLogFormat()
 			m.logsViewport.GotoBottom() // force the error into view even if paused
+			return m, nil
+		}
+		if flushed {
+			m.applyLogFormat() // subject the flushed line to the filter
+			if following {
+				m.logsViewport.GotoBottom()
+			}
 		}
 		return m, nil
 
@@ -1656,6 +1673,7 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.logsPartial = ""
 			m.logsScanned = 0
 			m.logsFormatted = ""
+			m.logFilterShown = 0
 			m.logsErrLine = ""
 			m.clearLogFilter()
 			m.clearLogSearch()
@@ -2237,6 +2255,7 @@ func (m *Model) enterLogs() (tea.Model, tea.Cmd) {
 	m.logsPartial = ""
 	m.logsScanned = 0
 	m.logsFormatted = ""
+	m.logFilterShown = 0
 	m.logsErrLine = ""
 	m.clearLogFilter()
 	m.clearLogSearch()
@@ -2299,7 +2318,7 @@ func (m *Model) appendRawChunk(data []byte) {
 // to the unfiltered pipeline. Call fullReformat() when the filter, toggles, or
 // width change.
 func (m *Model) applyLogFormat() {
-	delta, newScanned := foldNewRawLines(m.logsRawLines, m.logsScanned, m.logsViewport.Width, m.logsWrap, m.logsPretty, m.logFilterPred())
+	delta, newScanned, survivors := foldNewRawLines(m.logsRawLines, m.logsScanned, m.logsViewport.Width, m.logsWrap, m.logsPretty, m.logFilterPred())
 	if delta != "" {
 		if m.logsFormatted == "" {
 			m.logsFormatted = delta
@@ -2308,6 +2327,10 @@ func (m *Model) applyLogFormat() {
 		}
 	}
 	m.logsScanned = newScanned
+	// Accumulate the survivor count incrementally so logFilterCounts is O(1) per
+	// render frame instead of rescanning the whole buffer. fullReformat resets
+	// this to 0 before re-accumulating over the full buffer.
+	m.logFilterShown += survivors
 	m.setLogViewportContent()
 }
 
@@ -2341,6 +2364,7 @@ func (m *Model) derivedLogContent() string {
 func (m *Model) fullReformat() {
 	m.logsScanned = 0
 	m.logsFormatted = ""
+	m.logFilterShown = 0
 	m.applyLogFormat()
 }
 
@@ -2609,21 +2633,19 @@ func (m Model) logFilterInputWidth() int {
 }
 
 // logFilterCounts returns the survivor and total RAW-line counts for the current
-// committed filter predicate (nil pred ⇒ every line passes). Drives the "N/M
-// shown" segment of the log bar. It counts raw logical lines (not pretty-expanded
-// physical lines), matching how the filter runs (before pretty-expansion).
+// committed filter predicate. Drives the "N/M shown" segment of the log bar. It
+// counts raw logical lines (not pretty-expanded physical lines), matching how
+// the filter runs (before pretty-expansion). The survivor count is read from the
+// logFilterShown cache (maintained incrementally by applyLogFormat/fullReformat)
+// so this is O(1) per render frame rather than an O(buffered lines) rescan. With
+// no filter committed every line passes, so survivors == total (and the possibly
+// stale cache is never read).
 func (m Model) logFilterCounts() (survivors, total int) {
 	total = len(m.logsRawLines)
-	pred := m.logFilterPred()
-	if pred == nil {
+	if m.logFilterQuery == "" {
 		return total, total
 	}
-	for _, line := range m.logsRawLines {
-		if pred(line) {
-			survivors++
-		}
-	}
-	return survivors, total
+	return m.logFilterShown, total
 }
 
 // logFilterBadRegex reports whether the LIVE filter input is in regex mode with a
