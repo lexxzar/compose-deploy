@@ -4194,6 +4194,437 @@ func TestLogLadder_QActsAsBackWhenNoInputOpen(t *testing.T) {
 	}
 }
 
+// --- Code-review follow-ups: reopen-resets, scroll-into-view, streaming append,
+// follow-pinning, backspace/empty-enter clears, terminal-error partial flush ---
+
+// TestLogSearch_OpenOverCommittedResetsState pins that reopening `/` over a
+// committed search starts from a clean slate (empty query, no stale matches or
+// counter) and that an immediate enter cannot re-commit the old query. Mirrors
+// the container-screen TestSearchOpenOverCommittedResetsState.
+func TestLogSearch_OpenOverCommittedResetsState(t *testing.T) {
+	m := setupFilterableLogsModel()
+	updated, _ := m.Update(runeKey('/'))
+	m = updated.(Model)
+	m = typeInto(m, "ERROR")
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyEnter}) // commit
+	m = updated.(Model)
+	if m.logSearchQuery != "ERROR" || len(m.logSearchMatches) != 2 {
+		t.Fatalf("precondition: committed ERROR with 2 matches, got %q %v", m.logSearchQuery, m.logSearchMatches)
+	}
+
+	updated, _ = m.Update(runeKey('/')) // reopen
+	m = updated.(Model)
+	if !m.logSearching {
+		t.Error("logSearching should be true after reopening /")
+	}
+	if m.logSearchQuery != "" {
+		t.Errorf("query should be empty after reopen, got %q (stale leaked)", m.logSearchQuery)
+	}
+	if m.logSearchMatches != nil {
+		t.Errorf("matches should be nil after reopen, got %v (stale highlights leaked)", m.logSearchMatches)
+	}
+	if m.logSearchInput.Value() != "" {
+		t.Errorf("input should be empty after reopen, got %q", m.logSearchInput.Value())
+	}
+	if m.logSearchCounter() != "(no match)" {
+		t.Errorf("counter should reset after reopen, got %q (stale counter leaked)", m.logSearchCounter())
+	}
+
+	// An immediate enter must NOT re-commit the old query (matches empty ⇒ cleared).
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	m = updated.(Model)
+	if m.logSearchQuery != "" {
+		t.Errorf("immediate enter must not re-commit the old query, got %q", m.logSearchQuery)
+	}
+	if m.logSearching {
+		t.Error("empty enter should close the bar")
+	}
+}
+
+// TestLogFilter_OpenOverCommittedResetsState pins that reopening `f` over a
+// committed filter resets the query AND restores the full view (not a stale
+// narrowing), and that an immediate enter cannot re-commit the old filter.
+func TestLogFilter_OpenOverCommittedResetsState(t *testing.T) {
+	m := setupFilterableLogsModel()
+	fullContent := m.derivedLogContent()
+
+	updated, _ := m.Update(runeKey('f'))
+	m = updated.(Model)
+	m = typeInto(m, "ERROR")
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyEnter}) // commit
+	m = updated.(Model)
+	if m.logFilterQuery != "ERROR" {
+		t.Fatalf("precondition: committed filter ERROR, got %q", m.logFilterQuery)
+	}
+	if m.derivedLogContent() == fullContent {
+		t.Fatal("precondition: filter should have narrowed the view")
+	}
+
+	updated, _ = m.Update(runeKey('f')) // reopen
+	m = updated.(Model)
+	if !m.logFiltering {
+		t.Error("logFiltering should be true after reopening f")
+	}
+	if m.logFilterQuery != "" {
+		t.Errorf("query should be empty after reopen, got %q (stale leaked)", m.logFilterQuery)
+	}
+	if m.logFilterInput.Value() != "" {
+		t.Errorf("input should be empty after reopen, got %q", m.logFilterInput.Value())
+	}
+	if m.derivedLogContent() != fullContent {
+		t.Errorf("reopening f should restore the full view (not stay narrowed):\n got %q\nwant %q",
+			m.derivedLogContent(), fullContent)
+	}
+
+	// An immediate enter must NOT re-commit the old filter.
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	m = updated.(Model)
+	if m.logFilterQuery != "" {
+		t.Errorf("immediate enter must not re-commit the old filter, got %q", m.logFilterQuery)
+	}
+	if m.logFiltering {
+		t.Error("empty enter should close the filter bar")
+	}
+	if m.derivedLogContent() != fullContent {
+		t.Errorf("after empty commit the full view should remain, got %q", m.derivedLogContent())
+	}
+}
+
+// TestLogSearch_ScrollOffscreenMatchAutoPausesThenGResumes pins scrollLogMatchIntoView
+// and the auto-pause-on-jump behavior: with a short viewport, cycling to a match
+// below the fold scrolls it into view and pauses follow (AtBottom false); G then
+// resumes the live tail (AtBottom true).
+func TestLogSearch_ScrollOffscreenMatchAutoPausesThenGResumes(t *testing.T) {
+	m := setupFilterableLogsModel()
+	m.logsViewport = viewport.New(80, 3) // short: 3 rows visible
+	m.logsViewport.SetHorizontalStep(0)
+	lines := make([]string, 10)
+	for i := range lines {
+		lines[i] = fmt.Sprintf("app | plain row %02d", i)
+	}
+	lines[0] = "app | NEEDLE row 00" // visible at the top
+	lines[6] = "app | NEEDLE row 06" // below the fold
+	m.logsRawLines = lines
+	m.fullReformat()
+	m.logsViewport.SetYOffset(0)
+
+	updated, _ := m.Update(runeKey('/'))
+	m = updated.(Model)
+	m = typeInto(m, "NEEDLE")
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyEnter}) // commit
+	m = updated.(Model)
+	if !intSliceEq(m.logSearchMatches, []int{0, 6}) {
+		t.Fatalf("precondition: matches = %v, want [0 6]", m.logSearchMatches)
+	}
+	m.logsViewport.SetYOffset(0) // current match (0) visible at top
+	if m.logSearchCur != 0 {
+		t.Fatalf("precondition: cur = %d, want 0", m.logSearchCur)
+	}
+
+	// n → jump to the off-screen match at physical line 6.
+	updated, _ = m.Update(runeKey('n'))
+	m = updated.(Model)
+	if m.logSearchCur != 1 {
+		t.Fatalf("after n, cur = %d, want 1", m.logSearchCur)
+	}
+	if m.logsViewport.YOffset != 6 {
+		t.Errorf("YOffset = %d, want 6 (off-screen match scrolled into view / pinned to top)",
+			m.logsViewport.YOffset)
+	}
+	if m.logsViewport.AtBottom() {
+		t.Error("jumping to a mid-buffer match must auto-pause follow (AtBottom should be false)")
+	}
+
+	// G resumes follow.
+	updated, _ = m.Update(runeKey('G'))
+	m = updated.(Model)
+	if !m.logsViewport.AtBottom() {
+		t.Error("G should resume follow (AtBottom true again)")
+	}
+}
+
+// TestLogSearch_StreamingAppendGrowsMatches pins that a committed search picks up
+// a matching line that streams in after the commit: the match set grows and the
+// current-match cursor holds.
+func TestLogSearch_StreamingAppendGrowsMatches(t *testing.T) {
+	m := setupFilterableLogsModel()
+	pr, _ := io.Pipe()
+	m.logsPipeR = pr
+
+	updated, _ := m.Update(runeKey('/'))
+	m = updated.(Model)
+	m = typeInto(m, "ERROR")
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyEnter}) // commit
+	m = updated.(Model)
+	if !intSliceEq(m.logSearchMatches, []int{1, 4}) {
+		t.Fatalf("precondition: matches = %v, want [1 4]", m.logSearchMatches)
+	}
+	curBefore := m.logSearchCur
+
+	// A new ERROR line streams in — the committed search must include it.
+	updated, _ = m.Update(logChunkMsg{data: []byte("app | ERROR another failure\n")})
+	m = updated.(Model)
+	if !intSliceEq(m.logSearchMatches, []int{1, 4, 5}) {
+		t.Errorf("streamed matching line should grow matches to [1 4 5], got %v", m.logSearchMatches)
+	}
+	if m.logSearchCur != curBefore {
+		t.Errorf("current-match cursor should hold across an append, got %d want %d", m.logSearchCur, curBefore)
+	}
+}
+
+// TestLogRederive_FilterChangeFollowPinning pins the follow-aware re-pinning of
+// rederiveLogs across a filter commit and clear: a following view stays pinned to
+// the bottom, a paused view holds its YOffset (never yanked to the tail).
+func TestLogRederive_FilterChangeFollowPinning(t *testing.T) {
+	newModel := func() Model {
+		mc := &mockComposer{services: []string{"nginx"}}
+		m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
+		m.screen = screenLogs
+		m.logsService = "nginx"
+		m.height = 24
+		m.width = 84
+		m.logsViewport = viewport.New(80, 10)
+		m.logsViewport.SetHorizontalStep(0)
+		m.logsWrap = true
+		pr, _ := io.Pipe()
+		m.logsPipeR = pr
+		m.logsRawLines = logChunkLines(50) // every line contains "line"
+		m.applyLogFormat()
+		if m.logsViewport.TotalLineCount() <= m.logsViewport.Height {
+			t.Fatalf("precondition: content must exceed viewport height (lines=%d, height=%d)",
+				m.logsViewport.TotalLineCount(), m.logsViewport.Height)
+		}
+		return m
+	}
+
+	// commitFilter opens the filter, types q (kept as a no-narrowing "line" here so
+	// the survivor set == the full buffer and no YOffset clamping muddies the test),
+	// and commits.
+	commitFilter := func(m Model, q string) Model {
+		updated, _ := m.Update(runeKey('f'))
+		m = updated.(Model)
+		m = typeInto(m, q)
+		updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+		return updated.(Model)
+	}
+
+	t.Run("following stays pinned across filter commit and clear", func(t *testing.T) {
+		m := newModel()
+		m.logsViewport.GotoBottom()
+		if !m.logsViewport.AtBottom() {
+			t.Fatal("precondition: should be following (at bottom)")
+		}
+		m = commitFilter(m, "line")
+		if !m.logsViewport.AtBottom() {
+			t.Error("following view should stay pinned to the bottom across a filter commit")
+		}
+		updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyEsc}) // clear committed filter (rung 4)
+		m = updated.(Model)
+		if m.logFilterQuery != "" {
+			t.Fatalf("filter should be cleared, got %q", m.logFilterQuery)
+		}
+		if !m.logsViewport.AtBottom() {
+			t.Error("following view should stay pinned to the bottom across a filter clear")
+		}
+	})
+
+	t.Run("paused view holds YOffset across filter commit and clear", func(t *testing.T) {
+		m := newModel()
+		m.logsViewport.GotoBottom()
+		m.logsViewport.SetYOffset(m.logsViewport.YOffset - 5) // scroll up → paused
+		if m.logsViewport.AtBottom() {
+			t.Fatal("precondition: should be paused (not at bottom)")
+		}
+		off := m.logsViewport.YOffset
+
+		m = commitFilter(m, "line")
+		if m.logsViewport.AtBottom() {
+			t.Error("paused view must not snap to bottom on a filter commit")
+		}
+		if m.logsViewport.YOffset != off {
+			t.Errorf("paused YOffset should hold across a filter commit: got %d want %d",
+				m.logsViewport.YOffset, off)
+		}
+
+		updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyEsc}) // clear committed filter
+		m = updated.(Model)
+		if m.logsViewport.AtBottom() {
+			t.Error("paused view must not snap to bottom on a filter clear")
+		}
+		if m.logsViewport.YOffset != off {
+			t.Errorf("paused YOffset should hold across a filter clear: got %d want %d",
+				m.logsViewport.YOffset, off)
+		}
+	})
+}
+
+// TestLogFilter_BackspaceToEmptyRevealsFull pins the recomputeLogFilter
+// backspace-to-empty reveal branch: deleting the query back to empty clears the
+// committed filter and restores the full view (distinct from the esc-cancel path).
+func TestLogFilter_BackspaceToEmptyRevealsFull(t *testing.T) {
+	m := setupFilterableLogsModel()
+	fullContent := m.derivedLogContent()
+
+	updated, _ := m.Update(runeKey('f'))
+	m = updated.(Model)
+	m = typeInto(m, "ERROR")
+	if m.derivedLogContent() == fullContent {
+		t.Fatal("precondition: filter should have narrowed the view")
+	}
+
+	for i := 0; i < len("ERROR"); i++ {
+		updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyBackspace})
+		m = updated.(Model)
+	}
+
+	if m.logFilterInput.Value() != "" {
+		t.Errorf("input should be empty after backspacing, got %q", m.logFilterInput.Value())
+	}
+	if m.logFilterQuery != "" {
+		t.Errorf("query should clear when backspaced to empty, got %q", m.logFilterQuery)
+	}
+	if !m.logFiltering {
+		t.Error("still typing — the bar should remain open (empty, not committed)")
+	}
+	if m.derivedLogContent() != fullContent {
+		t.Errorf("backspacing to empty should restore the full view:\n got %q\nwant %q",
+			m.derivedLogContent(), fullContent)
+	}
+}
+
+// TestLogSearch_BackspaceToEmptyClearsHighlight pins the recomputeLogSearch
+// empty-query branch reached by backspacing the query away one rune at a time.
+func TestLogSearch_BackspaceToEmptyClearsHighlight(t *testing.T) {
+	m := setupFilterableLogsModel()
+	updated, _ := m.Update(runeKey('/'))
+	m = updated.(Model)
+	m = typeInto(m, "ERROR")
+	if len(m.logSearchMatches) == 0 {
+		t.Fatal("precondition: search should have matches")
+	}
+
+	for i := 0; i < len("ERROR"); i++ {
+		updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyBackspace})
+		m = updated.(Model)
+	}
+
+	if m.logSearchInput.Value() != "" {
+		t.Errorf("input should be empty after backspacing, got %q", m.logSearchInput.Value())
+	}
+	if m.logSearchQuery != "" {
+		t.Errorf("query should clear when backspaced to empty, got %q", m.logSearchQuery)
+	}
+	if m.logSearchMatches != nil {
+		t.Errorf("matches should clear when backspaced to empty, got %v", m.logSearchMatches)
+	}
+	if !m.logSearching {
+		t.Error("still typing — the bar should remain open")
+	}
+}
+
+// TestLogFilter_EmptyEnterCommitClears pins that pressing enter on an untouched
+// (empty) filter bar closes it with no filter lingering.
+func TestLogFilter_EmptyEnterCommitClears(t *testing.T) {
+	m := setupFilterableLogsModel()
+	updated, _ := m.Update(runeKey('f'))
+	m = updated.(Model)
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	m = updated.(Model)
+	if m.logFiltering {
+		t.Error("empty enter should close the filter bar")
+	}
+	if m.logFilterQuery != "" {
+		t.Errorf("no filter should linger after empty enter, got %q", m.logFilterQuery)
+	}
+	if m.logFilterInput.Value() != "" {
+		t.Errorf("input should be reset after empty enter, got %q", m.logFilterInput.Value())
+	}
+}
+
+// TestLogSearch_EmptyEnterCommitClears pins that pressing enter on an untouched
+// (empty) search bar closes it with no search state lingering.
+func TestLogSearch_EmptyEnterCommitClears(t *testing.T) {
+	m := setupFilterableLogsModel()
+	updated, _ := m.Update(runeKey('/'))
+	m = updated.(Model)
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	m = updated.(Model)
+	if m.logSearching {
+		t.Error("empty enter should close the search bar")
+	}
+	if m.logSearchQuery != "" {
+		t.Errorf("no search should linger after empty enter, got %q", m.logSearchQuery)
+	}
+	if m.logSearchMatches != nil {
+		t.Errorf("no matches should linger after empty enter, got %v", m.logSearchMatches)
+	}
+}
+
+// TestLogSearch_EnterOnNonMatchingQueryClears pins the F4 fix: committing a
+// valid-but-non-matching search drops the dead search (no lingering "(no match)"
+// counter with inert n/N), mirroring the container search's zero-match drop.
+func TestLogSearch_EnterOnNonMatchingQueryClears(t *testing.T) {
+	m := setupFilterableLogsModel()
+	updated, _ := m.Update(runeKey('/'))
+	m = updated.(Model)
+	m = typeInto(m, "zzz-no-such-term")
+	if m.logSearchQuery != "zzz-no-such-term" {
+		t.Fatalf("precondition: query set while typing, got %q", m.logSearchQuery)
+	}
+	if len(m.logSearchMatches) != 0 {
+		t.Fatalf("precondition: query should match nothing, got %v", m.logSearchMatches)
+	}
+
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyEnter}) // commit
+	m = updated.(Model)
+	if m.logSearching {
+		t.Error("bar should close on enter")
+	}
+	if m.logSearchQuery != "" {
+		t.Errorf("a non-matching search must be cleared on commit, got %q", m.logSearchQuery)
+	}
+	if m.logSearchMatches != nil {
+		t.Errorf("matches should be nil after clearing a dead search, got %v", m.logSearchMatches)
+	}
+}
+
+// TestLogDoneMsg_ErrorFlushesPartialLine pins that a terminal error flushes the
+// in-flight partial line into the raw buffer (so it is not lost) and that both the
+// flushed line and the terminal error render.
+func TestLogDoneMsg_ErrorFlushesPartialLine(t *testing.T) {
+	mc := &mockComposer{services: []string{"nginx"}}
+	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
+	m.screen = screenLogs
+	m.logsService = "nginx"
+	m.logsViewport = viewport.New(80, 20)
+
+	// A chunk with no trailing newline leaves an in-flight partial line.
+	updated, _ := m.Update(logChunkMsg{data: []byte("app | INFO partial without newline")})
+	m = updated.(Model)
+	if m.logsPartial != "app | INFO partial without newline" {
+		t.Fatalf("precondition: partial should hold the newline-less tail, got %q", m.logsPartial)
+	}
+	if len(m.logsRawLines) != 0 {
+		t.Fatalf("precondition: no complete raw line yet, got %v", m.logsRawLines)
+	}
+
+	updated, _ = m.Update(logDoneMsg{err: fmt.Errorf("stream closed")})
+	m = updated.(Model)
+	if m.logsPartial != "" {
+		t.Errorf("partial should be flushed on terminal error, got %q", m.logsPartial)
+	}
+	if len(m.logsRawLines) != 1 || m.logsRawLines[0] != "app | INFO partial without newline" {
+		t.Errorf("flushed partial should become a raw line, got %v", m.logsRawLines)
+	}
+	got := m.derivedLogContent()
+	if !strings.Contains(got, "partial without newline") {
+		t.Errorf("flushed partial should render, got %q", got)
+	}
+	if !strings.Contains(got, "Error: stream closed") {
+		t.Errorf("terminal error should render, got %q", got)
+	}
+}
+
 // intSliceEq reports whether two int slices are element-wise equal (nil and
 // empty are treated as equal).
 func intSliceEq(a, b []int) bool {

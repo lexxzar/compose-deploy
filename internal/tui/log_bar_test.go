@@ -261,12 +261,11 @@ func TestLogBarLineContent(t *testing.T) {
 
 	t.Run("committed regex filter shows rx tag", func(t *testing.T) {
 		m := base()
-		_, re, ok := buildMatcher("ERR.*", true, true)
-		if !ok {
+		if _, _, ok := buildMatcher("ERR.*", true, true); !ok {
 			t.Fatal("precondition: ERR.* should compile")
 		}
 		m.logFilterQuery = "ERR.*"
-		m.logFilterRe = re
+		m.logFilterCommittedRegex = true
 		if bar := m.logBarLine(); !strings.Contains(bar, "[rx]") {
 			t.Errorf("committed regex-filter bar %q missing [rx] tag", bar)
 		}

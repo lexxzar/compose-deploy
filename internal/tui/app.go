@@ -6,7 +6,6 @@ import (
 	"io"
 	"os"
 	"os/exec"
-	"regexp"
 	"slices"
 	"strings"
 	"time"
@@ -272,20 +271,20 @@ type Model struct {
 	logsErrLine   string   // filter-exempt terminal error text; always rendered regardless of an active filter
 
 	// Screen: logs — filter (live grep; see clearLogFilter/logFilterPred/recomputeLogFilter)
-	logFiltering     bool            // filter bar open, capturing text
-	logFilterInput   textinput.Model // (re)constructed lazily in the "f" open handler
-	logFilterQuery   string          // last-good committed query; != "" ⇒ filter active
-	logFilterIsRegex bool            // live/desired mode; ctrl+r toggles (regex vs. substring)
-	logFilterRe      *regexp.Regexp  // compiled matcher when the last-good query is a valid regex; nil ⇒ substring (source of truth for regex-ness in logFilterPred)
+	logFiltering            bool            // filter bar open, capturing text
+	logFilterInput          textinput.Model // (re)constructed lazily in the "f" open handler
+	logFilterQuery          string          // last-good committed query; != "" ⇒ filter active
+	logFilterIsRegex        bool            // live/desired mode; ctrl+r toggles (regex vs. substring)
+	logFilterCommittedRegex bool            // whether the last-good committed query is a regex; source of truth for regex-ness in logFilterPred (NOT the live logFilterIsRegex)
 
 	// Screen: logs — search-within-highlight (see clearLogSearch/logSearchPred/recomputeLogSearch)
-	logSearching     bool            // search bar open, capturing text
-	logSearchInput   textinput.Model // (re)constructed lazily in the "/" open handler
-	logSearchQuery   string          // live/committed query; != "" ⇒ highlights + n/N active
-	logSearchIsRegex bool            // live/desired mode; ctrl+r toggles (regex vs. substring)
-	logSearchRe      *regexp.Regexp  // compiled matcher when the query is a valid regex; nil ⇒ substring
-	logSearchMatches []int           // PHYSICAL line indices of matches, ascending (recomputed at SetContent time)
-	logSearchCur     int             // index into logSearchMatches (the current match)
+	logSearching            bool            // search bar open, capturing text
+	logSearchInput          textinput.Model // (re)constructed lazily in the "/" open handler
+	logSearchQuery          string          // live/committed query; != "" ⇒ highlights + n/N active
+	logSearchIsRegex        bool            // live/desired mode; ctrl+r toggles (regex vs. substring)
+	logSearchCommittedRegex bool            // whether the committed query is a regex; source of truth for regex-ness in logSearchPred (NOT the live logSearchIsRegex)
+	logSearchMatches        []int           // PHYSICAL line indices of matches, ascending (recomputed at SetContent time)
+	logSearchCur            int             // index into logSearchMatches (the current match)
 
 	// Screen: config
 	configContent  []byte         // raw compose file content
@@ -1567,8 +1566,10 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 				return m.tryQuit()
 			case "enter":
 				// Commit: close the bar, keep highlights + n/N live. An empty
-				// query fully clears so no dead search state lingers.
-				if m.logSearchQuery == "" {
+				// query — OR a valid-but-non-matching one — fully clears so no
+				// dead search state (a live "(no match)" counter with inert n/N)
+				// lingers. Mirrors the container search's zero-match drop.
+				if m.logSearchQuery == "" || len(m.logSearchMatches) == 0 {
 					m.clearLogSearch()
 					m.setLogViewportContent()
 				} else {
@@ -1688,6 +1689,13 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			if len(m.logsRawLines) == 0 {
 				return m, nil
 			}
+			// Reset any prior committed filter FIRST so reopening starts from a
+			// clean slate (mirrors the container `/` clearSearch guard): without
+			// this the fresh empty input would render while the view stays
+			// narrowed and the bar shows the stale N/M, and an immediate enter
+			// would re-commit the OLD query. rederiveLogs restores the full view.
+			m.clearLogFilter()
+			m.rederiveLogs()
 			m.logFilterInput = textinput.New()
 			m.logFiltering = true
 			m.logFilterInput.Focus()
@@ -1700,6 +1708,13 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			if m.derivedLogContent() == "" {
 				return m, nil
 			}
+			// Reset any prior committed search FIRST so reopening starts from a
+			// clean slate (mirrors the container `/` clearSearch guard): stale
+			// highlights + counter would otherwise persist and an immediate enter
+			// would re-commit the OLD query. setLogViewportContent drops the stale
+			// highlights immediately.
+			m.clearLogSearch()
+			m.setLogViewportContent()
 			m.logSearchInput = textinput.New()
 			m.logSearching = true
 			m.logSearchInput.Focus()
@@ -2305,19 +2320,19 @@ func (m *Model) fullReformat() {
 }
 
 // logFilterPred reconstructs the last-good filter predicate from the committed
-// state. logFilterQuery and logFilterRe are only ever set together (by
-// recomputeLogFilter, when buildMatcher succeeded), so this always reproduces a
-// valid predicate. Regex-ness is derived from logFilterRe (nil ⇒ substring),
+// state. logFilterQuery and logFilterCommittedRegex are only ever set together
+// (by recomputeLogFilter, when buildMatcher succeeded), so this always
+// reproduces a valid predicate. Regex-ness is read from logFilterCommittedRegex,
 // NOT from the live logFilterIsRegex — so a mid-type ctrl+r into a *bad* regex
 // keeps the last-good matcher rather than silently dropping the filter. Returns
 // nil (all-pass) when no filter is committed, degrading the derivation pipeline
-// to the Task 2 pass-through. The regex is recompiled once per call (reused
-// across every line inside deriveFiltered), never per line.
+// to the Task 2 pass-through. buildMatcher recompiles the regex once per call and
+// the returned closure reuses it across every line inside deriveFiltered.
 func (m Model) logFilterPred() func(string) bool {
 	if m.logFilterQuery == "" {
 		return nil
 	}
-	pred, _, _ := buildMatcher(m.logFilterQuery, m.logFilterRe != nil, true)
+	pred, _, _ := buildMatcher(m.logFilterQuery, m.logFilterCommittedRegex, true)
 	return pred
 }
 
@@ -2338,8 +2353,8 @@ func (m *Model) rederiveLogs() {
 // the live regex mode, then re-derives. An empty query (or a lone "!") clears the
 // filter so every line shows again. A non-empty query that fails to compile as a
 // regex is a mid-type error: keep the last-good query/predicate (no thrash) and
-// skip the re-derive so the view holds steady. logFilterRe carries the compiled
-// regex (nil for substring) so logFilterPred can reproduce the exact last-good.
+// skip the re-derive so the view holds steady. logFilterCommittedRegex records
+// whether the last-good query is a regex so logFilterPred can reproduce it.
 func (m *Model) recomputeLogFilter() {
 	newQuery := m.logFilterInput.Value()
 	stripped := newQuery
@@ -2350,7 +2365,7 @@ func (m *Model) recomputeLogFilter() {
 		// Empty (or lone "!") query — clear the filter, reveal everything.
 		if m.logFilterQuery != "" {
 			m.logFilterQuery = ""
-			m.logFilterRe = nil
+			m.logFilterCommittedRegex = false
 			m.rederiveLogs()
 		}
 		return
@@ -2361,7 +2376,7 @@ func (m *Model) recomputeLogFilter() {
 		return
 	}
 	m.logFilterQuery = newQuery
-	m.logFilterRe = re // nil for substring, non-nil for a valid regex
+	m.logFilterCommittedRegex = re != nil // re non-nil only for a valid regex
 	m.rederiveLogs()
 }
 
@@ -2372,21 +2387,21 @@ func (m *Model) clearLogFilter() {
 	m.logFiltering = false
 	m.logFilterQuery = ""
 	m.logFilterIsRegex = false
-	m.logFilterRe = nil
+	m.logFilterCommittedRegex = false
 	m.logFilterInput.SetValue("")
 	m.logFilterInput.Blur()
 }
 
 // logSearchPred reconstructs the live search predicate from the committed search
 // state. It mirrors logFilterPred but with allowNegate=false — search has no "!"
-// exclusion (that is a filter-only affordance). Regex-ness derives from
-// logSearchRe (nil ⇒ substring), so a mid-type ctrl+r into a *bad* regex keeps
-// the last-good matcher. Returns nil (no highlight) when no query is active.
+// exclusion (that is a filter-only affordance). Regex-ness is read from
+// logSearchCommittedRegex, so a mid-type ctrl+r into a *bad* regex keeps the
+// last-good matcher. Returns nil (no highlight) when no query is active.
 func (m Model) logSearchPred() func(string) bool {
 	if m.logSearchQuery == "" {
 		return nil
 	}
-	pred, _, _ := buildMatcher(m.logSearchQuery, m.logSearchRe != nil, false)
+	pred, _, _ := buildMatcher(m.logSearchQuery, m.logSearchCommittedRegex, false)
 	return pred
 }
 
@@ -2441,7 +2456,7 @@ func (m *Model) recomputeLogSearch() {
 	newQuery := m.logSearchInput.Value()
 	if newQuery == "" {
 		m.logSearchQuery = ""
-		m.logSearchRe = nil
+		m.logSearchCommittedRegex = false
 		m.logSearchCur = 0
 		m.setLogViewportContent() // clears matches + highlight
 		return
@@ -2451,7 +2466,7 @@ func (m *Model) recomputeLogSearch() {
 		return // bad regex mid-type: keep last-good, no re-highlight
 	}
 	m.logSearchQuery = newQuery
-	m.logSearchRe = re // nil for substring, non-nil for a valid regex
+	m.logSearchCommittedRegex = re != nil // re non-nil only for a valid regex
 	m.logSearchCur = 0
 	m.setLogViewportContent() // recomputes logSearchMatches
 	if len(m.logSearchMatches) > 0 {
@@ -2583,7 +2598,7 @@ func (m Model) logBarLine() string {
 		if m.logFilterQuery != "" {
 			survivors, total := m.logFilterCounts()
 			seg := "filter: " + m.logFilterQuery
-			if m.logFilterRe != nil {
+			if m.logFilterCommittedRegex {
 				seg += " [rx]"
 			}
 			seg += fmt.Sprintf(" · %d/%d", survivors, total)
@@ -2591,7 +2606,7 @@ func (m Model) logBarLine() string {
 		}
 		if m.logSearchQuery != "" {
 			seg := "search: " + m.logSearchQuery
-			if m.logSearchRe != nil {
+			if m.logSearchCommittedRegex {
 				seg += " [rx]"
 			}
 			seg += " " + m.logSearchCounter()
@@ -2611,7 +2626,7 @@ func (m *Model) clearLogSearch() {
 	m.logSearching = false
 	m.logSearchQuery = ""
 	m.logSearchIsRegex = false
-	m.logSearchRe = nil
+	m.logSearchCommittedRegex = false
 	m.logSearchMatches = nil
 	m.logSearchCur = 0
 	m.logSearchInput.SetValue("")
