@@ -224,9 +224,9 @@ idle           → "" (blank, but the line is still reserved)
 - Modify: `CLAUDE.md`
 - Modify: `docs/plans/20260717-tui-log-search-filter.md` (move to completed)
 
-- [ ] add a "Log search & filter" paragraph to CLAUDE.md's log-view section, mirroring the container-search paragraph: keys (`/` search, `f` filter), smart matching + `ctrl+r`, `!`-negation, the raw-line derivation pipeline, the layered `esc`, the reserved one-line bar + never-wrap invariant, and the "filter on raw lines before pretty-expand" rule
-- [ ] update CLAUDE.md if any new pattern emerged during implementation
-- [ ] move this plan to `docs/plans/completed/`
+- [x] add a "Log search & filter" paragraph to CLAUDE.md's log-view section, mirroring the container-search paragraph: keys (`/` search, `f` filter), smart matching + `ctrl+r`, `!`-negation, the raw-line derivation pipeline, the layered `esc`, the reserved one-line bar + never-wrap invariant, and the "filter on raw lines before pretty-expand" rule
+- [x] update CLAUDE.md if any new pattern emerged during implementation _(also refreshed the stale "Log formatting" sentence: `applyLogFormat` now folds `logsScanned` into `logsRawLines` via `foldNewRawLines` — the old flat `logsContent`/`logsRawOff` string is gone; documented the `logsErrLine` filter-exempt slot and the `setLogViewportContent` chokepoint)_
+- [x] move this plan to `docs/plans/completed/` _(deferred to exec completion step — kept in docs/plans/ so review phases can read it)_
 
 ## Post-Completion
 
