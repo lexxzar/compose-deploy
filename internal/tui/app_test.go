@@ -29,12 +29,12 @@ func mockFactory(mc *mockComposer) ComposerFactory {
 }
 
 type mockComposer struct {
-	services  []string
-	status    map[string]runner.ServiceStatus
-	err       error
-	statusErr error
-	stats     map[string]runner.ServiceStats
-	statsErr  error
+	services   []string
+	status     map[string]runner.ServiceStatus
+	err        error
+	statusErr  error
+	stats      map[string]runner.ServiceStats
+	statsErr   error
 	updates    map[string]bool
 	updatesErr error
 
@@ -2144,15 +2144,21 @@ func TestLogChunkMsg_AppendsContent(t *testing.T) {
 	updated, _ := m.Update(logChunkMsg{data: []byte("line 1\n")})
 	m = updated.(Model)
 
-	if m.logsContent != "line 1\n" {
-		t.Errorf("logsContent = %q, want %q", m.logsContent, "line 1\n")
+	if got := m.logsRawLines; len(got) != 1 || got[0] != "line 1" {
+		t.Errorf("logsRawLines = %q, want [line 1]", got)
+	}
+	if m.logsPartial != "" {
+		t.Errorf("logsPartial = %q, want empty", m.logsPartial)
 	}
 
 	updated, _ = m.Update(logChunkMsg{data: []byte("line 2\n")})
 	m = updated.(Model)
 
-	if m.logsContent != "line 1\nline 2\n" {
-		t.Errorf("logsContent = %q, want %q", m.logsContent, "line 1\nline 2\n")
+	if got := m.logsRawLines; len(got) != 2 || got[0] != "line 1" || got[1] != "line 2" {
+		t.Errorf("logsRawLines = %q, want [line 1 line 2]", got)
+	}
+	if m.logsPartial != "" {
+		t.Errorf("logsPartial = %q, want empty", m.logsPartial)
 	}
 }
 
@@ -2164,6 +2170,110 @@ func logChunkContent(n int) string {
 		fmt.Fprintf(&b, "line %d\n", i)
 	}
 	return b.String()
+}
+
+// logChunkLines returns n numbered raw log lines (no trailing-newline element),
+// used to seed logsRawLines directly in tests — the raw-line-buffer equivalent
+// of logChunkContent.
+func logChunkLines(n int) []string {
+	lines := make([]string, n)
+	for i := 0; i < n; i++ {
+		lines[i] = fmt.Sprintf("line %d", i)
+	}
+	return lines
+}
+
+// TestDerivedLogContentMatchesPreRefactor pins backward compatibility: with no
+// filter, the derived viewport content is byte-identical to the pre-refactor
+// formatLogContent output across the four wrap×pretty combinations. The fixture
+// ends WITHOUT a trailing newline (partial-line parity) and includes a JSON line
+// (pretty-print parity).
+func TestDerivedLogContentMatchesPreRefactor(t *testing.T) {
+	const width = 20
+	fixture := "plain line one\n" +
+		`svc | {"level":"info","msg":"hello world","n":42}` + "\n" +
+		"another somewhat long plain line\n" +
+		"trailing partial with no newline"
+
+	for _, wrap := range []bool{false, true} {
+		for _, pretty := range []bool{false, true} {
+			wrap, pretty := wrap, pretty
+			t.Run(fmt.Sprintf("wrap=%v/pretty=%v", wrap, pretty), func(t *testing.T) {
+				var m Model
+				m.logsViewport = viewport.New(width, 20)
+				m.logsWrap = wrap
+				m.logsPretty = pretty
+				m.appendRawChunk([]byte(fixture))
+				m.applyLogFormat()
+
+				got := m.derivedLogContent()
+				want := formatLogContent(fixture, width, wrap, pretty)
+				if got != want {
+					t.Errorf("derived content mismatch\n got: %q\nwant: %q", got, want)
+				}
+			})
+		}
+	}
+}
+
+// TestLogChunkMsg_SplitLineFoldsToOneRawLine verifies a single logical line
+// delivered across two chunks (the newline arriving only in the second) folds
+// into exactly one entry in logsRawLines.
+func TestLogChunkMsg_SplitLineFoldsToOneRawLine(t *testing.T) {
+	mc := &mockComposer{services: []string{"nginx"}}
+	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
+	m.screen = screenLogs
+	m.logsService = "nginx"
+	m.logsViewport = viewport.New(80, 20)
+	pr, _ := io.Pipe()
+	m.logsPipeR = pr
+
+	// First chunk: no newline yet — retained as the partial.
+	updated, _ := m.Update(logChunkMsg{data: []byte("hello ")})
+	m = updated.(Model)
+	if len(m.logsRawLines) != 0 {
+		t.Errorf("no complete line yet, logsRawLines = %q", m.logsRawLines)
+	}
+	if m.logsPartial != "hello " {
+		t.Errorf("logsPartial = %q, want %q", m.logsPartial, "hello ")
+	}
+
+	// Second chunk completes the line — folds into exactly one raw line.
+	updated, _ = m.Update(logChunkMsg{data: []byte("world\n")})
+	m = updated.(Model)
+	if len(m.logsRawLines) != 1 || m.logsRawLines[0] != "hello world" {
+		t.Errorf("logsRawLines = %q, want [hello world]", m.logsRawLines)
+	}
+	if m.logsPartial != "" {
+		t.Errorf("logsPartial = %q, want empty", m.logsPartial)
+	}
+}
+
+// TestLogDoneErrorIsFilterExempt proves the terminal error renders even when a
+// filter hides every raw line. Task 2 has no filter wiring yet, so we stand in
+// for the Task 3 filter by folding with a reject-all predicate (leaving
+// logsFormatted empty) and assert the error, held in the dedicated exempt slot,
+// still appears in the derived content.
+func TestLogDoneErrorIsFilterExempt(t *testing.T) {
+	var m Model
+	m.logsViewport = viewport.New(80, 20)
+	m.logsRawLines = []string{"noise one", "noise two"}
+
+	reject := func(string) bool { return false }
+	delta, scanned := foldNewRawLines(m.logsRawLines, m.logsScanned, m.logsViewport.Width, m.logsWrap, m.logsPretty, reject)
+	m.logsFormatted = delta
+	m.logsScanned = scanned
+	if m.logsFormatted != "" {
+		t.Fatalf("precondition: reject-all filter should leave logsFormatted empty, got %q", m.logsFormatted)
+	}
+
+	// The terminal error lands in the filter-exempt slot.
+	m.logsErrLine = "Error: connection lost"
+
+	got := m.derivedLogContent()
+	if !strings.Contains(got, "Error: connection lost") {
+		t.Errorf("terminal error must render even when the filter hides every line, got %q", got)
+	}
 }
 
 // TestLogChunkMsg_ScrolledUpDoesNotSnap verifies that when the user has scrolled
@@ -2180,7 +2290,7 @@ func TestLogChunkMsg_ScrolledUpDoesNotSnap(t *testing.T) {
 	m.logsPipeR = pr
 
 	// Fill the viewport with more content than its height so scrolling is possible.
-	m.logsContent = logChunkContent(50)
+	m.logsRawLines = logChunkLines(50)
 	m.applyLogFormat()
 	m.logsViewport.GotoBottom()
 	if !m.logsViewport.AtBottom() {
@@ -2223,7 +2333,7 @@ func TestLogChunkMsg_AtBottomFollowsTail(t *testing.T) {
 	pr, _ := io.Pipe()
 	m.logsPipeR = pr
 
-	m.logsContent = logChunkContent(50)
+	m.logsRawLines = logChunkLines(50)
 	m.applyLogFormat()
 	m.logsViewport.GotoBottom()
 	if !m.logsViewport.AtBottom() {
@@ -2254,7 +2364,7 @@ func TestLogsReformatWhileFollowingStaysPinned(t *testing.T) {
 	m.logsPipeR = pr
 
 	// Fill with more content than the viewport height so AtBottom() is meaningful.
-	m.logsContent = logChunkContent(50)
+	m.logsRawLines = logChunkLines(50)
 	m.applyLogFormat()
 	m.logsViewport.GotoBottom()
 	if !m.logsViewport.AtBottom() {
@@ -2293,7 +2403,7 @@ func TestLogsReformatWhilePausedStaysPaused(t *testing.T) {
 	pr, _ := io.Pipe()
 	m.logsPipeR = pr
 
-	m.logsContent = logChunkContent(50)
+	m.logsRawLines = logChunkLines(50)
 	m.applyLogFormat()
 	m.logsViewport.GotoBottom()
 	if m.logsViewport.TotalLineCount() <= m.logsViewport.Height {
@@ -2393,7 +2503,7 @@ func TestViewLogsIndicator(t *testing.T) {
 		m.height = 24
 		m.width = 80
 		m.logsViewport = viewport.New(80, 10)
-		m.logsContent = logChunkContent(50)
+		m.logsRawLines = logChunkLines(50)
 		m.applyLogFormat()
 		return m
 	}
@@ -2483,8 +2593,11 @@ func TestLogDoneMsg_WithError(t *testing.T) {
 	if m.logsErr.Error() != "connection lost" {
 		t.Errorf("logsErr = %q, want %q", m.logsErr.Error(), "connection lost")
 	}
-	if !strings.Contains(m.logsContent, "Error: connection lost") {
-		t.Errorf("logsContent should contain error, got %q", m.logsContent)
+	if m.logsErrLine != "Error: connection lost" {
+		t.Errorf("logsErrLine = %q, want %q", m.logsErrLine, "Error: connection lost")
+	}
+	if !strings.Contains(m.derivedLogContent(), "Error: connection lost") {
+		t.Errorf("derived content should contain error, got %q", m.derivedLogContent())
 	}
 }
 
@@ -2502,7 +2615,7 @@ func TestLogDoneMsg_WithError_ForcesScrolledUpViewToBottom(t *testing.T) {
 	m.logsViewport = viewport.New(80, 10)
 
 	// Fill with more content than the viewport height so scroll is meaningful.
-	m.logsContent = logChunkContent(50)
+	m.logsRawLines = logChunkLines(50)
 	m.applyLogFormat()
 	m.logsViewport.GotoBottom()
 	if m.logsViewport.TotalLineCount() <= m.logsViewport.Height {
@@ -2523,8 +2636,8 @@ func TestLogDoneMsg_WithError_ForcesScrolledUpViewToBottom(t *testing.T) {
 	if !m.logsViewport.AtBottom() {
 		t.Error("error logDoneMsg did not force the view to the bottom; the error would be hidden while paused")
 	}
-	if !strings.Contains(m.logsContent, "Error: connection lost") {
-		t.Errorf("logsContent should contain error, got %q", m.logsContent)
+	if !strings.Contains(m.derivedLogContent(), "Error: connection lost") {
+		t.Errorf("derived content should contain error, got %q", m.derivedLogContent())
 	}
 }
 
@@ -2551,7 +2664,7 @@ func TestLogsEsc_ReturnsToContainerScreen(t *testing.T) {
 	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
 	m.screen = screenLogs
 	m.logsService = "nginx"
-	m.logsContent = "some logs"
+	m.logsRawLines = []string{"some logs"}
 	m.logsCancel = func() {} // no-op cancel
 	m.logsDone = false
 	m.logsViewport = viewport.New(80, 20)
@@ -2565,8 +2678,8 @@ func TestLogsEsc_ReturnsToContainerScreen(t *testing.T) {
 	if m.logsService != "" {
 		t.Errorf("logsService should be cleared, got %q", m.logsService)
 	}
-	if m.logsContent != "" {
-		t.Errorf("logsContent should be cleared, got %q", m.logsContent)
+	if m.logsRawLines != nil {
+		t.Errorf("logsRawLines should be cleared, got %q", m.logsRawLines)
 	}
 	if m.logsCancel != nil {
 		t.Error("logsCancel should be nil")
@@ -2643,8 +2756,8 @@ func TestLogChunkMsg_IgnoredWhenNotOnLogScreen(t *testing.T) {
 	updated, cmd := m.Update(logChunkMsg{data: []byte("stale data")})
 	m = updated.(Model)
 
-	if m.logsContent != "" {
-		t.Errorf("logsContent should remain empty, got %q", m.logsContent)
+	if m.logsRawLines != nil || m.logsPartial != "" {
+		t.Errorf("raw buffer should remain empty, got lines=%q partial=%q", m.logsRawLines, m.logsPartial)
 	}
 	if cmd != nil {
 		t.Error("should not return a command for stale logChunkMsg")
@@ -2693,12 +2806,12 @@ func setupLogsModel() Model {
 	m.services = mc.services
 	m.composer = mc
 	m.logsService = "app"
-	m.logsContent = `app | {"level":"info","msg":"hello"}`
+	m.logsRawLines = []string{`app | {"level":"info","msg":"hello"}`}
 	m.logsWrap = true
 	m.logsPretty = false
 	m.logsViewport = viewport.New(80, 20)
 	m.logsViewport.SetHorizontalStep(0)
-	m.logsViewport.SetContent(m.logsContent)
+	m.applyLogFormat()
 	m.width = 84
 	m.height = 26
 	return m
@@ -2788,7 +2901,10 @@ func TestLogsScreen_WindowResizeReformats(t *testing.T) {
 
 func TestLogsScreen_LogChunkAppliesFormat(t *testing.T) {
 	m := setupLogsModel()
-	m.logsContent = ""
+	m.logsRawLines = nil
+	m.logsPartial = ""
+	m.logsScanned = 0
+	m.logsFormatted = ""
 	m.logsPretty = true
 	m.logsSession = 42
 
@@ -3003,36 +3119,42 @@ func TestLogsScreen_EscClearsWrapPretty(t *testing.T) {
 }
 
 // Regression: a wrapped partial line extended by the next chunk must not
-// duplicate the earlier wrapped segments (P1 corruption bug).
+// duplicate the earlier wrapped segments (P1 corruption bug). Chunk splitting
+// now happens in appendRawChunk (partial retained in logsPartial until a later
+// chunk's newline completes it).
 func TestLogsScreen_IncrementalWrapNoDuplication(t *testing.T) {
 	m := setupLogsModel()
-	m.logsContent = ""
+	m.logsRawLines = nil
+	m.logsPartial = ""
+	m.logsScanned = 0
 	m.logsFormatted = ""
-	m.logsRawOff = 0
 	m.logsWrap = true
 	m.logsPretty = false
 	m.logsViewport = viewport.New(5, 20) // width=5 to force wrapping
 	m.logsViewport.SetHorizontalStep(0)
 	m.logsSession = 1
 
-	pr, pw := io.Pipe()
-	m.logsPipeR = pr
-
-	// Chunk 1: partial line, no newline — 10 chars wraps to 2 segments
-	m.logsContent = strings.Repeat("a", 10)
+	// Chunk 1: partial line, no newline — retained in logsPartial.
+	m.appendRawChunk([]byte(strings.Repeat("a", 10)))
 	m.applyLogFormat()
-	content1 := m.logsFormatted
-	// logsFormatted should be empty (no complete lines yet)
-	if content1 != "" {
-		t.Errorf("no complete lines yet, logsFormatted should be empty, got %q", content1)
+	// No complete lines yet: the cached logsFormatted must be empty and the raw
+	// buffer must hold nothing (the 10 chars live in logsPartial).
+	if m.logsFormatted != "" {
+		t.Errorf("no complete lines yet, logsFormatted should be empty, got %q", m.logsFormatted)
+	}
+	if len(m.logsRawLines) != 0 {
+		t.Errorf("no complete lines yet, logsRawLines should be empty, got %q", m.logsRawLines)
+	}
+	if m.logsPartial != strings.Repeat("a", 10) {
+		t.Errorf("logsPartial = %q, want 10 a's", m.logsPartial)
 	}
 
-	// Chunk 2: extend the same line and complete it
-	m.logsContent = strings.Repeat("a", 10) + "bbbb\n"
+	// Chunk 2: extend the same line and complete it with a newline.
+	m.appendRawChunk([]byte("bbbb\n"))
 	m.applyLogFormat()
 
-	// The raw line "aaaaaaaaaabbbb" (14 chars) should wrap to: "aaaaa", "aaaaa", "aaaa", "bbbb"
-	// No duplicated segments
+	// The raw line "aaaaaaaaaabbbb" (14 chars) should wrap to: "aaaaa", "aaaaa",
+	// "aaaa", "bbbb" — no duplicated segments (exactly 10 'a' chars total).
 	viewContent := m.logsFormatted
 	lines := strings.Split(viewContent, "\n")
 	aCount := 0
@@ -3042,35 +3164,37 @@ func TestLogsScreen_IncrementalWrapNoDuplication(t *testing.T) {
 	if aCount != 10 {
 		t.Errorf("expected 10 'a' chars total, got %d in formatted output: %q", aCount, viewContent)
 	}
-
-	pw.Close()
-	pr.Close()
+	if m.logsPartial != "" {
+		t.Errorf("logsPartial should be empty after the newline, got %q", m.logsPartial)
+	}
 }
 
-// Verify that incremental formatting only scans new data, not the full buffer.
+// Verify that incremental formatting only scans new raw lines, advancing the
+// logsScanned raw-line cursor by the number of raw lines scanned.
 func TestLogsScreen_IncrementalOffsetAdvances(t *testing.T) {
 	m := setupLogsModel()
-	m.logsContent = ""
+	m.logsRawLines = nil
+	m.logsPartial = ""
+	m.logsScanned = 0
 	m.logsFormatted = ""
-	m.logsRawOff = 0
 	m.logsWrap = false
 	m.logsPretty = false
 	m.logsViewport = viewport.New(80, 20)
 
 	// Add two complete lines
-	m.logsContent = "line1\nline2\n"
+	m.appendRawChunk([]byte("line1\nline2\n"))
 	m.applyLogFormat()
 
-	if m.logsRawOff != 12 { // len("line1\nline2\n")
-		t.Errorf("logsRawOff = %d, want 12", m.logsRawOff)
+	if m.logsScanned != 2 {
+		t.Errorf("logsScanned = %d, want 2", m.logsScanned)
 	}
 
-	// Add a third line — offset should advance past it
-	m.logsContent += "line3\n"
+	// Add a third line — the cursor should advance past it
+	m.appendRawChunk([]byte("line3\n"))
 	m.applyLogFormat()
 
-	if m.logsRawOff != 18 { // 12 + len("line3\n")
-		t.Errorf("logsRawOff = %d, want 18", m.logsRawOff)
+	if m.logsScanned != 3 {
+		t.Errorf("logsScanned = %d, want 3", m.logsScanned)
 	}
 
 	// logsFormatted should contain all three lines

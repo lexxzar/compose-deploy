@@ -207,15 +207,15 @@ type Model struct {
 	projectsSession uint64 // bumped at every transition that swaps the projectLoader (server pick, server disconnect, local fast-track, etc.) so a stale loadProjects from server A can't overwrite server B's list
 
 	// Screen 1: service select
-	services     []string
-	svcStatus    map[string]runner.ServiceStatus // service name → status
-	stats           map[string]runner.ServiceStats // service name → resource usage; populated asynchronously by refreshStats
-	statsErr        error                          // last error from ContainerStats; rendered in the same slot as svcErr (svcErr wins)
-	statsSession    uint64                         // bumped before every refreshStats() and on context change so older in-flight responses are filtered out
-	statusSession   uint64                         // mirror of statsSession for refreshStatus(); without it, periodic-tick statusMsg from project A could overwrite the svcStatus map after the user has navigated to project B
-	statsRequested  bool                           // true once refreshStats has been requested for the current container-screen entry; reserves CPU/Mem column widths so captions don't pop in when data arrives
-	refreshInFlight bool                           // true while a periodic-tick refreshStats fetch is pending; prevents the next tick from stacking another fetch on top of a slow docker stats / SSH call
-	tickCmdOverride func() tea.Cmd                 // test seam: when non-nil, replaces tea.Tick in refreshTick() with a non-blocking Cmd; production code never sets this
+	services        []string
+	svcStatus       map[string]runner.ServiceStatus // service name → status
+	stats           map[string]runner.ServiceStats  // service name → resource usage; populated asynchronously by refreshStats
+	statsErr        error                           // last error from ContainerStats; rendered in the same slot as svcErr (svcErr wins)
+	statsSession    uint64                          // bumped before every refreshStats() and on context change so older in-flight responses are filtered out
+	statusSession   uint64                          // mirror of statsSession for refreshStatus(); without it, periodic-tick statusMsg from project A could overwrite the svcStatus map after the user has navigated to project B
+	statsRequested  bool                            // true once refreshStats has been requested for the current container-screen entry; reserves CPU/Mem column widths so captions don't pop in when data arrives
+	refreshInFlight bool                            // true while a periodic-tick refreshStats fetch is pending; prevents the next tick from stacking another fetch on top of a slow docker stats / SSH call
+	tickCmdOverride func() tea.Cmd                  // test seam: when non-nil, replaces tea.Tick in refreshTick() with a non-blocking Cmd; production code never sets this
 
 	// Update-available indicator state. CheckUpdates is run on entry to
 	// screenSelectContainers (when the cache is stale) and explicitly via `U`.
@@ -228,10 +228,10 @@ type Model struct {
 	updateInFlight bool   // mirror of refreshInFlight for refreshUpdates — prevents a slow CheckUpdates from stacking on the next screen entry / `U` press
 	updatesErr     string // last error from CheckUpdates; rendered as soft warning below statsErr (priority: svcErr > statsErr > updatesErr)
 	projDir        string // active project's config dir; used for the updateCache key
-	selected  map[int]bool
-	svcCursor int
-	svcOffset int // index of first visible service in scroll window
-	svcErr    error
+	selected       map[int]bool
+	svcCursor      int
+	svcOffset      int // index of first visible service in scroll window
+	svcErr         error
 
 	// Confirmation state (within container screen)
 	confirming  bool
@@ -253,18 +253,22 @@ type Model struct {
 	cancel      context.CancelFunc
 
 	// Screen: logs
-	logsService   string             // service being viewed
-	logsContent   string             // accumulated log output
-	logsViewport  viewport.Model     // dedicated viewport for log screen
-	logsCancel    context.CancelFunc // cancels the log goroutine; derived from m.ctx
-	logsDone      bool               // true when streaming finished
-	logsErr       error              // error from Logs() call
-	logsPipeR     io.Reader          // pipe reader for log streaming
-	logsSession   uint64             // monotonic counter to discard stale messages from prior sessions
-	logsWrap      bool               // soft-wrap long lines at viewport width
-	logsPretty    bool               // pretty-print JSON log bodies
-	logsFormatted string             // formatted output for complete raw lines (up to logsRawOff)
-	logsRawOff    int                // byte offset into logsContent: everything before this is in logsFormatted
+	logsService  string             // service being viewed
+	logsViewport viewport.Model     // dedicated viewport for log screen
+	logsCancel   context.CancelFunc // cancels the log goroutine; derived from m.ctx
+	logsDone     bool               // true when streaming finished
+	logsErr      error              // error from Logs() call
+	logsPipeR    io.Reader          // pipe reader for log streaming
+	logsSession  uint64             // monotonic counter to discard stale messages from prior sessions
+	logsWrap     bool               // soft-wrap long lines at viewport width
+	logsPretty   bool               // pretty-print JSON log bodies
+
+	// Screen: logs — raw-line buffer (source of truth for the viewport derivation)
+	logsRawLines  []string // complete logical lines, unfiltered
+	logsPartial   string   // trailing incomplete line (no newline yet)
+	logsScanned   int      // raw-line scan cursor: count of logsRawLines already folded into logsFormatted (a resume point, NOT a survivor count)
+	logsFormatted string   // cached formatted output for the scanned raw lines
+	logsErrLine   string   // filter-exempt terminal error text; always rendered regardless of an active filter
 
 	// Screen: config
 	configContent  []byte         // raw compose file content
@@ -888,7 +892,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 		following := m.logsViewport.AtBottom() // capture BEFORE appending
-		m.logsContent += string(msg.data)
+		m.appendRawChunk(msg.data)
 		m.applyLogFormat() // SetContent preserves YOffset
 		if following {
 			m.logsViewport.GotoBottom()
@@ -902,9 +906,17 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.logsDone = true
 		if msg.err != nil {
 			m.logsErr = msg.err
-			m.logsContent += fmt.Sprintf("\n\nError: %v", msg.err)
+			// Flush any in-flight partial line into the buffer so it is not lost.
+			if m.logsPartial != "" {
+				m.logsRawLines = append(m.logsRawLines, m.logsPartial)
+				m.logsPartial = ""
+			}
+			// The terminal error is filter-exempt: it must render regardless of an
+			// active filter, so it lives in a dedicated slot outside the filterable
+			// raw-line buffer.
+			m.logsErrLine = fmt.Sprintf("Error: %v", msg.err)
 			m.applyLogFormat()
-			m.logsViewport.GotoBottom()
+			m.logsViewport.GotoBottom() // force the error into view even if paused
 		}
 		return m, nil
 
@@ -1475,7 +1487,6 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 				m.logsCancel()
 			}
 			m.logsService = ""
-			m.logsContent = ""
 			m.logsCancel = nil
 			m.logsDone = false
 			m.logsErr = nil
@@ -1483,8 +1494,11 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.logsViewport = viewport.Model{}
 			m.logsWrap = false
 			m.logsPretty = false
+			m.logsRawLines = nil
+			m.logsPartial = ""
+			m.logsScanned = 0
 			m.logsFormatted = ""
-			m.logsRawOff = 0
+			m.logsErrLine = ""
 			m.screen = screenSelectContainers
 			m.statsSession++
 			m.statusSession++
@@ -2000,14 +2014,16 @@ func (m Model) fetchConfigValidate() tea.Cmd {
 func (m *Model) enterLogs() (tea.Model, tea.Cmd) {
 	service := m.services[m.svcCursor]
 	m.logsService = service
-	m.logsContent = ""
 	m.logsDone = false
 	m.logsErr = nil
 	m.logsSession++
 	m.logsWrap = true
 	m.logsPretty = false
+	m.logsRawLines = nil
+	m.logsPartial = ""
+	m.logsScanned = 0
 	m.logsFormatted = ""
-	m.logsRawOff = 0
+	m.logsErrLine = ""
 
 	vpHeight := m.height - 6
 	if vpHeight < 3 {
@@ -2039,44 +2055,73 @@ func (m *Model) enterLogs() (tea.Model, tea.Cmd) {
 	return *m, m.readLogChunk()
 }
 
-// applyLogFormat incrementally formats only new data since the last call.
-// It scans only m.logsContent[m.logsRawOff:] for new complete lines, formats
-// them, and appends to the cached logsFormatted. The trailing incomplete line
-// is formatted fresh each time. Call fullReformat() when toggles or width change.
+// appendRawChunk splits streamed bytes into complete logical lines — appending
+// them to logsRawLines — and retains any trailing bytes with no newline yet in
+// logsPartial until a later chunk completes them. Splitting on '\n' only (a
+// trailing '\r' stays on the line) preserves the pre-refactor line semantics.
+func (m *Model) appendRawChunk(data []byte) {
+	s := m.logsPartial + string(data)
+	for {
+		idx := strings.IndexByte(s, '\n')
+		if idx < 0 {
+			break
+		}
+		m.logsRawLines = append(m.logsRawLines, s[:idx])
+		s = s[idx+1:]
+	}
+	m.logsPartial = s
+}
+
+// applyLogFormat derives the viewport content from the raw-line buffer. It folds
+// only the not-yet-processed tail of logsRawLines (via foldNewRawLines) through
+// the filter predicate and the wrap/pretty formatter, appends the result to the
+// cached logsFormatted, and advances logsScanned per raw line scanned (NOT per
+// survivor — see the survivor-cursor trap in foldNewRawLines). Task 2 passes a
+// nil (all-pass) predicate, so with no filter the behaviour is identical to the
+// pre-refactor pipeline. Call fullReformat() when the filter, toggles, or width
+// change.
 func (m *Model) applyLogFormat() {
-	remaining := m.logsContent[m.logsRawOff:]
-
-	// Find new complete lines (everything up to the last \n in remaining)
-	if lastNL := strings.LastIndex(remaining, "\n"); lastNL >= 0 {
-		completePart := remaining[:lastNL]
-		newLines := strings.Split(completePart, "\n")
-		formatted := formatLogLines(newLines, m.logsViewport.Width, m.logsWrap, m.logsPretty)
+	delta, newScanned := foldNewRawLines(m.logsRawLines, m.logsScanned, m.logsViewport.Width, m.logsWrap, m.logsPretty, nil)
+	if delta != "" {
 		if m.logsFormatted == "" {
-			m.logsFormatted = formatted
+			m.logsFormatted = delta
 		} else {
-			m.logsFormatted += "\n" + formatted
+			m.logsFormatted += "\n" + delta
 		}
-		m.logsRawOff += lastNL + 1
-		remaining = remaining[lastNL+1:]
 	}
+	m.logsScanned = newScanned
+	m.logsViewport.SetContent(m.derivedLogContent())
+}
 
-	// Format the trailing incomplete line (if any) and combine with cache
-	if len(remaining) > 0 {
-		tail := formatLogLines([]string{remaining}, m.logsViewport.Width, m.logsWrap, m.logsPretty)
-		if m.logsFormatted == "" {
-			m.logsViewport.SetContent(tail)
+// derivedLogContent assembles the exact string handed to the log viewport:
+// the cached formatted survivors, then the unfiltered in-flight partial line,
+// then the filter-exempt terminal error. It is pure over the current Model
+// state so tests can assert on the derived content directly.
+func (m *Model) derivedLogContent() string {
+	content := m.logsFormatted
+	if m.logsPartial != "" {
+		tail := formatLogLines([]string{m.logsPartial}, m.logsViewport.Width, m.logsWrap, m.logsPretty)
+		if content == "" {
+			content = tail
 		} else {
-			m.logsViewport.SetContent(m.logsFormatted + "\n" + tail)
+			content += "\n" + tail
 		}
-	} else {
-		m.logsViewport.SetContent(m.logsFormatted)
 	}
+	if m.logsErrLine != "" {
+		errFmt := formatLogLines([]string{m.logsErrLine}, m.logsViewport.Width, m.logsWrap, m.logsPretty)
+		if content == "" {
+			content = errFmt
+		} else {
+			content += "\n\n" + errFmt // blank line before the terminal error
+		}
+	}
+	return content
 }
 
 // fullReformat re-processes all content from scratch. Used when toggles change
 // or the viewport is resized, since width/mode changes affect every line.
 func (m *Model) fullReformat() {
-	m.logsRawOff = 0
+	m.logsScanned = 0
 	m.logsFormatted = ""
 	m.applyLogFormat()
 }
@@ -3270,8 +3315,8 @@ func (m Model) searchInputWidth() int {
 	if m.width <= 0 {
 		return 0
 	}
-	const prefixWidth = 4 // "  / "
-	const promptWidth = 2 // textinput default prompt "> "
+	const prefixWidth = 4                  // "  / "
+	const promptWidth = 2                  // textinput default prompt "> "
 	suffixWidth := 2 + m.maxCounterWidth() // "  " + widest counter
 	budget := m.width - prefixWidth - promptWidth - suffixWidth
 	if budget < 1 {

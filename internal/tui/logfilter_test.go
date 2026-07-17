@@ -1,6 +1,9 @@
 package tui
 
-import "testing"
+import (
+	"strings"
+	"testing"
+)
 
 func TestBuildMatcher(t *testing.T) {
 	tests := []struct {
@@ -227,4 +230,66 @@ func TestLogComputeMatches(t *testing.T) {
 			t.Errorf("logComputeMatches(nil, pred) = %v, want nil", got)
 		}
 	})
+}
+
+// TestFoldNewRawLines_CursorAdvancesByRawCount pins the survivor-cursor trap:
+// the returned cursor counts RAW lines scanned, not survivors folded. Advancing
+// by survivor count would re-scan an already-filtered line and duplicate it.
+func TestFoldNewRawLines_CursorAdvancesByRawCount(t *testing.T) {
+	raw := []string{"keep0", "drop1", "keep2"}
+	pred := func(s string) bool { return !strings.Contains(s, "drop") }
+
+	delta, scanned := foldNewRawLines(raw, 0, 80, false, false, pred)
+	// Survivors: keep0, keep2 (2 lines). The cursor MUST advance to 3 (raw
+	// count), not 2 (survivor count).
+	if scanned != 3 {
+		t.Errorf("newScanned = %d, want 3 (raw count, not survivor count)", scanned)
+	}
+	if delta != "keep0\nkeep2" {
+		t.Errorf("delta = %q, want %q", delta, "keep0\nkeep2")
+	}
+
+	// A second fold from the advanced cursor sees no new lines — empty delta,
+	// cursor unchanged. This is the anti-duplication guarantee.
+	delta2, scanned2 := foldNewRawLines(raw, scanned, 80, false, false, pred)
+	if delta2 != "" {
+		t.Errorf("second fold delta = %q, want empty (no new raw lines)", delta2)
+	}
+	if scanned2 != 3 {
+		t.Errorf("second fold newScanned = %d, want 3", scanned2)
+	}
+}
+
+func TestFoldNewRawLines_NilPredPassesAll(t *testing.T) {
+	raw := []string{"a", "b", "c"}
+	delta, scanned := foldNewRawLines(raw, 0, 80, false, false, nil)
+	if delta != "a\nb\nc" {
+		t.Errorf("delta = %q, want %q", delta, "a\nb\nc")
+	}
+	if scanned != 3 {
+		t.Errorf("newScanned = %d, want 3", scanned)
+	}
+}
+
+// TestFoldNewRawLines_AllFilteredStillAdvances verifies the cursor still moves
+// to the raw count when every new line is filtered out, so those rejected lines
+// are never re-scanned on the next fold.
+func TestFoldNewRawLines_AllFilteredStillAdvances(t *testing.T) {
+	raw := []string{"x", "y"}
+	reject := func(string) bool { return false }
+	delta, scanned := foldNewRawLines(raw, 0, 80, false, false, reject)
+	if delta != "" {
+		t.Errorf("delta = %q, want empty (all filtered)", delta)
+	}
+	if scanned != 2 {
+		t.Errorf("newScanned = %d, want 2 (cursor advances even when all lines filtered)", scanned)
+	}
+}
+
+func TestFoldNewRawLines_NothingNewIsNoop(t *testing.T) {
+	raw := []string{"a", "b"}
+	delta, scanned := foldNewRawLines(raw, 2, 80, false, false, nil)
+	if delta != "" || scanned != 2 {
+		t.Errorf("fold with scanned==len should be a no-op, got delta=%q scanned=%d", delta, scanned)
+	}
 }
