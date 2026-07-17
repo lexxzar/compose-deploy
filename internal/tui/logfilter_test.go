@@ -3,6 +3,10 @@ package tui
 import (
 	"strings"
 	"testing"
+
+	"github.com/charmbracelet/lipgloss"
+	"github.com/charmbracelet/x/ansi"
+	"github.com/muesli/termenv"
 )
 
 func TestBuildMatcher(t *testing.T) {
@@ -228,6 +232,86 @@ func TestLogComputeMatches(t *testing.T) {
 		pred, _, _ := buildMatcher("health", false, false)
 		if got := logComputeMatches(nil, pred); got != nil {
 			t.Errorf("logComputeMatches(nil, pred) = %v, want nil", got)
+		}
+	})
+}
+
+// TestHighlightMatches proves the highlight overlay wraps matched lines with the
+// style escapes yet leaves the display width untouched (ANSI is zero-width), and
+// that the current match gets the bold style while other matches get the plain
+// one. Non-matching lines pass through byte-identical.
+func TestHighlightMatches(t *testing.T) {
+	// Force a color profile so the styles emit ANSI escapes (the default test
+	// profile may be Ascii, which renders styles as plain text).
+	prev := lipgloss.ColorProfile()
+	lipgloss.SetColorProfile(termenv.TrueColor)
+	defer lipgloss.SetColorProfile(prev)
+
+	physical := []string{
+		"web | GET /health 200",
+		"db  | connection established",
+		"web | GET /health 500",
+	}
+	matches := []int{0, 2}
+	cur := 2 // current match is the physical line at index 2
+
+	got := highlightMatches(physical, matches, cur)
+	if len(got) != len(physical) {
+		t.Fatalf("length changed: got %d, want %d", len(got), len(physical))
+	}
+
+	// Width invariant: every rendered line has the same display width as its
+	// unstyled source — the style adds only zero-width ANSI escapes.
+	for i := range physical {
+		if w1, w2 := ansi.StringWidth(got[i]), ansi.StringWidth(physical[i]); w1 != w2 {
+			t.Errorf("line %d width changed: got %d, want %d", i, w1, w2)
+		}
+	}
+
+	// Non-matching line passes through unchanged (no style bytes).
+	if got[1] != physical[1] {
+		t.Errorf("non-matching line mutated: got %q, want %q", got[1], physical[1])
+	}
+	if strings.Contains(got[1], "\x1b[") {
+		t.Errorf("non-matching line should carry no ANSI escapes: %q", got[1])
+	}
+
+	// Matching lines carry style escapes; the raw text is still present.
+	for _, i := range matches {
+		if !strings.Contains(got[i], "\x1b[") {
+			t.Errorf("matched line %d should carry ANSI style escapes: %q", i, got[i])
+		}
+		if !strings.Contains(got[i], physical[i]) {
+			t.Errorf("matched line %d should still contain its raw text: %q", i, got[i])
+		}
+	}
+
+	// The current match (index 2) must render with the bold current style, which
+	// differs from the plain match style used on the other match (index 0).
+	if got[2] == logSearchMatchStyle.Render(physical[2]) {
+		t.Error("current match should use the bold current style, not the plain match style")
+	}
+	if got[2] != logSearchCurrentStyle.Render(physical[2]) {
+		t.Errorf("current match not styled with logSearchCurrentStyle: %q", got[2])
+	}
+	if got[0] != logSearchMatchStyle.Render(physical[0]) {
+		t.Errorf("non-current match not styled with logSearchMatchStyle: %q", got[0])
+	}
+
+	t.Run("empty matches returns input unchanged", func(t *testing.T) {
+		out := highlightMatches(physical, nil, -1)
+		for i := range physical {
+			if out[i] != physical[i] {
+				t.Errorf("line %d mutated with no matches: got %q, want %q", i, out[i], physical[i])
+			}
+		}
+	})
+
+	t.Run("cur == -1 skips the bold pass", func(t *testing.T) {
+		out := highlightMatches(physical, matches, -1)
+		if out[0] != logSearchMatchStyle.Render(physical[0]) ||
+			out[2] != logSearchMatchStyle.Render(physical[2]) {
+			t.Error("with cur=-1 all matches should use the plain match style")
 		}
 	})
 }

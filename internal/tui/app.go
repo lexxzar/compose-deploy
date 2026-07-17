@@ -278,6 +278,15 @@ type Model struct {
 	logFilterIsRegex bool            // live/desired mode; ctrl+r toggles (regex vs. substring)
 	logFilterRe      *regexp.Regexp  // compiled matcher when the last-good query is a valid regex; nil ⇒ substring (source of truth for regex-ness in logFilterPred)
 
+	// Screen: logs — search-within-highlight (see clearLogSearch/logSearchPred/recomputeLogSearch)
+	logSearching     bool            // search bar open, capturing text
+	logSearchInput   textinput.Model // (re)constructed lazily in the "/" open handler
+	logSearchQuery   string          // live/committed query; != "" ⇒ highlights + n/N active
+	logSearchIsRegex bool            // live/desired mode; ctrl+r toggles (regex vs. substring)
+	logSearchRe      *regexp.Regexp  // compiled matcher when the query is a valid regex; nil ⇒ substring
+	logSearchMatches []int           // PHYSICAL line indices of matches, ascending (recomputed at SetContent time)
+	logSearchCur     int             // index into logSearchMatches (the current match)
+
 	// Screen: config
 	configContent  []byte         // raw compose file content
 	configResolved []byte         // resolved/interpolated config (cached)
@@ -1098,12 +1107,11 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			}
 			key = "esc"
 		case screenLogs:
-			if m.logFiltering {
-				// Filter bar is capturing text — q is a literal character that
-				// must reach the logFilterInput (mirrors the container-search
-				// and settings-form field-4 exceptions above). Leave key
-				// untouched so it falls through to the typing intercept.
-				// (Task 4 extends this to `|| m.logSearching`.)
+			if m.logFiltering || m.logSearching {
+				// A filter or search bar is capturing text — q is a literal
+				// character that must reach the open input (mirrors the
+				// container-search and settings-form field-4 exceptions above).
+				// Leave key untouched so it falls through to the typing intercept.
 				break
 			}
 			key = "esc"
@@ -1501,7 +1509,8 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		// bar is open every keystroke routes to it (mirrors the container-screen
 		// `if m.searching` intercept). Without this, typing `w`/`p`/`G`/`f`/`q`
 		// into the filter query would fire wrap/pretty/gotobottom/filter/back.
-		// (Task 4 extends the condition to `|| m.logSearching`.)
+		// The filter and search bars are mutually exclusive (only one input can
+		// be open at a time), so the two blocks below never both run.
 		if m.logFiltering {
 			switch key {
 			case "ctrl+c":
@@ -1537,6 +1546,42 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			}
 		}
 
+		// Search typing intercept — the Task 4 companion to the filter intercept
+		// above. While the search bar is open every keystroke routes to
+		// logSearchInput so q/n/N type literally instead of firing back/cycle.
+		if m.logSearching {
+			switch key {
+			case "ctrl+c":
+				return m.tryQuit()
+			case "enter":
+				// Commit: close the bar, keep highlights + n/N live. An empty
+				// query fully clears so no dead search state lingers.
+				if m.logSearchQuery == "" {
+					m.clearLogSearch()
+					m.setLogViewportContent()
+				} else {
+					m.logSearching = false
+					m.logSearchInput.Blur()
+				}
+				return m, nil
+			case "esc":
+				// Cancel (provisional — Task 5 folds this into the esc ladder):
+				// discard the query and clear the highlight.
+				m.clearLogSearch()
+				m.setLogViewportContent()
+				return m, nil
+			case "ctrl+r":
+				m.logSearchIsRegex = !m.logSearchIsRegex
+				m.recomputeLogSearch()
+				return m, nil
+			default:
+				var cmd tea.Cmd
+				m.logSearchInput, cmd = m.logSearchInput.Update(msg)
+				m.recomputeLogSearch()
+				return m, cmd
+			}
+		}
+
 		switch key {
 		case "ctrl+c":
 			return m.tryQuit()
@@ -1558,6 +1603,7 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.logsFormatted = ""
 			m.logsErrLine = ""
 			m.clearLogFilter()
+			m.clearLogSearch()
 			m.screen = screenSelectContainers
 			m.statsSession++
 			m.statusSession++
@@ -1609,6 +1655,27 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.logFilterInput = textinput.New()
 			m.logFiltering = true
 			m.logFilterInput.Focus()
+			return m, nil
+		case "/":
+			// Open search-within-highlight. Early-return on an empty rendered
+			// buffer (nothing to search). The input is built lazily here — NOT in
+			// NewModel — so Model{} test literals stay valid; it is only rendered
+			// while logSearching.
+			if m.derivedLogContent() == "" {
+				return m, nil
+			}
+			m.logSearchInput = textinput.New()
+			m.logSearching = true
+			m.logSearchInput.Focus()
+			return m, nil
+		case "n":
+			// Cycle to the next match. No-op without a committed search; the
+			// viewport does not bind n/N, so swallowing them when idle is a
+			// no-op either way.
+			m.cycleLogMatch(true)
+			return m, nil
+		case "N":
+			m.cycleLogMatch(false)
 			return m, nil
 		default:
 			var cmd tea.Cmd
@@ -2096,6 +2163,7 @@ func (m *Model) enterLogs() (tea.Model, tea.Cmd) {
 	m.logsFormatted = ""
 	m.logsErrLine = ""
 	m.clearLogFilter()
+	m.clearLogSearch()
 
 	vpHeight := m.height - 6
 	if vpHeight < 3 {
@@ -2162,7 +2230,7 @@ func (m *Model) applyLogFormat() {
 		}
 	}
 	m.logsScanned = newScanned
-	m.logsViewport.SetContent(m.derivedLogContent())
+	m.setLogViewportContent()
 }
 
 // derivedLogContent assembles the exact string handed to the log viewport:
@@ -2269,6 +2337,135 @@ func (m *Model) clearLogFilter() {
 	m.logFilterRe = nil
 	m.logFilterInput.SetValue("")
 	m.logFilterInput.Blur()
+}
+
+// logSearchPred reconstructs the live search predicate from the committed search
+// state. It mirrors logFilterPred but with allowNegate=false — search has no "!"
+// exclusion (that is a filter-only affordance). Regex-ness derives from
+// logSearchRe (nil ⇒ substring), so a mid-type ctrl+r into a *bad* regex keeps
+// the last-good matcher. Returns nil (no highlight) when no query is active.
+func (m Model) logSearchPred() func(string) bool {
+	if m.logSearchQuery == "" {
+		return nil
+	}
+	pred, _, _ := buildMatcher(m.logSearchQuery, m.logSearchRe != nil, false)
+	return pred
+}
+
+// setLogViewportContent is the single SetContent chokepoint for the log screen.
+// It assembles the derived (filtered) content and — when a search is active —
+// recomputes logSearchMatches over the PHYSICAL lines and overlays the highlight
+// as a SetContent-TIME pass (logsFormatted itself stays UNSTYLED). Routing every
+// content write through here means live streaming (applyLogFormat), filter
+// re-derivation (rederiveLogs), and w/p/resize reformats all pick up the search
+// highlight and fresh match set without duplicating the split/compute/highlight
+// logic. Search runs over the filtered survivors: a line hidden by the filter
+// is absent from derivedLogContent, so it can never be a match.
+func (m *Model) setLogViewportContent() {
+	content := m.derivedLogContent()
+	pred := m.logSearchPred()
+	if pred == nil {
+		m.logSearchMatches = nil
+		m.logsViewport.SetContent(content)
+		return
+	}
+	physical := strings.Split(content, "\n")
+	m.logSearchMatches = logComputeMatches(physical, pred)
+	// Keep the current-match cursor in range. Append-only streaming preserves
+	// existing indices (the prefix is stable), so a committed cursor holds; a
+	// filter/toggle/resize that shrinks the set clamps back to the first match.
+	if m.logSearchCur >= len(m.logSearchMatches) {
+		m.logSearchCur = 0
+	}
+	cur := -1
+	if len(m.logSearchMatches) > 0 {
+		cur = m.logSearchMatches[m.logSearchCur]
+	}
+	m.logsViewport.SetContent(strings.Join(highlightMatches(physical, m.logSearchMatches, cur), "\n"))
+}
+
+// recomputeLogSearch rebuilds the live search from the input value and regex
+// mode, re-highlights, and live-jumps to the first match. An empty query clears
+// the highlight; a bad regex mid-type keeps the last-good matcher (no thrash),
+// mirroring recomputeLogFilter. Called on every keystroke while the search bar
+// is open and on ctrl+r.
+func (m *Model) recomputeLogSearch() {
+	newQuery := m.logSearchInput.Value()
+	if newQuery == "" {
+		m.logSearchQuery = ""
+		m.logSearchRe = nil
+		m.logSearchCur = 0
+		m.setLogViewportContent() // clears matches + highlight
+		return
+	}
+	_, re, valid := buildMatcher(newQuery, m.logSearchIsRegex, false)
+	if !valid {
+		return // bad regex mid-type: keep last-good, no re-highlight
+	}
+	m.logSearchQuery = newQuery
+	m.logSearchRe = re // nil for substring, non-nil for a valid regex
+	m.logSearchCur = 0
+	m.setLogViewportContent() // recomputes logSearchMatches
+	if len(m.logSearchMatches) > 0 {
+		m.scrollLogMatchIntoView(m.logSearchMatches[0])
+	}
+}
+
+// cycleLogMatch moves the current match forward (n) or backward (N) through
+// logSearchMatches with wrap-around, scrolls the new match into view, and
+// re-highlights so the bold "current" style follows. No-op when no search is
+// committed or there are no matches. Mirrors cycleMatch (container search) but
+// over physical log-line indices with a dedicated logSearchCur cursor.
+func (m *Model) cycleLogMatch(forward bool) {
+	n := len(m.logSearchMatches)
+	if m.logSearchQuery == "" || n == 0 {
+		return
+	}
+	if forward {
+		m.logSearchCur = (m.logSearchCur + 1) % n
+	} else {
+		m.logSearchCur = (m.logSearchCur - 1 + n) % n
+	}
+	m.scrollLogMatchIntoView(m.logSearchMatches[m.logSearchCur])
+	m.setLogViewportContent()
+}
+
+// scrollLogMatchIntoView scrolls the log viewport so the given physical line is
+// visible: a no-op when it already sits within the visible window, otherwise it
+// pins the line to the top. Scrolling up off the bottom auto-pauses follow (the
+// AtBottom heuristic); G resumes. SetYOffset clamps into range, so a match near
+// the bottom lands visible without over-scrolling.
+func (m *Model) scrollLogMatchIntoView(line int) {
+	top := m.logsViewport.YOffset
+	h := m.logsViewport.Height
+	if line < top || line >= top+h {
+		m.logsViewport.SetYOffset(line)
+	}
+}
+
+// logSearchCounter renders the "(i/N)" position indicator for the search bar
+// (Task 6 renders the bar; this keeps the counter logic beside the state).
+// "(no match)" when the query matched nothing; i is 1-based (logSearchCur+1).
+func (m Model) logSearchCounter() string {
+	n := len(m.logSearchMatches)
+	if n == 0 {
+		return "(no match)"
+	}
+	return fmt.Sprintf("(%d/%d)", m.logSearchCur+1, n)
+}
+
+// clearLogSearch resets every search field to the no-search default. Called on
+// entry to the log screen and on the esc-to-containers cleanup, and used by the
+// typing-cancel path to discard an in-progress query.
+func (m *Model) clearLogSearch() {
+	m.logSearching = false
+	m.logSearchQuery = ""
+	m.logSearchIsRegex = false
+	m.logSearchRe = nil
+	m.logSearchMatches = nil
+	m.logSearchCur = 0
+	m.logSearchInput.SetValue("")
+	m.logSearchInput.Blur()
 }
 
 func (m Model) readLogChunk() tea.Cmd {

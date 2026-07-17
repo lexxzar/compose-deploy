@@ -174,14 +174,14 @@ idle           → "" (blank, but the line is still reserved)
 - Modify: `internal/tui/styles.go` (add `logSearchMatchStyle`, `logSearchCurrentStyle`)
 - Modify: `internal/tui/app_test.go`
 
-- [ ] add `logSearchMatchStyle` (yellow) and `logSearchCurrentStyle` (yellow + bold) to styles.go
-- [ ] add search Model fields; build `logSearchInput` lazily on `/`; early-return `/` when the rendered buffer is empty
-- [ ] **extend the Task 3 typing intercept and `q`-exception to `|| m.logSearching`** so `/`-mode keystrokes route to the search input and `q`/`n`/`N` type literally while searching
-- [ ] wire typing mode: split the formatted content on `\n` to get physical lines, recompute `logSearchMatches` (physical indices via `logComputeMatches` over the filtered physical lines) on each keystroke, live-jump to first match; `n`/`N` cycle with wrap-around (mirror `cycleMatch`); `ctrl+r` toggles `logSearchIsRegex`; bar shows `(i/N)` / `(no match)`; apply `highlightMatches` as a **SetContent-time pass** (keep `logsFormatted` unstyled)
-- [ ] recompute matches whenever the filter changes or new matching lines stream in (append-only in steady state; full recompute on filter/toggle/resize); jumping scrolls up and auto-pauses follow (existing behavior), `G` re-resumes. NOTE: `esc` handling here is **provisional** pending Task 5
-- [ ] add `clearLogSearch()` (resets all search fields), called from `enterLogs` init and the `esc`-to-containers cleanup
-- [ ] write tests: `/` opens; highlight applied to matches (assert style bytes present, `ansi.StringWidth` unchanged); `n`/`N` wrap-around; `ctrl+r` toggle; matches recompute after a filter change; search operates over filtered survivors (a line hidden by the filter is not a search match); **per-physical-line match semantics** — two occurrences on two wrapped rows both highlight/count, but an occurrence split *across* a soft-wrap boundary is not matched (accepted limitation, pinned so it's intentional)
-- [ ] run tests — must pass before Task 5
+- [x] add `logSearchMatchStyle` (yellow) and `logSearchCurrentStyle` (yellow + bold) to styles.go
+- [x] add search Model fields; build `logSearchInput` lazily on `/`; early-return `/` when the rendered buffer is empty
+- [x] **extend the Task 3 typing intercept and `q`-exception to `|| m.logSearching`** so `/`-mode keystrokes route to the search input and `q`/`n`/`N` type literally while searching
+- [x] wire typing mode: split the formatted content on `\n` to get physical lines, recompute `logSearchMatches` (physical indices via `logComputeMatches` over the filtered physical lines) on each keystroke, live-jump to first match; `n`/`N` cycle with wrap-around (mirror `cycleMatch`); `ctrl+r` toggles `logSearchIsRegex`; bar shows `(i/N)` / `(no match)`; apply `highlightMatches` as a **SetContent-time pass** (keep `logsFormatted` unstyled) _(routed through the single `setLogViewportContent()` chokepoint; `logSearchCounter()` helper returns the `(i/N)`/`(no match)` string for Task 6's bar)_
+- [x] recompute matches whenever the filter changes or new matching lines stream in (append-only in steady state; full recompute on filter/toggle/resize); jumping scrolls up and auto-pauses follow (existing behavior), `G` re-resumes. NOTE: `esc` handling here is **provisional** pending Task 5 _(match recompute rides `applyLogFormat`/`rederiveLogs`/`fullReformat` via `setLogViewportContent`; live-jump/cycle via `scrollLogMatchIntoView`)_
+- [x] add `clearLogSearch()` (resets all search fields), called from `enterLogs` init and the `esc`-to-containers cleanup
+- [x] write tests: `/` opens; highlight applied to matches (assert style bytes present, `ansi.StringWidth` unchanged); `n`/`N` wrap-around; `ctrl+r` toggle; matches recompute after a filter change; search operates over filtered survivors (a line hidden by the filter is not a search match); **per-physical-line match semantics** — two occurrences on two wrapped rows both highlight/count, but an occurrence split *across* a soft-wrap boundary is not matched (accepted limitation, pinned so it's intentional)
+- [x] run tests — must pass before Task 5
 
 ### Task 5: Consolidate the layered `esc` ladder
 

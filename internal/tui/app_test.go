@@ -18,6 +18,7 @@ import (
 	"github.com/charmbracelet/bubbles/viewport"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
+	"github.com/charmbracelet/x/ansi"
 	"github.com/lexxzar/compose-deploy/internal/compose"
 	"github.com/lexxzar/compose-deploy/internal/config"
 	"github.com/lexxzar/compose-deploy/internal/runner"
@@ -3536,6 +3537,364 @@ func TestLogFilter_QActsAsBackWhenNotFiltering(t *testing.T) {
 	if m.screen != screenSelectContainers {
 		t.Errorf("q should navigate back to the container screen, got screen %d", m.screen)
 	}
+}
+
+// --- Task 4: log-view search-within-highlight ---
+
+func TestLogSearch_SlashOpensInput(t *testing.T) {
+	m := setupFilterableLogsModel()
+	updated, _ := m.Update(runeKey('/'))
+	m = updated.(Model)
+	if !m.logSearching {
+		t.Fatal("logSearching should be true after pressing /")
+	}
+	if !m.logSearchInput.Focused() {
+		t.Error("search input should be focused after opening")
+	}
+}
+
+func TestLogSearch_SlashNoopOnEmptyBuffer(t *testing.T) {
+	m := setupFilterableLogsModel()
+	m.logsRawLines = nil
+	m.logsPartial = ""
+	m.logsScanned = 0
+	m.logsFormatted = ""
+	m.logsErrLine = ""
+	if m.derivedLogContent() != "" {
+		t.Fatalf("precondition: rendered buffer should be empty, got %q", m.derivedLogContent())
+	}
+	updated, _ := m.Update(runeKey('/'))
+	m = updated.(Model)
+	if m.logSearching {
+		t.Error("/ must be a no-op when the rendered buffer is empty")
+	}
+}
+
+// TestLogSearch_TypingActionKeysLandInInput pins the typing intercept: while the
+// search bar is open, q/n/N are literal characters, NOT the back/cycle actions.
+func TestLogSearch_TypingActionKeysLandInInput(t *testing.T) {
+	m := setupFilterableLogsModel()
+	wrapBefore := m.logsWrap
+
+	updated, _ := m.Update(runeKey('/'))
+	m = updated.(Model)
+	m = typeInto(m, "qnN")
+
+	if m.logSearchInput.Value() != "qnN" {
+		t.Errorf("input value = %q, want %q", m.logSearchInput.Value(), "qnN")
+	}
+	if m.screen != screenLogs {
+		t.Error("q must not navigate away while typing a search")
+	}
+	if !m.logSearching {
+		t.Error("should still be searching after typing")
+	}
+	if m.logsWrap != wrapBefore {
+		t.Error("wrap should be unchanged while typing a search")
+	}
+}
+
+// TestLogSearch_HighlightAppliedWidthPreserved pins that a live search overlays
+// the highlight (ANSI style bytes present in the render) yet leaves each line's
+// display width unchanged (ansi.StringWidth is escape-blind).
+func TestLogSearch_HighlightAppliedWidthPreserved(t *testing.T) {
+	prev := lipgloss.ColorProfile()
+	lipgloss.SetColorProfile(termenv.TrueColor)
+	defer lipgloss.SetColorProfile(prev)
+
+	m := setupFilterableLogsModel()
+	updated, _ := m.Update(runeKey('/'))
+	m = updated.(Model)
+	m = typeInto(m, "ERROR")
+
+	if m.logSearchQuery != "ERROR" {
+		t.Fatalf("logSearchQuery = %q, want ERROR", m.logSearchQuery)
+	}
+	if !intSliceEq(m.logSearchMatches, []int{1, 4}) {
+		t.Fatalf("logSearchMatches = %v, want [1 4]", m.logSearchMatches)
+	}
+
+	if !strings.Contains(m.logsViewport.View(), "\x1b[") {
+		t.Error("expected ANSI style escapes in the highlighted viewport render")
+	}
+
+	physical := strings.Split(m.derivedLogContent(), "\n")
+	styled := highlightMatches(physical, m.logSearchMatches, m.logSearchMatches[m.logSearchCur])
+	for i := range physical {
+		if a, b := ansi.StringWidth(styled[i]), ansi.StringWidth(physical[i]); a != b {
+			t.Errorf("line %d display width changed by highlight: %d vs %d", i, a, b)
+		}
+	}
+	if styled[1] == physical[1] {
+		t.Error("a matched line should be styled (differ from its raw form)")
+	}
+}
+
+// TestLogSearch_NCyclesWithWrapAround pins n/N cycle with wrap-around over the
+// committed match set.
+func TestLogSearch_NCyclesWithWrapAround(t *testing.T) {
+	m := setupFilterableLogsModel()
+	updated, _ := m.Update(runeKey('/'))
+	m = updated.(Model)
+	m = typeInto(m, "ERROR")
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyEnter}) // commit
+	m = updated.(Model)
+
+	if len(m.logSearchMatches) != 2 {
+		t.Fatalf("want 2 matches, got %v", m.logSearchMatches)
+	}
+	if m.logSearchCur != 0 {
+		t.Fatalf("cur should start at 0 (first match), got %d", m.logSearchCur)
+	}
+
+	updated, _ = m.Update(runeKey('n')) // → second match
+	m = updated.(Model)
+	if m.logSearchCur != 1 {
+		t.Errorf("after n, cur = %d, want 1", m.logSearchCur)
+	}
+	updated, _ = m.Update(runeKey('n')) // wrap → first match
+	m = updated.(Model)
+	if m.logSearchCur != 0 {
+		t.Errorf("after n wrap, cur = %d, want 0", m.logSearchCur)
+	}
+	updated, _ = m.Update(runeKey('N')) // wrap backward → last match
+	m = updated.(Model)
+	if m.logSearchCur != 1 {
+		t.Errorf("after N from first, cur = %d, want 1 (wrap to last)", m.logSearchCur)
+	}
+}
+
+// TestLogSearch_CtrlRTogglesRegex pins the substring→regex toggle: "ERROR|WARN"
+// is a literal that matches nothing as a substring, but matches the ERROR and
+// WARN lines once regex mode is on.
+func TestLogSearch_CtrlRTogglesRegex(t *testing.T) {
+	m := setupFilterableLogsModel()
+	updated, _ := m.Update(runeKey('/'))
+	m = updated.(Model)
+	if m.logSearchIsRegex {
+		t.Fatal("regex mode should be off by default")
+	}
+
+	m = typeInto(m, "ERROR|WARN")
+	if len(m.logSearchMatches) != 0 {
+		t.Errorf("substring mode: literal ERROR|WARN matches nothing, got %v", m.logSearchMatches)
+	}
+
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyCtrlR})
+	m = updated.(Model)
+	if !m.logSearchIsRegex {
+		t.Fatal("ctrl+r should enable regex mode")
+	}
+	// ERROR lines (idx 1, 4) and the WARN line (idx 3) → 3 matches, ascending.
+	if !intSliceEq(m.logSearchMatches, []int{1, 3, 4}) {
+		t.Errorf("regex ERROR|WARN should match [1 3 4], got %v", m.logSearchMatches)
+	}
+}
+
+// TestLogSearch_BadRegexKeepsLastGood pins that a mid-type invalid regex keeps
+// the last-good query/matches (no thrash), mirroring the filter behavior.
+func TestLogSearch_BadRegexKeepsLastGood(t *testing.T) {
+	m := setupFilterableLogsModel()
+	updated, _ := m.Update(runeKey('/'))
+	m = updated.(Model)
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyCtrlR}) // regex mode
+	m = updated.(Model)
+	m = typeInto(m, "ERROR")
+
+	goodMatches := append([]int(nil), m.logSearchMatches...)
+	if m.logSearchQuery != "ERROR" {
+		t.Fatalf("precondition: query = %q, want ERROR", m.logSearchQuery)
+	}
+
+	m = typeInto(m, "[") // "ERROR[" is an invalid regex
+
+	if m.logSearchQuery != "ERROR" {
+		t.Errorf("bad regex must not update logSearchQuery: got %q", m.logSearchQuery)
+	}
+	if !intSliceEq(m.logSearchMatches, goodMatches) {
+		t.Errorf("bad regex must keep last-good matches: got %v, want %v", m.logSearchMatches, goodMatches)
+	}
+	if m.logSearchInput.Value() != "ERROR[" {
+		t.Errorf("input should still echo the typed text: got %q", m.logSearchInput.Value())
+	}
+}
+
+// TestLogSearch_RecomputesAfterFilterChange pins that committing a filter
+// re-derives the survivors AND recomputes the search match indices over them.
+func TestLogSearch_RecomputesAfterFilterChange(t *testing.T) {
+	m := setupFilterableLogsModel()
+
+	// Commit a search for "timeout" (only the last raw line, physical idx 4).
+	updated, _ := m.Update(runeKey('/'))
+	m = updated.(Model)
+	m = typeInto(m, "timeout")
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	m = updated.(Model)
+	if !intSliceEq(m.logSearchMatches, []int{4}) {
+		t.Fatalf("before filter: matches = %v, want [4]", m.logSearchMatches)
+	}
+
+	// Apply a filter for "ERROR": survivors are the two ERROR lines; "timeout"
+	// is now physical index 1 among the survivors.
+	updated, _ = m.Update(runeKey('f'))
+	m = updated.(Model)
+	m = typeInto(m, "ERROR")
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	m = updated.(Model)
+	if !intSliceEq(m.logSearchMatches, []int{1}) {
+		t.Errorf("after filter: matches = %v, want [1] (recomputed over survivors)", m.logSearchMatches)
+	}
+}
+
+// TestLogSearch_OperatesOverFilteredSurvivors pins that search runs over the
+// filtered survivors only: a term present solely on a filtered-out line yields
+// zero matches.
+func TestLogSearch_OperatesOverFilteredSurvivors(t *testing.T) {
+	m := setupFilterableLogsModel()
+
+	// Filter to ERROR lines only — this hides the "healthcheck" line.
+	updated, _ := m.Update(runeKey('f'))
+	m = updated.(Model)
+	m = typeInto(m, "ERROR")
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	m = updated.(Model)
+	if strings.Contains(m.derivedLogContent(), "healthcheck") {
+		t.Fatal("precondition: the healthcheck line should be hidden by the filter")
+	}
+
+	// Search for a term only present on the filtered-out line.
+	updated, _ = m.Update(runeKey('/'))
+	m = updated.(Model)
+	m = typeInto(m, "healthcheck")
+	if len(m.logSearchMatches) != 0 {
+		t.Errorf("a line hidden by the filter must not be a search match, got %v", m.logSearchMatches)
+	}
+}
+
+// TestLogSearch_PerPhysicalLineMatchSemantics pins the accepted per-physical-line
+// semantics: two occurrences that each fall fully within a wrapped row both
+// count; an occurrence split across a soft-wrap boundary is NOT matched.
+func TestLogSearch_PerPhysicalLineMatchSemantics(t *testing.T) {
+	t.Run("two occurrences on two wrapped rows both match", func(t *testing.T) {
+		m := setupFilterableLogsModel()
+		m.logsViewport = viewport.New(6, 20) // wrap every 6 runes
+		m.logsViewport.SetHorizontalStep(0)
+		m.logsWrap = true
+		m.logsRawLines = []string{"XYZ000XYZ"} // → "XYZ000" + "XYZ", each holds a full XYZ
+		m.fullReformat()
+
+		updated, _ := m.Update(runeKey('/'))
+		m = updated.(Model)
+		m = typeInto(m, "XYZ")
+
+		if len(m.logSearchMatches) != 2 {
+			t.Errorf("want 2 matches (one per wrapped row), got %v; physical=%q",
+				m.logSearchMatches, strings.Split(m.derivedLogContent(), "\n"))
+		}
+	})
+
+	t.Run("occurrence split across a wrap boundary is not matched", func(t *testing.T) {
+		m := setupFilterableLogsModel()
+		m.logsViewport = viewport.New(6, 20)
+		m.logsViewport.SetHorizontalStep(0)
+		m.logsWrap = true
+		m.logsRawLines = []string{"0000XYZ00"} // → "0000XY" + "Z00", XYZ straddles the split
+		m.fullReformat()
+
+		updated, _ := m.Update(runeKey('/'))
+		m = updated.(Model)
+		m = typeInto(m, "XYZ")
+
+		if len(m.logSearchMatches) != 0 {
+			t.Errorf("an occurrence split across a wrap boundary must not match, got %v; physical=%q",
+				m.logSearchMatches, strings.Split(m.derivedLogContent(), "\n"))
+		}
+	})
+}
+
+func TestLogSearch_EnterCommitsKeepsSearch(t *testing.T) {
+	m := setupFilterableLogsModel()
+	updated, _ := m.Update(runeKey('/'))
+	m = updated.(Model)
+	m = typeInto(m, "ERROR")
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	m = updated.(Model)
+
+	if m.logSearching {
+		t.Error("the bar should close on enter (commit)")
+	}
+	if m.logSearchQuery != "ERROR" {
+		t.Errorf("committed query should persist, got %q", m.logSearchQuery)
+	}
+	if m.logSearchInput.Focused() {
+		t.Error("input should be blurred after commit")
+	}
+	if len(m.logSearchMatches) != 2 {
+		t.Errorf("committed search should keep matches, got %v", m.logSearchMatches)
+	}
+}
+
+func TestLogSearch_EscCancelClearsSearch(t *testing.T) {
+	m := setupFilterableLogsModel()
+	updated, _ := m.Update(runeKey('/'))
+	m = updated.(Model)
+	m = typeInto(m, "ERROR")
+	if m.logSearchQuery != "ERROR" {
+		t.Fatal("precondition: query should be set while typing")
+	}
+
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyEsc})
+	m = updated.(Model)
+
+	if m.logSearching {
+		t.Error("esc should close the search bar")
+	}
+	if m.logSearchQuery != "" {
+		t.Errorf("esc should clear the query, got %q", m.logSearchQuery)
+	}
+	if m.logSearchMatches != nil {
+		t.Errorf("esc should clear matches, got %v", m.logSearchMatches)
+	}
+	if m.screen != screenLogs {
+		t.Error("esc while typing a search must not leave the log screen")
+	}
+}
+
+// TestLogSearch_EscToContainersClearsSearch pins the cleanup wiring: a committed
+// search does not (yet, pre-Task 5) intercept esc, so esc leaves the screen and
+// the container-cleanup path must reset all search state.
+func TestLogSearch_EscToContainersClearsSearch(t *testing.T) {
+	m := setupFilterableLogsModel()
+	updated, _ := m.Update(runeKey('/'))
+	m = updated.(Model)
+	m = typeInto(m, "ERROR")
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyEnter}) // commit
+	m = updated.(Model)
+
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyEsc}) // leaves the screen
+	m = updated.(Model)
+
+	if m.screen != screenSelectContainers {
+		t.Fatalf("esc should return to the container screen, got screen %d", m.screen)
+	}
+	if m.logSearching || m.logSearchQuery != "" || m.logSearchMatches != nil {
+		t.Errorf("esc-to-containers must clear search state: searching=%v query=%q matches=%v",
+			m.logSearching, m.logSearchQuery, m.logSearchMatches)
+	}
+}
+
+// intSliceEq reports whether two int slices are element-wise equal (nil and
+// empty are treated as equal).
+func intSliceEq(a, b []int) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
 }
 
 func TestShortenPath_HomeDir(t *testing.T) {

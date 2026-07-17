@@ -111,3 +111,37 @@ func logComputeMatches(physical []string, pred func(string) bool) []int {
 	}
 	return matches
 }
+
+// highlightMatches overlays the search highlight on the rendered physical log
+// lines. Each matched line (its index present in matches) is wrapped in
+// logSearchMatchStyle; the current match's line (index cur) is wrapped in
+// logSearchCurrentStyle (bold) so it stands out among the matches.
+//
+// The WHOLE physical line is wrapped rather than a matched sub-span because the
+// caller passes only line indices, not the query — there is no substring offset
+// to locate. Wrapping the line still leaves ansi.StringWidth unaffected either
+// way, since a foreground-only style adds only zero-width ANSI escapes (same
+// rationale as the container-search name highlight). An empty matches slice
+// returns physical unchanged; cur == -1 (no current match) skips the bold pass.
+func highlightMatches(physical []string, matches []int, cur int) []string {
+	if len(matches) == 0 {
+		return physical
+	}
+	matchSet := make(map[int]struct{}, len(matches))
+	for _, idx := range matches {
+		matchSet[idx] = struct{}{}
+	}
+	out := make([]string, len(physical))
+	for i, line := range physical {
+		if i == cur {
+			out[i] = logSearchCurrentStyle.Render(line)
+			continue
+		}
+		if _, ok := matchSet[i]; ok {
+			out[i] = logSearchMatchStyle.Render(line)
+			continue
+		}
+		out[i] = line
+	}
+	return out
+}
