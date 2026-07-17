@@ -1741,11 +1741,15 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.logFilterInput.Focus()
 			return m, nil
 		case "/":
-			// Open search-within-highlight. Early-return on an empty rendered
-			// buffer (nothing to search). The input is built lazily here — NOT in
-			// NewModel — so Model{} test literals stay valid; it is only rendered
-			// while logSearching.
-			if m.derivedLogContent() == "" {
+			// Open search-within-highlight. Early-return when there is genuinely
+			// nothing to search: no folded survivor (logFilterShown == 0), no
+			// in-flight partial, and no terminal error. Testing derivedLogContent()
+			// == "" instead would wrongly refuse to open over a single kept BLANK
+			// survivor (logFilterShown == 1) — an empty rendered string that is
+			// still a real searchable physical line. The input is built lazily
+			// here — NOT in NewModel — so Model{} test literals stay valid; it is
+			// only rendered while logSearching.
+			if m.logFilterShown == 0 && m.logsPartial == "" && m.logsErrLine == "" {
 				return m, nil
 			}
 			// Reset any prior committed search FIRST so reopening starts from a
@@ -2351,20 +2355,30 @@ func (m *Model) applyLogFormat() {
 // state so tests can assert on the derived content directly.
 func (m *Model) derivedLogContent() string {
 	content := m.logsFormatted
+	// hasContent tracks whether a real physical line already sits in `content`.
+	// It CANNOT be derived from content != "": a single kept BLANK survivor folds
+	// to logsFormatted == "" yet is a real physical line (logFilterShown == 1), so
+	// an empty string is ambiguous. logFilterShown > 0 is the authoritative
+	// "have we folded any line" signal; the flag then flips true once the partial
+	// is appended so a later error still separates from it correctly (though in
+	// practice logDoneMsg flushes logsPartial before setting logsErrLine, so a
+	// partial and an error never coexist — the accumulator is the safe superset).
+	hasContent := m.logFilterShown > 0
 	if m.logsPartial != "" {
 		tail := formatLogLines([]string{m.logsPartial}, m.logsViewport.Width, m.logsWrap, m.logsPretty)
-		if content == "" {
-			content = tail
-		} else {
+		if hasContent {
 			content += "\n" + tail
+		} else {
+			content = tail
 		}
+		hasContent = true
 	}
 	if m.logsErrLine != "" {
 		errFmt := formatLogLines([]string{m.logsErrLine}, m.logsViewport.Width, m.logsWrap, m.logsPretty)
-		if content == "" {
-			content = errFmt
-		} else {
+		if hasContent {
 			content += "\n\n" + errFmt // blank line before the terminal error
+		} else {
+			content = errFmt
 		}
 	}
 	return content
@@ -2476,12 +2490,15 @@ func (m Model) logSearchPred() func(string) bool {
 // is absent from derivedLogContent, so it can never be a match.
 func (m *Model) setLogViewportContent() {
 	content := m.derivedLogContent()
-	// Zero-match placeholder: a committed filter that hides every complete raw
-	// line (and no in-flight partial / terminal error to show) would otherwise
-	// leave a blank viewport. `f` early-returns on an empty raw buffer, so an
-	// active filter with empty content can only mean "matched nothing". There is
-	// nothing to search either, so skip the highlight pass.
-	if content == "" && m.logFilterQuery != "" {
+	// Zero-match placeholder: a committed filter with ZERO survivors
+	// (logFilterShown == 0) and no in-flight partial / terminal error to show
+	// would otherwise leave a blank viewport. Gate on the survivor COUNT, not on
+	// content == "": a filter that keeps exactly one BLANK line has an empty
+	// rendered string yet a real searchable physical line (logFilterShown == 1),
+	// so content == "" would wrongly show the placeholder and suppress search over
+	// that blank line. When zero survivors there is nothing to search, so skip the
+	// highlight pass.
+	if m.logFilterShown == 0 && m.logFilterQuery != "" && m.logsPartial == "" && m.logsErrLine == "" {
 		m.logSearchMatches = nil
 		m.logsViewport.SetContent(descStyle.Render("  (no lines match filter)"))
 		return

@@ -2299,6 +2299,123 @@ func TestApplyLogFormat_BlankSurvivorRoundTripsAcrossChunkSplittings(t *testing.
 	}
 }
 
+// TestDerivedLogContent_BlankSurvivorThenPartial pins that a KEPT blank survivor
+// line followed by a trailing in-flight partial renders with the separating
+// newline preserved, identical across chunk splittings and equal to a full
+// reformat. Before the fix, derivedLogContent tested content == "" to decide the
+// partial join; a lone blank survivor has logsFormatted == "" yet logFilterShown
+// == 1, so the partial was rendered WITHOUT its leading "\n" — collapsing the
+// blank line and the partial onto one physical row.
+func TestDerivedLogContent_BlankSurvivorThenPartial(t *testing.T) {
+	const stream = "\ntail" // one blank complete line, then a partial with no newline
+
+	// Reference: single full reformat over the whole stream.
+	wantContent, _ := streamBlankTest([]string{stream}, "", "", true)
+	if wantContent != "\ntail" {
+		t.Fatalf("blank survivor + partial should render with a separating newline, got %q", wantContent)
+	}
+	physical := strings.Split(wantContent, "\n")
+	if len(physical) != 2 || physical[0] != "" || physical[1] != "tail" {
+		t.Fatalf("expected physical lines [\"\", \"tail\"], got %q", physical)
+	}
+
+	splittings := map[string][]string{
+		"all-at-once":  {stream},
+		"blank-alone":  {"\n", "tail"},
+		"byte-by-byte": {"\n", "t", "a", "i", "l"},
+	}
+	for split, chunks := range splittings {
+		gotContent, _ := streamBlankTest(chunks, "", "", false)
+		if gotContent != wantContent {
+			t.Errorf("[%s] incremental content differs from full reformat:\n got: %q\nwant: %q", split, gotContent, wantContent)
+		}
+	}
+}
+
+// TestDerivedLogContent_ErrorAfterBlankSurvivor pins that a terminal error
+// (logDoneMsg) arriving after a single KEPT blank survivor keeps the blank line
+// and the "\n\n" separator before the error. Before the fix, derivedLogContent
+// tested content == "" for the error join; a lone blank survivor has logsFormatted
+// == "" yet logFilterShown == 1, so the error rendered standalone and the blank
+// survivor plus its separator were dropped.
+func TestDerivedLogContent_ErrorAfterBlankSurvivor(t *testing.T) {
+	m := setupFilterableLogsModel()
+	// Replace the buffer with a single blank line: logsFormatted == "" but
+	// logFilterShown == 1 (a real folded survivor).
+	m.logsRawLines = []string{""}
+	m.logsPartial = ""
+	m.logsScanned = 0
+	m.logsFormatted = ""
+	m.logFilterShown = 0
+	m.logsErrLine = ""
+	m.applyLogFormat()
+
+	if m.logFilterShown != 1 {
+		t.Fatalf("precondition: expected 1 folded blank survivor, got logFilterShown=%d", m.logFilterShown)
+	}
+	if m.derivedLogContent() != "" {
+		t.Fatalf("precondition: blank survivor renders as an empty string, got %q", m.derivedLogContent())
+	}
+
+	updated, _ := m.Update(logDoneMsg{err: errors.New("connection lost"), session: m.logsSession})
+	m = updated.(Model)
+
+	content := m.derivedLogContent()
+	if !strings.HasPrefix(content, "\n\n") {
+		t.Errorf("blank survivor + separator lost before the terminal error, content = %q", content)
+	}
+	physical := strings.Split(content, "\n")
+	// Expect three physical lines: blank survivor, blank separator, error.
+	if len(physical) != 3 {
+		t.Fatalf("expected 3 physical lines (blank survivor, separator, error), got %d: %q", len(physical), physical)
+	}
+	if physical[0] != "" {
+		t.Errorf("line 0 should be the blank survivor, got %q", physical[0])
+	}
+	if !strings.Contains(physical[len(physical)-1], "connection lost") {
+		t.Errorf("last line should be the terminal error, got %q", physical[len(physical)-1])
+	}
+}
+
+// TestLogFilter_SingleBlankSurvivorNotZeroMatch pins that a committed filter which
+// keeps exactly one BLANK line is NOT treated as a zero-match: the placeholder is
+// suppressed and the blank line is a searchable physical line (`/` opens). Before
+// the fix, both the placeholder guard and the `/`-open guard tested content == "",
+// which a lone blank survivor (logFilterShown == 1) satisfies, so the UI wrongly
+// showed "(no lines match filter)" and refused to open search.
+func TestLogFilter_SingleBlankSurvivorNotZeroMatch(t *testing.T) {
+	m := setupFilterableLogsModel()
+	m.logsRawLines = []string{"noise", ""}
+	m.logsPartial = ""
+	m.logsScanned = 0
+	m.logsFormatted = ""
+	m.logFilterShown = 0
+	m.logsErrLine = ""
+	m.logFilterQuery = "!noise" // negated: drops "noise", keeps the blank line
+	m.logFilterCommittedRegex = false
+	m.applyLogFormat()
+
+	if m.logFilterShown != 1 {
+		t.Fatalf("precondition: filter should keep exactly one blank survivor, got logFilterShown=%d", m.logFilterShown)
+	}
+	if m.derivedLogContent() != "" {
+		t.Fatalf("precondition: the single blank survivor renders as an empty string, got %q", m.derivedLogContent())
+	}
+
+	// The zero-match placeholder must NOT be shown — there IS a survivor (blank).
+	m.setLogViewportContent()
+	if strings.Contains(m.logsViewport.View(), "no lines match filter") {
+		t.Error("placeholder shown for a filter that keeps one blank line; it must render the blank line instead")
+	}
+
+	// The blank line must be a searchable physical line: `/` opens the search.
+	updated, _ := m.Update(runeKey('/'))
+	m = updated.(Model)
+	if !m.logSearching {
+		t.Error("/ must open search over the single blank survivor (a real physical line)")
+	}
+}
+
 // TestLogChunkMsg_SplitLineFoldsToOneRawLine verifies a single logical line
 // delivered across two chunks (the newline arriving only in the second) folds
 // into exactly one entry in logsRawLines.
@@ -3641,6 +3758,7 @@ func TestLogSearch_SlashNoopOnEmptyBuffer(t *testing.T) {
 	m.logsPartial = ""
 	m.logsScanned = 0
 	m.logsFormatted = ""
+	m.logFilterShown = 0 // pairs with logsFormatted at every real reset site
 	m.logsErrLine = ""
 	if m.derivedLogContent() != "" {
 		t.Fatalf("precondition: rendered buffer should be empty, got %q", m.derivedLogContent())
