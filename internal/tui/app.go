@@ -579,7 +579,9 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if m.screen == screenLogs {
 			following := m.logsViewport.AtBottom()
 			m.logsViewport.Width = msg.Width - 4
-			h := msg.Height - 6
+			// -7 (not -6): one row reserved for the log bar line. The config
+			// branch above keeps -6 — do NOT unify these.
+			h := msg.Height - 7
 			if h < 3 {
 				h = 3
 			}
@@ -2199,7 +2201,9 @@ func (m *Model) enterLogs() (tea.Model, tea.Cmd) {
 	m.clearLogFilter()
 	m.clearLogSearch()
 
-	vpHeight := m.height - 6
+	// -7 (not -6): one row is reserved below the viewport for the log bar line
+	// (blank when idle). The two config sites keep -6 — do NOT unify these.
+	vpHeight := m.height - 7
 	if vpHeight < 3 {
 		vpHeight = 3
 	}
@@ -2397,6 +2401,16 @@ func (m Model) logSearchPred() func(string) bool {
 // is absent from derivedLogContent, so it can never be a match.
 func (m *Model) setLogViewportContent() {
 	content := m.derivedLogContent()
+	// Zero-match placeholder: a committed filter that hides every complete raw
+	// line (and no in-flight partial / terminal error to show) would otherwise
+	// leave a blank viewport. `f` early-returns on an empty raw buffer, so an
+	// active filter with empty content can only mean "matched nothing". There is
+	// nothing to search either, so skip the highlight pass.
+	if content == "" && m.logFilterQuery != "" {
+		m.logSearchMatches = nil
+		m.logsViewport.SetContent(descStyle.Render("  (no lines match filter)"))
+		return
+	}
 	pred := m.logSearchPred()
 	if pred == nil {
 		m.logSearchMatches = nil
@@ -2486,6 +2500,108 @@ func (m Model) logSearchCounter() string {
 		return "(no match)"
 	}
 	return fmt.Sprintf("(%d/%d)", m.logSearchCur+1, n)
+}
+
+// logModeTag renders the active match-mode tag for the log bar: "[rx]" for regex,
+// "[literal]" for substring. Shown while an input is open so ctrl+r's toggle is
+// visible; the committed summary uses a compact "[rx]"-only form (omitted for
+// literal) instead.
+func logModeTag(isRegex bool) string {
+	if isRegex {
+		return "[rx]"
+	}
+	return "[literal]"
+}
+
+// logFilterCounts returns the survivor and total RAW-line counts for the current
+// committed filter predicate (nil pred ⇒ every line passes). Drives the "N/M
+// shown" segment of the log bar. It counts raw logical lines (not pretty-expanded
+// physical lines), matching how the filter runs (before pretty-expansion).
+func (m Model) logFilterCounts() (survivors, total int) {
+	total = len(m.logsRawLines)
+	pred := m.logFilterPred()
+	if pred == nil {
+		return total, total
+	}
+	for _, line := range m.logsRawLines {
+		if pred(line) {
+			survivors++
+		}
+	}
+	return survivors, total
+}
+
+// logFilterBadRegex reports whether the LIVE filter input is in regex mode with a
+// non-empty query that fails to compile — the "(bad regex)" state the typing bar
+// surfaces while recomputeLogFilter holds the last-good predicate. A lone "!" (or
+// empty input) is not "bad", just incomplete.
+func (m Model) logFilterBadRegex() bool {
+	if !m.logFilterIsRegex {
+		return false
+	}
+	q := m.logFilterInput.Value()
+	if strings.TrimPrefix(q, "!") == "" {
+		return false
+	}
+	_, _, ok := buildMatcher(q, true, true)
+	return !ok
+}
+
+// logBarLine renders the reserved one-physical-line bar shown below the log
+// viewport (the log analogue of the container searchBarLine). Content precedence:
+//
+//	typing search  → "/ <q> [mode] (i/N)"                (or "(no match)")
+//	typing filter  → "f <q> [mode] · N/M shown"          (or "(bad regex)")
+//	committed      → "filter: <q> [rx] · N/M · search: <q> (i/N)"  (whichever active)
+//	idle           → "  "                                 (blank, line still reserved)
+//
+// Filter and search inputs are mutually exclusive (only one open at a time), so
+// the two typing cases never both apply. The unconditional final clampToWidth
+// guarantees the one-physical-line invariant at any width — a long query, long
+// service name, or dual summary is right-truncated rather than wrapped (mirrors
+// searchBarLine). clampToWidth is a no-op at m.width <= 0 (unknown test size).
+func (m Model) logBarLine() string {
+	var line string
+	switch {
+	case m.logSearching:
+		// Typing search — show the live query + mode + live (i/N) counter.
+		line = fmt.Sprintf("  / %s %s %s",
+			m.logSearchInput.Value(), logModeTag(m.logSearchIsRegex), m.logSearchCounter())
+	case m.logFiltering:
+		q := m.logFilterInput.Value()
+		if m.logFilterBadRegex() {
+			line = fmt.Sprintf("  f %s %s (bad regex)", q, logModeTag(true))
+		} else {
+			survivors, total := m.logFilterCounts()
+			line = fmt.Sprintf("  f %s %s · %d/%d shown",
+				q, logModeTag(m.logFilterIsRegex), survivors, total)
+		}
+	case m.logFilterQuery != "" || m.logSearchQuery != "":
+		// Committed summary — a compact recap of whichever is active. "[rx]" is
+		// appended only in regex mode (omitted for the common literal case).
+		var parts []string
+		if m.logFilterQuery != "" {
+			survivors, total := m.logFilterCounts()
+			seg := "filter: " + m.logFilterQuery
+			if m.logFilterRe != nil {
+				seg += " [rx]"
+			}
+			seg += fmt.Sprintf(" · %d/%d", survivors, total)
+			parts = append(parts, seg)
+		}
+		if m.logSearchQuery != "" {
+			seg := "search: " + m.logSearchQuery
+			if m.logSearchRe != nil {
+				seg += " [rx]"
+			}
+			seg += " " + m.logSearchCounter()
+			parts = append(parts, seg)
+		}
+		line = "  " + strings.Join(parts, " · ")
+	default:
+		line = "  "
+	}
+	return clampToWidth(line, m.width)
 }
 
 // clearLogSearch resets every search field to the no-search default. Called on
@@ -3798,23 +3914,41 @@ func (m Model) viewLogs() string {
 
 	b.WriteString(m.logsViewport.View())
 	b.WriteString("\n")
+	// Reserved one-physical-line bar directly under the viewport (blank when idle
+	// so the list height never jumps). The extra "\n" restores the blank
+	// separator before the help footer that helpStyle's MarginTop(1) alone used to
+	// provide — the net effect is +1 physical line, matching vpHeight's -6→-7.
+	b.WriteString(m.logBarLine())
+	b.WriteString("\n")
 
-	help := "  up/down scroll"
-	if !m.logsWrap {
-		help += "  •  <-/-> scroll"
+	var help string
+	switch {
+	case m.logSearching, m.logFiltering:
+		// While an input is open, q/n/N type literally — surface only the
+		// commit/cancel/regex affordances instead of the action-key legend.
+		help = "  enter commit  •  esc cancel  •  ctrl+r regex"
+	default:
+		help = "  up/down scroll"
+		if !m.logsWrap {
+			help += "  •  <-/-> scroll"
+		}
+		help += "  •  G bottom"
+		if m.logsWrap {
+			help += "  •  w unwrap"
+		} else {
+			help += "  •  w wrap"
+		}
+		if m.logsPretty {
+			help += "  •  p raw"
+		} else {
+			help += "  •  p pretty"
+		}
+		help += "  •  / search  •  f filter"
+		if m.logSearchQuery != "" {
+			help += "  •  n/N cycle"
+		}
+		help += "  •  q back"
 	}
-	help += "  •  G bottom"
-	if m.logsWrap {
-		help += "  •  w unwrap"
-	} else {
-		help += "  •  w wrap"
-	}
-	if m.logsPretty {
-		help += "  •  p raw"
-	} else {
-		help += "  •  p pretty"
-	}
-	help += "  •  q back"
 	b.WriteString(helpStyle.Render(help))
 	return b.String()
 }

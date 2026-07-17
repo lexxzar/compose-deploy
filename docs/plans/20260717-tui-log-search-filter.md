@@ -202,13 +202,13 @@ idle           → "" (blank, but the line is still reserved)
 - Create: `internal/tui/log_bar_test.go`
 - Modify: `internal/tui/app_test.go`
 
-- [ ] add `logBarLine() string` with the content precedence (typing-search / typing-filter / committed / blank), always exactly one physical line, final `clampToWidth(line, m.width)`
-- [ ] render the reserved bar above the help footer in `viewLogs`; extend the help footer with `/ search` and `f filter` tokens (and contextual `enter commit · esc cancel` / `n/N cycle` hints while active); keep the follow indicator on the title line
-- [ ] change viewport height `- 6` → `- 7` at EXACTLY the two log sites: `enterLogs` `m.height - 6` (@2012) and the `WindowSizeMsg` `screenLogs` branch `msg.Height - 6` (@561). **Do NOT touch** the two config sites — `enterConfig` `m.height - 6` (@1920) and the `WindowSizeMsg` config branch `msg.Height - 6` (@541) — so a blind find/replace of `- 6` is wrong; edit by matching the surrounding `logsViewport` context
-- [ ] render the zero-match placeholder `(no lines match filter)` in the viewport when the filter yields no survivors
-- [ ] write `TestLogBarLineNeverWraps` (assert `ansi.StringWidth(logBarLine()) <= m.width` at widths 40 and 20 with a long query, long service name, and dual committed summary)
-- [ ] write tests: idle bar is blank but the line is reserved (viewport height accounting drops by exactly 1 vs a no-bar baseline); typing/committed bar content; zero-match placeholder render
-- [ ] run tests — must pass before Task 7
+- [x] add `logBarLine() string` with the content precedence (typing-search / typing-filter / committed / blank), always exactly one physical line, final `clampToWidth(line, m.width)`
+- [x] render the reserved bar above the help footer in `viewLogs`; extend the help footer with `/ search` and `f filter` tokens (and contextual `enter commit · esc cancel` / `n/N cycle` hints while active); keep the follow indicator on the title line
+- [x] change viewport height `- 6` → `- 7` at EXACTLY the two log sites: `enterLogs` `m.height - 6` (@2012) and the `WindowSizeMsg` `screenLogs` branch `msg.Height - 6` (@561). **Do NOT touch** the two config sites — `enterConfig` `m.height - 6` (@1920) and the `WindowSizeMsg` config branch `msg.Height - 6` (@541) — so a blind find/replace of `- 6` is wrong; edit by matching the surrounding `logsViewport` context
+- [x] render the zero-match placeholder `(no lines match filter)` in the viewport when the filter yields no survivors
+- [x] write `TestLogBarLineNeverWraps` (assert `ansi.StringWidth(logBarLine()) <= m.width` at widths 40 and 20 with a long query, long service name, and dual committed summary)
+- [x] write tests: idle bar is blank but the line is reserved (viewport height accounting drops by exactly 1 vs a no-bar baseline); typing/committed bar content; zero-match placeholder render
+- [x] run tests — must pass before Task 7
 
 ### Task 7: Verify acceptance criteria
 
