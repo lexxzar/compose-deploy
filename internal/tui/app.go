@@ -589,6 +589,15 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if following {
 				m.logsViewport.GotoBottom()
 			}
+			// Refresh an open input's horizontal-scroll window for the new width —
+			// otherwise a narrower resize leaves a stale (right-clipped) viewport
+			// until the next keystroke (mirrors the screenSelectContainers branch).
+			if m.logFiltering {
+				m.logFilterInput.Width = m.logFilterInputWidth()
+			}
+			if m.logSearching {
+				m.logSearchInput.Width = m.logSearchInputWidth()
+			}
 		}
 		return m, nil
 
@@ -1550,6 +1559,12 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 				m.recomputeLogFilter()
 				return m, nil
 			default:
+				// Set the value-area budget BEFORE Update() so bubbles computes
+				// this keystroke's horizontal-scroll offset with the correct width
+				// (setting it after would use the previous width, clipping the
+				// newest char/cursor for one frame). logFilterInputWidth() is
+				// keystroke-stable, so it's already right regardless of the count.
+				m.logFilterInput.Width = m.logFilterInputWidth()
 				var cmd tea.Cmd
 				m.logFilterInput, cmd = m.logFilterInput.Update(msg)
 				m.recomputeLogFilter()
@@ -1557,8 +1572,8 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			}
 		}
 
-		// Search typing intercept — the Task 4 companion to the filter intercept
-		// above. While the search bar is open every keystroke routes to
+		// Search typing intercept — the filter intercept above has an exact
+		// companion here. While the search bar is open every keystroke routes to
 		// logSearchInput so q/n/N type literally instead of firing back/cycle.
 		if m.logSearching {
 			switch key {
@@ -1591,6 +1606,9 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 				m.recomputeLogSearch()
 				return m, nil
 			default:
+				// Set the value-area budget BEFORE Update() (see the filter
+				// intercept above for the ordering rationale).
+				m.logSearchInput.Width = m.logSearchInputWidth()
 				var cmd tea.Cmd
 				m.logSearchInput, cmd = m.logSearchInput.Update(msg)
 				m.recomputeLogSearch()
@@ -1698,6 +1716,10 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.rederiveLogs()
 			m.logFilterInput = textinput.New()
 			m.logFiltering = true
+			// Set Width on this PERSISTED model so bubbles scrolls the value to
+			// keep the cursor visible (a value-receiver set in logBarLine would be
+			// discarded). Width 0 = unbounded when size is unknown (tests).
+			m.logFilterInput.Width = m.logFilterInputWidth()
 			m.logFilterInput.Focus()
 			return m, nil
 		case "/":
@@ -1717,6 +1739,9 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.setLogViewportContent()
 			m.logSearchInput = textinput.New()
 			m.logSearching = true
+			// Set Width on the PERSISTED model so bubbles scrolls the value to keep
+			// the cursor visible (see the filter-open comment above).
+			m.logSearchInput.Width = m.logSearchInputWidth()
 			m.logSearchInput.Focus()
 			return m, nil
 		case "n":
@@ -2269,10 +2294,10 @@ func (m *Model) appendRawChunk(data []byte) {
 // only the not-yet-processed tail of logsRawLines (via foldNewRawLines) through
 // the filter predicate and the wrap/pretty formatter, appends the result to the
 // cached logsFormatted, and advances logsScanned per raw line scanned (NOT per
-// survivor — see the survivor-cursor trap in foldNewRawLines). Task 2 passes a
-// nil (all-pass) predicate, so with no filter the behaviour is identical to the
-// pre-refactor pipeline. Call fullReformat() when the filter, toggles, or width
-// change.
+// survivor — see the survivor-cursor trap in foldNewRawLines). With no filter
+// committed a nil (all-pass) predicate is passed, so the behaviour is identical
+// to the unfiltered pipeline. Call fullReformat() when the filter, toggles, or
+// width change.
 func (m *Model) applyLogFormat() {
 	delta, newScanned := foldNewRawLines(m.logsRawLines, m.logsScanned, m.logsViewport.Width, m.logsWrap, m.logsPretty, m.logFilterPred())
 	if delta != "" {
@@ -2326,8 +2351,8 @@ func (m *Model) fullReformat() {
 // NOT from the live logFilterIsRegex — so a mid-type ctrl+r into a *bad* regex
 // keeps the last-good matcher rather than silently dropping the filter. Returns
 // nil (all-pass) when no filter is committed, degrading the derivation pipeline
-// to the Task 2 pass-through. buildMatcher recompiles the regex once per call and
-// the returned closure reuses it across every line inside deriveFiltered.
+// to an unfiltered pass-through. buildMatcher recompiles the regex once per call
+// and the returned closure reuses it across every line inside deriveFiltered.
 func (m Model) logFilterPred() func(string) bool {
 	if m.logFilterQuery == "" {
 		return nil
@@ -2507,7 +2532,7 @@ func (m *Model) scrollLogMatchIntoView(line int) {
 }
 
 // logSearchCounter renders the "(i/N)" position indicator for the search bar
-// (Task 6 renders the bar; this keeps the counter logic beside the state).
+// (logBarLine renders the bar; this keeps the counter logic beside the state).
 // "(no match)" when the query matched nothing; i is 1-based (logSearchCur+1).
 func (m Model) logSearchCounter() string {
 	n := len(m.logSearchMatches)
@@ -2526,6 +2551,61 @@ func logModeTag(isRegex bool) string {
 		return "[rx]"
 	}
 	return "[literal]"
+}
+
+// logModeTagMaxWidth is the display width of the widest mode tag ("[literal]"),
+// reserved by the log-input width budgets so a ctrl+r toggle never shrinks the
+// input's horizontal-scroll window (mirrors searchInputWidth reserving the widest
+// counter, not the live one).
+var logModeTagMaxWidth = ansi.StringWidth(logModeTag(false))
+
+// logInputWidth is the arithmetic core of the log-bar input width budgets — the
+// analogue of searchInputWidth. It returns m.width minus the 4-col bar prefix
+// ("  / " or "  f "), the textinput's own 2-col prompt ("> "), and a
+// keystroke-stable reservation for everything the bar renders AFTER the value
+// (suffixWidth). Setting the returned value as textinput.Width on the PERSISTED
+// model lets bubbles scroll the value horizontally to keep the cursor visible.
+// Returns 0 (bubbles' "unbounded") when m.width <= 0 (unknown size, e.g. tests).
+func (m Model) logInputWidth(suffixWidth int) int {
+	if m.width <= 0 {
+		return 0
+	}
+	const prefixWidth = 4 // "  / " or "  f "
+	const promptWidth = 2 // textinput default prompt "> "
+	budget := m.width - prefixWidth - promptWidth - suffixWidth
+	if budget < 1 {
+		budget = 1
+	}
+	return budget
+}
+
+// logSearchInputWidth returns the horizontal-scroll budget for the open log
+// SEARCH input. The suffix reserves " <modeTag> <counter>" at its WIDEST stable
+// form — the widest mode tag plus the widest counter for the current raw-line
+// count. Magnitudes use len(logsRawLines) (stable per keystroke) rather than the
+// live match count so the budget — and thus bubbles' scroll offset — doesn't
+// fluctuate as matches change while typing (same rationale as maxCounterWidth).
+func (m Model) logSearchInputWidth() int {
+	n := len(m.logsRawLines)
+	counter := ansi.StringWidth("(no match)")
+	if c := ansi.StringWidth(fmt.Sprintf("(%d/%d)", n, n)); c > counter {
+		counter = c
+	}
+	suffix := 1 + logModeTagMaxWidth + 1 + counter // " " modeTag " " counter
+	return m.logInputWidth(suffix)
+}
+
+// logFilterInputWidth mirrors logSearchInputWidth for the open log FILTER input.
+// The suffix reserves the widest of " <modeTag> · N/M shown" (counts at their
+// len(logsRawLines) maximum) and " <modeTag> (bad regex)".
+func (m Model) logFilterInputWidth() int {
+	n := len(m.logsRawLines)
+	trailing := ansi.StringWidth(fmt.Sprintf(" · %d/%d shown", n, n))
+	if b := ansi.StringWidth(" (bad regex)"); b > trailing {
+		trailing = b
+	}
+	suffix := 1 + logModeTagMaxWidth + trailing // " " modeTag <trailing>
+	return m.logInputWidth(suffix)
 }
 
 // logFilterCounts returns the survivor and total RAW-line counts for the current
@@ -2571,19 +2651,29 @@ func (m Model) logFilterBadRegex() bool {
 //	idle           → "  "                                 (blank, line still reserved)
 //
 // Filter and search inputs are mutually exclusive (only one open at a time), so
-// the two typing cases never both apply. The unconditional final clampToWidth
-// guarantees the one-physical-line invariant at any width — a long query, long
-// service name, or dual summary is right-truncated rather than wrapped (mirrors
-// searchBarLine). clampToWidth is a no-op at m.width <= 0 (unknown test size).
+// the two typing cases never both apply. Both typing cases render the input's
+// .View() so bubbles scrolls a long query within the input (keeping the cursor +
+// newest chars visible) rather than right-clipping them; the input's Width is set
+// on the persisted model at the open/typing/resize sites (see logSearchInputWidth
+// / logFilterInputWidth), mirroring searchBarLine's two mechanisms. The
+// unconditional final clampToWidth is the hard guarantee of the one-physical-line
+// invariant at any width — a long query, long service name, or dual summary is
+// right-truncated rather than wrapped. clampToWidth is a no-op at m.width <= 0
+// (unknown test size).
 func (m Model) logBarLine() string {
 	var line string
 	switch {
 	case m.logSearching:
-		// Typing search — show the live query + mode + live (i/N) counter.
+		// Typing search — show the live query + mode + live (i/N) counter. Render
+		// the input's .View() (not .Value()) so bubbles scrolls the value to keep
+		// the cursor + newest chars visible; its Width is set on the PERSISTED
+		// model in the '/' open + typing-intercept + resize paths (mirrors
+		// searchBarLine — a value-receiver set here would be discarded).
 		line = fmt.Sprintf("  / %s %s %s",
-			m.logSearchInput.Value(), logModeTag(m.logSearchIsRegex), m.logSearchCounter())
+			m.logSearchInput.View(), logModeTag(m.logSearchIsRegex), m.logSearchCounter())
 	case m.logFiltering:
-		q := m.logFilterInput.Value()
+		// Render .View() for the same reason as the search branch above.
+		q := m.logFilterInput.View()
 		if m.logFilterBadRegex() {
 			line = fmt.Sprintf("  f %s %s (bad regex)", q, logModeTag(true))
 		} else {

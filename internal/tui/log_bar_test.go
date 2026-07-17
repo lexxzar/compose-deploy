@@ -102,6 +102,76 @@ func TestLogBarLineNeverWraps(t *testing.T) {
 	}
 }
 
+// TestLogInputWidthPersists pins the log-view analogue of TestSearchInputWidthPersists:
+// the open input's Width must be set on the PERSISTED model (the one returned by
+// Update/handleKey), NOT inside the value-receiver logBarLine() where the assignment
+// would land on a throwaway copy. A bounded Width lets bubbles scroll the value
+// horizontally so a long typed query keeps the cursor + newest chars visible instead
+// of clipping from the right; the bar's ansi width must still be <= m.width in every
+// case (the final clampToWidth is the hard guarantee). Driven through the real
+// f/'/' open + typing paths. It FAILS under the pre-fix code (Width stays 0).
+func TestLogInputWidthPersists(t *testing.T) {
+	longQuery := "this-is-an-extremely-long-query-that-overflows-a-narrow-terminal-many-times"
+
+	t.Run("filter open + typing sets Width and never wraps", func(t *testing.T) {
+		m := setupFilterableLogsModel()
+		updated, _ := m.Update(runeKey('f'))
+		om := updated.(Model)
+		if !om.logFiltering {
+			t.Fatal("precondition: f should open the filter bar")
+		}
+		if want := om.logFilterInputWidth(); om.logFilterInput.Width != want {
+			t.Errorf("after f open: logFilterInput.Width = %d, want %d (persisted budget)", om.logFilterInput.Width, want)
+		}
+		if om.logFilterInput.Width <= 0 {
+			t.Errorf("after f open: logFilterInput.Width = %d, want > 0 at width %d (bubbles never scrolls to keep cursor visible)", om.logFilterInput.Width, om.width)
+		}
+		tm := typeInto(om, longQuery)
+		if want := tm.logFilterInputWidth(); tm.logFilterInput.Width != want {
+			t.Errorf("after typing: logFilterInput.Width = %d, want %d (re-persisted budget)", tm.logFilterInput.Width, want)
+		}
+		if w := ansi.StringWidth(tm.logBarLine()); w > tm.width {
+			t.Errorf("after typing long query: log bar width %d exceeds terminal width %d — it will wrap", w, tm.width)
+		}
+	})
+
+	t.Run("search open + typing sets Width and never wraps", func(t *testing.T) {
+		m := setupFilterableLogsModel()
+		updated, _ := m.Update(runeKey('/'))
+		om := updated.(Model)
+		if !om.logSearching {
+			t.Fatal("precondition: / should open the search bar")
+		}
+		if want := om.logSearchInputWidth(); om.logSearchInput.Width != want {
+			t.Errorf("after / open: logSearchInput.Width = %d, want %d (persisted budget)", om.logSearchInput.Width, want)
+		}
+		if om.logSearchInput.Width <= 0 {
+			t.Errorf("after / open: logSearchInput.Width = %d, want > 0 at width %d", om.logSearchInput.Width, om.width)
+		}
+		tm := typeInto(om, longQuery)
+		if want := tm.logSearchInputWidth(); tm.logSearchInput.Width != want {
+			t.Errorf("after typing: logSearchInput.Width = %d, want %d (re-persisted budget)", tm.logSearchInput.Width, want)
+		}
+		if w := ansi.StringWidth(tm.logBarLine()); w > tm.width {
+			t.Errorf("after typing long query: log bar width %d exceeds terminal width %d — it will wrap", w, tm.width)
+		}
+	})
+
+	t.Run("resize refreshes an open input's Width", func(t *testing.T) {
+		m := setupFilterableLogsModel()
+		updated, _ := m.Update(runeKey('/'))
+		om := updated.(Model)
+		resized, _ := om.Update(tea.WindowSizeMsg{Width: 40, Height: 26})
+		rm := resized.(Model)
+		if rm.width != 40 {
+			t.Fatalf("resize: m.width = %d, want 40", rm.width)
+		}
+		if want := rm.logSearchInputWidth(); rm.logSearchInput.Width != want {
+			t.Errorf("resize: logSearchInput.Width = %d, want %d (stale viewport not refreshed)", rm.logSearchInput.Width, want)
+		}
+	})
+}
+
 // TestLogBarReservedLineHeightAccounting pins the -6→-7 viewport-height change:
 // one physical row is reserved for the bar, so the log viewport is sized
 // m.height-7 — exactly one row less than the pre-bar m.height-6 baseline. Driven
