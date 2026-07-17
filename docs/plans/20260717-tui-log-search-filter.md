@@ -130,12 +130,12 @@ idle           → "" (blank, but the line is still reserved)
 - Create: `internal/tui/logfilter.go`
 - Create: `internal/tui/logfilter_test.go`
 
-- [ ] add `buildMatcher(query, isRegex, allowNegate)` — case-insensitive substring by default; compile `regexp` once when `isRegex`; strip leading `!` and invert when `allowNegate`; return `valid=false` (and `pred=nil`, `re=nil`) on empty query or bad regex
-- [ ] add `deriveFiltered(raw []string, pred func(string) bool) []string` (nil pred ⇒ return `raw` as-is)
-- [ ] add `logComputeMatches(physical []string, pred func(string) bool) []int` (ascending physical-line indices; nil/`valid=false` pred ⇒ `nil`)
-- [ ] write tests for `buildMatcher`: literal match, case-insensitivity, regex `ERROR|WARN`, bad-regex ⇒ `valid=false`, negation `!healthcheck`, empty query
-- [ ] write tests for `deriveFiltered` (nil pred pass-through, subset selection) and `logComputeMatches` (order, empty, no-match)
-- [ ] run tests — must pass before Task 2
+- [x] add `buildMatcher(query, isRegex, allowNegate)` — case-insensitive substring by default; compile `regexp` once when `isRegex`; strip leading `!` and invert when `allowNegate`; return `valid=false` (and `pred=nil`, `re=nil`) on empty query or bad regex
+- [x] add `deriveFiltered(raw []string, pred func(string) bool) []string` (nil pred ⇒ return `raw` as-is)
+- [x] add `logComputeMatches(physical []string, pred func(string) bool) []int` (ascending physical-line indices; nil/`valid=false` pred ⇒ `nil`)
+- [x] write tests for `buildMatcher`: literal match, case-insensitivity, regex `ERROR|WARN`, bad-regex ⇒ `valid=false`, negation `!healthcheck`, empty query
+- [x] write tests for `deriveFiltered` (nil pred pass-through, subset selection) and `logComputeMatches` (order, empty, no-match)
+- [x] run tests — must pass before Task 2
 
 ### Task 2: Raw-line buffer + derivation pipeline (no user-facing filter yet)
 
