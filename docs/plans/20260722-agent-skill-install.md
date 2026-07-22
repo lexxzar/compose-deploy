@@ -248,12 +248,12 @@ Dev builds stamp `cdeploy-version: dev` — update detection keys on content has
 
 ### Task 6: [Final] Update documentation
 
-- [ ] README.md: "AI agent integration" section — `cdeploy skill install claude|codex|all`,
+- [x] README.md: "AI agent integration" section — `cdeploy skill install claude|codex|all`,
       external channels (`npx skills add lexxzar/compose-deploy`, `gh skill install`), what the
       skill teaches
-- [ ] CLAUDE.md: document the `skills/` package, stamp/hash ownership model, and the
+- [x] CLAUDE.md: document the `skills/` package, stamp/hash ownership model, and the
       SKILL.md-content test pins (so future SKILL.md edits keep frontmatter constraints)
-- [ ] move this plan to `docs/plans/completed/`
+- [x] move this plan to `docs/plans/completed/` (performed by exec orchestrator at completion)
 
 ## Post-Completion
 
