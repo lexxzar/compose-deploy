@@ -271,6 +271,294 @@ func TestVerifyDevVersionStamp(t *testing.T) {
 	}
 }
 
+// runSkillInstall executes `skill install <args...>` through the real root
+// command, capturing stdout/stderr so tests can assert on the routed output.
+func runSkillInstallCLI(t *testing.T, args ...string) (stdout, stderr string, err error) {
+	t.Helper()
+	root := NewRootCmd()
+	var outBuf, errBuf bytes.Buffer
+	root.SetOut(&outBuf)
+	root.SetErr(&errBuf)
+	root.SetArgs(append([]string{"skill", "install"}, args...))
+	err = root.Execute()
+	return outBuf.String(), errBuf.String(), err
+}
+
+// claudeSkillFile resolves the on-disk SKILL.md path for the claude target,
+// matching what the install command writes (symlink-resolved).
+func claudeSkillFile(t *testing.T) string {
+	t.Helper()
+	dirs, err := skillTargetDirs("claude")
+	if err != nil {
+		t.Fatalf("skillTargetDirs: %v", err)
+	}
+	return filepath.Join(dirs[0], "SKILL.md")
+}
+
+// TestSkillInstall_Fresh: a fresh HOME yields "installed" and writes the stamped
+// canonical file.
+func TestSkillInstall_Fresh(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("CODEX_HOME", "")
+
+	stdout, stderr, err := runSkillInstallCLI(t, "claude")
+	if err != nil {
+		t.Fatalf("install: %v (stderr=%s)", err, stderr)
+	}
+	if !strings.Contains(stdout, "installed ") {
+		t.Fatalf("stdout missing 'installed': %q", stdout)
+	}
+
+	path := claudeSkillFile(t)
+	got, rerr := os.ReadFile(path)
+	if rerr != nil {
+		t.Fatalf("read installed file: %v", rerr)
+	}
+	want := renderSkill(skills.CanonicalSkill(), version)
+	if !bytes.Equal(got, want) {
+		t.Fatalf("installed file != rendered skill")
+	}
+	if !strings.Contains(stdout, path) {
+		t.Fatalf("stdout missing resolved path %q:\n%s", path, stdout)
+	}
+	if !strings.Contains(stdout, "Claude Code") {
+		t.Fatalf("stdout missing claude pickup note:\n%s", stdout)
+	}
+}
+
+// TestSkillInstall_IdenticalRerun: a second identical install reports unchanged.
+func TestSkillInstall_IdenticalRerun(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("CODEX_HOME", "")
+
+	if _, _, err := runSkillInstallCLI(t, "claude"); err != nil {
+		t.Fatalf("first install: %v", err)
+	}
+	stdout, stderr, err := runSkillInstallCLI(t, "claude")
+	if err != nil {
+		t.Fatalf("second install: %v (stderr=%s)", err, stderr)
+	}
+	if !strings.Contains(stdout, "unchanged ") {
+		t.Fatalf("stdout missing 'unchanged': %q", stdout)
+	}
+}
+
+// TestSkillInstall_OldContentUpdated: a valid stamp over OLDER content is
+// overwritten and reported as updated.
+func TestSkillInstall_OldContentUpdated(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("CODEX_HOME", "")
+
+	path := claudeSkillFile(t)
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	// A self-consistent stamp over DIFFERENT (older) canonical content.
+	oldCanonical := []byte("---\nname: cdeploy\ndescription: old\n---\n\nOld body.\n")
+	if err := os.WriteFile(path, renderSkill(oldCanonical, version), 0o644); err != nil {
+		t.Fatalf("write old: %v", err)
+	}
+
+	stdout, stderr, err := runSkillInstallCLI(t, "claude")
+	if err != nil {
+		t.Fatalf("install: %v (stderr=%s)", err, stderr)
+	}
+	if !strings.Contains(stdout, "updated ") {
+		t.Fatalf("stdout missing 'updated': %q", stdout)
+	}
+	got, _ := os.ReadFile(path)
+	want := renderSkill(skills.CanonicalSkill(), version)
+	if !bytes.Equal(got, want) {
+		t.Fatalf("file not overwritten with current canonical")
+	}
+}
+
+// TestSkillInstall_StampRefresh: EQUAL content but an OLDER version is reported
+// as updated, and the on-disk file afterward differs from the pre-install file
+// only in the cdeploy-version line.
+func TestSkillInstall_StampRefresh(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("CODEX_HOME", "")
+
+	canonical := skills.CanonicalSkill()
+	path := claudeSkillFile(t)
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	// Same canonical content, older version stamp.
+	before := renderSkill(canonical, "v0.0.0-old")
+	if err := os.WriteFile(path, before, 0o644); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+
+	stdout, stderr, err := runSkillInstallCLI(t, "claude")
+	if err != nil {
+		t.Fatalf("install: %v (stderr=%s)", err, stderr)
+	}
+	if !strings.Contains(stdout, "updated ") {
+		t.Fatalf("stamp refresh should report 'updated': %q", stdout)
+	}
+
+	after, _ := os.ReadFile(path)
+	if bytes.Equal(after, before) {
+		t.Fatal("file unchanged; expected a stamp refresh")
+	}
+	if !bytes.Equal(after, renderSkill(canonical, version)) {
+		t.Fatal("file not rewritten with current version stamp")
+	}
+	// The only differing line must be cdeploy-version.
+	assertOnlyVersionLineDiffers(t, before, after)
+}
+
+// TestSkillInstall_TamperedRefusedThenForced: a modified file is refused without
+// --force and overwritten with it.
+func TestSkillInstall_TamperedRefusedThenForced(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("CODEX_HOME", "")
+
+	canonical := skills.CanonicalSkill()
+	path := claudeSkillFile(t)
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	tampered := append(append([]byte{}, renderSkill(canonical, version)...), []byte("\nUSER EDIT\n")...)
+	if err := os.WriteFile(path, tampered, 0o644); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+
+	// Without --force: refused, non-zero exit, file untouched.
+	stdout, stderr, err := runSkillInstallCLI(t, "claude")
+	if err == nil {
+		t.Fatal("expected error when refusing a modified file")
+	}
+	if !strings.Contains(stderr, "refused ") {
+		t.Fatalf("stderr missing 'refused': %q", stderr)
+	}
+	if strings.Contains(stdout, "updated ") {
+		t.Fatalf("modified file must not be updated without --force: %q", stdout)
+	}
+	if got, _ := os.ReadFile(path); !bytes.Equal(got, tampered) {
+		t.Fatal("modified file changed despite refusal")
+	}
+
+	// With --force: overwritten.
+	stdout, stderr, err = runSkillInstallCLI(t, "claude", "--force")
+	if err != nil {
+		t.Fatalf("forced install: %v (stderr=%s)", err, stderr)
+	}
+	if !strings.Contains(stdout, "updated ") {
+		t.Fatalf("forced install should report 'updated': %q", stdout)
+	}
+	if got, _ := os.ReadFile(path); !bytes.Equal(got, renderSkill(canonical, version)) {
+		t.Fatal("forced install did not overwrite with current canonical")
+	}
+}
+
+// TestSkillInstall_UnstampedRefusedThenForced: a pre-existing unstamped file
+// (e.g. dropped by `npx skills`) is refused without --force.
+func TestSkillInstall_UnstampedRefusedThenForced(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("CODEX_HOME", "")
+
+	canonical := skills.CanonicalSkill()
+	path := claudeSkillFile(t)
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	// Raw canonical: no stamp at all.
+	if err := os.WriteFile(path, canonical, 0o644); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+
+	stdout, stderr, err := runSkillInstallCLI(t, "claude")
+	if err == nil {
+		t.Fatal("expected error when refusing an unstamped file")
+	}
+	if !strings.Contains(stderr, "refused ") || !strings.Contains(stderr, "unstamped") {
+		t.Fatalf("stderr missing unstamped refusal: %q", stderr)
+	}
+	if strings.Contains(stdout, "updated ") {
+		t.Fatalf("unstamped file must not be updated without --force: %q", stdout)
+	}
+
+	// With --force: overwritten with the stamped canonical.
+	if _, stderr, err = runSkillInstallCLI(t, "claude", "--force"); err != nil {
+		t.Fatalf("forced install: %v (stderr=%s)", err, stderr)
+	}
+	if got, _ := os.ReadFile(path); !bytes.Equal(got, renderSkill(canonical, version)) {
+		t.Fatal("forced install did not stamp the unstamped file")
+	}
+}
+
+// TestSkillInstall_AggregatesFailures: a plain FILE where the claude cdeploy dir
+// should be obstructs MkdirAll, so the claude path fails while the codex paths
+// still get written and the command returns a non-zero result.
+func TestSkillInstall_AggregatesFailures(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("CODEX_HOME", "")
+
+	// Obstruct the claude destination with a regular file at .../skills/cdeploy.
+	claudeSkills := filepath.Join(home, ".claude", "skills")
+	if err := os.MkdirAll(claudeSkills, 0o755); err != nil {
+		t.Fatalf("mkdir claude skills: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(claudeSkills, "cdeploy"), []byte("obstruction"), 0o644); err != nil {
+		t.Fatalf("write obstruction: %v", err)
+	}
+
+	stdout, stderr, err := runSkillInstallCLI(t, "all")
+	if err == nil {
+		t.Fatal("expected non-zero result when a destination fails")
+	}
+	if !strings.Contains(stderr, "error ") {
+		t.Fatalf("stderr missing claude error line: %q", stderr)
+	}
+
+	// Codex paths must still be written despite the claude failure.
+	codexDirs, derr := skillTargetDirs("codex")
+	if derr != nil {
+		t.Fatalf("skillTargetDirs codex: %v", derr)
+	}
+	want := renderSkill(skills.CanonicalSkill(), version)
+	for _, dir := range codexDirs {
+		p := filepath.Join(dir, "SKILL.md")
+		got, rerr := os.ReadFile(p)
+		if rerr != nil {
+			t.Fatalf("codex path %q not written: %v", p, rerr)
+		}
+		if !bytes.Equal(got, want) {
+			t.Fatalf("codex path %q content mismatch", p)
+		}
+		if !strings.Contains(stdout, p) {
+			t.Fatalf("stdout missing successful codex path %q:\n%s", p, stdout)
+		}
+	}
+}
+
+// assertOnlyVersionLineDiffers fails unless a and b differ on exactly one line,
+// and that line is the cdeploy-version stamp.
+func assertOnlyVersionLineDiffers(t *testing.T, a, b []byte) {
+	t.Helper()
+	la := strings.Split(string(a), "\n")
+	lb := strings.Split(string(b), "\n")
+	if len(la) != len(lb) {
+		t.Fatalf("line count differs: %d vs %d", len(la), len(lb))
+	}
+	diffs := 0
+	for i := range la {
+		if la[i] != lb[i] {
+			diffs++
+			if !strings.Contains(la[i], "cdeploy-version:") {
+				t.Fatalf("unexpected differing line %d: %q vs %q", i, la[i], lb[i])
+			}
+		}
+	}
+	if diffs != 1 {
+		t.Fatalf("expected exactly 1 differing line, got %d", diffs)
+	}
+}
+
 func equalStrings(a, b []string) bool {
 	if len(a) != len(b) {
 		return false

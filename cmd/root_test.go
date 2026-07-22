@@ -126,10 +126,36 @@ func TestRootCmd_Subcommands(t *testing.T) {
 		subcommands[sub.Name()] = true
 	}
 
-	for _, name := range []string{"deploy", "restart", "stop", "list", "logs", "exec"} {
+	for _, name := range []string{"deploy", "restart", "stop", "list", "logs", "exec", "skill"} {
 		if !subcommands[name] {
 			t.Errorf("subcommand %q not found", name)
 		}
+	}
+}
+
+// TestSkillCmd_Registration pins that the `skill` command is registered and that
+// its `install` verb exists. (`show`/`uninstall` are added by a later task; this
+// asserts only what exists now.)
+func TestSkillCmd_Registration(t *testing.T) {
+	root := NewRootCmd()
+
+	var skillFound, installFound bool
+	for _, sub := range root.Commands() {
+		if sub.Name() != "skill" {
+			continue
+		}
+		skillFound = true
+		for _, verb := range sub.Commands() {
+			if verb.Name() == "install" {
+				installFound = true
+			}
+		}
+	}
+	if !skillFound {
+		t.Fatal("skill command not registered")
+	}
+	if !installFound {
+		t.Error("skill install verb not found")
 	}
 }
 

@@ -199,19 +199,20 @@ Dev builds stamp `cdeploy-version: dev` — update detection keys on content has
 - Modify: `cmd/skill_test.go`
 - Modify: `cmd/root_test.go`
 
-- [ ] implement `newSkillCmd()` with `install <claude|codex|all>` (`--force` flag), wire the
+- [x] implement `newSkillCmd()` with `install <claude|codex|all>` (`--force` flag), wire the
       per-destination decision matrix (absent/unchanged/stamp-refresh/updated/refused) with
       aggregated errors — one failed path doesn't abort others; exit non-zero on any failure
-- [ ] print exact resolved paths + per-agent pickup notes to stdout after install
-- [ ] register `newSkillCmd()` in `cmd/root.go` `rootCmd.AddCommand(…)`
-- [ ] write install decision-matrix tests in temp HOME: fresh ⇒ installed; identical ⇒ unchanged;
+- [x] print exact resolved paths + per-agent pickup notes to stdout after install
+- [x] register `newSkillCmd()` in `cmd/root.go` `rootCmd.AddCommand(…)`
+- [x] write install decision-matrix tests in temp HOME: fresh ⇒ installed; identical ⇒ unchanged;
       valid stamp + old content ⇒ updated; valid stamp + EQUAL content + older version ⇒ stamp
       refresh reported as `updated` (on-disk file differs only in the version line afterwards);
       tampered ⇒ refused without `--force`, overwritten with; pre-existing unstamped file ⇒ refused
-- [ ] write aggregation test: plain FILE at `~/.claude/skills/cdeploy` obstructs MkdirAll ⇒
+- [x] write aggregation test: plain FILE at `~/.claude/skills/cdeploy` obstructs MkdirAll ⇒
       claude path fails, codex paths still written, non-zero exit
-- [ ] add registration assertions to `cmd/root_test.go` (skill command + 3 verbs exist)
-- [ ] run tests — must pass before task 4
+- [x] add registration assertions to `cmd/root_test.go` (skill command + `install` verb exists;
+      `show`/`uninstall` are added in Task 4, so only current-state verbs are asserted)
+- [x] run tests — must pass before task 4
 
 ### Task 4: `skill show` + `skill uninstall` verbs
 

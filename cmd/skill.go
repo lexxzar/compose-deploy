@@ -5,9 +5,13 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
+
+	"github.com/lexxzar/compose-deploy/skills"
+	"github.com/spf13/cobra"
 )
 
 // Skill-file verification states. verifySkillFile answers only "is this file
@@ -236,4 +240,203 @@ func parseStamp(onDisk []byte) (version, contentHash string, ok bool) {
 		}
 	}
 	return version, contentHash, contentHash != ""
+}
+
+// newSkillCmd builds the `skill` parent command. It hosts the `install`
+// subcommand today; `show` and `uninstall` are attached by a later task.
+func newSkillCmd() *cobra.Command {
+	cmd := &cobra.Command{
+		Use:   "skill",
+		Short: "Install the cdeploy Agent Skill for AI coding agents",
+		Long: `Install the embedded cdeploy Agent Skill (SKILL.md) into AI coding-agent
+skill directories so agents learn how to install, configure, and drive cdeploy.
+
+The skill content is version-locked to this binary. Files installed by cdeploy
+carry a content-hash stamp; user-edited or externally-installed files are never
+overwritten without --force.
+
+For project-level placement, write the raw skill to your repo instead:
+
+  cdeploy skill show > .claude/skills/cdeploy/SKILL.md`,
+	}
+	cmd.AddCommand(newSkillInstallCmd())
+	return cmd
+}
+
+// newSkillInstallCmd builds `skill install <claude|codex|all>`.
+func newSkillInstallCmd() *cobra.Command {
+	var force bool
+
+	cmd := &cobra.Command{
+		Use:   "install <claude|codex|all>",
+		Short: "Install the cdeploy skill into agent skill directories",
+		Long: `Install the cdeploy Agent Skill into the target agent's skill directory.
+
+  claude → ~/.claude/skills/cdeploy/          (also read by Cursor/OpenCode)
+  codex  → ~/.agents/skills/cdeploy/ and $CODEX_HOME/skills/cdeploy/
+           ($CODEX_HOME defaults to ~/.codex; covers Codex/Gemini/Amp)
+  all    → the union of both, deduplicated
+
+Install is idempotent: an unchanged file is reported as such, an older version is
+refreshed, and outdated content is updated. A file that cdeploy did not install,
+or that was edited after install, is refused unless --force is given.`,
+		Example: `  # Install for Claude Code
+  cdeploy skill install claude
+
+  # Install for Codex/Gemini/Amp
+  cdeploy skill install codex
+
+  # Install everywhere, overwriting user-modified files
+  cdeploy skill install all --force`,
+		ValidArgs: []string{"claude", "codex", "all"},
+		Args:      cobra.MatchAll(cobra.ExactArgs(1), cobra.OnlyValidArgs),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			return runSkillInstall(cmd, args[0], force)
+		},
+		SilenceUsage:  true,
+		SilenceErrors: true,
+	}
+
+	cmd.Flags().BoolVar(&force, "force", false, "overwrite user-modified or externally-installed (unstamped) files")
+
+	return cmd
+}
+
+// runSkillInstall renders the stamped skill and writes it to every resolved
+// destination for target. Per-path outcomes are printed as they happen —
+// successes to stdout, refusals/errors to stderr — and one failed destination
+// never aborts the others. It returns a non-nil error (non-zero exit) when any
+// destination failed.
+func runSkillInstall(cmd *cobra.Command, target string, force bool) error {
+	dirs, err := skillTargetDirs(target)
+	if err != nil {
+		return err
+	}
+
+	canonical := skills.CanonicalSkill()
+	rendered := renderSkill(canonical, version)
+
+	out := cmd.OutOrStdout()
+	errOut := cmd.ErrOrStderr()
+
+	var (
+		failures  int
+		succeeded []string
+	)
+	for _, dir := range dirs {
+		skillPath := filepath.Join(dir, "SKILL.md")
+		msg, perr := installSkillPath(dir, skillPath, canonical, rendered, version, force)
+		if perr != nil {
+			fmt.Fprintln(errOut, msg)
+			failures++
+			continue
+		}
+		fmt.Fprintln(out, msg)
+		succeeded = append(succeeded, skillPath)
+	}
+
+	if len(succeeded) > 0 {
+		printSkillPickupNotes(out, target, succeeded)
+	}
+
+	if failures > 0 {
+		return fmt.Errorf("%d of %d skill destination(s) failed (see messages above)", failures, len(dirs))
+	}
+	return nil
+}
+
+// installSkillPath applies the per-destination install decision matrix for a
+// single SKILL.md path. It returns a human-readable outcome line and a non-nil
+// error only when the destination failed (refused or I/O error).
+func installSkillPath(dir, skillPath string, canonical, rendered []byte, newVer string, force bool) (string, error) {
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return fmt.Sprintf("error %s: %v", skillPath, err), err
+	}
+
+	onDisk, err := os.ReadFile(skillPath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			if werr := os.WriteFile(skillPath, rendered, 0o644); werr != nil {
+				return fmt.Sprintf("error %s: %v", skillPath, werr), werr
+			}
+			return fmt.Sprintf("installed %s (%s)", skillPath, newVer), nil
+		}
+		return fmt.Sprintf("error %s: %v", skillPath, err), err
+	}
+
+	stampVer, state := verifySkillFile(onDisk)
+	// contentEqual asks the second, distinct question: does the file's stripped
+	// content match THIS binary's canonical bytes? (verifySkillFile only checks
+	// self-consistency of the stamp.) Both are required for "unchanged".
+	contentEqual := bytes.Equal(stripOwned(onDisk), canonical)
+
+	write := func() (string, error) {
+		if werr := os.WriteFile(skillPath, rendered, 0o644); werr != nil {
+			return fmt.Sprintf("error %s: %v", skillPath, werr), werr
+		}
+		return fmt.Sprintf("updated %s (%s → %s)", skillPath, skillVerDisplay(stampVer), newVer), nil
+	}
+
+	if force {
+		// Overwrite unconditionally, but skip a pointless rewrite when the bytes
+		// on disk already equal what we would write.
+		if state == skillStateIntact && contentEqual && stampVer == newVer {
+			return fmt.Sprintf("unchanged %s", skillPath), nil
+		}
+		return write()
+	}
+
+	switch state {
+	case skillStateIntact:
+		if contentEqual {
+			if stampVer == newVer {
+				return fmt.Sprintf("unchanged %s", skillPath), nil
+			}
+			// Same content, older stamp → refresh the stamp only.
+			return write()
+		}
+		// Stamp is self-consistent but the content predates this binary → update.
+		return write()
+	default: // skillStateModified or skillStateUnstamped
+		reason := "modified since install"
+		if state == skillStateUnstamped {
+			reason = "not installed by cdeploy (unstamped)"
+		}
+		return fmt.Sprintf("refused %s: %s; re-run with --force to overwrite", skillPath, reason),
+			fmt.Errorf("%s: %s", skillPath, reason)
+	}
+}
+
+// skillVerDisplay renders a stamp version for outcome messages, labelling the
+// empty (unstamped) case explicitly.
+func skillVerDisplay(v string) string {
+	if v == "" {
+		return "unstamped"
+	}
+	return v
+}
+
+const (
+	claudePickupNote = "Claude Code: restart Claude Code (or run /skills) to pick up the cdeploy skill."
+	codexPickupNote  = "Codex: scans skills at startup — restart Codex to pick up the cdeploy skill."
+)
+
+// printSkillPickupNotes lists the resolved SKILL.md paths and the per-agent
+// pickup instructions after an install.
+func printSkillPickupNotes(w io.Writer, target string, paths []string) {
+	fmt.Fprintln(w)
+	fmt.Fprintln(w, "Skill file(s):")
+	for _, p := range paths {
+		fmt.Fprintf(w, "  %s\n", p)
+	}
+	fmt.Fprintln(w)
+	switch target {
+	case "claude":
+		fmt.Fprintln(w, claudePickupNote)
+	case "codex":
+		fmt.Fprintln(w, codexPickupNote)
+	case "all":
+		fmt.Fprintln(w, claudePickupNote)
+		fmt.Fprintln(w, codexPickupNote)
+	}
 }
