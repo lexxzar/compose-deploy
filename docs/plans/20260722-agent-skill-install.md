@@ -144,28 +144,28 @@ Dev builds stamp `cdeploy-version: dev` — update detection keys on content has
 - Create: `skills/skills.go`
 - Create: `skills/skills_test.go`
 
-- [ ] write `skills/cdeploy/SKILL.md` (<500 lines, ~5k tokens): frontmatter `name: cdeploy`,
+- [x] write `skills/cdeploy/SKILL.md` (<500 lines, ~5k tokens): frontmatter `name: cdeploy`,
       `description` ≤1024 chars naming BOTH ops triggers (deploy/status/logs/updates) AND setup
       triggers (install cdeploy, configure servers.yml, SSH setup)
-- [ ] body §1 What cdeploy is (3 lines; agents use CLI subcommands, never the TTY-requiring TUI)
-- [ ] body §2 Setup & configuration: `cdeploy --version` check, install paths (brew/go install/
+- [x] body §1 What cdeploy is (3 lines; agents use CLI subcommands, never the TTY-requiring TUI)
+- [x] body §2 Setup & configuration: `cdeploy --version` check, install paths (brew/go install/
       releases), full servers.yml schema + worked example (servers: name/host/project_dir/group/
       color; groups: name/color; valid colors red green yellow blue magenta cyan white gray),
       direct YAML editing (validated by cdeploy on startup — `Load()` then `Validate()`, see
       `cmd/root.go:76-82`), SSH prerequisites (key-based auth; `~/.ssh/config`
       for advanced), ad-hoc/CI form `--ssh [user@]host[:port] --project-dir … --identity …`
-- [ ] body §3 Read-only ops: `list --json` with `--stats`/`--updates`/`-s`/`-C`, JSON parsing
+- [x] body §3 Read-only ops: `list --json` with `--stats`/`--updates`/`-s`/`-C`, JSON parsing
       guide (tri-state `update_available`, health values, ports array), `logs` with tail,
       stale-image sweep workflow; §4 Mutating ops SAFETY PROTOCOL: restate services+server and
       get user confirmation first, never `-a` unless user explicitly said all, verify with `list`
       after, tail logs on failure; §5 Troubleshooting: `registry unreachable`, `remote update
       check transport failure`, `updates unavailable: …`, detect failures — meaning + next action
-- [ ] create `skills/skills.go`: `package skills`, `//go:embed cdeploy`, export `FS embed.FS`
+- [x] create `skills/skills.go`: `package skills`, `//go:embed cdeploy`, export `FS embed.FS`
       (+ helper returning the canonical SKILL.md bytes)
-- [ ] write `skills/skills_test.go` content pins: FS contains `cdeploy/SKILL.md`; file starts
+- [x] write `skills/skills_test.go` content pins: FS contains `cdeploy/SKILL.md`; file starts
       with `---`; `name: cdeploy` matches dir + regex `^[a-z0-9]+(-[a-z0-9]+)*$`; description
       non-empty ≤1024 chars; <500 lines; no `metadata:` key in canonical frontmatter
-- [ ] run tests — must pass before task 2
+- [x] run tests — must pass before task 2
 
 ### Task 2: cmd/skill.go pure helpers — paths, render/stamp, verify
 
