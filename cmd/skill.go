@@ -242,8 +242,8 @@ func parseStamp(onDisk []byte) (version, contentHash string, ok bool) {
 	return version, contentHash, contentHash != ""
 }
 
-// newSkillCmd builds the `skill` parent command. It hosts the `install`
-// subcommand today; `show` and `uninstall` are attached by a later task.
+// newSkillCmd builds the `skill` parent command and attaches the install, show,
+// and uninstall subcommands.
 func newSkillCmd() *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "skill",
@@ -253,13 +253,15 @@ skill directories so agents learn how to install, configure, and drive cdeploy.
 
 The skill content is version-locked to this binary. Files installed by cdeploy
 carry a content-hash stamp; user-edited or externally-installed files are never
-overwritten without --force.
+overwritten or removed without --force.
 
 For project-level placement, write the raw skill to your repo instead:
 
   cdeploy skill show > .claude/skills/cdeploy/SKILL.md`,
 	}
 	cmd.AddCommand(newSkillInstallCmd())
+	cmd.AddCommand(newSkillShowCmd())
+	cmd.AddCommand(newSkillUninstallCmd())
 	return cmd
 }
 
@@ -439,4 +441,136 @@ func printSkillPickupNotes(w io.Writer, target string, paths []string) {
 		fmt.Fprintln(w, claudePickupNote)
 		fmt.Fprintln(w, codexPickupNote)
 	}
+}
+
+// newSkillShowCmd builds `skill show`, which writes the raw embedded (unstamped)
+// canonical SKILL.md to stdout so it can be redirected into a project-level
+// skill directory.
+func newSkillShowCmd() *cobra.Command {
+	cmd := &cobra.Command{
+		Use:   "show",
+		Short: "Print the embedded cdeploy SKILL.md to stdout",
+		Long: `Print the raw embedded cdeploy SKILL.md (without the install-time
+content-hash stamp) to stdout.
+
+Use this for project-level placement — redirect it into your repo's skill
+directory so the skill travels with the project:
+
+  cdeploy skill show > .claude/skills/cdeploy/SKILL.md`,
+		Args: cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			_, err := cmd.OutOrStdout().Write(skills.CanonicalSkill())
+			return err
+		},
+		SilenceUsage:  true,
+		SilenceErrors: true,
+	}
+	return cmd
+}
+
+// newSkillUninstallCmd builds `skill uninstall <claude|codex|all>`.
+func newSkillUninstallCmd() *cobra.Command {
+	var force bool
+
+	cmd := &cobra.Command{
+		Use:   "uninstall <claude|codex|all>",
+		Short: "Remove the cdeploy skill from agent skill directories",
+		Long: `Remove the cdeploy Agent Skill from the target agent's skill directory.
+
+  claude → ~/.claude/skills/cdeploy/
+  codex  → ~/.agents/skills/cdeploy/ and $CODEX_HOME/skills/cdeploy/
+           ($CODEX_HOME defaults to ~/.codex)
+  all    → the union of both, deduplicated
+
+A destination with no installed skill is reported and treated as success. A
+cdeploy-stamped file is removed (and its cdeploy/ directory too, but only when
+it becomes empty). A file that cdeploy did not install, or that was edited after
+install, is refused unless --force is given.`,
+		Example: `  # Remove the skill for Claude Code
+  cdeploy skill uninstall claude
+
+  # Remove everywhere, including user-modified files
+  cdeploy skill uninstall all --force`,
+		ValidArgs: []string{"claude", "codex", "all"},
+		Args:      cobra.MatchAll(cobra.ExactArgs(1), cobra.OnlyValidArgs),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			return runSkillUninstall(cmd, args[0], force)
+		},
+		SilenceUsage:  true,
+		SilenceErrors: true,
+	}
+
+	cmd.Flags().BoolVar(&force, "force", false, "remove user-modified or externally-installed (unstamped) files")
+
+	return cmd
+}
+
+// runSkillUninstall removes the SKILL.md from every resolved destination for
+// target. Per-path outcomes are printed as they happen — successes to stdout,
+// refusals/errors to stderr — and one failed destination never aborts the
+// others. It returns a non-nil error (non-zero exit) when any destination was
+// refused or failed.
+func runSkillUninstall(cmd *cobra.Command, target string, force bool) error {
+	dirs, err := skillTargetDirs(target)
+	if err != nil {
+		return err
+	}
+
+	out := cmd.OutOrStdout()
+	errOut := cmd.ErrOrStderr()
+
+	var failures int
+	for _, dir := range dirs {
+		skillPath := filepath.Join(dir, "SKILL.md")
+		msg, perr := uninstallSkillPath(dir, skillPath, force)
+		if perr != nil {
+			fmt.Fprintln(errOut, msg)
+			failures++
+			continue
+		}
+		fmt.Fprintln(out, msg)
+	}
+
+	if failures > 0 {
+		return fmt.Errorf("%d of %d skill destination(s) failed (see messages above)", failures, len(dirs))
+	}
+	return nil
+}
+
+// uninstallSkillPath applies the per-destination uninstall decision for a single
+// SKILL.md path. It returns a human-readable outcome line and a non-nil error
+// only when the destination was refused (user-owned without --force) or an I/O
+// operation failed. An absent file is a success ("not installed").
+func uninstallSkillPath(dir, skillPath string, force bool) (string, error) {
+	onDisk, err := os.ReadFile(skillPath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return fmt.Sprintf("not installed %s", skillPath), nil
+		}
+		return fmt.Sprintf("error %s: %v", skillPath, err), err
+	}
+
+	_, state := verifySkillFile(onDisk)
+	if state != skillStateIntact && !force {
+		reason := "modified since install"
+		if state == skillStateUnstamped {
+			reason = "not installed by cdeploy (unstamped)"
+		}
+		return fmt.Sprintf("refused %s: %s; re-run with --force to remove", skillPath, reason),
+			fmt.Errorf("%s: %s", skillPath, reason)
+	}
+
+	if rerr := os.Remove(skillPath); rerr != nil {
+		return fmt.Sprintf("error %s: %v", skillPath, rerr), rerr
+	}
+	removeSkillDirIfEmpty(dir)
+	return fmt.Sprintf("removed %s", skillPath), nil
+}
+
+// removeSkillDirIfEmpty removes the enclosing cdeploy/ directory, but only when
+// it is empty — a cdeploy/ dir holding extra user files is retained. Never a
+// recursive delete; any error (non-empty, permission) is silently ignored since
+// leaving the directory in place is a safe no-op.
+func removeSkillDirIfEmpty(dir string) {
+	_ = os.Remove(dir)
 }

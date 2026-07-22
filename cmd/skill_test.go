@@ -559,6 +559,213 @@ func assertOnlyVersionLineDiffers(t *testing.T, a, b []byte) {
 	}
 }
 
+// runSkillShowCLI executes `skill show` through the real root command, capturing
+// stdout/stderr so tests can assert on the routed output.
+func runSkillShowCLI(t *testing.T, args ...string) (stdout, stderr string, err error) {
+	t.Helper()
+	root := NewRootCmd()
+	var outBuf, errBuf bytes.Buffer
+	root.SetOut(&outBuf)
+	root.SetErr(&errBuf)
+	root.SetArgs(append([]string{"skill", "show"}, args...))
+	err = root.Execute()
+	return outBuf.String(), errBuf.String(), err
+}
+
+// runSkillUninstallCLI executes `skill uninstall <args...>` through the real root
+// command, capturing stdout/stderr so tests can assert on the routed output.
+func runSkillUninstallCLI(t *testing.T, args ...string) (stdout, stderr string, err error) {
+	t.Helper()
+	root := NewRootCmd()
+	var outBuf, errBuf bytes.Buffer
+	root.SetOut(&outBuf)
+	root.SetErr(&errBuf)
+	root.SetArgs(append([]string{"skill", "uninstall"}, args...))
+	err = root.Execute()
+	return outBuf.String(), errBuf.String(), err
+}
+
+// TestSkillShow_ByteEqualsCanonical: `skill show` writes the raw embedded
+// (unstamped) SKILL.md — captured via cmd.SetOut — byte-for-byte.
+func TestSkillShow_ByteEqualsCanonical(t *testing.T) {
+	stdout, stderr, err := runSkillShowCLI(t)
+	if err != nil {
+		t.Fatalf("show: %v (stderr=%s)", err, stderr)
+	}
+	if stdout != string(skills.CanonicalSkill()) {
+		t.Fatalf("show output != canonical SKILL.md")
+	}
+	// The stamp must NOT be present in `show` output (raw canonical only).
+	if strings.Contains(stdout, "cdeploy-content-hash:") {
+		t.Fatalf("show output must be unstamped, found content-hash line:\n%s", stdout)
+	}
+}
+
+// TestSkillUninstall_Absent: uninstalling a target that was never installed is a
+// success and reports "not installed".
+func TestSkillUninstall_Absent(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("CODEX_HOME", "")
+
+	stdout, stderr, err := runSkillUninstallCLI(t, "claude")
+	if err != nil {
+		t.Fatalf("uninstall absent: %v (stderr=%s)", err, stderr)
+	}
+	if !strings.Contains(stdout, "not installed ") {
+		t.Fatalf("stdout missing 'not installed': %q", stdout)
+	}
+}
+
+// TestSkillUninstall_StampedRemovesFileAndEmptyDir: a properly stamped install is
+// removed, and the now-empty cdeploy/ directory is removed too.
+func TestSkillUninstall_StampedRemovesFileAndEmptyDir(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("CODEX_HOME", "")
+
+	// Install first so the file is properly stamped.
+	if _, _, err := runSkillInstallCLI(t, "claude"); err != nil {
+		t.Fatalf("install: %v", err)
+	}
+	path := claudeSkillFile(t)
+	dir := filepath.Dir(path)
+
+	stdout, stderr, err := runSkillUninstallCLI(t, "claude")
+	if err != nil {
+		t.Fatalf("uninstall: %v (stderr=%s)", err, stderr)
+	}
+	if !strings.Contains(stdout, "removed ") {
+		t.Fatalf("stdout missing 'removed': %q", stdout)
+	}
+	if _, serr := os.Stat(path); !os.IsNotExist(serr) {
+		t.Fatalf("SKILL.md still present after uninstall: %v", serr)
+	}
+	if _, serr := os.Stat(dir); !os.IsNotExist(serr) {
+		t.Fatalf("empty cdeploy/ dir not removed: %v", serr)
+	}
+}
+
+// TestSkillUninstall_DirWithExtraFileRetained: when the cdeploy/ dir holds an
+// extra user file, the SKILL.md is removed but the directory is retained (never
+// rm -rf).
+func TestSkillUninstall_DirWithExtraFileRetained(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("CODEX_HOME", "")
+
+	if _, _, err := runSkillInstallCLI(t, "claude"); err != nil {
+		t.Fatalf("install: %v", err)
+	}
+	path := claudeSkillFile(t)
+	dir := filepath.Dir(path)
+	extra := filepath.Join(dir, "NOTES.md")
+	if err := os.WriteFile(extra, []byte("user notes"), 0o644); err != nil {
+		t.Fatalf("write extra file: %v", err)
+	}
+
+	stdout, stderr, err := runSkillUninstallCLI(t, "claude")
+	if err != nil {
+		t.Fatalf("uninstall: %v (stderr=%s)", err, stderr)
+	}
+	if !strings.Contains(stdout, "removed ") {
+		t.Fatalf("stdout missing 'removed': %q", stdout)
+	}
+	if _, serr := os.Stat(path); !os.IsNotExist(serr) {
+		t.Fatalf("SKILL.md still present after uninstall: %v", serr)
+	}
+	// The directory and the extra user file must survive.
+	if _, serr := os.Stat(dir); serr != nil {
+		t.Fatalf("cdeploy/ dir with extra file was removed: %v", serr)
+	}
+	if _, serr := os.Stat(extra); serr != nil {
+		t.Fatalf("extra user file was removed: %v", serr)
+	}
+}
+
+// TestSkillUninstall_ModifiedRefusedThenForced: a modified (tampered) file is
+// refused without --force and removed with it.
+func TestSkillUninstall_ModifiedRefusedThenForced(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("CODEX_HOME", "")
+
+	path := claudeSkillFile(t)
+	dir := filepath.Dir(path)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	tampered := append(append([]byte{}, renderSkill(skills.CanonicalSkill(), version)...), []byte("\nUSER EDIT\n")...)
+	if err := os.WriteFile(path, tampered, 0o644); err != nil {
+		t.Fatalf("write tampered: %v", err)
+	}
+
+	// Without --force: refused, non-zero exit, file untouched.
+	stdout, stderr, err := runSkillUninstallCLI(t, "claude")
+	if err == nil {
+		t.Fatal("expected error when refusing a modified file")
+	}
+	if !strings.Contains(stderr, "refused ") {
+		t.Fatalf("stderr missing 'refused': %q", stderr)
+	}
+	if strings.Contains(stdout, "removed ") {
+		t.Fatalf("modified file must not be removed without --force: %q", stdout)
+	}
+	if _, serr := os.Stat(path); serr != nil {
+		t.Fatalf("modified file removed despite refusal: %v", serr)
+	}
+
+	// With --force: removed (and the now-empty dir too).
+	stdout, stderr, err = runSkillUninstallCLI(t, "claude", "--force")
+	if err != nil {
+		t.Fatalf("forced uninstall: %v (stderr=%s)", err, stderr)
+	}
+	if !strings.Contains(stdout, "removed ") {
+		t.Fatalf("forced uninstall should report 'removed': %q", stdout)
+	}
+	if _, serr := os.Stat(path); !os.IsNotExist(serr) {
+		t.Fatalf("modified file not removed with --force: %v", serr)
+	}
+	if _, serr := os.Stat(dir); !os.IsNotExist(serr) {
+		t.Fatalf("empty cdeploy/ dir not removed with --force: %v", serr)
+	}
+}
+
+// TestSkillUninstall_UnstampedRefusedThenForced: an unstamped file (e.g. dropped
+// by `npx skills`) is refused without --force and removed with it.
+func TestSkillUninstall_UnstampedRefusedThenForced(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("CODEX_HOME", "")
+
+	path := claudeSkillFile(t)
+	dir := filepath.Dir(path)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	// Raw canonical: no stamp at all.
+	if err := os.WriteFile(path, skills.CanonicalSkill(), 0o644); err != nil {
+		t.Fatalf("write unstamped: %v", err)
+	}
+
+	stdout, stderr, err := runSkillUninstallCLI(t, "claude")
+	if err == nil {
+		t.Fatal("expected error when refusing an unstamped file")
+	}
+	if !strings.Contains(stderr, "refused ") || !strings.Contains(stderr, "unstamped") {
+		t.Fatalf("stderr missing unstamped refusal: %q", stderr)
+	}
+	if strings.Contains(stdout, "removed ") {
+		t.Fatalf("unstamped file must not be removed without --force: %q", stdout)
+	}
+	if _, serr := os.Stat(path); serr != nil {
+		t.Fatalf("unstamped file removed despite refusal: %v", serr)
+	}
+
+	// With --force: removed.
+	if _, stderr, err = runSkillUninstallCLI(t, "claude", "--force"); err != nil {
+		t.Fatalf("forced uninstall: %v (stderr=%s)", err, stderr)
+	}
+	if _, serr := os.Stat(path); !os.IsNotExist(serr) {
+		t.Fatalf("unstamped file not removed with --force: %v", serr)
+	}
+}
+
 func equalStrings(a, b []string) bool {
 	if len(a) != len(b) {
 		return false

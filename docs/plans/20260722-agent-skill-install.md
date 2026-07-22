@@ -220,17 +220,17 @@ Dev builds stamp `cdeploy-version: dev` — update detection keys on content has
 - Modify: `cmd/skill.go`
 - Modify: `cmd/skill_test.go`
 
-- [ ] implement `show` (`Args: cobra.NoArgs`): raw embedded SKILL.md written via
+- [x] implement `show` (`Args: cobra.NoArgs`): raw embedded SKILL.md written via
       `cmd.OutOrStdout()` (testable with `cmd.SetOut(&buf)`); help text documents
       `cdeploy skill show > .claude/skills/cdeploy/SKILL.md` for project-level placement
-- [ ] implement `uninstall <claude|codex|all>` (`--force`): absent ⇒ "not installed" (no error);
+- [x] implement `uninstall <claude|codex|all>` (`--force`): absent ⇒ "not installed" (no error);
       intact stamp ⇒ delete SKILL.md only, remove `cdeploy/` dir only if empty; modified/
       unstamped ⇒ refuse without `--force`; aggregate multi-path results
-- [ ] write `show` test: capture via `cmd.SetOut(&buf)`, output byte-equals embedded canonical
-- [ ] write uninstall matrix tests: absent ok / stamped removes file + empty dir / dir with
+- [x] write `show` test: capture via `cmd.SetOut(&buf)`, output byte-equals embedded canonical
+- [x] write uninstall matrix tests: absent ok / stamped removes file + empty dir / dir with
       extra user file retained / modified refused without `--force`, removed with / UNSTAMPED
       file (e.g. dropped by `npx skills`) refused without `--force`, removed with
-- [ ] run tests — must pass before task 5
+- [x] run tests — must pass before task 5
 
 ### Task 5: Verify acceptance criteria
 
