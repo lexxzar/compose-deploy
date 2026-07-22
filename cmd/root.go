@@ -195,7 +195,7 @@ Remote server configuration (~/.cdeploy/servers.yml):
 	rootCmd.PersistentFlags().StringVarP(&sshTarget, "ssh", "S", "", "ad-hoc SSH connection string [user@]host[:port] (mutually exclusive with --server)")
 	rootCmd.PersistentFlags().StringVarP(&identityFile, "identity", "i", "", "path to SSH private key (requires --ssh)")
 
-	rootCmd.AddCommand(newDeployCmd(), newRestartCmd(), newStopCmd(), newListCmd(), newLogsCmd(), newExecCmd())
+	rootCmd.AddCommand(newDeployCmd(), newRestartCmd(), newStopCmd(), newListCmd(), newLogsCmd(), newExecCmd(), newSkillCmd())
 
 	return rootCmd
 }

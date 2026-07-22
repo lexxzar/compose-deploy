@@ -315,6 +315,47 @@ From the service screen, press `c` to open the compose config viewer/editor. Thi
 - `e` opens the compose file in your editor. Local mode uses `$EDITOR`, then `$VISUAL`, then `vi`; values like `code --wait` are supported. Remote mode runs `${EDITOR:-vi}` over SSH on the target host.
 - After the editor exits, cdeploy reloads the raw file, switches back to raw view, and validates it with `docker compose config --quiet`. Validation errors are shown inline in the TUI.
 
+## AI agent integration
+
+cdeploy ships an embedded [Agent Skill](https://agentskills.io) (`SKILL.md`) that teaches AI coding agents — Claude Code, plus Codex/Gemini/Amp via the shared `.agents/skills` convention (Cursor and OpenCode read Claude's directories) — how to install, configure, and drive cdeploy safely. The skill content is version-locked to the binary (embedded at build time), so it never drifts from the CLI you have. Install it into your agent's skill directory:
+
+```bash
+# Install for Claude Code (dirs also read by Cursor/OpenCode)
+cdeploy skill install claude
+
+# Install for Codex/Gemini/Amp (~/.agents/skills + $CODEX_HOME/skills, default ~/.codex)
+cdeploy skill install codex
+
+# Install everywhere, deduplicated
+cdeploy skill install all
+```
+
+Restart your agent (or run `/skills` in Claude Code) afterwards so it picks up the new skill.
+
+**Other verbs:**
+
+```bash
+# Print the raw skill to stdout (inspect it, or redirect it somewhere)
+cdeploy skill show
+
+# Place it in a repo for project-level, version-controlled distribution
+cdeploy skill show > .claude/skills/cdeploy/SKILL.md
+
+# Remove the skill again
+cdeploy skill uninstall all
+```
+
+Installed files carry a content-hash stamp so cdeploy knows what it owns: a file you edited by hand, or one placed by another installer, is never overwritten or removed without `--force`. `install` is idempotent — an unchanged file is reported as such, an out-of-date one is refreshed, and each destination succeeds or fails independently (non-zero exit if any failed).
+
+**External channels:** because `skills/cdeploy/SKILL.md` lives at the repo root on the default branch, the skill is also installable through the community tooling without cdeploy itself:
+
+```bash
+npx skills add lexxzar/compose-deploy
+gh skill install lexxzar/compose-deploy
+```
+
+**What the skill teaches:** setting up `~/.cdeploy/servers.yml` and key-based SSH from scratch (servers, groups, badge colors, ad-hoc `--ssh`/`--identity`/`--project-dir` for CI); read-only inspection (`list --json` with `--stats`/`--updates`, `logs` with tail, and the stale-image sweep for spotting containers running behind the registry); and a safety protocol for mutating operations — restate the target services and server and confirm before deploying/restarting/stopping, never assume `-a`, and verify with `list` afterwards.
+
 ## License
 
 [MIT](LICENSE)
