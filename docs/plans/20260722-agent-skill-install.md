@@ -173,23 +173,23 @@ Dev builds stamp `cdeploy-version: dev` — update detection keys on content has
 - Create: `cmd/skill.go`
 - Create: `cmd/skill_test.go`
 
-- [ ] implement `skillTargetDirs(target string) ([]string, error)`: claude/codex/all matrix,
+- [x] implement `skillTargetDirs(target string) ([]string, error)`: claude/codex/all matrix,
       `os.UserHomeDir()`, `$CODEX_HOME` override (empty value = unset → fall back to
       `~/.codex`), symlink-resolve dedupe (deepest existing ancestor, fallback cleaned path)
-- [ ] implement `renderSkill(canonical []byte, version string) []byte`: inject the metadata
+- [x] implement `renderSkill(canonical []byte, version string) []byte`: inject the metadata
       block (`metadata:` header + `cdeploy-version` + `cdeploy-content-hash: sha256(canonical)`)
       before the frontmatter's CLOSING `---` (the second `---` — never a bare `---` in the body)
-- [ ] implement `stripOwned(onDisk []byte) []byte` (removes the entire injected block) and
+- [x] implement `stripOwned(onDisk []byte) []byte` (removes the entire injected block) and
       `verifySkillFile(onDisk []byte) (stampVersion string, state int)` returning unstamped /
       modified / intact (stripOwned → sha256 → compare to own stamp)
-- [ ] write table tests: path matrix with `t.Setenv` HOME/CODEX_HOME (incl. empty CODEX_HOME
+- [x] write table tests: path matrix with `t.Setenv` HOME/CODEX_HOME (incl. empty CODEX_HOME
       ⇒ `~/.codex` fallback); symlink dedupe (`~/.codex/skills` → symlink to
       `~/.agents/skills` in temp home ⇒ one path)
-- [ ] write render/verify round-trip tests: `stripOwned(renderSkill(canonical, v))` byte-equals
+- [x] write render/verify round-trip tests: `stripOwned(renderSkill(canonical, v))` byte-equals
       canonical; metadata lands inside frontmatter, frontmatter stays first bytes; a canonical
       whose BODY contains a bare `---` line still gets the injection at the frontmatter close;
       tampered body ⇒ modified; no stamp ⇒ unstamped
-- [ ] run tests — must pass before task 3
+- [x] run tests — must pass before task 3
 
 ### Task 3: `skill install` verb + command registration
 
