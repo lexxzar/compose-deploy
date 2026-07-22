@@ -234,14 +234,17 @@ Dev builds stamp `cdeploy-version: dev` — update detection keys on content has
 
 ### Task 5: Verify acceptance criteria
 
-- [ ] verify all Overview requirements implemented (install/show/uninstall, all targets,
+- [x] verify all Overview requirements implemented (install/show/uninstall, all targets,
       hash guard, dedupe, aggregation, pickup notes)
-- [ ] verify edge cases: `$CODEX_HOME` set/unset, symlinked dirs, dev-version stamp, unstamped
+- [x] verify edge cases: `$CODEX_HOME` set/unset, symlinked dirs, dev-version stamp, unstamped
       pre-existing files, obstructed destination
-- [ ] run full suite: `go test ./... -count=1` and `go build -o cdeploy .`
-- [ ] smoke test in temp HOME: `HOME=$(mktemp -d) ./cdeploy skill install all` then re-run
+- [x] run full suite: `go test ./... -count=1` and `go build -o cdeploy .` (all packages green)
+- [x] smoke test in temp HOME: `HOME=$(mktemp -d) ./cdeploy skill install all` then re-run
       (⇒ unchanged), edit file, re-run (⇒ refusal), `--force` (⇒ updated), `uninstall all`
-- [ ] `go mod tidy` (no new deps expected — stdlib only)
+      — observed: install=3×installed exit0; rerun=3×unchanged exit0; edited claude file ⇒
+      refused (others unchanged) exit1 (aggregation); --force ⇒ updated exit0; uninstall all ⇒
+      3×removed exit0, temp HOME clean. Version stamped `dev` (dev build) — confirms dev stamp.
+- [x] `go mod tidy` (no new deps — go.mod/go.sum unchanged, stdlib + existing cobra only)
 
 ### Task 6: [Final] Update documentation
 
