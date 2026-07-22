@@ -140,6 +140,59 @@ func TestSkillTargetDirs_SymlinkDedupe(t *testing.T) {
 	}
 }
 
+// TestSkillDests_MergesAgentsOnCollision pins that when a claude candidate and a
+// codex candidate resolve to the SAME physical directory (here via a
+// ~/.claude/skills → ~/.agents/skills symlink), they collapse to a single write
+// target whose agents slice records BOTH labels — so both pickup notes fire for
+// the one write.
+func TestSkillDests_MergesAgentsOnCollision(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("CODEX_HOME", "")
+
+	agentsSkills := filepath.Join(home, ".agents", "skills")
+	if err := os.MkdirAll(agentsSkills, 0o755); err != nil {
+		t.Fatalf("mkdir agents skills: %v", err)
+	}
+	if err := os.MkdirAll(filepath.Join(home, ".claude"), 0o755); err != nil {
+		t.Fatalf("mkdir claude home: %v", err)
+	}
+	// ~/.claude/skills -> ~/.agents/skills, so the claude cdeploy dir and the
+	// codex ~/.agents cdeploy dir are the same physical path.
+	if err := os.Symlink(agentsSkills, filepath.Join(home, ".claude", "skills")); err != nil {
+		t.Fatalf("symlink: %v", err)
+	}
+
+	dests, err := skillDests("all")
+	if err != nil {
+		t.Fatalf("skillDests: %v", err)
+	}
+
+	sharedDir := resolvedJoin(t, agentsSkills, "cdeploy")
+	var shared *skillDest
+	for i := range dests {
+		if dests[i].dir == sharedDir {
+			shared = &dests[i]
+		}
+	}
+	if shared == nil {
+		t.Fatalf("shared physical dir %q not among dests: %v", sharedDir, dests)
+	}
+	if !containsStr(shared.agents, "claude") || !containsStr(shared.agents, "codex") {
+		t.Fatalf("collapsed dest must record both agents, got %v", shared.agents)
+	}
+	// The dedupe still holds: agents dir appears exactly once.
+	count := 0
+	for _, d := range dests {
+		if d.dir == sharedDir {
+			count++
+		}
+	}
+	if count != 1 {
+		t.Fatalf("shared physical dir appears %d times, want 1: %v", count, dests)
+	}
+}
+
 // TestRenderStripRoundTrip pins the core invariant:
 // stripOwned(renderSkill(canonical, v)) byte-equals canonical.
 func TestRenderStripRoundTrip(t *testing.T) {
@@ -271,17 +324,165 @@ func TestVerifyDevVersionStamp(t *testing.T) {
 	}
 }
 
-// runSkillInstall executes `skill install <args...>` through the real root
-// command, capturing stdout/stderr so tests can assert on the routed output.
-func runSkillInstallCLI(t *testing.T, args ...string) (stdout, stderr string, err error) {
+// TestVerifyForgedStampInBodyIgnored pins the integrity property that parseStamp
+// scans ONLY the frontmatter region — a forged metadata / cdeploy-content-hash
+// block planted in the BODY must not be read as a stamp, so an otherwise
+// unstamped file stays unstamped (never mistaken for intact).
+func TestVerifyForgedStampInBodyIgnored(t *testing.T) {
+	canonical := skills.CanonicalSkill() // canonical frontmatter carries no stamp
+	forged := append(append([]byte{}, canonical...),
+		[]byte("\nmetadata:\n  cdeploy-version: v9.9.9\n  cdeploy-content-hash: sha256:"+
+			strings.Repeat("a", 64)+"\n")...)
+
+	ver, state := verifySkillFile(forged)
+	if state != skillStateUnstamped {
+		t.Fatalf("forged body stamp must not be read; state = %d, want unstamped (%d)", state, skillStateUnstamped)
+	}
+	if ver != "" {
+		t.Fatalf("version = %q, want empty (body stamp must be ignored)", ver)
+	}
+}
+
+// TestVerifyStampedFileWithBodyInjectedStampModified pins the integrity property
+// that stripOwned scans ONLY the frontmatter region. A genuinely stamped file
+// with a forged `metadata:`/`cdeploy-content-hash:` block appended to the BODY
+// must be reported as MODIFIED — not intact. Were stripOwned to remove the
+// body-injected block (as a whole-file scan would), the stripped content would
+// hash straight back to the canonical and the tampered file would verify as
+// intact, letting install/uninstall overwrite or delete it without --force.
+func TestVerifyStampedFileWithBodyInjectedStampModified(t *testing.T) {
+	canonical := skills.CanonicalSkill()
+	stamped := renderSkill(canonical, version) // legit frontmatter stamp = sha256(canonical)
+
+	// The canonical ends with a trailing newline, so this block lands as fresh
+	// lines in the BODY, after the frontmatter's closing `---`. A whole-file
+	// stripOwned would peel it back to the canonical and mis-verify as intact.
+	bodyBlock := "metadata:\n  cdeploy-version: v9.9.9\n  cdeploy-content-hash: sha256:" +
+		strings.Repeat("a", 64) + "\n"
+	tampered := append(append([]byte{}, stamped...), []byte(bodyBlock)...)
+
+	_, state := verifySkillFile(tampered)
+	if state != skillStateModified {
+		t.Fatalf("body-injected metadata block must be treated as a modification; state = %d, want modified (%d)", state, skillStateModified)
+	}
+
+	// The body block itself must survive stripOwned byte-for-byte (only the
+	// frontmatter stamp is removed) — the body is never touched.
+	stripped := stripOwned(tampered)
+	if !bytes.Contains(stripped, []byte(bodyBlock)) {
+		t.Fatalf("stripOwned removed a body-injected metadata block; the body must be left untouched")
+	}
+	// And parseStamp still reads only the real frontmatter stamp.
+	ver, hash, ok := parseStamp(tampered)
+	if !ok || ver != version {
+		t.Fatalf("parseStamp should read the real frontmatter stamp: ver=%q hash=%q ok=%v", ver, hash, ok)
+	}
+}
+
+// runSkillCLI executes `skill <verb> <args...>` through the real root command,
+// capturing stdout/stderr so tests can assert on the routed output.
+func runSkillCLI(t *testing.T, verb string, args ...string) (stdout, stderr string, err error) {
 	t.Helper()
 	root := NewRootCmd()
 	var outBuf, errBuf bytes.Buffer
 	root.SetOut(&outBuf)
 	root.SetErr(&errBuf)
-	root.SetArgs(append([]string{"skill", "install"}, args...))
+	root.SetArgs(append([]string{"skill", verb}, args...))
 	err = root.Execute()
 	return outBuf.String(), errBuf.String(), err
+}
+
+// runRootArgs executes an arbitrary root argv (so tests can place persistent
+// flags BEFORE the subcommand, e.g. `--ssh user@host skill show`), capturing
+// stdout/stderr.
+func runRootArgs(t *testing.T, args ...string) (stdout, stderr string, err error) {
+	t.Helper()
+	root := NewRootCmd()
+	var outBuf, errBuf bytes.Buffer
+	root.SetOut(&outBuf)
+	root.SetErr(&errBuf)
+	root.SetArgs(args)
+	err = root.Execute()
+	return outBuf.String(), errBuf.String(), err
+}
+
+// TestSkillRejectsRemoteFlags pins that every skill verb rejects the inherited
+// root remote/project globals (--server/--ssh/--identity/--project-dir) with an
+// error naming the offending flag — skill installs into LOCAL user-level dirs
+// only. Both flag placements are covered (post-subcommand via runSkillCLI and
+// pre-subcommand via runRootArgs); the PersistentPreRunE reads the shared package
+// global, which is set the same way regardless of position.
+func TestSkillRejectsRemoteFlags(t *testing.T) {
+	flags := []struct {
+		flag string
+		val  string
+	}{
+		{"--server", "prod"},
+		{"--ssh", "user@host"},
+		{"--identity", "/tmp/some-key"},
+		{"--project-dir", "/tmp/proj"},
+	}
+	// Each verb with its own required positional args.
+	verbs := [][]string{
+		{"show"},
+		{"install", "claude"},
+		{"uninstall", "claude"},
+	}
+
+	for _, f := range flags {
+		for _, verb := range verbs {
+			t.Run(strings.TrimLeft(f.flag, "-")+"_"+verb[0]+"_post", func(t *testing.T) {
+				t.Setenv("HOME", t.TempDir())
+				t.Setenv("CODEX_HOME", "")
+
+				// `skill <verb> [pos...] <flag> <val>`
+				extra := append(append([]string{}, verb[1:]...), f.flag, f.val)
+				_, _, err := runSkillCLI(t, verb[0], extra...)
+				if err == nil {
+					t.Fatalf("expected error for `skill %s %s`, got nil", strings.Join(verb, " "), f.flag)
+				}
+				if !strings.Contains(err.Error(), f.flag) {
+					t.Fatalf("error %q must name the offending flag %q", err, f.flag)
+				}
+				if !strings.Contains(err.Error(), "local") {
+					t.Fatalf("error %q should explain skill is local-only", err)
+				}
+			})
+
+			t.Run(strings.TrimLeft(f.flag, "-")+"_"+verb[0]+"_pre", func(t *testing.T) {
+				t.Setenv("HOME", t.TempDir())
+				t.Setenv("CODEX_HOME", "")
+
+				// `<flag> <val> skill <verb> [pos...]`
+				args := append([]string{f.flag, f.val, "skill"}, verb...)
+				_, _, err := runRootArgs(t, args...)
+				if err == nil {
+					t.Fatalf("expected error for `%s skill %s`, got nil", f.flag, strings.Join(verb, " "))
+				}
+				if !strings.Contains(err.Error(), f.flag) {
+					t.Fatalf("error %q must name the offending flag %q", err, f.flag)
+				}
+			})
+		}
+	}
+}
+
+// TestSkillNoGlobalFlagsSucceeds pins the positive path: with none of the
+// remote/project globals set, each skill verb runs to a zero exit — the guard
+// must not fire on a plain invocation.
+func TestSkillNoGlobalFlagsSucceeds(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("CODEX_HOME", "")
+
+	if _, stderr, err := runSkillCLI(t, "show"); err != nil {
+		t.Fatalf("skill show: %v (stderr=%s)", err, stderr)
+	}
+	if _, stderr, err := runSkillCLI(t, "install", "claude"); err != nil {
+		t.Fatalf("skill install claude: %v (stderr=%s)", err, stderr)
+	}
+	if _, stderr, err := runSkillCLI(t, "uninstall", "claude"); err != nil {
+		t.Fatalf("skill uninstall claude: %v (stderr=%s)", err, stderr)
+	}
 }
 
 // claudeSkillFile resolves the on-disk SKILL.md path for the claude target,
@@ -301,7 +502,7 @@ func TestSkillInstall_Fresh(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
 	t.Setenv("CODEX_HOME", "")
 
-	stdout, stderr, err := runSkillInstallCLI(t, "claude")
+	stdout, stderr, err := runSkillCLI(t, "install", "claude")
 	if err != nil {
 		t.Fatalf("install: %v (stderr=%s)", err, stderr)
 	}
@@ -331,10 +532,10 @@ func TestSkillInstall_IdenticalRerun(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
 	t.Setenv("CODEX_HOME", "")
 
-	if _, _, err := runSkillInstallCLI(t, "claude"); err != nil {
+	if _, _, err := runSkillCLI(t, "install", "claude"); err != nil {
 		t.Fatalf("first install: %v", err)
 	}
-	stdout, stderr, err := runSkillInstallCLI(t, "claude")
+	stdout, stderr, err := runSkillCLI(t, "install", "claude")
 	if err != nil {
 		t.Fatalf("second install: %v (stderr=%s)", err, stderr)
 	}
@@ -359,7 +560,7 @@ func TestSkillInstall_OldContentUpdated(t *testing.T) {
 		t.Fatalf("write old: %v", err)
 	}
 
-	stdout, stderr, err := runSkillInstallCLI(t, "claude")
+	stdout, stderr, err := runSkillCLI(t, "install", "claude")
 	if err != nil {
 		t.Fatalf("install: %v (stderr=%s)", err, stderr)
 	}
@@ -391,7 +592,7 @@ func TestSkillInstall_StampRefresh(t *testing.T) {
 		t.Fatalf("write: %v", err)
 	}
 
-	stdout, stderr, err := runSkillInstallCLI(t, "claude")
+	stdout, stderr, err := runSkillCLI(t, "install", "claude")
 	if err != nil {
 		t.Fatalf("install: %v (stderr=%s)", err, stderr)
 	}
@@ -427,7 +628,7 @@ func TestSkillInstall_TamperedRefusedThenForced(t *testing.T) {
 	}
 
 	// Without --force: refused, non-zero exit, file untouched.
-	stdout, stderr, err := runSkillInstallCLI(t, "claude")
+	stdout, stderr, err := runSkillCLI(t, "install", "claude")
 	if err == nil {
 		t.Fatal("expected error when refusing a modified file")
 	}
@@ -442,7 +643,7 @@ func TestSkillInstall_TamperedRefusedThenForced(t *testing.T) {
 	}
 
 	// With --force: overwritten.
-	stdout, stderr, err = runSkillInstallCLI(t, "claude", "--force")
+	stdout, stderr, err = runSkillCLI(t, "install", "claude", "--force")
 	if err != nil {
 		t.Fatalf("forced install: %v (stderr=%s)", err, stderr)
 	}
@@ -470,7 +671,7 @@ func TestSkillInstall_UnstampedRefusedThenForced(t *testing.T) {
 		t.Fatalf("write: %v", err)
 	}
 
-	stdout, stderr, err := runSkillInstallCLI(t, "claude")
+	stdout, stderr, err := runSkillCLI(t, "install", "claude")
 	if err == nil {
 		t.Fatal("expected error when refusing an unstamped file")
 	}
@@ -482,7 +683,7 @@ func TestSkillInstall_UnstampedRefusedThenForced(t *testing.T) {
 	}
 
 	// With --force: overwritten with the stamped canonical.
-	if _, stderr, err = runSkillInstallCLI(t, "claude", "--force"); err != nil {
+	if _, stderr, err = runSkillCLI(t, "install", "claude", "--force"); err != nil {
 		t.Fatalf("forced install: %v (stderr=%s)", err, stderr)
 	}
 	if got, _ := os.ReadFile(path); !bytes.Equal(got, renderSkill(canonical, version)) {
@@ -507,7 +708,7 @@ func TestSkillInstall_AggregatesFailures(t *testing.T) {
 		t.Fatalf("write obstruction: %v", err)
 	}
 
-	stdout, stderr, err := runSkillInstallCLI(t, "all")
+	stdout, stderr, err := runSkillCLI(t, "install", "all")
 	if err == nil {
 		t.Fatal("expected non-zero result when a destination fails")
 	}
@@ -534,6 +735,188 @@ func TestSkillInstall_AggregatesFailures(t *testing.T) {
 			t.Fatalf("stdout missing successful codex path %q:\n%s", p, stdout)
 		}
 	}
+
+	// Pickup notes must reflect the destinations that actually succeeded: the
+	// codex note prints (its paths were written) but the claude note must NOT,
+	// since the claude destination failed.
+	if !strings.Contains(stdout, "Codex") {
+		t.Fatalf("stdout missing codex pickup note for the succeeded codex paths:\n%s", stdout)
+	}
+	if strings.Contains(stdout, "Claude Code") {
+		t.Fatalf("claude pickup note printed despite the claude destination failing:\n%s", stdout)
+	}
+}
+
+// TestSkillInstall_Codex drives the standalone codex dual-write happy path: both
+// resolved SKILL.md paths are written, only the codex pickup note is printed, and
+// an identical rerun reports unchanged for both.
+func TestSkillInstall_Codex(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("CODEX_HOME", "")
+
+	stdout, stderr, err := runSkillCLI(t, "install", "codex")
+	if err != nil {
+		t.Fatalf("install codex: %v (stderr=%s)", err, stderr)
+	}
+
+	dirs, derr := skillTargetDirs("codex")
+	if derr != nil {
+		t.Fatalf("skillTargetDirs codex: %v", derr)
+	}
+	if len(dirs) != 2 {
+		t.Fatalf("expected 2 codex dirs (agents + codex home), got %d: %v", len(dirs), dirs)
+	}
+	if n := strings.Count(stdout, "installed "); n != 2 {
+		t.Fatalf("expected 2 'installed' lines, got %d:\n%s", n, stdout)
+	}
+
+	want := renderSkill(skills.CanonicalSkill(), version)
+	for _, dir := range dirs {
+		p := filepath.Join(dir, "SKILL.md")
+		got, rerr := os.ReadFile(p)
+		if rerr != nil {
+			t.Fatalf("codex path %q not written: %v", p, rerr)
+		}
+		if !bytes.Equal(got, want) {
+			t.Fatalf("codex path %q content != rendered skill", p)
+		}
+		if !strings.Contains(stdout, p) {
+			t.Fatalf("stdout missing resolved codex path %q:\n%s", p, stdout)
+		}
+	}
+
+	// Only the codex pickup note — never the claude one.
+	if !strings.Contains(stdout, "Codex") {
+		t.Fatalf("stdout missing codex pickup note:\n%s", stdout)
+	}
+	if strings.Contains(stdout, "Claude Code") {
+		t.Fatalf("codex install must not print the claude pickup note:\n%s", stdout)
+	}
+
+	// Idempotent rerun: both destinations report unchanged.
+	stdout2, stderr2, err := runSkillCLI(t, "install", "codex")
+	if err != nil {
+		t.Fatalf("codex rerun: %v (stderr=%s)", err, stderr2)
+	}
+	if n := strings.Count(stdout2, "unchanged "); n != 2 {
+		t.Fatalf("expected 2 'unchanged' lines on rerun, got %d:\n%s", n, stdout2)
+	}
+}
+
+// TestSkillInstall_CollapsedDirEmitsBothPickupNotes pins the merged-agent
+// behaviour end-to-end: when ALL candidate dirs (claude, codex-agents, and
+// codex-home) collapse to one physical path via symlinks, that path is written
+// exactly ONCE but BOTH pickup notes still print, because both agents read it.
+// The all-collapse setup makes this a true regression pin — the codex note can
+// ONLY come from the merged dest (there is no separate codex path to leak it), so
+// a dedupe that dropped the secondary agent label would omit the Codex note.
+func TestSkillInstall_CollapsedDirEmitsBothPickupNotes(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("CODEX_HOME", "")
+
+	agentsSkills := filepath.Join(home, ".agents", "skills")
+	if err := os.MkdirAll(agentsSkills, 0o755); err != nil {
+		t.Fatalf("mkdir agents skills: %v", err)
+	}
+	if err := os.MkdirAll(filepath.Join(home, ".claude"), 0o755); err != nil {
+		t.Fatalf("mkdir claude home: %v", err)
+	}
+	// ~/.claude/skills -> ~/.agents/skills  (collapses the claude candidate)
+	if err := os.Symlink(agentsSkills, filepath.Join(home, ".claude", "skills")); err != nil {
+		t.Fatalf("symlink claude skills: %v", err)
+	}
+	// ~/.codex -> ~/.agents  (so ~/.codex/skills -> ~/.agents/skills, collapsing
+	// the codex-home candidate too)
+	if err := os.Symlink(filepath.Join(home, ".agents"), filepath.Join(home, ".codex")); err != nil {
+		t.Fatalf("symlink codex home: %v", err)
+	}
+
+	stdout, stderr, err := runSkillCLI(t, "install", "all")
+	if err != nil {
+		t.Fatalf("install all: %v (stderr=%s)", err, stderr)
+	}
+
+	// All three candidates collapse to one physical dir → exactly one write.
+	if n := strings.Count(stdout, "installed "); n != 1 {
+		t.Fatalf("expected 1 'installed' line (all candidates collapse), got %d:\n%s", n, stdout)
+	}
+	sharedFile := resolvedJoin(t, agentsSkills, "cdeploy", "SKILL.md")
+	if !strings.Contains(stdout, "installed "+sharedFile) {
+		t.Fatalf("shared dir not installed at %q, stdout:\n%s", sharedFile, stdout)
+	}
+
+	// Both pickup notes must fire even though the shared dir was written once.
+	if !strings.Contains(stdout, "Claude Code") {
+		t.Fatalf("stdout missing claude pickup note for the collapsed dir:\n%s", stdout)
+	}
+	if !strings.Contains(stdout, "Codex") {
+		t.Fatalf("stdout missing codex pickup note for the collapsed dir:\n%s", stdout)
+	}
+}
+
+// TestSkillUninstall_Codex drives standalone codex uninstall: both dual-write
+// SKILL.md paths (and their now-empty cdeploy/ dirs) are removed.
+func TestSkillUninstall_Codex(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("CODEX_HOME", "")
+
+	if _, _, err := runSkillCLI(t, "install", "codex"); err != nil {
+		t.Fatalf("install codex: %v", err)
+	}
+	dirs, derr := skillTargetDirs("codex")
+	if derr != nil {
+		t.Fatalf("skillTargetDirs codex: %v", derr)
+	}
+
+	stdout, stderr, err := runSkillCLI(t, "uninstall", "codex")
+	if err != nil {
+		t.Fatalf("uninstall codex: %v (stderr=%s)", err, stderr)
+	}
+	if n := strings.Count(stdout, "removed "); n != 2 {
+		t.Fatalf("expected 2 'removed' lines, got %d:\n%s", n, stdout)
+	}
+	for _, dir := range dirs {
+		p := filepath.Join(dir, "SKILL.md")
+		if _, serr := os.Stat(p); !os.IsNotExist(serr) {
+			t.Fatalf("codex SKILL.md %q still present after uninstall: %v", p, serr)
+		}
+		if _, serr := os.Stat(dir); !os.IsNotExist(serr) {
+			t.Fatalf("empty codex cdeploy/ dir %q not removed: %v", dir, serr)
+		}
+	}
+}
+
+// TestSkillInstall_ForceUnchangedSkipsRewrite pins the --force short-circuit: when
+// the on-disk file is already the current stamped canonical, --force reports
+// unchanged (not updated) and leaves the bytes untouched.
+func TestSkillInstall_ForceUnchangedSkipsRewrite(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("CODEX_HOME", "")
+
+	if _, _, err := runSkillCLI(t, "install", "claude"); err != nil {
+		t.Fatalf("install: %v", err)
+	}
+	path := claudeSkillFile(t)
+	before, rerr := os.ReadFile(path)
+	if rerr != nil {
+		t.Fatalf("read installed file: %v", rerr)
+	}
+
+	stdout, stderr, err := runSkillCLI(t, "install", "claude", "--force")
+	if err != nil {
+		t.Fatalf("forced install over current file: %v (stderr=%s)", err, stderr)
+	}
+	if !strings.Contains(stdout, "unchanged ") {
+		t.Fatalf("--force over the current file should report 'unchanged': %q", stdout)
+	}
+	if strings.Contains(stdout, "updated ") {
+		t.Fatalf("--force over an identical current file must not rewrite: %q", stdout)
+	}
+	after, _ := os.ReadFile(path)
+	if !bytes.Equal(before, after) {
+		t.Fatal("file bytes changed despite the --force unchanged short-circuit")
+	}
 }
 
 // assertOnlyVersionLineDiffers fails unless a and b differ on exactly one line,
@@ -559,36 +942,10 @@ func assertOnlyVersionLineDiffers(t *testing.T, a, b []byte) {
 	}
 }
 
-// runSkillShowCLI executes `skill show` through the real root command, capturing
-// stdout/stderr so tests can assert on the routed output.
-func runSkillShowCLI(t *testing.T, args ...string) (stdout, stderr string, err error) {
-	t.Helper()
-	root := NewRootCmd()
-	var outBuf, errBuf bytes.Buffer
-	root.SetOut(&outBuf)
-	root.SetErr(&errBuf)
-	root.SetArgs(append([]string{"skill", "show"}, args...))
-	err = root.Execute()
-	return outBuf.String(), errBuf.String(), err
-}
-
-// runSkillUninstallCLI executes `skill uninstall <args...>` through the real root
-// command, capturing stdout/stderr so tests can assert on the routed output.
-func runSkillUninstallCLI(t *testing.T, args ...string) (stdout, stderr string, err error) {
-	t.Helper()
-	root := NewRootCmd()
-	var outBuf, errBuf bytes.Buffer
-	root.SetOut(&outBuf)
-	root.SetErr(&errBuf)
-	root.SetArgs(append([]string{"skill", "uninstall"}, args...))
-	err = root.Execute()
-	return outBuf.String(), errBuf.String(), err
-}
-
 // TestSkillShow_ByteEqualsCanonical: `skill show` writes the raw embedded
 // (unstamped) SKILL.md — captured via cmd.SetOut — byte-for-byte.
 func TestSkillShow_ByteEqualsCanonical(t *testing.T) {
-	stdout, stderr, err := runSkillShowCLI(t)
+	stdout, stderr, err := runSkillCLI(t, "show")
 	if err != nil {
 		t.Fatalf("show: %v (stderr=%s)", err, stderr)
 	}
@@ -607,7 +964,7 @@ func TestSkillUninstall_Absent(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
 	t.Setenv("CODEX_HOME", "")
 
-	stdout, stderr, err := runSkillUninstallCLI(t, "claude")
+	stdout, stderr, err := runSkillCLI(t, "uninstall", "claude")
 	if err != nil {
 		t.Fatalf("uninstall absent: %v (stderr=%s)", err, stderr)
 	}
@@ -623,13 +980,13 @@ func TestSkillUninstall_StampedRemovesFileAndEmptyDir(t *testing.T) {
 	t.Setenv("CODEX_HOME", "")
 
 	// Install first so the file is properly stamped.
-	if _, _, err := runSkillInstallCLI(t, "claude"); err != nil {
+	if _, _, err := runSkillCLI(t, "install", "claude"); err != nil {
 		t.Fatalf("install: %v", err)
 	}
 	path := claudeSkillFile(t)
 	dir := filepath.Dir(path)
 
-	stdout, stderr, err := runSkillUninstallCLI(t, "claude")
+	stdout, stderr, err := runSkillCLI(t, "uninstall", "claude")
 	if err != nil {
 		t.Fatalf("uninstall: %v (stderr=%s)", err, stderr)
 	}
@@ -651,7 +1008,7 @@ func TestSkillUninstall_DirWithExtraFileRetained(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
 	t.Setenv("CODEX_HOME", "")
 
-	if _, _, err := runSkillInstallCLI(t, "claude"); err != nil {
+	if _, _, err := runSkillCLI(t, "install", "claude"); err != nil {
 		t.Fatalf("install: %v", err)
 	}
 	path := claudeSkillFile(t)
@@ -661,7 +1018,7 @@ func TestSkillUninstall_DirWithExtraFileRetained(t *testing.T) {
 		t.Fatalf("write extra file: %v", err)
 	}
 
-	stdout, stderr, err := runSkillUninstallCLI(t, "claude")
+	stdout, stderr, err := runSkillCLI(t, "uninstall", "claude")
 	if err != nil {
 		t.Fatalf("uninstall: %v (stderr=%s)", err, stderr)
 	}
@@ -697,7 +1054,7 @@ func TestSkillUninstall_ModifiedRefusedThenForced(t *testing.T) {
 	}
 
 	// Without --force: refused, non-zero exit, file untouched.
-	stdout, stderr, err := runSkillUninstallCLI(t, "claude")
+	stdout, stderr, err := runSkillCLI(t, "uninstall", "claude")
 	if err == nil {
 		t.Fatal("expected error when refusing a modified file")
 	}
@@ -712,7 +1069,7 @@ func TestSkillUninstall_ModifiedRefusedThenForced(t *testing.T) {
 	}
 
 	// With --force: removed (and the now-empty dir too).
-	stdout, stderr, err = runSkillUninstallCLI(t, "claude", "--force")
+	stdout, stderr, err = runSkillCLI(t, "uninstall", "claude", "--force")
 	if err != nil {
 		t.Fatalf("forced uninstall: %v (stderr=%s)", err, stderr)
 	}
@@ -743,7 +1100,7 @@ func TestSkillUninstall_UnstampedRefusedThenForced(t *testing.T) {
 		t.Fatalf("write unstamped: %v", err)
 	}
 
-	stdout, stderr, err := runSkillUninstallCLI(t, "claude")
+	stdout, stderr, err := runSkillCLI(t, "uninstall", "claude")
 	if err == nil {
 		t.Fatal("expected error when refusing an unstamped file")
 	}
@@ -758,12 +1115,21 @@ func TestSkillUninstall_UnstampedRefusedThenForced(t *testing.T) {
 	}
 
 	// With --force: removed.
-	if _, stderr, err = runSkillUninstallCLI(t, "claude", "--force"); err != nil {
+	if _, stderr, err = runSkillCLI(t, "uninstall", "claude", "--force"); err != nil {
 		t.Fatalf("forced uninstall: %v (stderr=%s)", err, stderr)
 	}
 	if _, serr := os.Stat(path); !os.IsNotExist(serr) {
 		t.Fatalf("unstamped file not removed with --force: %v", serr)
 	}
+}
+
+func containsStr(s []string, v string) bool {
+	for _, x := range s {
+		if x == v {
+			return true
+		}
+	}
+	return false
 }
 
 func equalStrings(a, b []string) bool {

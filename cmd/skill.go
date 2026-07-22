@@ -29,12 +29,29 @@ const (
 	skillStateIntact
 )
 
-// skillTargetDirs resolves the on-disk SKILL.md parent directories for an
-// install/uninstall target. Returns the deduplicated, symlink-resolved write
-// targets — one entry per distinct physical location.
+// skillFileName is the on-disk filename written into each agent's skill
+// directory (e.g. ~/.claude/skills/cdeploy/SKILL.md).
+const skillFileName = "SKILL.md"
+
+// skillDest is a single resolved write target plus the agent(s) it belongs to.
+// The agent labels ("claude" and/or "codex") drive which pickup notes are printed
+// — keyed on the destinations that actually succeeded, not on the CLI target, so a
+// partial-failure `install all` never advises restarting an agent whose path
+// failed. agents is a slice (not a single label) because two candidates from
+// different agents can resolve to the SAME physical directory (e.g. via a
+// symlink); both must be recorded so both pickup notes fire for that one write.
+type skillDest struct {
+	dir    string
+	agents []string
+}
+
+// skillDests resolves the on-disk SKILL.md parent directories for an
+// install/uninstall target, tagging each with its owning agent. Returns the
+// deduplicated, symlink-resolved write targets — one entry per distinct physical
+// location.
 //
-//   - "claude" → ~/.claude/skills/cdeploy
-//   - "codex"  → ~/.agents/skills/cdeploy AND $CODEX_HOME/skills/cdeploy
+//   - "claude" → ~/.claude/skills/cdeploy                              (agent claude)
+//   - "codex"  → ~/.agents/skills/cdeploy AND $CODEX_HOME/skills/cdeploy (agent codex)
 //     ($CODEX_HOME defaults to ~/.codex; an EMPTY value is treated as unset so
 //     the fallback triggers — t.Setenv can set but never unset an env var)
 //   - "all"    → the union of both, deduped
@@ -42,35 +59,71 @@ const (
 // Dedupe resolves symlinks on the deepest EXISTING ancestor of each candidate
 // (the target dir itself usually does not exist yet, and filepath.EvalSymlinks
 // errors on missing paths), so two candidates that point at the same physical
-// directory through a symlink collapse to a single write.
-func skillTargetDirs(target string) ([]string, error) {
+// directory through a symlink collapse to a single write. On collision the agent
+// labels are MERGED onto that one physical destination (first-seen order), so a
+// dir shared by both agents still prints both pickup notes.
+func skillDests(target string) ([]skillDest, error) {
 	home, err := os.UserHomeDir()
 	if err != nil {
 		return nil, err
 	}
 
-	var candidates []string
+	type candidate struct {
+		dir   string
+		agent string
+	}
+	var candidates []candidate
 	switch target {
 	case "claude":
-		candidates = append(candidates, claudeSkillDir(home))
+		candidates = append(candidates, candidate{claudeSkillDir(home), "claude"})
 	case "codex":
-		candidates = append(candidates, codexSkillDirs(home)...)
+		for _, d := range codexSkillDirs(home) {
+			candidates = append(candidates, candidate{d, "codex"})
+		}
 	case "all":
-		candidates = append(candidates, claudeSkillDir(home))
-		candidates = append(candidates, codexSkillDirs(home)...)
+		candidates = append(candidates, candidate{claudeSkillDir(home), "claude"})
+		for _, d := range codexSkillDirs(home) {
+			candidates = append(candidates, candidate{d, "codex"})
+		}
 	default:
 		return nil, fmt.Errorf("unknown skill target %q (want claude, codex, or all)", target)
 	}
 
-	seen := make(map[string]bool, len(candidates))
-	out := make([]string, 0, len(candidates))
+	index := make(map[string]int, len(candidates)) // physical key → out index
+	out := make([]skillDest, 0, len(candidates))
 	for _, c := range candidates {
-		key := resolveDedupeKey(c)
-		if seen[key] {
+		key := resolveDedupeKey(c.dir)
+		if i, ok := index[key]; ok {
+			out[i].agents = appendUnique(out[i].agents, c.agent)
 			continue
 		}
-		seen[key] = true
-		out = append(out, key)
+		index[key] = len(out)
+		out = append(out, skillDest{dir: key, agents: []string{c.agent}})
+	}
+	return out, nil
+}
+
+// appendUnique appends v to s only when it is not already present, keeping the
+// slice a first-seen-ordered set.
+func appendUnique(s []string, v string) []string {
+	for _, x := range s {
+		if x == v {
+			return s
+		}
+	}
+	return append(s, v)
+}
+
+// skillTargetDirs returns just the resolved write-target directories for target,
+// discarding the agent labels. Retained for callers that only need the paths.
+func skillTargetDirs(target string) ([]string, error) {
+	dests, err := skillDests(target)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]string, len(dests))
+	for i, d := range dests {
+		out[i] = d.dir
 	}
 	return out, nil
 }
@@ -170,13 +223,27 @@ func frontmatterCloseOffset(data []byte) (int, bool) {
 	return len(open) + idx + 1, true
 }
 
-// stripOwned removes the entire injected metadata block — the `metadata:` header
-// line plus both `cdeploy-*` lines — so the result byte-equals the canonical
-// bytes the stamp was computed from. Lines that are not our injected block are
+// stripOwned removes the injected metadata block — the `metadata:` header line
+// plus both `cdeploy-*` lines — so the result byte-equals the canonical bytes the
+// stamp was computed from. The scan is constrained to the FRONTMATTER region
+// (everything before the frontmatter's closing `---`), mirroring parseStamp: the
+// injected block only ever lives in the frontmatter, so a `metadata:`/`cdeploy-*`
+// block a user plants in the BODY must be left byte-for-byte untouched. Stripping
+// it too would let a tampered file hash back to the canonical and verify as
+// intact, defeating the ownership guard. Lines that are not our injected block are
 // left untouched; a lone `metadata:` with no cdeploy child lines is preserved.
 func stripOwned(onDisk []byte) []byte {
-	lines := strings.SplitAfter(string(onDisk), "\n")
-	out := make([]string, 0, len(lines))
+	closeStart, ok := frontmatterCloseOffset(onDisk)
+	if !ok {
+		// No frontmatter fence → nothing was injected (renderSkill leaves such
+		// input untouched too), so there is nothing to strip.
+		return onDisk
+	}
+
+	// Scan only onDisk[:closeStart]; the closing `---` and the entire body
+	// (onDisk[closeStart:]) are appended back verbatim.
+	lines := strings.SplitAfter(string(onDisk[:closeStart]), "\n")
+	out := make([]byte, 0, len(onDisk))
 	for i := 0; i < len(lines); i++ {
 		if strings.TrimRight(lines[i], "\n") == "metadata:" {
 			// Peel consecutive cdeploy-owned child lines under this header.
@@ -197,9 +264,10 @@ func stripOwned(onDisk []byte) []byte {
 				continue
 			}
 		}
-		out = append(out, lines[i])
+		out = append(out, lines[i]...)
 	}
-	return []byte(strings.Join(out, ""))
+	out = append(out, onDisk[closeStart:]...)
+	return out
 }
 
 // verifySkillFile answers only "is this file consistent with its OWN stamp?" —
@@ -242,6 +310,34 @@ func parseStamp(onDisk []byte) (version, contentHash string, ok bool) {
 	return version, contentHash, contentHash != ""
 }
 
+// checkSkillNoRemoteFlags rejects the root persistent flags that are meaningless
+// for the skill command family. The skill verbs install into LOCAL, user-level
+// agent skill directories only — they never target a remote host or a compose
+// project — so --server/--ssh/--identity/--project-dir would otherwise be silent
+// no-ops-of-intent (e.g. `cdeploy --ssh user@host skill install claude` reads as
+// "install on the remote host" but writes to local dirs). Rejecting them with a
+// clear error is aligned with the plan's user-level/local-only scope.
+func checkSkillNoRemoteFlags() error {
+	var offending []string
+	if serverName != "" {
+		offending = append(offending, "--server")
+	}
+	if sshTarget != "" {
+		offending = append(offending, "--ssh")
+	}
+	if identityFile != "" {
+		offending = append(offending, "--identity")
+	}
+	if projectDir != "" {
+		offending = append(offending, "--project-dir")
+	}
+	if len(offending) > 0 {
+		return fmt.Errorf("%s not valid for `skill`: it installs into local user-level skill directories only",
+			strings.Join(offending, ", "))
+	}
+	return nil
+}
+
 // newSkillCmd builds the `skill` parent command and attaches the install, show,
 // and uninstall subcommands.
 func newSkillCmd() *cobra.Command {
@@ -258,6 +354,13 @@ overwritten or removed without --force.
 For project-level placement, write the raw skill to your repo instead:
 
   cdeploy skill show > .claude/skills/cdeploy/SKILL.md`,
+		// The skill verbs are local/user-level only; reject the inherited remote
+		// and project-targeting globals so a supplied --server/--ssh/--identity/
+		// --project-dir errors instead of silently operating on local dirs. A
+		// parent PersistentPreRunE covers all three verbs (none define their own).
+		PersistentPreRunE: func(cmd *cobra.Command, args []string) error {
+			return checkSkillNoRemoteFlags()
+		},
 	}
 	cmd.AddCommand(newSkillInstallCmd())
 	cmd.AddCommand(newSkillShowCmd())
@@ -310,7 +413,7 @@ or that was edited after install, is refused unless --force is given.`,
 // never aborts the others. It returns a non-nil error (non-zero exit) when any
 // destination failed.
 func runSkillInstall(cmd *cobra.Command, target string, force bool) error {
-	dirs, err := skillTargetDirs(target)
+	dests, err := skillDests(target)
 	if err != nil {
 		return err
 	}
@@ -322,12 +425,13 @@ func runSkillInstall(cmd *cobra.Command, target string, force bool) error {
 	errOut := cmd.ErrOrStderr()
 
 	var (
-		failures  int
-		succeeded []string
+		failures       int
+		succeeded      []string
+		succeededAgent = map[string]bool{}
 	)
-	for _, dir := range dirs {
-		skillPath := filepath.Join(dir, "SKILL.md")
-		msg, perr := installSkillPath(dir, skillPath, canonical, rendered, version, force)
+	for _, dest := range dests {
+		skillPath := filepath.Join(dest.dir, skillFileName)
+		msg, perr := installSkillPath(dest.dir, skillPath, canonical, rendered, version, force)
 		if perr != nil {
 			fmt.Fprintln(errOut, msg)
 			failures++
@@ -335,14 +439,50 @@ func runSkillInstall(cmd *cobra.Command, target string, force bool) error {
 		}
 		fmt.Fprintln(out, msg)
 		succeeded = append(succeeded, skillPath)
+		for _, a := range dest.agents {
+			succeededAgent[a] = true
+		}
 	}
 
 	if len(succeeded) > 0 {
-		printSkillPickupNotes(out, target, succeeded)
+		printSkillPickupNotes(out, succeeded, succeededAgent)
 	}
 
 	if failures > 0 {
-		return fmt.Errorf("%d of %d skill destination(s) failed (see messages above)", failures, len(dirs))
+		return fmt.Errorf("%d of %d skill destination(s) failed (see messages above)", failures, len(dests))
+	}
+	return nil
+}
+
+// atomicWriteFile writes data to path atomically by writing to a temp file in
+// the same directory and renaming it into place — mirroring config.Save. An
+// interrupted plain os.WriteFile could leave a truncated SKILL.md whose closing
+// frontmatter fence is lost, so the next install would read it as unstamped and
+// refuse the path without --force; the temp+rename removes that failure mode.
+func atomicWriteFile(path string, data []byte, perm os.FileMode) error {
+	dir := filepath.Dir(path)
+	tmp, err := os.CreateTemp(dir, ".SKILL-*.md")
+	if err != nil {
+		return err
+	}
+	tmpName := tmp.Name()
+	if _, err := tmp.Write(data); err != nil {
+		tmp.Close()
+		os.Remove(tmpName)
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		os.Remove(tmpName)
+		return err
+	}
+	// os.CreateTemp makes the file 0600; restore the intended mode before rename.
+	if err := os.Chmod(tmpName, perm); err != nil {
+		os.Remove(tmpName)
+		return err
+	}
+	if err := os.Rename(tmpName, path); err != nil {
+		os.Remove(tmpName)
+		return err
 	}
 	return nil
 }
@@ -358,7 +498,7 @@ func installSkillPath(dir, skillPath string, canonical, rendered []byte, newVer 
 	onDisk, err := os.ReadFile(skillPath)
 	if err != nil {
 		if os.IsNotExist(err) {
-			if werr := os.WriteFile(skillPath, rendered, 0o644); werr != nil {
+			if werr := atomicWriteFile(skillPath, rendered, 0o644); werr != nil {
 				return fmt.Sprintf("error %s: %v", skillPath, werr), werr
 			}
 			return fmt.Sprintf("installed %s (%s)", skillPath, newVer), nil
@@ -373,7 +513,7 @@ func installSkillPath(dir, skillPath string, canonical, rendered []byte, newVer 
 	contentEqual := bytes.Equal(stripOwned(onDisk), canonical)
 
 	write := func() (string, error) {
-		if werr := os.WriteFile(skillPath, rendered, 0o644); werr != nil {
+		if werr := atomicWriteFile(skillPath, rendered, 0o644); werr != nil {
 			return fmt.Sprintf("error %s: %v", skillPath, werr), werr
 		}
 		return fmt.Sprintf("updated %s (%s → %s)", skillPath, skillVerDisplay(stampVer), newVer), nil
@@ -424,21 +564,21 @@ const (
 )
 
 // printSkillPickupNotes lists the resolved SKILL.md paths and the per-agent
-// pickup instructions after an install.
-func printSkillPickupNotes(w io.Writer, target string, paths []string) {
+// pickup instructions after an install. Notes are keyed on the agents whose
+// destinations actually succeeded (agents set) — never the CLI target — so a
+// partial-failure `install all` never tells the user to restart an agent whose
+// path failed.
+func printSkillPickupNotes(w io.Writer, paths []string, agents map[string]bool) {
 	fmt.Fprintln(w)
 	fmt.Fprintln(w, "Skill file(s):")
 	for _, p := range paths {
 		fmt.Fprintf(w, "  %s\n", p)
 	}
 	fmt.Fprintln(w)
-	switch target {
-	case "claude":
+	if agents["claude"] {
 		fmt.Fprintln(w, claudePickupNote)
-	case "codex":
-		fmt.Fprintln(w, codexPickupNote)
-	case "all":
-		fmt.Fprintln(w, claudePickupNote)
+	}
+	if agents["codex"] {
 		fmt.Fprintln(w, codexPickupNote)
 	}
 }
@@ -521,7 +661,7 @@ func runSkillUninstall(cmd *cobra.Command, target string, force bool) error {
 
 	var failures int
 	for _, dir := range dirs {
-		skillPath := filepath.Join(dir, "SKILL.md")
+		skillPath := filepath.Join(dir, skillFileName)
 		msg, perr := uninstallSkillPath(dir, skillPath, force)
 		if perr != nil {
 			fmt.Fprintln(errOut, msg)
@@ -563,14 +703,8 @@ func uninstallSkillPath(dir, skillPath string, force bool) (string, error) {
 	if rerr := os.Remove(skillPath); rerr != nil {
 		return fmt.Sprintf("error %s: %v", skillPath, rerr), rerr
 	}
-	removeSkillDirIfEmpty(dir)
-	return fmt.Sprintf("removed %s", skillPath), nil
-}
-
-// removeSkillDirIfEmpty removes the enclosing cdeploy/ directory, but only when
-// it is empty — a cdeploy/ dir holding extra user files is retained. Never a
-// recursive delete; any error (non-empty, permission) is silently ignored since
-// leaving the directory in place is a safe no-op.
-func removeSkillDirIfEmpty(dir string) {
+	// Remove the enclosing cdeploy/ dir only if it is now empty; os.Remove fails
+	// (a safe no-op) when the dir still holds extra user files — never rm -rf.
 	_ = os.Remove(dir)
+	return fmt.Sprintf("removed %s", skillPath), nil
 }

@@ -93,9 +93,11 @@ func TestSkillDescription(t *testing.T) {
 		t.Fatalf("description length %d exceeds 1024", len(desc))
 	}
 	// Description must name both operational and setup triggers so agents
-	// activate the skill in either context.
+	// activate the skill in either context. Avoid "deploy" as a keyword — it is a
+	// substring of the product name "cdeploy", so it can never fail; assert on
+	// operational verbs ("restart", "logs") that are NOT substrings of the name.
 	lower := strings.ToLower(desc)
-	for _, kw := range []string{"deploy", "servers.yml", "ssh"} {
+	for _, kw := range []string{"restart", "logs", "servers.yml", "ssh"} {
 		if !strings.Contains(lower, kw) {
 			t.Errorf("description should mention %q (ops+setup triggers)", kw)
 		}
