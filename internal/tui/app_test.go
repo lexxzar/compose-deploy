@@ -13608,6 +13608,7 @@ func TestRollbackSnapshotMsg_TargetedMissingWarns(t *testing.T) {
 		screen:               screenSelectContainers,
 		services:             []string{"web", "db"},
 		selected:             map[int]bool{0: true, 1: true},
+		rollbackTargets:      []string{"web", "db"}, // captured at R-press
 		rollbackFetchSession: 2,
 	}
 	updated, _ := m.Update(rollbackSnapshotMsg{snap: snap, session: 2})
@@ -13632,6 +13633,7 @@ func TestRollbackSnapshotMsg_ComposeRemovedWarns(t *testing.T) {
 		screen:               screenSelectContainers,
 		services:             []string{"web", "db"},
 		selected:             map[int]bool{0: true, 1: true}, // both selected
+		rollbackTargets:      []string{"web", "db"},          // captured at R-press
 		rollbackFetchSession: 2,
 	}
 	updated, _ := m.Update(rollbackSnapshotMsg{snap: snap, live: []string{"web"}, session: 2})
@@ -13705,6 +13707,7 @@ func TestRollbackSnapshotMsg_PresentEntersConfirm(t *testing.T) {
 		screen:               screenSelectContainers,
 		services:             []string{"web"},
 		selected:             map[int]bool{0: true},
+		rollbackTargets:      []string{"web"}, // captured at R-press
 		rollbackFetchSession: 1,
 	}
 	// live includes the selected target, so the live-compose intersection passes.
@@ -13761,6 +13764,7 @@ func TestRollbackConfirm_MultiSelectTargetSet(t *testing.T) {
 	m.composer = mc
 	m.selected = map[int]bool{0: true, 1: true}
 	m.rollbackSnapshot = snap
+	m.rollbackTargets = []string{"db", "web"} // captured at R-press; drives the pipeline target
 	m.pendingOp = runner.Rollback
 	m.confirming = true
 	m.ctx = context.Background()
@@ -13774,6 +13778,86 @@ func TestRollbackConfirm_MultiSelectTargetSet(t *testing.T) {
 	}
 	if strings.Join(m.opContainers, ",") != "db,web" {
 		t.Errorf("opContainers = %v, want [db web] (multi-select target set)", m.opContainers)
+	}
+}
+
+// TestRollbackTargets_CapturedAtPressNotAfterFetch (C11): the target set is
+// captured at R-press. If the user changes/clears the multi-select during the
+// async snapshot fetch, the rollback must still target the CAPTURED set — never
+// the mutated (here: cleared) selection, which the runner would treat as "all
+// services". This is the TOCTOU guard for an unintended all-service rollback.
+func TestRollbackTargets_CapturedAtPressNotAfterFetch(t *testing.T) {
+	snap := rollbackTestSnapshot() // records web + db
+	mc := &mockRollbackComposer{mockComposer: mockComposer{services: []string{"web", "db"}}, snap: snap}
+	m := Model{
+		screen:   screenSelectContainers,
+		services: []string{"web", "db"},
+		composer: mc,
+		selected: map[int]bool{0: true}, // web only
+		ctx:      context.Background(),
+	}
+	// Press R: captures {web}, bumps the fetch session, fires the async fetch.
+	updated, cmd := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'R'}})
+	m = updated.(Model)
+	if got := strings.Join(m.rollbackTargets, ","); got != "web" {
+		t.Fatalf("rollbackTargets after R = %q, want web (captured at press)", got)
+	}
+	if cmd == nil {
+		t.Fatal("R with a Preparer + selection should fire a fetch cmd")
+	}
+	session := m.rollbackFetchSession
+
+	// Simulate the user CLEARING the selection while the fetch is in flight.
+	m.selected = map[int]bool{}
+
+	// The snapshot lands for the captured session.
+	updated, _ = m.Update(rollbackSnapshotMsg{snap: snap, live: []string{"web", "db"}, session: session})
+	m = updated.(Model)
+	if !m.confirming || m.pendingOp != runner.Rollback {
+		t.Fatalf("want confirming Rollback for the captured target; confirming=%v pendingOp=%v", m.confirming, m.pendingOp)
+	}
+	if got := strings.Join(m.rollbackTargets, ","); got != "web" {
+		t.Errorf("captured rollbackTargets mutated to %q; a selection change must not touch it (want web)", got)
+	}
+
+	// Confirm: the pipeline target must be the captured {web}, NOT the now-empty
+	// selection (empty would become an all-service rollback in the runner).
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	m = updated.(Model)
+	if m.screen != screenProgress {
+		t.Fatalf("screen = %d, want screenProgress after confirm", m.screen)
+	}
+	if got := strings.Join(m.opContainers, ","); got != "web" {
+		t.Errorf("opContainers = %q, want web (captured set) — never empty/all", got)
+	}
+}
+
+// TestRollbackSnapshotMsg_EmptyCapturedRefuses (C11): if the captured target set
+// is somehow empty when the snapshot lands, the handler must REFUSE (warn) rather
+// than fall through to the confirm flow — an empty set would become an
+// all-service rollback in PrepareRollback/runner.Run.
+func TestRollbackSnapshotMsg_EmptyCapturedRefuses(t *testing.T) {
+	snap := rollbackTestSnapshot()
+	m := Model{
+		screen:               screenSelectContainers,
+		services:             []string{"web", "db"},
+		selected:             map[int]bool{0: true, 1: true},
+		rollbackTargets:      nil, // captured set empty
+		rollbackFetchSession: 2,
+	}
+	updated, _ := m.Update(rollbackSnapshotMsg{snap: snap, live: []string{"web", "db"}, session: 2})
+	m = updated.(Model)
+	if m.confirming {
+		t.Error("an empty captured target set must not enter the confirm flow")
+	}
+	if m.pendingOp == runner.Rollback {
+		t.Error("pendingOp must not be Rollback with an empty captured set")
+	}
+	if m.rollbackSnapshot != nil {
+		t.Error("the snapshot must not be stored when the captured set is empty")
+	}
+	if m.warning != warnNoSelection {
+		t.Errorf("warning = %q, want %q", m.warning, warnNoSelection)
 	}
 }
 
@@ -14121,6 +14205,7 @@ func TestViewProgress_RollbackConfirmShowsAge(t *testing.T) {
 	m.composer = mc
 	m.selected = map[int]bool{0: true}
 	m.rollbackSnapshot = snap
+	m.rollbackTargets = []string{"web"} // captured at R-press; drives the confirm prompt
 	m.pendingOp = runner.Rollback
 	m.confirming = true
 	m.width, m.height = 120, 24

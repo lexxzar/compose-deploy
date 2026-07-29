@@ -299,13 +299,21 @@ type Model struct {
 
 	// Rollback (`R` key) support. rollbackSnapshot holds the host-side snapshot
 	// fetched by `R` so the confirm prompt can show its age and PrepareRollback
-	// can pin the digests. rollbackFetchSession gates the async
-	// rollbackSnapshotMsg (bumped on `R` press and at the same context-change
-	// sites as the other sessions). rollbackCleanup is PrepareRollback's cleanup
-	// (override-file removal + ExtraComposeFiles reset), invoked when LEAVING
-	// screenProgress — NEVER goroutine-deferred (see the rollback cleanup timing
-	// race rule). rollbackErr surfaces a prep failure on the progress screen.
+	// can pin the digests. rollbackTargets is the selected service set CAPTURED
+	// at `R`-press time — the async snapshot fetch means the live multi-select
+	// may change or clear before rollbackSnapshotMsg lands, so the captured set
+	// (never the live selection) drives validation, the confirm prompt, prep, and
+	// the pipeline; an empty target set must NEVER reach the runner (empty == all
+	// services). rollbackFetchSession gates the async rollbackSnapshotMsg (bumped
+	// on `R` press and at the same context-change sites as the other sessions),
+	// which also protects the captured rollbackTargets from a stale fetch.
+	// rollbackCleanup is PrepareRollback's cleanup (override-file removal +
+	// ExtraComposeFiles reset), invoked when LEAVING screenProgress — NEVER
+	// goroutine-deferred (see the rollback cleanup timing race rule). rollbackErr
+	// surfaces a prep failure on the progress screen. rollbackSnapshot and
+	// rollbackTargets are cleared together at every documented departure site.
 	rollbackSnapshot     *compose.Snapshot
+	rollbackTargets      []string
 	rollbackFetchSession uint64
 	rollbackCleanup      func()
 	rollbackErr          string
@@ -1000,6 +1008,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			// been in flight during a connect attempt, but keep the departure-site
 			// cleanup discipline uniform (mirrors clearSearch/clearWaitState).
 			m.rollbackSnapshot = nil
+			m.rollbackTargets = nil
 			m.rollbackCleanup = nil
 			m.rollbackFetchSession++
 			m.clearSearch()
@@ -1246,9 +1255,23 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.fixSvcOffset()
 			return m, nil
 		}
+		// Use the target set captured at R-press time — NOT the live selection.
+		// The user may have changed or cleared the multi-select during the async
+		// fetch; re-deriving from the current selection would let an empty set
+		// become an unintended all-service rollback (empty == all in the runner).
+		// The session check above already rejected a stale fetch, so a matching
+		// fetch always carries the capture from this R press.
+		targets := m.rollbackTargets
+		if len(targets) == 0 {
+			// Defensive: a matching-session fetch always carries a non-empty
+			// capture (guarded at R-press). Refuse rather than fall through to
+			// an all-service rollback.
+			m.warning = warnNoSelection
+			m.fixSvcOffset()
+			return m, nil
+		}
 		// Every selected service must have a snapshot entry — mirror the CLI
 		// refusal, naming exactly what is missing.
-		targets := m.selectedContainers()
 		var missing []string
 		for _, svc := range targets {
 			if _, ok := msg.snap.Services[svc]; !ok {
@@ -1461,6 +1484,7 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 				m.projName = ""
 				m.updatesErr = ""
 				m.rollbackSnapshot = nil
+				m.rollbackTargets = nil
 				m.rollbackCleanup = nil
 				m.clearSearch()
 				m.clearWaitState()
@@ -1601,6 +1625,13 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 					return m.enterExec()
 				}
 				containers := m.selectedContainers()
+				if m.pendingOp == runner.Rollback {
+					// Rollback uses the set captured at R-press, not the live
+					// selection (which the async fetch let drift). This keeps the
+					// pipeline/prep target identical to what was validated and shown
+					// in the confirm prompt.
+					containers = m.rollbackTargets
+				}
 				return m.enterProgress(containers)
 			case "esc":
 				m.confirming = false
@@ -1678,6 +1709,7 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 				m.updatesSession++
 				m.rollbackFetchSession++
 				m.rollbackSnapshot = nil
+				m.rollbackTargets = nil
 				m.refreshInFlight = false
 				m.updateInFlight = false
 				m.updatesErr = ""
@@ -1763,8 +1795,16 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 				m.fixSvcOffset()
 				return m, nil
 			}
+			// Capture the selected target set NOW, at press time. The snapshot
+			// fetch below is async, so the live multi-select can change or clear
+			// before rollbackSnapshotMsg lands; carrying the captured set through
+			// the whole flow (validation → confirm → prep → pipeline) prevents a
+			// since-cleared selection from becoming an all-service rollback
+			// (empty == all in the runner). Non-empty here (selectedCount guard).
+			m.rollbackTargets = m.selectedContainers()
 			// Bump the fetch session first (invalidating any prior in-flight R
-			// fetch) and capture it inside the Cmd for staleness rejection.
+			// fetch) and capture it inside the Cmd for staleness rejection; the
+			// same session also guards the captured rollbackTargets.
 			m.rollbackFetchSession++
 			return m, m.fetchRollbackSnapshot()
 		case "n":
@@ -2381,6 +2421,7 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 				m.logContent = ""
 				m.rollbackErr = ""
 				m.rollbackSnapshot = nil
+				m.rollbackTargets = nil
 				// Invoke the rollback prep cleanup (override-file removal +
 				// ExtraComposeFiles reset) NOW, on the main goroutine, AFTER the
 				// wait phase — never goroutine-deferred (see the rollback cleanup
@@ -4421,7 +4462,9 @@ func (m Model) viewSelectContainers() string {
 				service,
 			)))
 		case m.pendingOp == runner.Rollback:
-			containers := m.selectedContainers()
+			// Show the captured target set (what will actually roll back), not the
+			// live selection which the async fetch may have let drift.
+			containers := m.rollbackTargets
 			b.WriteString(helpStyle.Render(fmt.Sprintf(
 				"  Rollback %s%s?  enter confirm  •  esc cancel",
 				strings.Join(containers, ", "),
