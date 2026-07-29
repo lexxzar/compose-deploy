@@ -270,15 +270,15 @@ function-scoped `defer cleanup()` — it runs after `WaitHealthy` returns, so no
 - Modify: `internal/runner/wait.go`
 - Modify: `internal/runner/wait_test.go`
 
-- [ ] implement `WaitHealthy(ctx, c Composer, services, opts)` — resolve empty target set via
+- [x] implement `WaitHealthy(ctx, c Composer, services, opts)` — resolve empty target set via
       `ListServices()`, poll `ContainerStatus()` every `Poll`, feed `EvaluateWait`, honor ctx
       cancellation (return partial report + ctx err)
-- [ ] `ContainerStatus` transient error handling: a failed poll is skipped (state carried
+- [x] `ContainerStatus` transient error handling: a failed poll is skipped (state carried
       forward), N consecutive poll errors (3) fail the wait with that error
-- [ ] write tests with a scripted mock Composer (sequence of status maps) + millisecond
+- [x] write tests with a scripted mock Composer (sequence of status maps) + millisecond
       durations: success path, fail-fast path, timeout path, ctx-cancel partial report,
       poll-error tolerance + 3-strike failure, empty-services → ListServices resolution
-- [ ] run tests — must pass before task 3
+- [x] run tests — must pass before task 3
 
 ### Task 3: `Rollback` operation in the runner
 

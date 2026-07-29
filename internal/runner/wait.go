@@ -1,6 +1,10 @@
 package runner
 
-import "time"
+import (
+	"context"
+	"fmt"
+	"time"
+)
 
 // Default wait tuning. Grace and Poll are internal constants in v1 (no flags);
 // only Timeout is user-exposed via --wait-timeout.
@@ -23,6 +27,11 @@ const (
 	// first-poll race where a container is caught mid-transition right after
 	// Start returns.
 	neverRunningThreshold = 5
+	// pollErrorThreshold is the number of consecutive ContainerStatus errors
+	// that fail the wait. Below the threshold a failed poll is transient: it is
+	// skipped and the reducer state is carried forward to the next tick, so a
+	// single flaky SSH round-trip doesn't abort an otherwise-healthy wait.
+	pollErrorThreshold = 3
 )
 
 // WaitVerdict is the resolved outcome for a single service during a health wait.
@@ -264,4 +273,81 @@ func EvaluateWait(prev WaitState, status map[string]ServiceStatus, opts WaitOpti
 	}
 
 	return next, done
+}
+
+// WaitHealthy is the thin blocking driver of the wait engine for the CLI: it
+// resolves the target set, polls ContainerStatus every opts.Poll, feeds each
+// snapshot to the pure EvaluateWait reducer, and returns once the wait resolves
+// (all services passed / a service failed fast / the timeout elapsed). An empty
+// services slice is resolved via ListServices — the same "empty means all"
+// convention the pipeline steps use.
+//
+// The returned error is reserved for OPERATIONAL failures, never for a service
+// that simply failed its health verdict: a completed wait with an unhealthy or
+// timed-out service returns (report, nil) with report.OK == false — the caller
+// decides how to map a non-OK report (the CLI wraps it in a WaitError → exit 2).
+// A non-nil error is returned only when the wait could not run to a verdict:
+//   - context cancellation: the current (partial) report plus ctx.Err().
+//   - pollErrorThreshold consecutive ContainerStatus errors: the partial report
+//     plus the wrapped underlying error. A run of fewer consecutive errors is
+//     transient — the poll is skipped and the state carried forward.
+//   - ListServices failure when the target set must be resolved.
+//
+// The first poll fires immediately (containers were just started); subsequent
+// polls are spaced by opts.Poll. Elapsed time is measured from the first poll's
+// scheduling via a monotonic clock and handed to EvaluateWait, which owns the
+// timeout rule — so the loop always terminates by opts.Timeout at the latest.
+func WaitHealthy(ctx context.Context, c Composer, services []string, opts WaitOptions) (WaitReport, error) {
+	opts = opts.normalize()
+
+	if len(services) == 0 {
+		resolved, err := c.ListServices(ctx)
+		if err != nil {
+			return WaitReport{}, fmt.Errorf("resolve services: %w", err)
+		}
+		services = resolved
+	}
+
+	state := NewWaitState(services)
+	start := time.Now()
+	var pollErrs int
+
+	// Fire the first poll immediately, then re-arm for opts.Poll each tick.
+	timer := time.NewTimer(0)
+	defer timer.Stop()
+
+	for {
+		// Give cancellation priority so a cancelled context can't be starved by
+		// a poll timer that is also ready.
+		if err := ctx.Err(); err != nil {
+			return state.Report(time.Since(start)), err
+		}
+
+		select {
+		case <-ctx.Done():
+			return state.Report(time.Since(start)), ctx.Err()
+		case <-timer.C:
+		}
+
+		status, err := c.ContainerStatus(ctx)
+		if err != nil {
+			pollErrs++
+			if pollErrs >= pollErrorThreshold {
+				return state.Report(time.Since(start)),
+					fmt.Errorf("health poll failed %d consecutive times: %w", pollErrs, err)
+			}
+			timer.Reset(opts.Poll)
+			continue
+		}
+		pollErrs = 0
+
+		elapsed := time.Since(start)
+		var done bool
+		state, done = EvaluateWait(state, status, opts, elapsed)
+		if done {
+			return state.Report(elapsed), nil
+		}
+
+		timer.Reset(opts.Poll)
+	}
 }

@@ -1,6 +1,8 @@
 package runner
 
 import (
+	"context"
+	"errors"
 	"testing"
 	"time"
 )
@@ -397,5 +399,234 @@ func TestNewWaitState_SeedsPending(t *testing.T) {
 		if st.Verdicts[svc] != VerdictPending {
 			t.Errorf("%s verdict = %q, want pending", svc, st.Verdicts[svc])
 		}
+	}
+}
+
+// --- WaitHealthy (blocking wrapper) ---
+
+// statusResult is a single scripted ContainerStatus outcome.
+type statusResult struct {
+	status map[string]ServiceStatus
+	err    error
+}
+
+// scriptedComposer feeds WaitHealthy a scripted sequence of ContainerStatus
+// results. Once the sequence is exhausted it repeats the last entry, so
+// never-resolving scenarios (timeout, ctx-cancel) need only one trailing entry.
+// It embeds mockComposer for the no-op pipeline methods and overrides
+// ListServices / ContainerStatus.
+type scriptedComposer struct {
+	mockComposer
+	results       []statusResult
+	idx           int
+	statusCalls   int
+	listServices  []string // non-nil overrides the embedded default
+	listErr       error
+	listCallCount int
+}
+
+func (s *scriptedComposer) ListServices(ctx context.Context) ([]string, error) {
+	s.listCallCount++
+	if s.listErr != nil {
+		return nil, s.listErr
+	}
+	if s.listServices != nil {
+		return s.listServices, nil
+	}
+	return s.mockComposer.ListServices(ctx)
+}
+
+func (s *scriptedComposer) ContainerStatus(ctx context.Context) (map[string]ServiceStatus, error) {
+	s.statusCalls++
+	if len(s.results) == 0 {
+		return map[string]ServiceStatus{}, nil
+	}
+	i := s.idx
+	if i >= len(s.results) {
+		i = len(s.results) - 1 // repeat the last scripted result
+	} else {
+		s.idx++
+	}
+	return s.results[i].status, s.results[i].err
+}
+
+// fastWaitOpts uses millisecond durations so the wrapper's real-time polling
+// loop runs quickly while leaving generous margins against flakiness.
+func fastWaitOpts() WaitOptions {
+	return WaitOptions{Timeout: time.Hour, Grace: time.Hour, Poll: time.Millisecond}
+}
+
+func healthyStatus(svcs ...string) map[string]ServiceStatus {
+	m := make(map[string]ServiceStatus, len(svcs))
+	for _, s := range svcs {
+		m[s] = ServiceStatus{Running: true, Health: "healthy"}
+	}
+	return m
+}
+
+func TestWaitHealthy_Success(t *testing.T) {
+	c := &scriptedComposer{results: []statusResult{
+		{status: healthyStatus("web", "db")},
+	}}
+	rep, err := WaitHealthy(context.Background(), c, []string{"web", "db"}, fastWaitOpts())
+	if err != nil {
+		t.Fatalf("WaitHealthy err = %v, want nil", err)
+	}
+	if !rep.OK {
+		t.Errorf("report OK = false, want true: %+v", rep.Verdicts)
+	}
+	if rep.Verdicts["web"] != VerdictHealthy || rep.Verdicts["db"] != VerdictHealthy {
+		t.Errorf("verdicts = %v, want both healthy", rep.Verdicts)
+	}
+}
+
+func TestWaitHealthy_FailFast(t *testing.T) {
+	// An unhealthy service fails the wait but is NOT an operational error:
+	// the wrapper returns (report, nil) with report.OK == false.
+	c := &scriptedComposer{results: []statusResult{
+		{status: map[string]ServiceStatus{"web": {Running: true, Health: "unhealthy"}}},
+	}}
+	rep, err := WaitHealthy(context.Background(), c, []string{"web"}, fastWaitOpts())
+	if err != nil {
+		t.Fatalf("WaitHealthy err = %v, want nil (verdict failure, not operational)", err)
+	}
+	if rep.OK {
+		t.Errorf("report OK = true, want false")
+	}
+	if rep.Verdicts["web"] != VerdictUnhealthy {
+		t.Errorf("verdict = %q, want %q", rep.Verdicts["web"], VerdictUnhealthy)
+	}
+}
+
+func TestWaitHealthy_Timeout(t *testing.T) {
+	// Never resolves (has a healthcheck stuck "starting"); small timeout so the
+	// reducer's timeout sweep terminates the loop.
+	opts := WaitOptions{Timeout: 25 * time.Millisecond, Grace: time.Hour, Poll: time.Millisecond}
+	c := &scriptedComposer{results: []statusResult{
+		{status: map[string]ServiceStatus{"web": {Running: true, Health: "starting"}}},
+	}}
+	rep, err := WaitHealthy(context.Background(), c, []string{"web"}, opts)
+	if err != nil {
+		t.Fatalf("WaitHealthy err = %v, want nil", err)
+	}
+	if rep.OK {
+		t.Errorf("report OK = true, want false")
+	}
+	if rep.Verdicts["web"] != VerdictTimedOut {
+		t.Errorf("verdict = %q, want %q", rep.Verdicts["web"], VerdictTimedOut)
+	}
+}
+
+func TestWaitHealthy_CtxCancelPartialReport(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel() // cancelled before the first poll
+	// Never-resolving status; the loop must bail on the cancelled context.
+	c := &scriptedComposer{results: []statusResult{
+		{status: map[string]ServiceStatus{"web": {Running: true, Health: "starting"}}},
+	}}
+	rep, err := WaitHealthy(ctx, c, []string{"web"}, fastWaitOpts())
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("WaitHealthy err = %v, want context.Canceled", err)
+	}
+	// Partial report: the pending verdict survives, OK is false.
+	if rep.OK {
+		t.Errorf("report OK = true, want false")
+	}
+	if rep.Verdicts["web"] != VerdictPending {
+		t.Errorf("verdict = %q, want pending (partial report)", rep.Verdicts["web"])
+	}
+}
+
+func TestWaitHealthy_PollErrorTolerance(t *testing.T) {
+	// Two transient poll errors (< threshold) are skipped; the third healthy
+	// poll resolves the wait.
+	pollErr := errors.New("ssh: connection reset")
+	c := &scriptedComposer{results: []statusResult{
+		{err: pollErr},
+		{err: pollErr},
+		{status: healthyStatus("web")},
+	}}
+	rep, err := WaitHealthy(context.Background(), c, []string{"web"}, fastWaitOpts())
+	if err != nil {
+		t.Fatalf("WaitHealthy err = %v, want nil (errors below threshold are transient)", err)
+	}
+	if !rep.OK || rep.Verdicts["web"] != VerdictHealthy {
+		t.Errorf("report = %+v, want OK with web healthy", rep)
+	}
+}
+
+func TestWaitHealthy_PollErrorThreeStrike(t *testing.T) {
+	pollErr := errors.New("ssh: could not resolve hostname")
+	// Every poll errors (repeat-last exhausts to the error entry).
+	c := &scriptedComposer{results: []statusResult{{err: pollErr}}}
+	rep, err := WaitHealthy(context.Background(), c, []string{"web"}, fastWaitOpts())
+	if err == nil {
+		t.Fatalf("WaitHealthy err = nil, want a poll-failure error")
+	}
+	if !errors.Is(err, pollErr) {
+		t.Errorf("err = %v, want wrapped %v", err, pollErr)
+	}
+	// Exactly pollErrorThreshold poll attempts before giving up.
+	if c.statusCalls != pollErrorThreshold {
+		t.Errorf("statusCalls = %d, want %d", c.statusCalls, pollErrorThreshold)
+	}
+	// Partial report: nothing resolved.
+	if rep.OK || rep.Verdicts["web"] != VerdictPending {
+		t.Errorf("report = %+v, want not-OK with web pending", rep)
+	}
+}
+
+func TestWaitHealthy_PollErrorCounterResets(t *testing.T) {
+	// Two errors, a good poll (resets the counter), two more errors, another
+	// good poll that resolves: the run of errors never reaches the threshold
+	// because a successful poll in between resets the consecutive count.
+	pollErr := errors.New("transient")
+	starting := map[string]ServiceStatus{"web": {Running: true, Health: "starting"}}
+	c := &scriptedComposer{results: []statusResult{
+		{err: pollErr},
+		{err: pollErr},
+		{status: starting}, // resets counter
+		{err: pollErr},
+		{err: pollErr},
+		{status: healthyStatus("web")},
+	}}
+	rep, err := WaitHealthy(context.Background(), c, []string{"web"}, fastWaitOpts())
+	if err != nil {
+		t.Fatalf("WaitHealthy err = %v, want nil (counter resets between error runs)", err)
+	}
+	if !rep.OK || rep.Verdicts["web"] != VerdictHealthy {
+		t.Errorf("report = %+v, want OK with web healthy", rep)
+	}
+}
+
+func TestWaitHealthy_EmptyServicesResolvesViaListServices(t *testing.T) {
+	c := &scriptedComposer{
+		listServices: []string{"api"},
+		results:      []statusResult{{status: healthyStatus("api")}},
+	}
+	rep, err := WaitHealthy(context.Background(), c, nil, fastWaitOpts())
+	if err != nil {
+		t.Fatalf("WaitHealthy err = %v, want nil", err)
+	}
+	if c.listCallCount != 1 {
+		t.Errorf("ListServices called %d times, want 1", c.listCallCount)
+	}
+	if _, ok := rep.Verdicts["api"]; !ok {
+		t.Fatalf("report missing resolved service %q: %+v", "api", rep.Verdicts)
+	}
+	if !rep.OK || rep.Verdicts["api"] != VerdictHealthy {
+		t.Errorf("report = %+v, want OK with api healthy", rep)
+	}
+}
+
+func TestWaitHealthy_ListServicesError(t *testing.T) {
+	listErr := errors.New("compose config --services failed")
+	c := &scriptedComposer{listErr: listErr}
+	_, err := WaitHealthy(context.Background(), c, nil, fastWaitOpts())
+	if err == nil {
+		t.Fatalf("WaitHealthy err = nil, want ListServices error")
+	}
+	if !errors.Is(err, listErr) {
+		t.Errorf("err = %v, want wrapped %v", err, listErr)
 	}
 }
