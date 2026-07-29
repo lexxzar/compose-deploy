@@ -172,8 +172,11 @@ services:
     image: nginx@sha256:ab12...
 ```
 
-Delivery: local → file in `os.TempDir()`; remote → piped stdin over the ControlMaster socket
-to `/tmp/cdeploy-rollback-<pid>.yml`. Remote state write: `mkdir -p ~/.cdeploy/state && cat >
+Delivery: local → file in `os.TempDir()` (via `os.CreateTemp`, unique per process); remote →
+piped stdin over the ControlMaster socket to `/tmp/cdeploy-rollback-<pid>-<rand>.yml` (a
+`crypto/rand` hex suffix makes the path unique across CLIENTS — the local PID alone collides
+when two machines roll back the same project on the same host; generated once, reused for the
+write and the cleanup `rm -f`). Remote state write: `mkdir -p ~/.cdeploy/state && cat >
 <tmp> && mv <tmp> <final>` (same piped-stdin primitive). Remote state read: `cat <file>`
 tolerating missing-file exit status.
 
@@ -405,7 +408,8 @@ function-scoped `defer cleanup()` — it runs after `WaitHealthy` returns, so no
       cleanup removes the temp file and resets the field; abort with per-image error before
       any pipeline step if a required digest is unobtainable
 - [x] implement `(*RemoteCompose) PrepareRollback(...)` mirroring via remote primitives
-      (override delivered with `writeRemoteFile` to `/tmp/cdeploy-rollback-<pid>.yml`;
+      (override delivered with `writeRemoteFile` to `/tmp/cdeploy-rollback-<pid>-<rand>.yml`,
+      a `crypto/rand` suffix keeping the path unique across clients;
       `findRemoteComposeFile`; cleanup `rm -f` over SSH)
 - [x] detect current == snapshot digest → append `already at snapshot` warning, proceed
 - [x] write tests: presence-check/pull argv (incl. the streaming runners' argv local +

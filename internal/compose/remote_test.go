@@ -3208,6 +3208,7 @@ func TestRemotePrepareRollback_PullAndOverride(t *testing.T) {
 		"web": {Image: "nginx:latest", Digest: "sha256:ab12"},
 	}
 	var pullRC string
+	var writeRC string
 	var overrideWritten []byte
 	r := &RemoteCompose{
 		Host:       "user@example.com",
@@ -3233,6 +3234,7 @@ func TestRemotePrepareRollback_PullAndOverride(t *testing.T) {
 			case strings.Contains(rc, "'pull'"):
 				pullRC = rc
 			case strings.Contains(rc, "mkdir -p"):
+				writeRC = rc
 				overrideWritten, _ = io.ReadAll(cmd.Stdin)
 			default:
 				return fmt.Errorf("unexpected runCmd: %q", rc)
@@ -3253,11 +3255,23 @@ func TestRemotePrepareRollback_PullAndOverride(t *testing.T) {
 	if pullRC != "docker 'pull' 'nginx@sha256:ab12'" {
 		t.Errorf("pull remote command = %q, want %q", pullRC, "docker 'pull' 'nginx@sha256:ab12'")
 	}
-	// Override delivered to /tmp/cdeploy-rollback-<pid>.yml, main file first.
-	wantOverridePath := fmt.Sprintf("/tmp/cdeploy-rollback-%d.yml", os.Getpid())
-	want := []string{"compose.yml", wantOverridePath}
-	if len(r.ExtraComposeFiles) != 2 || r.ExtraComposeFiles[0] != want[0] || r.ExtraComposeFiles[1] != want[1] {
-		t.Errorf("ExtraComposeFiles = %v, want %v", r.ExtraComposeFiles, want)
+	// Override delivered to a per-invocation-unique /tmp/cdeploy-rollback-<pid>-<rand>.yml,
+	// main file first. The exact path must not be the pid-only form (which
+	// collides across clients rolling back the same project on the same host).
+	if len(r.ExtraComposeFiles) != 2 || r.ExtraComposeFiles[0] != "compose.yml" {
+		t.Fatalf("ExtraComposeFiles = %v, want [compose.yml <unique-override>]", r.ExtraComposeFiles)
+	}
+	overridePath := r.ExtraComposeFiles[1]
+	if !strings.HasPrefix(overridePath, "/tmp/cdeploy-rollback-") || !strings.HasSuffix(overridePath, ".yml") {
+		t.Errorf("override path = %q, want /tmp/cdeploy-rollback-*.yml", overridePath)
+	}
+	if overridePath == fmt.Sprintf("/tmp/cdeploy-rollback-%d.yml", os.Getpid()) {
+		t.Errorf("override path = %q, want a random suffix (pid-only form collides across clients)", overridePath)
+	}
+	// The file must be delivered to the EXACT unique path that was recorded in
+	// ExtraComposeFiles (write-path == recorded-path).
+	if !strings.Contains(writeRC, overridePath) {
+		t.Errorf("writeRemoteFile command %q does not reference override path %q", writeRC, overridePath)
 	}
 	if string(overrideWritten) != "services:\n  web:\n    image: nginx@sha256:ab12\n" {
 		t.Errorf("override content = %q", string(overrideWritten))
@@ -3345,15 +3359,44 @@ func TestRemotePrepareRollback_CleanupRemovesFileAndResetsField(t *testing.T) {
 	if len(r.ExtraComposeFiles) != 2 {
 		t.Fatalf("ExtraComposeFiles not set: %v", r.ExtraComposeFiles)
 	}
+	// Capture the exact unique override path BEFORE cleanup so we can assert
+	// cleanup removes THAT path (not a recomputed/pid-only one).
+	overridePath := r.ExtraComposeFiles[1]
+	if !strings.HasPrefix(overridePath, "/tmp/cdeploy-rollback-") || !strings.HasSuffix(overridePath, ".yml") {
+		t.Errorf("override path = %q, want /tmp/cdeploy-rollback-*.yml", overridePath)
+	}
 
 	cleanup()
 
 	if r.ExtraComposeFiles != nil {
 		t.Errorf("cleanup did not reset ExtraComposeFiles: %v", r.ExtraComposeFiles)
 	}
-	wantPath := fmt.Sprintf("/tmp/cdeploy-rollback-%d.yml", os.Getpid())
-	if !strings.Contains(rmRC, "rm -f") || !strings.Contains(rmRC, wantPath) {
-		t.Errorf("cleanup rm command = %q, want it to rm -f %q", rmRC, wantPath)
+	if !strings.Contains(rmRC, "rm -f") || !strings.Contains(rmRC, overridePath) {
+		t.Errorf("cleanup rm command = %q, want it to rm -f %q", rmRC, overridePath)
+	}
+}
+
+func TestRemoteRollbackOverridePath_UniqueAndShaped(t *testing.T) {
+	pidPrefix := fmt.Sprintf("/tmp/cdeploy-rollback-%d-", os.Getpid())
+	seen := make(map[string]bool)
+	for i := 0; i < 100; i++ {
+		p, err := remoteRollbackOverridePath()
+		if err != nil {
+			t.Fatalf("remoteRollbackOverridePath: %v", err)
+		}
+		if !strings.HasPrefix(p, pidPrefix) || !strings.HasSuffix(p, ".yml") {
+			t.Fatalf("path %q, want prefix %q and suffix .yml", p, pidPrefix)
+		}
+		// The random component must not be empty (pid-only form collides across
+		// clients on the same host).
+		suffix := strings.TrimSuffix(strings.TrimPrefix(p, pidPrefix), ".yml")
+		if suffix == "" {
+			t.Fatalf("path %q has an empty random suffix", p)
+		}
+		if seen[p] {
+			t.Fatalf("duplicate path generated: %q", p)
+		}
+		seen[p] = true
 	}
 }
 

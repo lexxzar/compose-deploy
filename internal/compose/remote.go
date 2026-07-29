@@ -3,7 +3,9 @@ package compose
 import (
 	"bytes"
 	"context"
+	"crypto/rand"
 	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -1179,8 +1181,12 @@ func (r *RemoteCompose) runRemoteDockerCmdStream(ctx context.Context, dockerArgs
 //   - the presence check (`docker image inspect`) and pull-by-digest go through
 //     runRemoteDockerCmd / runRemoteDockerCmdStream (top-level docker commands,
 //     NOT compose subcommands), matching the CLAUDE.md inspect-bypass invariant.
-//   - the generated override is delivered to /tmp/cdeploy-rollback-<pid>.yml via
-//     writeRemoteFile (atomic stdin pipe over the ControlMaster socket).
+//   - the generated override is delivered to
+//     /tmp/cdeploy-rollback-<pid>-<rand>.yml via writeRemoteFile (atomic stdin
+//     pipe over the ControlMaster socket). The random suffix (see
+//     remoteRollbackOverridePath) makes the path unique across CLIENTS — the
+//     local PID alone collides when two machines roll back the same project on
+//     the same host.
 //   - the main compose file is discovered via findRemoteComposeFile (a bare
 //     name relative to ProjectDir, which remoteCommand cd's into), placed FIRST
 //     in ExtraComposeFiles so `-f` auto-discovery disabling keeps the right
@@ -1216,7 +1222,12 @@ func (r *RemoteCompose) PrepareRollback(ctx context.Context, entries map[string]
 	}
 
 	override := buildOverrideYAML(entries, targets)
-	remotePath := fmt.Sprintf("/tmp/cdeploy-rollback-%d.yml", os.Getpid())
+	// Generate the unique remote path ONCE and use the SAME value for both the
+	// delivery and the cleanup rm -f, so cleanup removes the exact file written.
+	remotePath, err := remoteRollbackOverridePath()
+	if err != nil {
+		return nil, fmt.Errorf("rollback prep: %w", err)
+	}
 	if err := r.writeRemoteFile(ctx, remotePath, override); err != nil {
 		return nil, fmt.Errorf("rollback prep: writing override: %w", err)
 	}
@@ -1238,6 +1249,23 @@ func (r *RemoteCompose) PrepareRollback(ctx context.Context, entries map[string]
 		r.ExtraComposeFiles = nil
 	}
 	return cleanup, nil
+}
+
+// remoteRollbackOverridePath returns a per-invocation-unique path for the remote
+// rollback override file. The local process PID is NOT unique across client
+// machines, so two clients rolling back the same project against the same docker
+// host would otherwise collide on an identical remote path — one overwriting the
+// other's digest-pinned override, or a cleanup `rm -f` deleting the file while
+// the other client's pipeline/wait still references it in ExtraComposeFiles. A
+// crypto/rand hex suffix appended to the PID makes the final path unique across
+// clients. Deviates from the plan's literal /tmp/cdeploy-rollback-<pid>.yml spec,
+// which is defective for the cross-client case. The hex suffix is shell-safe.
+func remoteRollbackOverridePath() (string, error) {
+	var b [8]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		return "", fmt.Errorf("generating unique override path: %w", err)
+	}
+	return fmt.Sprintf("/tmp/cdeploy-rollback-%d-%s.yml", os.Getpid(), hex.EncodeToString(b[:])), nil
 }
 
 // warnAlreadyAtSnapshot writes an "already at snapshot" advisory to w for each
