@@ -121,6 +121,18 @@ func newStopCmd() *cobra.Command {
 }
 
 func runOperation(ctx context.Context, op runner.Operation, all bool, containers []string) error {
+	return runOperationWithPrep(ctx, op, all, containers, nil)
+}
+
+// runOperationWithPrep is runOperation with an optional op-specific pre-run
+// hook. When prep is non-nil it runs AFTER the composer is built and BEFORE the
+// pipeline, so it can apply refusal rules and configure the composer (rollback
+// uses it to pin ExtraComposeFiles to a generated digest override). The cleanup
+// it returns is deferred function-scoped — it runs after the wait phase and,
+// crucially, before the composer's remote SSH teardown (LIFO), so a remote
+// `rm -f` of the override file still rides the live ControlMaster socket. deploy,
+// restart and stop pass a nil prep and keep the original code path.
+func runOperationWithPrep(ctx context.Context, op runner.Operation, all bool, containers []string, prep func(context.Context, runner.Composer) (func(), error)) error {
 	// Mutex check runs before container-arg validation so that misuse of
 	// `--ssh` together with `--server` reports the mutex error consistently
 	// across subcommands (matching exec/logs/list ordering), regardless of
@@ -175,6 +187,18 @@ func runOperation(ctx context.Context, op runner.Operation, all bool, containers
 			return err
 		}
 		c = lc
+	}
+
+	// Op-specific pre-run hook (rollback: read snapshot, apply refusal rules,
+	// print the plan, prepare the digest override). Runs before the pipeline;
+	// a refusal here aborts without touching any container. The cleanup is
+	// deferred so it runs after the wait phase but before the SSH teardown.
+	if prep != nil {
+		cleanup, err := prep(ctx, c)
+		if err != nil {
+			return err
+		}
+		defer cleanup()
 	}
 
 	logger, err := opNewLogger(logDir)

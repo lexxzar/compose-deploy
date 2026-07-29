@@ -444,19 +444,19 @@ function-scoped `defer cleanup()` — it runs after `WaitHealthy` returns, so no
 - Create: `cmd/rollback_test.go`
 - Modify: `cmd/root.go`
 
-- [ ] `newRollbackCmd()`: `rollback [containers...]` + `-a`, `--wait`/`--wait-timeout`;
+- [x] `newRollbackCmd()`: `rollback [containers...]` + `-a`, `--wait`/`--wait-timeout`;
       `checkRemoteMutex` first; same local/`--server`/`--ssh` composer branches as
       `runOperation` (reuse it — extend with an op-specific pre-run hook rather than forking
       the function)
-- [ ] pre-run: `ReadSnapshot` → refusal rules (missing file / schema / targeted service
+- [x] pre-run: `ReadSnapshot` → refusal rules (missing file / schema / targeted service
       absent — name what's missing); print plan lines
       `web  nginx@sha256:ab12… (recorded 2026-07-28 14:03)`; `PrepareRollback` with deferred
       cleanup; then `runner.Run(Rollback)`; `--wait` phase identical to task 9
-- [ ] register in `cmd/root.go`; help/examples text (incl. images-only caveat one-liner)
-- [ ] write tests: arg validation (names xor `-a`); refusal paths (no state, schema mismatch,
+- [x] register in `cmd/root.go`; help/examples text (incl. images-only caveat one-liner)
+- [x] write tests: arg validation (names xor `-a`); refusal paths (no state, schema mismatch,
       missing service — exact error text names the service); plan-line formatting; flag
       registration; subcommand registered on root
-- [ ] run tests — must pass before task 11
+- [x] run tests — must pass before task 11
 
 ### Task 11: TUI — snapshot-on-deploy + wait phase on progress screen
 
