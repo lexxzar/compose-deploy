@@ -6,7 +6,9 @@ import (
 	"io"
 	"os"
 	"os/signal"
+	"sort"
 	"strings"
+	"time"
 
 	"github.com/charmbracelet/lipgloss"
 	"github.com/lexxzar/compose-deploy/internal/compose"
@@ -23,6 +25,13 @@ var (
 	opNewLocal  = compose.New
 	opNewRemote = compose.NewRemote
 	opNewLogger = logging.NewLogger
+
+	// Health-wait flags, shared by the deploy and restart subcommands (stop
+	// never registers them, so a stop invocation keeps waitEnabled==false).
+	// Package-level like the other cross-cutting flags (serverName, projectDir,
+	// …); runOperation reads them directly.
+	waitEnabled bool
+	waitTimeout time.Duration
 )
 
 func newDeployCmd() *cobra.Command {
@@ -46,6 +55,7 @@ func newDeployCmd() *cobra.Command {
 	}
 
 	cmd.Flags().BoolVarP(&all, "all", "a", false, "operate on all containers")
+	addWaitFlags(cmd)
 
 	return cmd
 }
@@ -71,8 +81,18 @@ func newRestartCmd() *cobra.Command {
 	}
 
 	cmd.Flags().BoolVarP(&all, "all", "a", false, "operate on all containers")
+	addWaitFlags(cmd)
 
 	return cmd
+}
+
+// addWaitFlags registers the health-wait flags on a subcommand. Only deploy and
+// restart get them — stop has no health phase.
+func addWaitFlags(cmd *cobra.Command) {
+	cmd.Flags().BoolVar(&waitEnabled, "wait", false,
+		"after the operation, wait for services to become healthy (exit 2 if any fail)")
+	cmd.Flags().DurationVar(&waitTimeout, "wait-timeout", runner.DefaultWaitTimeout,
+		"maximum time to wait for health (with --wait)")
 }
 
 func newStopCmd() *cobra.Command {
@@ -163,6 +183,16 @@ func runOperation(ctx context.Context, op runner.Operation, all bool, containers
 	}
 	defer logger.Close()
 
+	// Snapshot the currently-running image digests BEFORE the pipeline touches
+	// anything, so `cdeploy rollback` can restore them. Deploy only (a restart
+	// after a bad deploy must not overwrite the good snapshot). Best-effort:
+	// SnapshotServices/WriteSnapshot failures warn but never block the deploy.
+	if op == runner.Deploy {
+		if s, ok := c.(snapshotter); ok {
+			recordSnapshot(ctx, s, containers, os.Stderr)
+		}
+	}
+
 	w := io.MultiWriter(logger.Writer(), os.Stdout)
 	events := make(chan runner.StepEvent, 20)
 
@@ -186,5 +216,140 @@ func runOperation(ctx context.Context, op runner.Operation, all bool, containers
 	}
 
 	fmt.Fprintf(os.Stderr, "\nFor details see logfile: %s\n", logger.Path())
+
+	// Health-wait phase. Only deploy and restart register --wait; stop is
+	// excluded defensively so a leaked global can never make a stop wait.
+	if waitEnabled && op != runner.StopOnly {
+		return waitForHealth(ctx, c, op, containers)
+	}
+
 	return nil
+}
+
+// waitForHealth runs the post-operation health wait and prints the per-service
+// verdict table. It returns a *WaitError (mapped to exit code 2 by main.go) when
+// any targeted service failed to become healthy or the wait could not complete;
+// nil when every service passed. Deploy failures also print the rollback hint.
+func waitForHealth(ctx context.Context, c runner.Composer, op runner.Operation, containers []string) error {
+	timeout := waitTimeout
+	if timeout <= 0 {
+		timeout = runner.DefaultWaitTimeout
+	}
+
+	fmt.Fprintf(os.Stderr, "\nWaiting for health (timeout %s)...\n", timeout)
+	report, err := runner.WaitHealthy(ctx, c, containers, runner.WaitOptions{Timeout: timeout})
+	fmt.Fprint(os.Stderr, formatWaitReport(report))
+
+	if err != nil || !report.OK {
+		if op == runner.Deploy {
+			fmt.Fprintln(os.Stderr, styleWarning.Render("run 'cdeploy rollback' to restore the previous images"))
+		}
+		return &WaitError{Report: report, Err: err}
+	}
+
+	fmt.Fprintln(os.Stderr, styleOK.Render("All services healthy"))
+	return nil
+}
+
+// WaitError signals that a post-operation health wait failed. main.go maps it to
+// exit code 2 via errors.As, letting CI distinguish "deployed but unhealthy"
+// (code 2) from "pipeline step failed" (code 1). Report carries the per-service
+// verdicts; Err (if set) is the operational failure that aborted the wait
+// (context cancellation, repeated poll failures, service resolution), exposed via
+// Unwrap so callers can inspect the underlying cause.
+type WaitError struct {
+	Report runner.WaitReport
+	Err    error
+}
+
+func (e *WaitError) Error() string {
+	if e.Err != nil {
+		return fmt.Sprintf("health wait failed: %v", e.Err)
+	}
+	var failed []string
+	for name, v := range e.Report.Verdicts {
+		if !v.OK() {
+			label := string(v)
+			if v == runner.VerdictPending {
+				label = "pending"
+			}
+			failed = append(failed, fmt.Sprintf("%s (%s)", name, label))
+		}
+	}
+	sort.Strings(failed)
+	return fmt.Sprintf("health wait failed: %s", strings.Join(failed, ", "))
+}
+
+func (e *WaitError) Unwrap() error { return e.Err }
+
+// snapshotter is the subset of the concrete composers used to record a pre-deploy
+// digest snapshot. Both *compose.Compose and *compose.RemoteCompose satisfy it;
+// a composer that does not (e.g. a test mock) is silently skipped, so snapshotting
+// is a best-effort capability rather than part of the runner.Composer contract.
+type snapshotter interface {
+	SnapshotServices(ctx context.Context, services []string) (compose.SnapshotResult, error)
+	WriteSnapshot(ctx context.Context, fresh *compose.Snapshot) error
+}
+
+// recordSnapshot captures the currently-running image digests for the targeted
+// services and merge-writes them to the host state file. It is strictly
+// best-effort: a capture error, per-service warnings, and a write failure are all
+// surfaced to warn without ever returning an error, so a snapshot problem can
+// never block the deploy that follows.
+func recordSnapshot(ctx context.Context, s snapshotter, services []string, warn io.Writer) {
+	res, err := s.SnapshotServices(ctx, services)
+	if err != nil {
+		fmt.Fprintf(warn, "%s rollback snapshot skipped: %v\n", styleWarning.Render("Warning:"), err)
+		return
+	}
+	for _, msg := range res.Warnings {
+		fmt.Fprintf(warn, "%s rollback snapshot: %s\n", styleWarning.Render("Warning:"), msg)
+	}
+	if err := s.WriteSnapshot(ctx, res.Snapshot); err != nil {
+		fmt.Fprintf(warn, "%s failed to write rollback snapshot: %v (deploy continues)\n",
+			styleWarning.Render("Warning:"), err)
+	}
+}
+
+// waitVerdictIcon maps a verdict to a colored status glyph, reusing the ♥/✗/~
+// vocabulary of the list command: ♥ for a healthy pass, ● for a no-healthcheck
+// running pass, ✗ for any failure, ~ for still-pending.
+func waitVerdictIcon(v runner.WaitVerdict) string {
+	switch v {
+	case runner.VerdictHealthy:
+		return styleOK.Render("♥")
+	case runner.VerdictRunningNoHC:
+		return styleOK.Render("●")
+	case runner.VerdictPending:
+		return styleWarning.Render("~")
+	default:
+		return styleFailed.Render("✗")
+	}
+}
+
+// formatWaitReport renders the per-service verdict table (services sorted by
+// name, left-aligned). It is a pure function of the report so it can be
+// golden-tested; colors come from the shared styles and collapse to plain text
+// when the output is not a terminal.
+func formatWaitReport(report runner.WaitReport) string {
+	names := make([]string, 0, len(report.Verdicts))
+	width := 0
+	for name := range report.Verdicts {
+		names = append(names, name)
+		if len(name) > width {
+			width = len(name)
+		}
+	}
+	sort.Strings(names)
+
+	var b strings.Builder
+	for _, name := range names {
+		v := report.Verdicts[name]
+		label := string(v)
+		if v == runner.VerdictPending {
+			label = "pending"
+		}
+		fmt.Fprintf(&b, "  %s %-*s  %s\n", waitVerdictIcon(v), width, name, label)
+	}
+	return b.String()
 }

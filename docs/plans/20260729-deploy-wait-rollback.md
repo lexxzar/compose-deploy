@@ -421,21 +421,21 @@ function-scoped `defer cleanup()` — it runs after `WaitHealthy` returns, so no
 - Modify: `main.go`
 - Modify: `cmd/deploy_test.go`
 
-- [ ] add `--wait` + `--wait-timeout` (default `2m`) flags to `deploy` and `restart`; thread
+- [x] add `--wait` + `--wait-timeout` (default `2m`) flags to `deploy` and `restart`; thread
       into `runOperation` (options struct or params — keep `stop` unaffected)
-- [ ] after the events loop completes cleanly and `--wait` is set: print
+- [x] after the events loop completes cleanly and `--wait` is set: print
       `Waiting for health (timeout 2m)…`, call `runner.WaitHealthy`, print per-service verdict
       table (aligned, colored via existing styles)
-- [ ] define exported `WaitError{Report}` in `cmd`; on wait failure return it wrapped; print
+- [x] define exported `WaitError{Report}` in `cmd`; on wait failure return it wrapped; print
       rollback hint (deploy only); `main.go`: `errors.As` → `os.Exit(2)` (stderr message
       preserved)
-- [ ] snapshot hook: for `Deploy`, call `SnapshotServices` + merge-write BEFORE `runner.Run`
+- [x] snapshot hook: for `Deploy`, call `SnapshotServices` + merge-write BEFORE `runner.Run`
       (via a small unexported interface both composers satisfy); warnings to stderr;
       write failure → prominent warning, deploy proceeds
-- [ ] write tests: flag registration on both cmds (absent on `stop`); `--wait-timeout` parse;
+- [x] write tests: flag registration on both cmds (absent on `stop`); `--wait-timeout` parse;
       WaitError → exit-2 mapping (unit-test the errors.As branch); snapshot-failure
       warn-and-proceed (mock via seam); verdict table rendering (golden-ish string check)
-- [ ] run tests — must pass before task 10
+- [x] run tests — must pass before task 10
 
 ### Task 10: `cmd/rollback.go` subcommand
 
