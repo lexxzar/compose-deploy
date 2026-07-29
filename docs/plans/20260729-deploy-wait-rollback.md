@@ -491,25 +491,25 @@ function-scoped `defer cleanup()` — it runs after `WaitHealthy` returns, so no
 - Modify: `internal/tui/app.go`
 - Modify: `internal/tui/app_test.go`
 
-- [ ] define `RollbackPreparer` optional interface (ReadSnapshot + PrepareRollback); `R` key
+- [x] define `RollbackPreparer` optional interface (ReadSnapshot + PrepareRollback); `R` key
       handler: guard empty list; type-assert composer — not supported → ignore; async
       snapshot fetch (`rollbackSnapshotMsg{session}`, new session counter bumped at the same
       7 context-change sites)
-- [ ] fetch result: absent/targeted-missing → inline warning (x-not-running pattern);
+- [x] fetch result: absent/targeted-missing → inline warning (x-not-running pattern);
       present → existing `confirming` flow with `pendingOp = runner.Rollback`, prompt shows
       service list + snapshot age; respects multi-select like `r`/`d`/`s`
-- [ ] confirm → progress screen: prep (inside the op tea.Cmd, before `runner.Run`; prep
+- [x] confirm → progress screen: prep (inside the op tea.Cmd, before `runner.Run`; prep
       failure → op failed with error), then Rollback pipeline, then wait phase (task 11
       covers it via op == Rollback); cleanup stored as `m.rollbackCleanup` and invoked on
       LEAVING screenProgress — NOT goroutine-deferred (see Technical Details: rollback
       cleanup timing race rule)
-- [ ] extend post-op update-cache invalidation at `app.go:2049` to include `runner.Rollback`;
+- [x] extend post-op update-cache invalidation at `app.go:2049` to include `runner.Rollback`;
       footer gains `R rollback`; new fields cleared at departure sites
-- [ ] write tests: `R` with non-Preparer mock ignored; no-snapshot warning; confirm y/n flow
+- [x] write tests: `R` with non-Preparer mock ignored; no-snapshot warning; confirm y/n flow
       sets/clears `pendingOp`; multi-select target set; stale snapshot-fetch msg rejected;
       cache invalidation on Rollback success; `rollbackCleanup` invoked exactly once on
       leaving progress; footer text
-- [ ] run tests — must pass before task 13
+- [x] run tests — must pass before task 13
 
 ### Task 13: Verify acceptance criteria
 
