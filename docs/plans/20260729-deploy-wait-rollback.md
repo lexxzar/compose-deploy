@@ -557,17 +557,17 @@ function-scoped `defer cleanup()` — it runs after `WaitHealthy` returns, so no
 - Modify: `CLAUDE.md`
 - Modify: `skills/cdeploy/SKILL.md`
 
-- [ ] README.md: `--wait`/`--wait-timeout` on deploy/restart/rollback, `rollback` command
+- [x] README.md: `--wait`/`--wait-timeout` on deploy/restart/rollback, `rollback` command
       section (snapshot model, host-side state path, images-only caveat, long-running-
       services caveat for `--wait`, exit codes 0/1/2), TUI key table (`R`, esc-skip),
       progress-screen wait description
-- [ ] CLAUDE.md: new architecture paragraphs — wait engine (reducer + two drivers), snapshot
+- [x] CLAUDE.md: new architecture paragraphs — wait engine (reducer + two drivers), snapshot
       ownership rules (Deploy-only, merge, host-side state), rollback pipeline + prep,
       `ExtraComposeFiles` contract (nil-pinned), new TUI sessions/cleanup sites; extend the
       "Adding New Operations" note if the recipe grew a prep-hook step
-- [ ] `cdeploy skill` SKILL.md (`skills/cdeploy/SKILL.md`): add rollback + --wait usage for
+- [x] `cdeploy skill` SKILL.md (`skills/cdeploy/SKILL.md`): add rollback + --wait usage for
       agents (respect the content pins: no `metadata:` key, <500 lines, description limits)
-- [ ] move this plan to `docs/plans/completed/`
+- [x] (deferred to orchestrator finalize step) move this plan to `docs/plans/completed/`
 
 ## Post-Completion
 
