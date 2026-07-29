@@ -319,24 +319,24 @@ function-scoped `defer cleanup()` — it runs after `WaitHealthy` returns, so no
 - Create: `internal/compose/snapshot.go`
 - Create: `internal/compose/snapshot_test.go`
 
-- [ ] define `Snapshot` / `SnapshotEntry` structs matching the schema; `snapshotKey(projectDir)`
+- [x] define `Snapshot` / `SnapshotEntry` structs matching the schema; `snapshotKey(projectDir)`
       — normalize BEFORE hashing (local: `filepath.Abs` + `filepath.Clean`; remote:
       `path.Clean` + trailing-slash trim, otherwise verbatim — `-C ./myapp` and
       `-C /abs/myapp` MUST produce the same key), then sha256 → 12 hex;
       `stateFileRelPath(projectDir)` (`.cdeploy/state/<key>.json`)
-- [ ] implement `mergeSnapshot(existing, fresh *Snapshot) *Snapshot` — per-service
+- [x] implement `mergeSnapshot(existing, fresh *Snapshot) *Snapshot` — per-service
       merge-not-replace, fresh entries win, `schema`/`project_dir` refreshed
-- [ ] implement `parseSnapshot([]byte)` — strict: unknown schema or malformed JSON → typed
+- [x] implement `parseSnapshot([]byte)` — strict: unknown schema or malformed JSON → typed
       errors (`errSnapshotSchema`, distinguishable from not-found)
-- [ ] implement `buildOverrideYAML(entries map[string]SnapshotEntry, services []string) []byte`
+- [x] implement `buildOverrideYAML(entries map[string]SnapshotEntry, services []string) []byte`
       — minimal `services:` YAML with `image: <repo>@<digest>` refs (repo derived from the
       recorded image ref via existing `stripTag`); emit services in SORTED order (Go map
       iteration is random — build from a sorted slice, never Marshal a map)
-- [ ] write table tests: key derivation stability (rel vs abs path of the same dir ⇒ same
+- [x] write table tests: key derivation stability (rel vs abs path of the same dir ⇒ same
       key; trailing slash ⇒ same key); merge (partial deploy keeps other services,
       per-service recorded_at preserved); parse (valid / bad JSON / schema 2); override YAML
       (single + multi service, subset selection, deterministic ordering)
-- [ ] run tests — must pass before task 6
+- [x] run tests — must pass before task 6
 
 ### Task 6: Local snapshot capture + state IO (`Compose`)
 
