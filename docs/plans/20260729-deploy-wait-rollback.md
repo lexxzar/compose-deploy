@@ -345,21 +345,22 @@ function-scoped `defer cleanup()` — it runs after `WaitHealthy` returns, so no
 - Modify: `internal/compose/compose.go` (only if capture needs unexported access)
 - Modify: `internal/compose/snapshot_test.go`
 
-- [ ] implement `(*Compose) SnapshotServices(ctx, services []string) (SnapshotResult, error)`:
+- [x] implement `(*Compose) SnapshotServices(ctx, services []string) (SnapshotResult, error)`:
       reuse the updates.go service→image mapping; `compose ps --format json` for running
       container IDs; batched `docker inspect --format '{{.Image}}'` + `docker image inspect`
       via `runDockerCmd`; `parseLocalDigest` filtering; collect per-service warnings
       (not-running, no-digest) into `SnapshotResult.Warnings`
-- [ ] implement `(*Compose) ReadSnapshot(ctx)` / `writeSnapshotFile(path, snap)` — read
+- [x] implement `(*Compose) ReadSnapshot(ctx)` / `writeSnapshotFile(path, snap)` — read
       existing, merge, atomic temp+rename write under `$HOME/.cdeploy/state/` (MkdirAll,
       `config.Save` pattern); distinguish not-found from parse errors
-- [ ] write capture tests via `SetTestHooks` (scripted ps/inspect outputs): happy path,
+      (`WriteSnapshot(ctx, fresh)` ties read+merge+write; both composers will satisfy it)
+- [x] write capture tests via `SetTestHooks` (scripted ps/inspect outputs): happy path,
       service not running (warning + absent entry), build-only image (warning + absent),
       scaled service (one entry, running replica's digest)
-- [ ] write state IO tests with `t.TempDir()` + `t.Setenv("HOME", ...)`: round-trip, merge on
+- [x] write state IO tests with `t.TempDir()` + `t.Setenv("HOME", ...)`: round-trip, merge on
       second write, corrupt file → typed error, atomicity (no partial file on simulated
       failure)
-- [ ] run tests — must pass before task 7
+- [x] run tests — must pass before task 7
 
 ### Task 7: Remote snapshot capture + state IO (`RemoteCompose`)
 

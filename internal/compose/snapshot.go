@@ -1,15 +1,18 @@
 package compose
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"os"
 	"path"
 	"path/filepath"
 	"sort"
 	"strings"
+	"time"
 )
 
 // Deploy snapshots and rollback state.
@@ -162,4 +165,299 @@ func buildOverrideYAML(entries map[string]SnapshotEntry, services []string) []by
 		fmt.Fprintf(&b, "    image: %s@%s\n", repo, entry.Digest)
 	}
 	return []byte(b.String())
+}
+
+// snapshotClock returns the timestamp stamped into freshly-captured snapshot
+// entries (recorded_at). It is a package var so tests can pin it for
+// deterministic output; production uses UTC wall-clock time. UTC keeps the
+// recorded_at string stable regardless of the deploying machine's timezone.
+var snapshotClock = func() time.Time { return time.Now().UTC() }
+
+// SnapshotResult is the outcome of a capture: the fresh Snapshot plus any
+// per-service warnings (service not running, image built locally with no
+// registry digest, etc.). Warnings are non-fatal — the caller surfaces them but
+// the snapshot of the remaining services is still recorded.
+type SnapshotResult struct {
+	Snapshot *Snapshot
+	Warnings []string
+}
+
+// SnapshotServices captures the image digest each *running* container of the
+// requested services actually uses, so a later rollback can pin those digests.
+//
+// Flow (all data-plane calls honor the outputCmd test hook):
+//  1. `docker compose config --format json` → service → image ref (reused from
+//     updates.go via fetchServiceImages; build-only services are absent).
+//  2. `docker compose ps --format json` → the first RUNNING container ID per
+//     service.
+//  3. one batched `docker inspect --format '{{.Image}}' <ids...>` → the exact
+//     image ID each running container was created from (NOT the tag's current
+//     digest — a pulled-but-not-deployed newer image must not poison the
+//     snapshot).
+//  4. per image ID, `docker image inspect` → RepoDigests, filtered against the
+//     compose-config image ref via parseLocalDigest.
+//
+// Steps 3–4 are top-level docker CLI commands, so they bypass c.command() via
+// runDockerCmd (same rationale as AllContainerStats). A service that is not
+// running, or whose image has no registry digest (locally built), is skipped
+// with a warning rather than failing the whole capture. When services is empty
+// the capture targets every service that has an image in the compose config.
+func (c *Compose) SnapshotServices(ctx context.Context, services []string) (SnapshotResult, error) {
+	images, err := c.fetchServiceImages(ctx)
+	if err != nil {
+		return SnapshotResult{}, err
+	}
+	running, err := c.runningContainerIDs(ctx)
+	if err != nil {
+		return SnapshotResult{}, err
+	}
+
+	targets := services
+	if len(targets) == 0 {
+		targets = sortedStringKeys(images)
+	}
+
+	// Batch a single `docker inspect` over the container IDs we actually need
+	// (targets that both have an image ref AND a running replica).
+	var toInspect []string
+	seen := map[string]bool{}
+	for _, svc := range targets {
+		if _, ok := images[svc]; !ok {
+			continue
+		}
+		cid, ok := running[svc]
+		if !ok || seen[cid] {
+			continue
+		}
+		seen[cid] = true
+		toInspect = append(toInspect, cid)
+	}
+	imageIDs, err := c.inspectContainerImageIDs(ctx, toInspect)
+	if err != nil {
+		return SnapshotResult{}, err
+	}
+
+	snap := &Snapshot{
+		Schema:     snapshotSchemaVersion,
+		ProjectDir: localProjectDir(c.ProjectDir),
+		Services:   map[string]SnapshotEntry{},
+	}
+	recordedAt := snapshotClock().Format(time.RFC3339)
+	var warnings []string
+	for _, svc := range targets {
+		imageRef, hasImage := images[svc]
+		if !hasImage {
+			warnings = append(warnings, fmt.Sprintf("%s: no image in compose config (build-only?), skipped", svc))
+			continue
+		}
+		cid, ok := running[svc]
+		if !ok {
+			warnings = append(warnings, fmt.Sprintf("%s: not running, skipped", svc))
+			continue
+		}
+		out, derr := c.runDockerCmd(ctx, imageInspectArgs(imageIDs[cid]))
+		if derr != nil {
+			warnings = append(warnings, fmt.Sprintf("%s: inspecting image failed: %v, skipped", svc, derr))
+			continue
+		}
+		digest := parseLocalDigest(string(out), imageRef)
+		if digest == "" {
+			warnings = append(warnings, fmt.Sprintf("%s: no repository digest (locally built?), skipped", svc))
+			continue
+		}
+		snap.Services[svc] = SnapshotEntry{
+			Image:      imageRef,
+			Digest:     digest,
+			RecordedAt: recordedAt,
+		}
+	}
+	return SnapshotResult{Snapshot: snap, Warnings: warnings}, nil
+}
+
+// runningContainerIDs runs `docker compose ps --format json` and returns a map
+// of service name → the FULL container ID of its first running replica.
+// Services with no running replica are absent. Full IDs (not the short form)
+// are returned because `docker inspect` needs the full ID. The first running
+// replica wins for a scaled service: all replicas share the same image, so any
+// running one yields the correct digest.
+func (c *Compose) runningContainerIDs(ctx context.Context) (map[string]string, error) {
+	cmd := c.command(ctx, "ps", "--format", "json")
+	var out []byte
+	var err error
+	if c.outputCmd != nil {
+		out, err = c.outputCmd(cmd)
+	} else {
+		out, err = cmd.Output()
+	}
+	if err != nil {
+		return nil, fmt.Errorf("listing containers for snapshot: %w", withStderr(err))
+	}
+	return parseRunningContainerIDs(out)
+}
+
+// parseRunningContainerIDs parses `docker compose ps --format json` (array or
+// NDJSON, mirroring parseContainerStatus) into a service → first-running
+// container ID map. Entries with an empty service/ID or a non-running State are
+// skipped.
+func parseRunningContainerIDs(data []byte) (map[string]string, error) {
+	s := strings.TrimSpace(string(data))
+	if s == "" || s == "[]" {
+		return map[string]string{}, nil
+	}
+	var entries []psEntry
+	if strings.HasPrefix(s, "[") {
+		if err := json.Unmarshal([]byte(s), &entries); err != nil {
+			return nil, fmt.Errorf("parsing ps for snapshot: %w", err)
+		}
+	} else {
+		for _, line := range strings.Split(s, "\n") {
+			line = strings.TrimSpace(line)
+			if line == "" {
+				continue
+			}
+			var e psEntry
+			if err := json.Unmarshal([]byte(line), &e); err != nil {
+				return nil, fmt.Errorf("parsing ps for snapshot: %w", err)
+			}
+			entries = append(entries, e)
+		}
+	}
+	out := make(map[string]string)
+	for _, e := range entries {
+		if e.Service == "" || e.ID == "" || e.State != "running" {
+			continue
+		}
+		if _, ok := out[e.Service]; !ok {
+			out[e.Service] = e.ID
+		}
+	}
+	return out, nil
+}
+
+// inspectContainerImageIDs runs a single batched
+// `docker inspect --format '{{.Image}}' <ids...>` and returns container ID →
+// image ID. Bypasses c.command() because `docker inspect` is a top-level docker
+// CLI command, not a compose subcommand (same rationale as runDockerCmd's other
+// callers). `docker inspect` preserves argument order in its output, so the
+// image IDs are zipped back to the input container IDs positionally; a
+// line-count mismatch is treated as an error.
+func (c *Compose) inspectContainerImageIDs(ctx context.Context, containerIDs []string) (map[string]string, error) {
+	if len(containerIDs) == 0 {
+		return map[string]string{}, nil
+	}
+	args := append([]string{"inspect", "--format", "{{.Image}}"}, containerIDs...)
+	out, err := c.runDockerCmd(ctx, args)
+	if err != nil {
+		return nil, err
+	}
+	lines := nonEmptyLines(string(out))
+	if len(lines) != len(containerIDs) {
+		return nil, fmt.Errorf("docker inspect returned %d image IDs for %d containers", len(lines), len(containerIDs))
+	}
+	m := make(map[string]string, len(containerIDs))
+	for i, id := range containerIDs {
+		m[id] = lines[i]
+	}
+	return m, nil
+}
+
+// nonEmptyLines splits s on newlines and returns the trimmed, non-empty lines.
+func nonEmptyLines(s string) []string {
+	var out []string
+	for _, line := range strings.Split(s, "\n") {
+		if t := strings.TrimSpace(line); t != "" {
+			out = append(out, t)
+		}
+	}
+	return out
+}
+
+// sortedStringKeys returns the keys of m in ascending order so callers that
+// iterate get deterministic output (Go map iteration is randomized).
+func sortedStringKeys(m map[string]string) []string {
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	return keys
+}
+
+// localStatePath returns the absolute path of this project's state file under
+// $HOME/.cdeploy/state/. The key is derived from the normalized project dir so
+// `-C ./app` and its absolute spelling share one file.
+func (c *Compose) localStatePath() (string, error) {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return "", fmt.Errorf("resolving home directory: %w", err)
+	}
+	key := snapshotKey(localProjectDir(c.ProjectDir))
+	return filepath.Join(home, ".cdeploy", "state", key+".json"), nil
+}
+
+// ReadSnapshot reads and parses this project's local state file. A missing file
+// returns (nil, nil) — the normal first-deploy case, distinguishable from a
+// parse/schema error (which is returned as a typed error via parseSnapshot).
+func (c *Compose) ReadSnapshot(ctx context.Context) (*Snapshot, error) {
+	path, err := c.localStatePath()
+	if err != nil {
+		return nil, err
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("reading snapshot: %w", err)
+	}
+	return parseSnapshot(data)
+}
+
+// WriteSnapshot merges fresh into the existing on-disk snapshot (if any) and
+// writes the result atomically under $HOME/.cdeploy/state/. A corrupt or
+// unreadable existing file is ignored (treated as empty) so a single bad state
+// file never blocks recording a fresh, good snapshot; the per-service merge
+// safety net is best-effort. Not-found is normal (first deploy).
+func (c *Compose) WriteSnapshot(ctx context.Context, fresh *Snapshot) error {
+	path, err := c.localStatePath()
+	if err != nil {
+		return err
+	}
+	existing, _ := c.ReadSnapshot(ctx) // ignore read/parse errors: overwrite a corrupt state
+	merged := mergeSnapshot(existing, fresh)
+	return writeSnapshotFile(path, merged)
+}
+
+// writeSnapshotFile writes snap as indented JSON to path atomically: a temp
+// file in the same directory followed by a rename, so a crashed or interrupted
+// write never leaves a half-written state file that parseSnapshot would later
+// reject. Parent directories are created as needed. Mirrors config.Save.
+func writeSnapshotFile(path string, snap *Snapshot) error {
+	data, err := json.MarshalIndent(snap, "", "  ")
+	if err != nil {
+		return fmt.Errorf("marshaling snapshot: %w", err)
+	}
+	dir := filepath.Dir(path)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return fmt.Errorf("creating state directory: %w", err)
+	}
+	tmp, err := os.CreateTemp(dir, ".snapshot-*.json")
+	if err != nil {
+		return fmt.Errorf("creating temp file: %w", err)
+	}
+	tmpName := tmp.Name()
+	if _, err := tmp.Write(data); err != nil {
+		tmp.Close()
+		os.Remove(tmpName)
+		return fmt.Errorf("writing snapshot: %w", err)
+	}
+	if err := tmp.Close(); err != nil {
+		os.Remove(tmpName)
+		return fmt.Errorf("closing temp file: %w", err)
+	}
+	if err := os.Rename(tmpName, path); err != nil {
+		os.Remove(tmpName)
+		return fmt.Errorf("renaming snapshot: %w", err)
+	}
+	return nil
 }
