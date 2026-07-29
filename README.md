@@ -313,7 +313,7 @@ cdeploy restart -a --wait
 cdeploy rollback -a --wait
 ```
 
-Flags: `--wait` (enable the health gate), `--wait-timeout <dur>` (default `2m`). The poll interval and no-healthcheck grace window are fixed internally (2s / 10s).
+Flags: `--wait` (enable the health gate), `--wait-timeout <dur>` (default `2m`). The poll interval and no-healthcheck grace window are fixed internally (2s / 10s). `--wait-timeout` is a firm deadline: a service that only becomes healthy *after* it elapses is reported as timed out, and the wait never runs more than the timeout (the final poll is scheduled to land at the deadline rather than a poll-interval past it).
 
 Each service resolves to one verdict:
 
@@ -363,7 +363,11 @@ cdeploy rollback web --ssh deploy@host -C /opt/myapp
 
 **Rollback refuses (rather than guessing) when** no snapshot exists for the project, the state file is unreadable or has an unknown schema, or a named service is absent from the snapshot (the error names exactly which services are missing). If the snapshot digest's blob is no longer cached on the host, rollback pulls it by digest first; if that pull fails (blob pruned *and* registry down), it aborts before touching any container.
 
+**Only services still in the compose file are touched.** Rollback intersects the snapshot with the current `docker compose config --services`: a snapshot entry for a service that has since been removed from the compose file is skipped with a warning under `-a`, or refused with a clear error when named explicitly — the generated override never resurrects a removed service.
+
 > **Caveat — images only.** Rollback pins **images only** against the *current* compose file. Other config drift (changed env, ports, volumes) is not rewound. It restores which image runs, not the whole compose configuration.
+
+> **Caveat — concurrent deploys of the same project.** The per-project state file is written with a read-modify-merge. Locally, an advisory file lock serializes concurrent deploys of the same project so their snapshots can't clobber each other. For a **remote** host, two deploys of the same project running at the same time from different machines can race — the merge is host-local between two SSH round-trips and there is no cross-host lock in v1 — so the later write can drop the earlier deploy's fresh entry for an overlapping service. Snapshotting is best-effort, so this only affects rollback precision for that narrow overlap.
 
 ## Health Checks
 

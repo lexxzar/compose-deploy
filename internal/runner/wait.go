@@ -204,10 +204,22 @@ func (s WaitState) Report(elapsed time.Duration) WaitReport {
 //  6. Health == "" && Running ⇒ grace timer ⇒ passes after running
 //     continuously >= Grace.
 //
-// Any service still pending once elapsed >= Timeout is marked timed out.
+// Firm timeout boundary: a PASS (rules 5 and 6) is only recorded while
+// elapsed <= Timeout, so a service that first becomes healthy STRICTLY AFTER the
+// deadline can never flip a would-be-timeout into a success — it stays pending
+// and the sweep below marks it timed out. A pass observed at exactly the
+// deadline (elapsed == Timeout) still counts, and a pass recorded on any earlier
+// poll is terminal and kept. Fail-fast rules (1–4) are NOT gated: a genuine
+// crash/restart seen at the deadline keeps its true verdict rather than being
+// relabeled "timed out". Any service still pending once elapsed >= Timeout is
+// marked timed out.
 func EvaluateWait(prev WaitState, status map[string]ServiceStatus, opts WaitOptions, elapsed time.Duration) (WaitState, bool) {
 	opts = opts.normalize()
 	next := prev.clone()
+
+	// A pass is only allowed up to and including the deadline; a poll observed
+	// strictly after the deadline can only fail-fast or time out (see doc above).
+	beforeDeadline := elapsed <= opts.Timeout
 
 	for _, svc := range next.Services {
 		if next.Verdicts[svc].Terminal() {
@@ -256,27 +268,29 @@ func EvaluateWait(prev WaitState, status map[string]ServiceStatus, opts WaitOpti
 		next.neverRunningCount[svc] = 0
 
 		// Rule 5: has a healthcheck ⇒ pass on healthy, else keep waiting
-		// (e.g. "starting").
+		// (e.g. "starting"). The pass is gated on beforeDeadline so a post-timeout
+		// poll can't flip a would-be-timed-out service to healthy.
 		if st.Health != "" {
-			if st.Health == "healthy" {
+			if st.Health == "healthy" && beforeDeadline {
 				next.Verdicts[svc] = VerdictHealthy
 			}
 			continue
 		}
 
-		// Rule 6: no healthcheck ⇒ grace timer.
+		// Rule 6: no healthcheck ⇒ grace timer. The grace-satisfied pass is gated
+		// on beforeDeadline for the same firm-boundary reason as rule 5.
 		if _, ok := next.firstRunningAt[svc]; !ok {
 			next.firstRunningAt[svc] = elapsed
 		}
-		if elapsed-next.firstRunningAt[svc] >= opts.Grace {
+		if elapsed-next.firstRunningAt[svc] >= opts.Grace && beforeDeadline {
 			next.Verdicts[svc] = VerdictRunningNoHC
 		}
 	}
 
 	// Timeout sweep: any service still pending once the deadline passed is
-	// marked timed out. Normal resolution above wins on the same poll (a
-	// service that goes healthy exactly at the timeout keeps its healthy
-	// verdict).
+	// marked timed out. A pass recorded at or before the deadline above is
+	// terminal and survives this sweep; a pass is never recorded past the
+	// deadline (see beforeDeadline gating), so nothing sneaks through.
 	done := true
 	timedOut := elapsed >= opts.Timeout
 	for _, svc := range next.Services {
@@ -366,6 +380,17 @@ func WaitHealthy(ctx context.Context, c Composer, services []string, opts WaitOp
 			return state.Report(elapsed), nil
 		}
 
-		timer.Reset(opts.Poll)
+		// Cap the next poll so it lands no later than the deadline. Without this,
+		// a full opts.Poll sleep could carry the next observation up to opts.Poll
+		// PAST the timeout, letting a service that only becomes healthy after the
+		// deadline still be observed and (before the firm-boundary fix) pass. The
+		// reducer's firm >Timeout boundary relies on a poll landing at ~deadline
+		// rather than a Poll-interval late. remaining is > 0 here (done would be
+		// true otherwise), so the timer never resets to a non-positive duration.
+		nextPoll := opts.Poll
+		if remaining := opts.Timeout - elapsed; remaining < nextPoll {
+			nextPoll = remaining
+		}
+		timer.Reset(nextPoll)
 	}
 }

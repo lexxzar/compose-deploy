@@ -14,6 +14,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"syscall"
 	"time"
 )
 
@@ -494,16 +495,58 @@ func existingForMerge(existing *Snapshot, err error) (*Snapshot, error) {
 	return nil, err
 }
 
+// lockStateFile takes an exclusive advisory flock on a sidecar `<state>.lock`
+// file, serializing concurrent LOCAL deploys of the SAME project around the
+// whole read-modify-rename of the shared state file. Without it, two overlapping
+// partial deploys could both read the same old file, merge different service
+// sets, and the later rename would clobber the earlier deploy's fresh entry —
+// defeating merge-not-replace. The returned unlock releases the flock and closes
+// the descriptor. The lock is per-project (the state key is per-project) and
+// blocks until acquired. The lock file is intentionally NEVER unlinked: removing
+// it would race a waiter that already holds a descriptor to the old inode.
+//
+// Advisory and unix-only (syscall.Flock; this tool is unix-only per the SSH /
+// ControlMaster design). Separate os.OpenFile calls yield independent open file
+// descriptions, so the flock contends even between goroutines of one process.
+// The remote path is deliberately NOT locked — a cross-host distributed lock is
+// out of v1 scope (see RemoteCompose.WriteSnapshot's concurrency caveat).
+func lockStateFile(statePath string) (func(), error) {
+	if err := os.MkdirAll(filepath.Dir(statePath), 0o755); err != nil {
+		return nil, err
+	}
+	f, err := os.OpenFile(statePath+".lock", os.O_CREATE|os.O_RDWR, 0o644)
+	if err != nil {
+		return nil, err
+	}
+	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX); err != nil {
+		_ = f.Close()
+		return nil, err
+	}
+	return func() {
+		_ = syscall.Flock(int(f.Fd()), syscall.LOCK_UN)
+		_ = f.Close()
+	}, nil
+}
+
 // WriteSnapshot merges fresh into the existing on-disk snapshot (if any) and
 // writes the result atomically under $HOME/.cdeploy/state/. A missing or
 // malformed-JSON existing file is treated as empty so one bad state file never
 // blocks recording a fresh, good snapshot; a future-schema or transiently
 // unreadable file instead ABORTS the write (see existingForMerge) so the merge
 // history is preserved rather than clobbered. Not-found is normal (first deploy).
+//
+// An advisory flock (lockStateFile) serializes the read-modify-rename against
+// concurrent local deploys of the same project so their merges can't clobber one
+// another. It is best-effort: if the lock cannot be taken the write still
+// proceeds unlocked — exactly the prior behavior for the common single-deploy
+// case.
 func (c *Compose) WriteSnapshot(ctx context.Context, fresh *Snapshot) error {
 	path, err := c.localStatePath()
 	if err != nil {
 		return err
+	}
+	if unlock, lerr := lockStateFile(path); lerr == nil {
+		defer unlock()
 	}
 	existing, err := existingForMerge(c.ReadSnapshot(ctx))
 	if err != nil {

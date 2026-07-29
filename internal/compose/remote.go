@@ -1115,6 +1115,18 @@ func (r *RemoteCompose) ReadSnapshot(ctx context.Context) (*Snapshot, error) {
 // ABORTS the write (see existingForMerge) so the merge history is preserved
 // rather than clobbered. Mirrors Compose.WriteSnapshot. Both composers satisfy
 // the same read+merge+write seam consumed by the deploy/rollback flows.
+//
+// Concurrency caveat (v1, documented): unlike the local path — which serializes
+// the read-modify-rename with an advisory flock (see lockStateFile) — the remote
+// read (cat) and write (stdin-pipe + rename) are two separate SSH round-trips
+// with the merge done host-locally in between, so a cross-SSH lock would need a
+// held remote session or shell-side JSON merge. Both are out of the plan's v1
+// scope (depth-1, best-effort, warn-and-proceed). Two concurrent deploys of the
+// SAME project to the SAME host from different machines can therefore race and
+// the later write can clobber the earlier deploy's fresh entry. This is
+// acceptable in v1: the local single-host case is the common one, and snapshot
+// writes are best-effort (a lost entry only means that one service can't be
+// rolled back to the exact digest of an overlapping concurrent deploy).
 func (r *RemoteCompose) WriteSnapshot(ctx context.Context, fresh *Snapshot) error {
 	existing, err := existingForMerge(r.ReadSnapshot(ctx))
 	if err != nil {

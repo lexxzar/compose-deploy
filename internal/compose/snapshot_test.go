@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -1207,5 +1208,94 @@ func TestWriteSnapshotFileAtomicNoPartial(t *testing.T) {
 	// failure — a successful Stat here would mean a partial/truncated write.
 	if _, statErr := os.Stat(target); statErr == nil {
 		t.Fatal("a file was created at the target despite the write failing")
+	}
+}
+
+// --- C4: local state-write locking (concurrent-deploy safety) ---
+
+// TestWriteSnapshot_ConcurrentDeploysAllMerge exercises the flock: many
+// concurrent WriteSnapshot calls for the SAME project, each merging a distinct
+// single service, must all survive in the final merged state. Without the
+// advisory lock the read-modify-rename would interleave and later renames would
+// clobber earlier writers' fresh entries, dropping services.
+func TestWriteSnapshot_ConcurrentDeploysAllMerge(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+
+	c := New("/opt/myapp")
+	ctx := context.Background()
+
+	const n = 24
+	var wg sync.WaitGroup
+	wg.Add(n)
+	for i := 0; i < n; i++ {
+		go func(i int) {
+			defer wg.Done()
+			svc := fmt.Sprintf("svc%02d", i)
+			fresh := &Snapshot{
+				Schema:     snapshotSchemaVersion,
+				ProjectDir: localProjectDir("/opt/myapp"),
+				Services: map[string]SnapshotEntry{
+					svc: {Image: svc + ":latest", Digest: "sha256:" + svc, RecordedAt: "2026-07-29T00:00:00Z"},
+				},
+			}
+			if err := c.WriteSnapshot(ctx, fresh); err != nil {
+				t.Errorf("WriteSnapshot(%s): %v", svc, err)
+			}
+		}(i)
+	}
+	wg.Wait()
+
+	snap, err := c.ReadSnapshot(ctx)
+	if err != nil {
+		t.Fatalf("ReadSnapshot: %v", err)
+	}
+	if snap == nil {
+		t.Fatal("snapshot missing after concurrent writes")
+	}
+	if len(snap.Services) != n {
+		t.Errorf("merged services = %d, want %d — a concurrent write clobbered another's entry", len(snap.Services), n)
+	}
+	for i := 0; i < n; i++ {
+		svc := fmt.Sprintf("svc%02d", i)
+		if _, ok := snap.Services[svc]; !ok {
+			t.Errorf("service %s missing from the merged snapshot", svc)
+		}
+	}
+}
+
+// TestLockStateFile_Serializes pins the helper directly: while one lock is held,
+// a second lock on the same path must block, then acquire once the first is
+// released.
+func TestLockStateFile_Serializes(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "state", "k.json")
+
+	unlock1, err := lockStateFile(path)
+	if err != nil {
+		t.Fatalf("first lock: %v", err)
+	}
+
+	acquired := make(chan struct{})
+	go func() {
+		unlock2, err := lockStateFile(path)
+		if err != nil {
+			return
+		}
+		close(acquired)
+		unlock2()
+	}()
+
+	select {
+	case <-acquired:
+		t.Fatal("second lock acquired while the first was still held")
+	case <-time.After(50 * time.Millisecond):
+		// expected: still blocked
+	}
+
+	unlock1()
+	select {
+	case <-acquired:
+		// expected: acquired after release
+	case <-time.After(2 * time.Second):
+		t.Fatal("second lock not acquired after the first was released")
 	}
 }

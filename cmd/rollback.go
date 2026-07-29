@@ -87,6 +87,21 @@ func rollbackPrep(all bool, containers []string, out io.Writer) func(context.Con
 			return nil, nil, err
 		}
 
+		// Rollback pins images only against the CURRENT compose file. Intersect
+		// the snapshot targets with the services that actually still exist in the
+		// compose file, so a stale snapshot entry for a since-removed service is
+		// never re-added by the generated override (which would resurrect it as a
+		// minimal image-only service). For `-a` a stale entry is warned-and-
+		// skipped; a named target that no longer exists is a hard error.
+		live, err := c.ListServices(ctx)
+		if err != nil {
+			return nil, nil, fmt.Errorf("listing current compose services: %w", err)
+		}
+		targets, err = filterLiveTargets(targets, live, all, out)
+		if err != nil {
+			return nil, nil, err
+		}
+
 		fmt.Fprintln(out, "Rollback plan:")
 		for _, svc := range targets {
 			fmt.Fprintf(out, "  %s\n", rollbackPlanLine(svc, snap.Services[svc]))
@@ -139,6 +154,45 @@ func resolveRollbackTargets(snap *compose.Snapshot, all bool, containers []strin
 
 	sort.Strings(targets)
 	return targets, nil
+}
+
+// filterLiveTargets intersects the snapshot-resolved rollback targets with the
+// services that CURRENTLY exist in the compose file (from ListServices /
+// `config --services`). Rollback pins images only against the current compose
+// file (documented caveat), so a snapshot service that has since been removed
+// from compose must not be re-added by the generated override. For `-a` a stale
+// entry is warned-and-skipped; for an explicitly named target that no longer
+// exists it is a hard error naming exactly the missing services — matching the
+// refusal-rule style of resolveRollbackTargets (never guesses). The returned
+// slice preserves input (sorted) order.
+func filterLiveTargets(targets, live []string, all bool, out io.Writer) ([]string, error) {
+	liveSet := make(map[string]bool, len(live))
+	for _, s := range live {
+		liveSet[s] = true
+	}
+
+	var kept, missing []string
+	for _, t := range targets {
+		if liveSet[t] {
+			kept = append(kept, t)
+			continue
+		}
+		if all {
+			fmt.Fprintf(out, "  %s %s is in the snapshot but no longer in the compose file; skipping\n",
+				styleWarning.Render("Warning:"), t)
+			continue
+		}
+		missing = append(missing, t)
+	}
+
+	if len(missing) > 0 {
+		sort.Strings(missing)
+		return nil, fmt.Errorf("service(s) no longer in the current compose file: %s", strings.Join(missing, ", "))
+	}
+	if len(kept) == 0 {
+		return nil, fmt.Errorf("no snapshot services remain in the current compose file to roll back")
+	}
+	return kept, nil
 }
 
 // rollbackPlanLine formats one plan entry, e.g.

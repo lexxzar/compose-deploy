@@ -1368,6 +1368,94 @@ func TestWaitForHealth_CtxCancelNotWaitError(t *testing.T) {
 	}
 }
 
+// TestRunOperationWithPrep_PipelineTargets (C1): a prep hook that resolves a
+// target set narrows the PIPELINE (runner.Run) to exactly those services, not
+// just the wait phase. For `rollback -a` (containers == nil) the pipeline must
+// Stop/Create the resolved snapshot services, never every compose service with
+// its current unpinned image. A nil prep (deploy/restart) is unchanged.
+func TestRunOperationWithPrep_PipelineTargets(t *testing.T) {
+	tests := []struct {
+		name       string
+		op         runner.Operation
+		all        bool
+		containers []string
+		prep       func(context.Context, runner.Composer) (func(), []string, error)
+		wantIn     []string
+		wantNotIn  []string
+	}{
+		{
+			name: "rollback -a uses the resolved snapshot targets (not all)",
+			op:   runner.Rollback, all: true, containers: nil,
+			prep: func(_ context.Context, _ runner.Composer) (func(), []string, error) {
+				return nil, []string{"db", "web"}, nil
+			},
+			wantIn: []string{"db", "web"},
+		},
+		{
+			name: "rollback named passes the explicit service through unchanged",
+			op:   runner.Rollback, all: false, containers: []string{"web"},
+			prep:      func(_ context.Context, _ runner.Composer) (func(), []string, error) { return nil, []string{"web"}, nil },
+			wantIn:    []string{"web"},
+			wantNotIn: []string{"db"},
+		},
+		{
+			name: "restart with nil prep keeps operating on the explicit containers",
+			op:   runner.Restart, all: false, containers: []string{"api"},
+			prep:   nil,
+			wantIn: []string{"api"},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Setenv("HOME", t.TempDir())
+			oldNew, oldLogger, oldProj, oldServer, oldLogDir := opNewLocal, opNewLogger, projectDir, serverName, logDir
+			t.Cleanup(func() {
+				opNewLocal, opNewLogger, projectDir, serverName, logDir = oldNew, oldLogger, oldProj, oldServer, oldLogDir
+			})
+
+			var stopArgs string
+			opNewLocal = func(dir string) *compose.Compose {
+				c := compose.New(dir)
+				c.SetTestHooks(
+					func(cmd *exec.Cmd) error {
+						a := strings.Join(cmd.Args, " ")
+						if strings.Contains(a, "stop") {
+							stopArgs = a
+						}
+						return nil
+					},
+					func(cmd *exec.Cmd) ([]byte, error) {
+						if strings.Contains(strings.Join(cmd.Args, " "), "version") {
+							return []byte("Docker Compose version v2.24.0\n"), nil
+						}
+						return nil, nil
+					},
+				)
+				return c
+			}
+			opNewLogger = func(dir string) (*logging.Logger, error) { return logging.NewLogger(t.TempDir()) }
+			projectDir, serverName, logDir = "", "", t.TempDir()
+
+			if err := runOperationWithPrep(context.Background(), tt.op, tt.all, tt.containers, tt.prep); err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if stopArgs == "" {
+				t.Fatal("stop step never ran")
+			}
+			for _, w := range tt.wantIn {
+				if !strings.Contains(stopArgs, " "+w) {
+					t.Errorf("stop argv = %q, want it to include service %q", stopArgs, w)
+				}
+			}
+			for _, w := range tt.wantNotIn {
+				if strings.Contains(stopArgs, " "+w) {
+					t.Errorf("stop argv = %q, should NOT include %q", stopArgs, w)
+				}
+			}
+		})
+	}
+}
+
 func TestRunOperation_LocalDetectFailure(t *testing.T) {
 	oldNew := opNewLocal
 	oldProj := projectDir

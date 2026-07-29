@@ -201,17 +201,26 @@ func runOperationWithPrep(ctx context.Context, op runner.Operation, all bool, co
 	// print the plan, prepare the digest override). Runs before the pipeline;
 	// a refusal here aborts without touching any container. The cleanup is
 	// deferred so it runs after the wait phase but before the SSH teardown.
+	//
+	// prep's resolved target set drives BOTH the pipeline and the wait phase.
+	// For `rollback -a`, `containers` is nil (would make runner.Run recreate
+	// EVERY compose service — including ones absent from the snapshot, with their
+	// current UNPINNED image); the resolved snapshot services keep Stop/Remove/
+	// Create/Start scoped to exactly what the override pins. deploy/restart/stop
+	// pass a nil prep and keep operating on `containers` unchanged.
+	pipelineContainers := containers
 	waitContainers := containers
 	if prep != nil {
-		cleanup, waitTargets, err := prep(ctx, c)
+		cleanup, targets, err := prep(ctx, c)
 		if err != nil {
 			return err
 		}
 		if cleanup != nil {
 			defer cleanup()
 		}
-		if len(waitTargets) > 0 {
-			waitContainers = waitTargets
+		if len(targets) > 0 {
+			pipelineContainers = targets
+			waitContainers = targets
 		}
 	}
 
@@ -234,11 +243,11 @@ func runOperationWithPrep(ctx context.Context, op runner.Operation, all bool, co
 	w := io.MultiWriter(logger.Writer(), os.Stdout)
 	events := make(chan runner.StepEvent, 20)
 
-	go runner.Run(ctx, c, op, containers, w, events)
+	go runner.Run(ctx, c, op, pipelineContainers, w, events)
 
 	containerLabel := "all containers"
-	if len(containers) > 0 {
-		containerLabel = strings.Join(containers, ", ")
+	if len(pipelineContainers) > 0 {
+		containerLabel = strings.Join(pipelineContainers, ", ")
 	}
 
 	for event := range events {

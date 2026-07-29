@@ -284,6 +284,45 @@ func TestEvaluateWait_ResolutionWinsOnTimeoutPoll(t *testing.T) {
 	}
 }
 
+func TestEvaluateWait_TimeoutPrecedesPostDeadlineHealthy(t *testing.T) {
+	// Firm boundary (C3): a service that first reports healthy STRICTLY AFTER the
+	// deadline must NOT flip a would-be-timeout into a pass — it times out. This
+	// complements TestEvaluateWait_ResolutionWinsOnTimeoutPoll (healthy AT the
+	// deadline still wins).
+	opts := WaitOptions{Timeout: 4 * time.Second, Grace: 10 * time.Second, Poll: 2 * time.Second}
+	st := NewWaitState([]string{"web"})
+	st, done := EvaluateWait(st, map[string]ServiceStatus{"web": {Running: true, Health: "starting"}}, opts, 2*time.Second)
+	if done {
+		t.Fatalf("unexpected done before the deadline")
+	}
+	// elapsed 6s > timeout 4s: the healthy poll must be overridden by the timeout.
+	st, done = EvaluateWait(st, map[string]ServiceStatus{"web": {Running: true, Health: "healthy"}}, opts, 6*time.Second)
+	if !done {
+		t.Fatalf("expected done past the deadline")
+	}
+	if st.Verdicts["web"] != VerdictTimedOut {
+		t.Errorf("verdict = %q, want %q (timeout precedes post-deadline resolution)", st.Verdicts["web"], VerdictTimedOut)
+	}
+}
+
+func TestEvaluateWait_GracePassBlockedAfterDeadline(t *testing.T) {
+	// A no-healthcheck service whose grace window would only be satisfied AFTER
+	// the deadline must time out, not pass — the grace pass is gated on the
+	// deadline just like the healthy pass.
+	opts := WaitOptions{Timeout: 4 * time.Second, Grace: 2 * time.Second, Poll: 2 * time.Second}
+	running := map[string]ServiceStatus{"web": {Running: true}}
+	st := NewWaitState([]string{"web"})
+	// First observation at elapsed 6s (> timeout): firstRunningAt=6, grace not yet
+	// met AND past the deadline ⇒ swept to timed out rather than passing later.
+	st, done := EvaluateWait(st, running, opts, 6*time.Second)
+	if !done {
+		t.Fatalf("expected done past the deadline")
+	}
+	if st.Verdicts["web"] != VerdictTimedOut {
+		t.Errorf("verdict = %q, want %q", st.Verdicts["web"], VerdictTimedOut)
+	}
+}
+
 func TestEvaluateWait_MixedCheckedAndUnchecked(t *testing.T) {
 	opts := testWaitOpts() // Grace 10s
 	// web has a healthcheck (resolves on healthy); worker has none (grace).
@@ -533,6 +572,30 @@ func TestWaitHealthy_Timeout(t *testing.T) {
 	}
 	if rep.Verdicts["web"] != VerdictTimedOut {
 		t.Errorf("verdict = %q, want %q", rep.Verdicts["web"], VerdictTimedOut)
+	}
+}
+
+func TestWaitHealthy_TimeoutIsHardDeadline(t *testing.T) {
+	// C3: the Poll interval far exceeds the timeout. Without capping the next
+	// poll at the remaining time, the driver would sleep a full Poll (1s) past
+	// the deadline before noticing the timeout. The cap makes the wait terminate
+	// at ~Timeout (15ms). A stuck-starting service must time out, not hang.
+	opts := WaitOptions{Timeout: 15 * time.Millisecond, Grace: time.Hour, Poll: time.Second}
+	c := &scriptedComposer{results: []statusResult{
+		{status: map[string]ServiceStatus{"web": {Running: true, Health: "starting"}}},
+	}}
+	start := time.Now()
+	rep, err := WaitHealthy(context.Background(), c, []string{"web"}, opts)
+	elapsed := time.Since(start)
+	if err != nil {
+		t.Fatalf("WaitHealthy err = %v, want nil", err)
+	}
+	if rep.Verdicts["web"] != VerdictTimedOut {
+		t.Errorf("verdict = %q, want %q", rep.Verdicts["web"], VerdictTimedOut)
+	}
+	// Generous margin: uncapped this would take ~1s (a full Poll); capped it is ~15ms.
+	if elapsed > 500*time.Millisecond {
+		t.Errorf("wait took %v, want ~Timeout — the Poll interval was not capped to the deadline", elapsed)
 	}
 }
 
