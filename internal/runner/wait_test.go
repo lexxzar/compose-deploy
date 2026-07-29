@@ -719,11 +719,18 @@ func TestWaitHealthy_ListServicesError(t *testing.T) {
 // the deadline); otherwise it returns ctx.Err().
 type blockingComposer struct {
 	mockComposer
-	retErr error
-	calls  int
+	retErr    error
+	calls     int
+	blockList bool // when true, ListServices also blocks on ctx.Done (C7)
+	listCalls int
 }
 
 func (b *blockingComposer) ListServices(ctx context.Context) ([]string, error) {
+	b.listCalls++
+	if b.blockList {
+		<-ctx.Done()
+		return nil, ctx.Err()
+	}
 	return []string{"web"}, nil
 }
 
@@ -802,5 +809,58 @@ func TestWaitHealthy_PollErrorPastDeadlineTimesOut(t *testing.T) {
 	}
 	if elapsed > 500*time.Millisecond {
 		t.Errorf("wait took %v — a failing poll overran the deadline", elapsed)
+	}
+}
+
+func TestWaitHealthy_HungListServicesInterruptedAtDeadline(t *testing.T) {
+	// C7: an empty target set resolved via a HUNG ListServices (stalled
+	// `docker compose config --services` / SSH transport) must not block past the
+	// timeout. The wait-scoped deadline context — now created BEFORE the resolution
+	// — interrupts it at the deadline. A resolution cut off by the deadline is a
+	// health-wait timeout (→ exit 2), classified via context.DeadlineExceeded and
+	// NOT misread as a user cancel (context.Canceled → exit 1).
+	opts := WaitOptions{Timeout: 40 * time.Millisecond, Grace: time.Hour, Poll: time.Second}
+	c := &blockingComposer{blockList: true}
+	start := time.Now()
+	_, err := WaitHealthy(context.Background(), c, nil, opts)
+	elapsed := time.Since(start)
+	if err == nil {
+		t.Fatalf("WaitHealthy err = nil, want resolve-timeout error")
+	}
+	if errors.Is(err, context.Canceled) {
+		t.Errorf("err = %v classified as context.Canceled (exit 1); a deadline expiry must map to exit 2", err)
+	}
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Errorf("err = %v, want wrapped context.DeadlineExceeded", err)
+	}
+	if elapsed > 500*time.Millisecond {
+		t.Errorf("wait took %v — a hung ListServices was not interrupted at the deadline", elapsed)
+	}
+	if c.listCalls != 1 {
+		t.Errorf("ListServices called %d times, want 1", c.listCalls)
+	}
+	if c.calls != 0 {
+		t.Errorf("ContainerStatus called %d times, want 0 (resolution never completed)", c.calls)
+	}
+}
+
+func TestWaitHealthy_HungListServicesParentCancelIsCanceled(t *testing.T) {
+	// C7 companion: a parent cancellation (user Ctrl-C) while ListServices is hung
+	// must still surface as context.Canceled RAW (→ exit 1), NOT the resolve-timeout
+	// error (→ exit 2). Preserves the Q4/C4/C5 exit-1-vs-exit-2 distinction for the
+	// resolution phase, mirroring the poll phase.
+	opts := WaitOptions{Timeout: time.Hour, Grace: time.Hour, Poll: time.Second}
+	c := &blockingComposer{blockList: true}
+	ctx, cancel := context.WithCancel(context.Background())
+	go func() {
+		time.Sleep(20 * time.Millisecond)
+		cancel()
+	}()
+	_, err := WaitHealthy(ctx, c, nil, opts)
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("WaitHealthy err = %v, want context.Canceled (exit 1)", err)
+	}
+	if errors.Is(err, context.DeadlineExceeded) {
+		t.Errorf("err = %v also matched context.DeadlineExceeded; a parent cancel is not a timeout", err)
 	}
 }

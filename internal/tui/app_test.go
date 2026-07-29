@@ -13354,6 +13354,93 @@ func TestWaitStatusMsg_PollErrorBeforeDeadlineRetries(t *testing.T) {
 	}
 }
 
+// hangingStatusComposer blocks ContainerStatus until its context is cancelled,
+// simulating a hung Docker daemon or a stalled SSH status call during the TUI
+// wait poll. It records whether the received context carried a deadline and
+// returns ctx.Err() once the context fires. The channel handoff in the test
+// establishes a happens-before edge for reading sawDeadline, so no lock is needed.
+type hangingStatusComposer struct {
+	mockComposer
+	sawDeadline bool
+}
+
+func (h *hangingStatusComposer) ContainerStatus(ctx context.Context) (map[string]runner.ServiceStatus, error) {
+	if _, ok := ctx.Deadline(); ok {
+		h.sawDeadline = true
+	}
+	<-ctx.Done()
+	return nil, ctx.Err()
+}
+
+func TestPollWaitStatus_BoundedByDeadline(t *testing.T) {
+	// C8: the TUI health poll must bound each ContainerStatus by m.waitDeadline. A
+	// HUNG Docker/SSH call under the raw m.ctx would never deliver a waitStatusMsg,
+	// so the reducer's timeout sweep would never run and the progress screen would
+	// wait indefinitely. With the deadline bound, the hung poll returns a deadline
+	// error at ~m.waitDeadline and the wait can resolve.
+	c := &hangingStatusComposer{}
+	m := Model{
+		screen:       screenProgress,
+		waiting:      true,
+		composer:     c,
+		ctx:          context.Background(),
+		waitSession:  3,
+		waitDeadline: time.Now().Add(40 * time.Millisecond),
+	}
+	m.waitState = runner.NewWaitState([]string{"web"})
+
+	cmd := m.pollWaitStatus()
+	if cmd == nil {
+		t.Fatal("pollWaitStatus returned nil cmd")
+	}
+
+	done := make(chan tea.Msg, 1)
+	go func() { done <- cmd() }()
+
+	select {
+	case msg := <-done:
+		ws, ok := msg.(waitStatusMsg)
+		if !ok {
+			t.Fatalf("poll produced %T, want waitStatusMsg", msg)
+		}
+		if ws.err == nil {
+			t.Error("a hung poll cut off at the deadline should carry a (deadline) error")
+		}
+		if ws.session != 3 {
+			t.Errorf("waitStatusMsg session = %d, want 3", ws.session)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("pollWaitStatus never returned — the poll was NOT bounded by the wait deadline (C8)")
+	}
+
+	if !c.sawDeadline {
+		t.Error("ContainerStatus received a context WITHOUT a deadline — poll not deadline-bound")
+	}
+}
+
+func TestPollWaitStatus_HungPollResolvesAsTimedOut(t *testing.T) {
+	// C8 end-to-end: a hung poll bounded by the deadline returns a deadline error at
+	// ~m.waitDeadline; feeding that waitStatusMsg (deadline already past) into
+	// Update() must sweep the pending verdicts to timed out and finalize the wait,
+	// NOT stall.
+	m := Model{screen: screenProgress, waiting: true, pendingOp: runner.Deploy, waitSession: 1}
+	m.waitState = runner.NewWaitState([]string{"web"})
+	m.waitDeadline = time.Now().Add(-time.Millisecond) // deadline reached
+
+	updated, cmd := m.Update(waitStatusMsg{err: context.DeadlineExceeded, session: 1})
+	m = updated.(Model)
+
+	if m.waiting {
+		t.Error("a deadline-error poll at/after the deadline must finalize the wait")
+	}
+	if m.waitState.Verdicts["web"] != runner.VerdictTimedOut {
+		t.Errorf("verdict = %q, want timed out", m.waitState.Verdicts["web"])
+	}
+	if cmd != nil {
+		t.Error("no reschedule after the timeout sweep")
+	}
+}
+
 // --- Task 12: TUI `R` rollback key ---------------------------------------
 
 // The `R` key type-asserts m.composer to RollbackPreparer at runtime; pin that

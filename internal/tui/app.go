@@ -2652,12 +2652,23 @@ func (m Model) waitForEvent() tea.Cmd {
 // pollWaitStatus returns a Cmd that fetches one ContainerStatus snapshot and
 // delivers it as a waitStatusMsg tagged with the current wait session. It has no
 // delay of its own — the poll cadence comes from waitTick between polls.
+//
+// Each poll is bounded by a context derived from m.waitDeadline (the same wall
+// clock the countdown uses), NOT the raw m.ctx: a HUNG Docker daemon or a stalled
+// SSH status call would otherwise never return a waitStatusMsg, so the reducer's
+// timeout sweep would never run and the progress screen would wait indefinitely.
+// With the deadline bound, a hung poll returns a deadline error at ~m.waitDeadline
+// and the waitStatusMsg error path (elapsed >= timeout → sweepWaitTimeout) resolves
+// the wait as timed out. This mirrors the CLI driver's wait-scoped context (C5/C7).
 func (m Model) pollWaitStatus() tea.Cmd {
 	ctx := m.ctx
+	deadline := m.waitDeadline
 	c := m.composer
 	session := m.waitSession
 	return func() tea.Msg {
-		status, err := c.ContainerStatus(ctx)
+		pollCtx, cancel := context.WithDeadline(ctx, deadline)
+		defer cancel()
+		status, err := c.ContainerStatus(pollCtx)
 		return waitStatusMsg{status: status, err: err, session: session}
 	}
 }

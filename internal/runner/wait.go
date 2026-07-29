@@ -349,43 +349,66 @@ func EvaluateWait(prev WaitState, status map[string]ServiceStatus, opts WaitOpti
 //     deadline: the partial report plus the wrapped underlying error. A run of
 //     fewer consecutive errors is transient — the poll is skipped and the state
 //     carried forward.
-//   - ListServices failure when the target set must be resolved.
+//   - ListServices failure when the target set must be resolved (a non-deadline
+//     failure; a resolution cut off by the wait deadline instead maps to exit 2,
+//     see below).
 //
 // A wait-DEADLINE expiry is NOT an operational error: it returns a timed-out
 // (non-OK) report with a nil error, which the CLI wraps into a WaitError → exit 2.
+// A resolution (ListServices) cut off by the deadline returns a resolve-timeout
+// error (also exit 2), distinct from a parent-cancel during resolution which
+// returns context.Canceled raw (exit 1).
 //
-// Firm deadline: the polls run under a wait-scoped context whose deadline is
-// start+Timeout (a CHILD of ctx), so a HUNG ContainerStatus (stuck Docker daemon
-// or dead SSH hop) is interrupted at the deadline rather than blocking far past
-// --wait-timeout, and the error-retry sleep is capped to the remaining budget so
-// retries can't overrun either. The first poll fires immediately (containers
+// Firm deadline: BOTH the empty-target-set resolution AND the ContainerStatus
+// polls run under a single wait-scoped context whose deadline is start+Timeout
+// (a CHILD of ctx), so a HUNG ListServices or ContainerStatus (stuck Docker
+// daemon or dead SSH hop) is interrupted at the deadline rather than blocking
+// far past --wait-timeout, and the error-retry sleep is capped to the remaining
+// budget so retries can't overrun either. The first poll fires immediately (containers
 // were just started); subsequent polls are spaced by opts.Poll (capped at the
 // remaining budget). Elapsed time is measured from the first poll's scheduling
 // via a monotonic clock and handed to EvaluateWait, which owns the timeout rule.
 func WaitHealthy(ctx context.Context, c Composer, services []string, opts WaitOptions) (WaitReport, error) {
 	opts = opts.normalize()
 
+	start := time.Now()
+	deadline := start.Add(opts.Timeout)
+
+	// Derive the wait-scoped deadline context FIRST — before ANY blocking call —
+	// so EVERY status/list round-trip in the wait phase (the empty-target-set
+	// resolution below AND the ContainerStatus polls) is bounded by --wait-timeout.
+	// A hung Docker daemon or a stalled SSH hop is interrupted AT the deadline
+	// instead of blocking far past --wait-timeout. waitCtx is a CHILD of ctx: a
+	// genuine parent cancellation (user Ctrl-C) also cancels these calls, and is
+	// distinguished from a pure deadline expiry via ctx.Err() — a parent cancel
+	// returns ctx.Err() raw (→ CLI exit 1), a deadline expiry returns a timed-out
+	// (non-OK) report or a resolve-timeout error, both mapping to exit 2.
+	// (An earlier revision created waitCtx only AFTER this ListServices resolution,
+	// leaving a hung `docker compose config --services` able to hang deploy -a
+	// --wait indefinitely; the deadline context now covers resolution too.)
+	waitCtx, cancel := context.WithDeadline(ctx, deadline)
+	defer cancel()
+
 	if len(services) == 0 {
-		resolved, err := c.ListServices(ctx)
+		resolved, err := c.ListServices(waitCtx)
 		if err != nil {
+			// Classify exactly like a failed poll (see the select below): a genuine
+			// parent cancellation surfaces as context.Canceled (→ exit 1); a
+			// resolution cut off by the wait deadline is a health-wait timeout,
+			// returned as an operational error the CLI maps to exit 2 — never a user
+			// cancel. ctx.Err() is checked first so a Ctrl-C racing the deadline wins.
+			if ctx.Err() != nil {
+				return WaitReport{}, ctx.Err()
+			}
+			if waitCtx.Err() != nil {
+				return WaitReport{}, fmt.Errorf("resolve services: wait timeout %s exceeded: %w", opts.Timeout, context.DeadlineExceeded)
+			}
 			return WaitReport{}, fmt.Errorf("resolve services: %w", err)
 		}
 		services = resolved
 	}
 
 	state := NewWaitState(services)
-	start := time.Now()
-	deadline := start.Add(opts.Timeout)
-
-	// Derive a wait-scoped context bounded by the timeout and use it for the
-	// ContainerStatus polls, so a hung Docker daemon or a stalled SSH status call
-	// is interrupted AT the deadline instead of blocking far past --wait-timeout.
-	// waitCtx is a CHILD of ctx: a genuine parent cancellation (user Ctrl-C) also
-	// cancels the poll, and is distinguished from a pure deadline expiry after the
-	// select via ctx.Err() — a parent cancel returns ctx.Err() raw (→ CLI exit 1),
-	// a deadline expiry returns a timed-out report with a nil error (→ exit 2).
-	waitCtx, cancel := context.WithDeadline(ctx, deadline)
-	defer cancel()
 
 	var pollErrs int
 
