@@ -2,6 +2,7 @@ package cmd
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -132,7 +133,14 @@ func runOperation(ctx context.Context, op runner.Operation, all bool, containers
 // crucially, before the composer's remote SSH teardown (LIFO), so a remote
 // `rm -f` of the override file still rides the live ControlMaster socket. deploy,
 // restart and stop pass a nil prep and keep the original code path.
-func runOperationWithPrep(ctx context.Context, op runner.Operation, all bool, containers []string, prep func(context.Context, runner.Composer) (func(), error)) error {
+//
+// prep also returns the set of services the wait phase should gate on. For
+// rollback this is the resolved snapshot services — NOT the raw containers arg,
+// which is nil for `-a` and would otherwise make WaitHealthy resolve the target
+// set via ListServices() (every compose service, dragging build-only /
+// run-to-completion services that were never rolled back into the health gate).
+// An empty waitTargets falls back to containers (the deploy/restart behavior).
+func runOperationWithPrep(ctx context.Context, op runner.Operation, all bool, containers []string, prep func(context.Context, runner.Composer) (func(), []string, error)) error {
 	// Mutex check runs before container-arg validation so that misuse of
 	// `--ssh` together with `--server` reports the mutex error consistently
 	// across subcommands (matching exec/logs/list ordering), regardless of
@@ -193,12 +201,18 @@ func runOperationWithPrep(ctx context.Context, op runner.Operation, all bool, co
 	// print the plan, prepare the digest override). Runs before the pipeline;
 	// a refusal here aborts without touching any container. The cleanup is
 	// deferred so it runs after the wait phase but before the SSH teardown.
+	waitContainers := containers
 	if prep != nil {
-		cleanup, err := prep(ctx, c)
+		cleanup, waitTargets, err := prep(ctx, c)
 		if err != nil {
 			return err
 		}
-		defer cleanup()
+		if cleanup != nil {
+			defer cleanup()
+		}
+		if len(waitTargets) > 0 {
+			waitContainers = waitTargets
+		}
 	}
 
 	logger, err := opNewLogger(logDir)
@@ -242,9 +256,10 @@ func runOperationWithPrep(ctx context.Context, op runner.Operation, all bool, co
 	fmt.Fprintf(os.Stderr, "\nFor details see logfile: %s\n", logger.Path())
 
 	// Health-wait phase. Only deploy and restart register --wait; stop is
-	// excluded defensively so a leaked global can never make a stop wait.
+	// excluded defensively so a leaked global can never make a stop wait. For
+	// rollback, waitContainers is the resolved snapshot service set (see prep).
 	if waitEnabled && op != runner.StopOnly {
-		return waitForHealth(ctx, c, op, containers)
+		return waitForHealth(ctx, c, op, waitContainers)
 	}
 
 	return nil
@@ -263,6 +278,15 @@ func waitForHealth(ctx context.Context, c runner.Composer, op runner.Operation, 
 	fmt.Fprintf(os.Stderr, "\nWaiting for health (timeout %s)...\n", timeout)
 	report, err := runner.WaitHealthy(ctx, c, containers, runner.WaitOptions{Timeout: timeout})
 	fmt.Fprint(os.Stderr, formatWaitReport(report))
+
+	// An operator interrupt (Ctrl-C cancels the signal context) is NOT a health
+	// failure: return the raw error so main.go treats it as a generic abort
+	// (exit 1), the same as interrupting the pipeline itself — never exit 2, and
+	// never the rollback hint, which would misread a deliberate abort as
+	// "deployed but unhealthy".
+	if errors.Is(err, context.Canceled) {
+		return err
+	}
 
 	if err != nil || !report.OK {
 		if op == runner.Deploy {
@@ -335,19 +359,17 @@ func recordSnapshot(ctx context.Context, s snapshotter, services []string, warn 
 	}
 }
 
-// waitVerdictIcon maps a verdict to a colored status glyph, reusing the ♥/✗/~
-// vocabulary of the list command: ♥ for a healthy pass, ● for a no-healthcheck
-// running pass, ✗ for any failure, ~ for still-pending.
+// waitVerdictIcon renders the shared verdict glyph (runner.WaitVerdict.Icon)
+// with the CLI's colors: green for a pass, yellow for pending, red for failure.
 func waitVerdictIcon(v runner.WaitVerdict) string {
-	switch v {
-	case runner.VerdictHealthy:
-		return styleOK.Render("♥")
-	case runner.VerdictRunningNoHC:
-		return styleOK.Render("●")
-	case runner.VerdictPending:
-		return styleWarning.Render("~")
+	icon := v.Icon()
+	switch {
+	case v.OK():
+		return styleOK.Render(icon)
+	case v == runner.VerdictPending:
+		return styleWarning.Render(icon)
 	default:
-		return styleFailed.Render("✗")
+		return styleFailed.Render(icon)
 	}
 }
 

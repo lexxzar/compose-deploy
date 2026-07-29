@@ -13092,8 +13092,15 @@ func TestPipelineDone_EmptyTargetsFallsBackToServices(t *testing.T) {
 	if !m.waiting {
 		t.Fatal("waiting should start with a services fallback target set")
 	}
-	if len(m.waitState.Services) != 2 {
-		t.Errorf("waitState.Services = %v, want [web db]", m.waitState.Services)
+	// The fallback target set must be exactly m.services, in order.
+	want := []string{"web", "db"}
+	if len(m.waitState.Services) != len(want) {
+		t.Fatalf("waitState.Services = %v, want %v", m.waitState.Services, want)
+	}
+	for i, svc := range want {
+		if m.waitState.Services[i] != svc {
+			t.Errorf("waitState.Services[%d] = %q, want %q", i, m.waitState.Services[i], svc)
+		}
 	}
 }
 
@@ -13774,6 +13781,135 @@ func TestEscSkipDuringWait_DefersRollbackCleanup(t *testing.T) {
 	m = updated.(Model)
 	if calls != 1 {
 		t.Errorf("cleanup should run once on leaving progress, got %d", calls)
+	}
+}
+
+// TestCtrlCOnProgress_LocalRunsRollbackCleanup (Q5): a hard exit (ctrl+c → quit)
+// during a local rollback wait must remove the override temp file — otherwise it
+// leaks because the esc-only cleanup path is skipped on quit.
+func TestCtrlCOnProgress_LocalRunsRollbackCleanup(t *testing.T) {
+	calls := 0
+	m := Model{
+		screen:          screenProgress,
+		waiting:         true,
+		done:            true,
+		pendingOp:       runner.Rollback,
+		composer:        &mockComposer{},
+		ctx:             context.Background(),
+		rollbackCleanup: func() { calls++ },
+		waitSession:     1,
+		// disconnectFunc nil → local session → ctrl+c quits immediately.
+	}
+	m.waitState = runner.NewWaitState([]string{"web"})
+	m.waitDeadline = time.Now().Add(runner.DefaultWaitTimeout)
+
+	updated, cmd := m.Update(tea.KeyMsg{Type: tea.KeyCtrlC})
+	m = updated.(Model)
+	if calls != 1 {
+		t.Fatalf("rollbackCleanup calls = %d, want 1 on hard-quit", calls)
+	}
+	if m.rollbackCleanup != nil {
+		t.Error("rollbackCleanup should be cleared after invocation")
+	}
+	if cmd == nil {
+		t.Fatal("expected a quit command")
+	}
+	if _, ok := cmd().(tea.QuitMsg); !ok {
+		t.Errorf("expected tea.QuitMsg, got %T", cmd())
+	}
+}
+
+// TestCtrlCOnProgress_RemoteRunsCleanupOnConfirm (Q5): on a remote session the
+// ctrl+c shows the disconnect prompt (no cleanup yet); the cleanup runs only when
+// the user confirms with "y", while the ControlMaster socket is still live.
+func TestCtrlCOnProgress_RemoteRunsCleanupOnConfirm(t *testing.T) {
+	calls := 0
+	m := Model{
+		screen:          screenProgress,
+		waiting:         true,
+		done:            true,
+		pendingOp:       runner.Rollback,
+		composer:        &mockComposer{},
+		ctx:             context.Background(),
+		rollbackCleanup: func() { calls++ },
+		waitSession:     1,
+		disconnectFunc:  func() error { return nil }, // remote session
+		serverName:      "prod",
+	}
+	m.waitState = runner.NewWaitState([]string{"web"})
+	m.waitDeadline = time.Now().Add(runner.DefaultWaitTimeout)
+
+	// ctrl+c → confirmation prompt, cleanup deferred.
+	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyCtrlC})
+	m = updated.(Model)
+	if !m.quitting {
+		t.Fatal("ctrl+c on a remote session should show the disconnect prompt")
+	}
+	if calls != 0 {
+		t.Error("cleanup must NOT run until the quit is confirmed")
+	}
+	// Confirm quit → cleanup runs before teardown.
+	updated, cmd := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'y'}})
+	m = updated.(Model)
+	if calls != 1 {
+		t.Fatalf("rollbackCleanup calls = %d, want 1 after confirming quit", calls)
+	}
+	if cmd == nil || func() bool { _, ok := cmd().(tea.QuitMsg); return !ok }() {
+		t.Error("confirming quit should return tea.QuitMsg")
+	}
+}
+
+// TestHumanizeAge (T2) pins the four relative-age ranges.
+func TestHumanizeAge(t *testing.T) {
+	cases := []struct {
+		d    time.Duration
+		want string
+	}{
+		{30 * time.Second, "moments ago"},
+		{5 * time.Minute, "5m ago"},
+		{3 * time.Hour, "3h ago"},
+		{50 * time.Hour, "2d ago"},
+	}
+	for _, c := range cases {
+		if got := humanizeAge(c.d); got != c.want {
+			t.Errorf("humanizeAge(%v) = %q, want %q", c.d, got, c.want)
+		}
+	}
+}
+
+// TestRollbackAgeSuffix_PicksNewest (T2): with two target entries of different
+// ages the suffix reflects the NEWEST recorded_at (the most representative
+// "last deploy"), not the oldest.
+func TestRollbackAgeSuffix_PicksNewest(t *testing.T) {
+	now := time.Now().UTC()
+	m := Model{
+		rollbackSnapshot: &compose.Snapshot{
+			Services: map[string]compose.SnapshotEntry{
+				"web": {RecordedAt: now.Add(-3 * time.Hour).Format(time.RFC3339)},
+				"db":  {RecordedAt: now.Add(-50 * time.Hour).Format(time.RFC3339)},
+			},
+		},
+	}
+	got := m.rollbackAgeSuffix([]string{"web", "db"})
+	if !strings.Contains(got, "to snapshot") {
+		t.Errorf("rollbackAgeSuffix = %q, want the 'to snapshot' prefix", got)
+	}
+	if !strings.Contains(got, "3h ago") {
+		t.Errorf("rollbackAgeSuffix = %q, want the NEWEST age (3h ago), not the oldest (2d)", got)
+	}
+}
+
+// TestRollbackAgeSuffix_NilSnapshotEmpty (T2): no snapshot → empty suffix so the
+// confirm prompt degrades to the plain service list.
+func TestRollbackAgeSuffix_NilSnapshotEmpty(t *testing.T) {
+	m := Model{}
+	if got := m.rollbackAgeSuffix([]string{"web"}); got != "" {
+		t.Errorf("rollbackAgeSuffix with nil snapshot = %q, want empty", got)
+	}
+	// A snapshot with no parseable ages also degrades to empty.
+	m.rollbackSnapshot = &compose.Snapshot{Services: map[string]compose.SnapshotEntry{"web": {RecordedAt: "not-a-time"}}}
+	if got := m.rollbackAgeSuffix([]string{"web"}); got != "" {
+		t.Errorf("rollbackAgeSuffix with unparseable age = %q, want empty", got)
 	}
 }
 

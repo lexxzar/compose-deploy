@@ -1216,6 +1216,158 @@ func TestFormatWaitReport(t *testing.T) {
 	}
 }
 
+// newWaitTestCompose extends newTestCompose's hooks to also script the
+// ContainerStatus poll (`compose ps -a --format json`) the --wait phase drives,
+// plus best-effort empty snapshot data (`config`/`ps`). psJSON is returned for the
+// `ps -a` status query.
+func newWaitTestCompose(dir string, mock *opMockComposer, psJSON string) *compose.Compose {
+	c := compose.New(dir)
+	c.SetTestHooks(
+		func(cmd *exec.Cmd) error {
+			args := strings.Join(cmd.Args, " ")
+			switch {
+			case strings.Contains(args, "stop"):
+				return mock.Stop(context.Background(), nil, cmd.Stdout)
+			case strings.Contains(args, "rm"):
+				return mock.Remove(context.Background(), nil, cmd.Stdout)
+			case strings.Contains(args, "pull"):
+				return mock.Pull(context.Background(), nil, cmd.Stdout)
+			case strings.Contains(args, "up"):
+				return mock.Create(context.Background(), nil, cmd.Stdout)
+			case strings.Contains(args, "start"):
+				return mock.Start(context.Background(), nil, cmd.Stdout)
+			}
+			return nil
+		},
+		func(cmd *exec.Cmd) ([]byte, error) {
+			args := strings.Join(cmd.Args, " ")
+			switch {
+			case strings.Contains(args, "version"):
+				return []byte("Docker Compose version v2.24.0\n"), nil
+			case strings.Contains(args, "ps") && strings.Contains(args, "-a"):
+				return []byte(psJSON), nil // ContainerStatus for the wait
+			case strings.Contains(args, "config"):
+				return []byte(`{"services":{}}`), nil // snapshot: no services
+			case strings.Contains(args, "ps"):
+				return []byte("[]"), nil // snapshot: nothing running
+			}
+			return nil, nil
+		},
+	)
+	return c
+}
+
+// runWaitOperation wires the --wait globals and a scripted compose, runs the
+// operation, and returns its error plus everything written to stderr.
+func runWaitOperation(t *testing.T, op runner.Operation, containers []string, psJSON string, timeout time.Duration) (error, string) {
+	t.Helper()
+	t.Setenv("HOME", t.TempDir())
+
+	oldNew, oldLogger, oldProj, oldServer, oldLogDir := opNewLocal, opNewLogger, projectDir, serverName, logDir
+	oldWait, oldTimeout := waitEnabled, waitTimeout
+	t.Cleanup(func() {
+		opNewLocal, opNewLogger, projectDir, serverName, logDir = oldNew, oldLogger, oldProj, oldServer, oldLogDir
+		waitEnabled, waitTimeout = oldWait, oldTimeout
+	})
+
+	mock := &opMockComposer{}
+	opNewLocal = func(dir string) *compose.Compose { return newWaitTestCompose(dir, mock, psJSON) }
+	opNewLogger = func(dir string) (*logging.Logger, error) { return logging.NewLogger(t.TempDir()) }
+	projectDir, serverName, logDir = "", "", t.TempDir()
+	waitEnabled, waitTimeout = true, timeout
+
+	oldStderr := os.Stderr
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	os.Stderr = w
+	runErr := runOperation(context.Background(), op, false, containers)
+	w.Close()
+	os.Stderr = oldStderr
+	var buf strings.Builder
+	if _, cerr := io.Copy(&buf, r); cerr != nil {
+		t.Fatal(cerr)
+	}
+	return runErr, buf.String()
+}
+
+// TestRunOperation_WaitHealthy (T1/AC1): a --wait deploy whose services report
+// healthy exits with no error (also exercises the timeout<=0 default fallback).
+func TestRunOperation_WaitHealthy(t *testing.T) {
+	ps := `[{"Service":"web","State":"running","Health":"healthy","Status":"Up 5 minutes (healthy)"}]`
+	err, stderr := runWaitOperation(t, runner.Deploy, []string{"web"}, ps, 0) // 0 → default fallback
+	if err != nil {
+		t.Fatalf("healthy --wait deploy should succeed, got: %v", err)
+	}
+	if !strings.Contains(stderr, "All services healthy") {
+		t.Errorf("stderr missing the success line:\n%s", stderr)
+	}
+}
+
+// TestRunOperation_WaitUnhealthyDeploy (T1/AC1): a --wait deploy whose service is
+// unhealthy returns a *WaitError (exit 2) and prints the rollback hint.
+func TestRunOperation_WaitUnhealthyDeploy(t *testing.T) {
+	ps := `[{"Service":"web","State":"running","Health":"unhealthy","Status":"Up 5 minutes (unhealthy)"}]`
+	err, stderr := runWaitOperation(t, runner.Deploy, []string{"web"}, ps, 30*time.Second)
+	var we *WaitError
+	if !errors.As(err, &we) {
+		t.Fatalf("unhealthy --wait deploy should return *WaitError, got: %v", err)
+	}
+	if !strings.Contains(stderr, "run 'cdeploy rollback'") {
+		t.Errorf("deploy wait-failure must print the rollback hint:\n%s", stderr)
+	}
+}
+
+// TestRunOperation_WaitUnhealthyRestart (T1): a --wait restart failure also
+// returns a *WaitError but must NOT print the deploy-only rollback hint.
+func TestRunOperation_WaitUnhealthyRestart(t *testing.T) {
+	ps := `[{"Service":"web","State":"running","Health":"unhealthy","Status":"Up 5 minutes (unhealthy)"}]`
+	err, stderr := runWaitOperation(t, runner.Restart, []string{"web"}, ps, 30*time.Second)
+	var we *WaitError
+	if !errors.As(err, &we) {
+		t.Fatalf("unhealthy --wait restart should return *WaitError, got: %v", err)
+	}
+	if strings.Contains(stderr, "run 'cdeploy rollback'") {
+		t.Errorf("restart wait-failure must NOT print the deploy-only rollback hint:\n%s", stderr)
+	}
+}
+
+// TestWaitForHealth_CtxCancelNotWaitError (Q4): an operator interrupt (canceled
+// context) must NOT be wrapped in *WaitError — that would map to exit 2 and
+// misreport a deliberate Ctrl-C as "deployed but unhealthy".
+func TestWaitForHealth_CtxCancelNotWaitError(t *testing.T) {
+	oldWait, oldTimeout := waitEnabled, waitTimeout
+	t.Cleanup(func() { waitEnabled, waitTimeout = oldWait, oldTimeout })
+	waitTimeout = 30 * time.Second
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel() // pre-cancel: WaitHealthy returns context.Canceled on its first check
+
+	oldStderr := os.Stderr
+	r, w, _ := os.Pipe()
+	os.Stderr = w
+	err := waitForHealth(ctx, &opMockComposer{}, runner.Deploy, []string{"web"})
+	w.Close()
+	os.Stderr = oldStderr
+	var sb strings.Builder
+	_, _ = io.Copy(&sb, r)
+
+	if err == nil {
+		t.Fatal("expected an error on canceled context")
+	}
+	var we *WaitError
+	if errors.As(err, &we) {
+		t.Errorf("ctx-cancel must not be a *WaitError (would exit 2), got %v", err)
+	}
+	if !errors.Is(err, context.Canceled) {
+		t.Errorf("error should unwrap to context.Canceled, got %v", err)
+	}
+	if strings.Contains(sb.String(), "run 'cdeploy rollback'") {
+		t.Errorf("interrupt must not print the rollback hint:\n%s", sb.String())
+	}
+}
+
 func TestRunOperation_LocalDetectFailure(t *testing.T) {
 	oldNew := opNewLocal
 	oldProj := projectDir

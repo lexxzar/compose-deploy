@@ -3077,6 +3077,79 @@ func TestRemoteWriteSnapshot_MergeAndWrite(t *testing.T) {
 	}
 }
 
+// TestRemoteWriteSnapshot_RefusesFutureSchema: a future-schema remote state file
+// must NOT be clobbered — WriteSnapshot aborts and never pipes a downgraded file.
+func TestRemoteWriteSnapshot_RefusesFutureSchema(t *testing.T) {
+	wrote := false
+	r := &RemoteCompose{
+		Host:       "user@example.com",
+		ProjectDir: "/proj",
+		SocketPath: "/tmp/cdeploy-ctrl-abc-99",
+		outputCmd: func(cmd *exec.Cmd) ([]byte, error) {
+			return []byte(`{"schema":2,"project_dir":"/proj","services":{}}`), nil
+		},
+		runCmd: func(cmd *exec.Cmd) error { wrote = true; return nil },
+	}
+	fresh := &Snapshot{Schema: snapshotSchemaVersion, Services: map[string]SnapshotEntry{"web": {Digest: "sha256:w"}}}
+	if err := r.WriteSnapshot(context.Background(), fresh); err == nil {
+		t.Fatal("WriteSnapshot must refuse to overwrite a future-schema remote file")
+	}
+	if wrote {
+		t.Error("writeRemoteFile must not run when the write is aborted")
+	}
+}
+
+// TestRemoteWriteSnapshot_RefusesUnreadable: a transient SSH read failure must
+// abort the write so a flaky round-trip never wipes the remote merge history.
+func TestRemoteWriteSnapshot_RefusesUnreadable(t *testing.T) {
+	wrote := false
+	r := &RemoteCompose{
+		Host:       "user@example.com",
+		ProjectDir: "/proj",
+		SocketPath: "/tmp/cdeploy-ctrl-abc-99",
+		outputCmd: func(cmd *exec.Cmd) ([]byte, error) {
+			return nil, fmt.Errorf("ssh timeout")
+		},
+		runCmd: func(cmd *exec.Cmd) error { wrote = true; return nil },
+	}
+	fresh := &Snapshot{Schema: snapshotSchemaVersion, Services: map[string]SnapshotEntry{"web": {Digest: "sha256:w"}}}
+	if err := r.WriteSnapshot(context.Background(), fresh); err == nil {
+		t.Fatal("WriteSnapshot must abort on a transient remote read failure")
+	}
+	if wrote {
+		t.Error("writeRemoteFile must not run when the write is aborted")
+	}
+}
+
+// TestRemoteWriteSnapshot_OverwritesCorrupt: a malformed-JSON remote file is
+// safe to overwrite (it carries no interpretable merge history).
+func TestRemoteWriteSnapshot_OverwritesCorrupt(t *testing.T) {
+	var written []byte
+	r := &RemoteCompose{
+		Host:       "user@example.com",
+		ProjectDir: "/proj",
+		SocketPath: "/tmp/cdeploy-ctrl-abc-99",
+		outputCmd: func(cmd *exec.Cmd) ([]byte, error) {
+			return []byte("{not json"), nil
+		},
+		runCmd: func(cmd *exec.Cmd) error {
+			written, _ = io.ReadAll(cmd.Stdin)
+			return nil
+		},
+	}
+	fresh := &Snapshot{Schema: snapshotSchemaVersion, ProjectDir: remoteProjectDir("/proj"), Services: map[string]SnapshotEntry{"web": {Digest: "sha256:w"}}}
+	if err := r.WriteSnapshot(context.Background(), fresh); err != nil {
+		t.Fatalf("WriteSnapshot over corrupt file: %v", err)
+	}
+	got, err := parseSnapshot(written)
+	if err != nil {
+		t.Fatalf("parsing written snapshot: %v", err)
+	}
+	if got.Services["web"].Digest != "sha256:w" {
+		t.Errorf("fresh snapshot not written over corrupt file: %+v", got.Services)
+	}
+}
+
 func TestRunRemoteDockerCmdStream_Argv(t *testing.T) {
 	extras := []string{"-i", "/tmp/key"}
 	host := "user@example.com"

@@ -989,24 +989,36 @@ func (r *RemoteCompose) runningContainerIDs(ctx context.Context) (map[string]str
 // `docker inspect` is a top-level docker CLI command, not a compose subcommand;
 // runRemoteDockerCmd shell-escapes each arg and splices SSHExtraArgs before the
 // host (same convention as CheckUpdates' inspect calls). Output order is
-// preserved by `docker inspect`, so image IDs are zipped back positionally; a
-// line-count mismatch is treated as an error.
+// preserved by `docker inspect`, so image IDs are zipped back positionally.
+//
+// If the batch fails or returns a mismatched line count (a container vanished
+// between `ps` and `inspect`), it falls back to inspecting each container
+// individually so one disappearing container only drops its own entry instead of
+// failing the whole capture — mirrors Compose.inspectContainerImageIDs. A partial
+// result is not an error (best-effort, warn-and-proceed snapshot contract).
 func (r *RemoteCompose) inspectContainerImageIDs(ctx context.Context, containerIDs []string) (map[string]string, error) {
 	if len(containerIDs) == 0 {
 		return map[string]string{}, nil
 	}
 	args := append([]string{"inspect", "--format", "{{.Image}}"}, containerIDs...)
-	out, err := r.runRemoteDockerCmd(ctx, args)
-	if err != nil {
-		return nil, err
-	}
-	lines := nonEmptyLines(string(out))
-	if len(lines) != len(containerIDs) {
-		return nil, fmt.Errorf("docker inspect returned %d image IDs for %d containers", len(lines), len(containerIDs))
+	if out, err := r.runRemoteDockerCmd(ctx, args); err == nil {
+		if lines := nonEmptyLines(string(out)); len(lines) == len(containerIDs) {
+			m := make(map[string]string, len(containerIDs))
+			for i, id := range containerIDs {
+				m[id] = lines[i]
+			}
+			return m, nil
+		}
 	}
 	m := make(map[string]string, len(containerIDs))
-	for i, id := range containerIDs {
-		m[id] = lines[i]
+	for _, id := range containerIDs {
+		out, err := r.runRemoteDockerCmd(ctx, []string{"inspect", "--format", "{{.Image}}", id})
+		if err != nil {
+			continue
+		}
+		if lines := nonEmptyLines(string(out)); len(lines) == 1 {
+			m[id] = lines[0]
+		}
 	}
 	return m, nil
 }
@@ -1097,13 +1109,17 @@ func (r *RemoteCompose) ReadSnapshot(ctx context.Context) (*Snapshot, error) {
 }
 
 // WriteSnapshot merges fresh into the existing remote state file (if any) and
-// writes the result atomically over SSH. A corrupt or unreadable existing file
-// is ignored (treated as empty) so a single bad state file never blocks
-// recording a fresh, good snapshot — the per-service merge safety net is
-// best-effort, mirroring Compose.WriteSnapshot. Both composers satisfy the
-// same read+merge+write seam consumed by the deploy/rollback flows.
+// writes the result atomically over SSH. A missing or malformed-JSON existing
+// file is treated as empty so one bad state file never blocks recording a fresh,
+// good snapshot; a future-schema file or a transient SSH/read failure instead
+// ABORTS the write (see existingForMerge) so the merge history is preserved
+// rather than clobbered. Mirrors Compose.WriteSnapshot. Both composers satisfy
+// the same read+merge+write seam consumed by the deploy/rollback flows.
 func (r *RemoteCompose) WriteSnapshot(ctx context.Context, fresh *Snapshot) error {
-	existing, _ := r.ReadSnapshot(ctx) // ignore read/parse errors: overwrite a corrupt state
+	existing, err := existingForMerge(r.ReadSnapshot(ctx))
+	if err != nil {
+		return fmt.Errorf("refusing to overwrite snapshot state: %w", err)
+	}
 	merged := mergeSnapshot(existing, fresh)
 	data, err := json.MarshalIndent(merged, "", "  ")
 	if err != nil {

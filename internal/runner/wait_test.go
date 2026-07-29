@@ -372,6 +372,25 @@ func TestWaitVerdict_Labels(t *testing.T) {
 	}
 }
 
+// TestWaitVerdict_Icon pins the shared glyphs (the CLI table and TUI both render
+// WaitVerdict.Icon and style it themselves — single source of truth).
+func TestWaitVerdict_Icon(t *testing.T) {
+	cases := map[WaitVerdict]string{
+		VerdictHealthy:     "♥",
+		VerdictRunningNoHC: "●",
+		VerdictPending:     "~",
+		VerdictUnhealthy:   "✗",
+		VerdictExited:      "✗",
+		VerdictRestarting:  "✗",
+		VerdictTimedOut:    "✗",
+	}
+	for v, want := range cases {
+		if got := v.Icon(); got != want {
+			t.Errorf("%q.Icon() = %q, want %q", v, got, want)
+		}
+	}
+}
+
 func TestWaitOptions_Normalize(t *testing.T) {
 	got := WaitOptions{}.normalize()
 	if got.Timeout != DefaultWaitTimeout {

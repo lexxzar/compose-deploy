@@ -216,23 +216,6 @@ func TestRollbackPlanLine(t *testing.T) {
 	}
 }
 
-func TestStripImageTag(t *testing.T) {
-	cases := map[string]string{
-		"nginx:latest":                "nginx",
-		"nginx":                       "nginx",
-		"localhost:5000/foo:1.2":      "localhost:5000/foo",
-		"localhost:5000/foo":          "localhost:5000/foo",
-		"repo/name:tag":               "repo/name",
-		"nginx@sha256:abc":            "nginx",
-		"registry.io:443/team/app:v2": "registry.io:443/team/app",
-	}
-	for in, want := range cases {
-		if got := stripImageTag(in); got != want {
-			t.Errorf("stripImageTag(%q) = %q, want %q", in, got, want)
-		}
-	}
-}
-
 func TestFormatRecordedAt(t *testing.T) {
 	if got := formatRecordedAt("2026-07-28T14:03:00Z"); got != "2026-07-28 14:03" {
 		t.Errorf("formatRecordedAt = %q, want %q", got, "2026-07-28 14:03")
@@ -297,7 +280,7 @@ func TestRollbackPrep_NoSnapshot(t *testing.T) {
 	m := newRollbackMock() // snap == nil → missing state file
 	var buf bytes.Buffer
 
-	_, err := rollbackPrep(false, []string{"web"}, &buf)(context.Background(), m)
+	_, _, err := rollbackPrep(false, []string{"web"}, &buf)(context.Background(), m)
 	if err == nil {
 		t.Fatal("expected refusal for missing snapshot")
 	}
@@ -316,7 +299,7 @@ func TestRollbackPrep_SchemaMismatchPropagates(t *testing.T) {
 	m.readErr = errors.New("unsupported snapshot schema: 2")
 	var buf bytes.Buffer
 
-	_, err := rollbackPrep(true, nil, &buf)(context.Background(), m)
+	_, _, err := rollbackPrep(true, nil, &buf)(context.Background(), m)
 	if err == nil {
 		t.Fatal("expected error for schema mismatch")
 	}
@@ -333,7 +316,7 @@ func TestRollbackPrep_MissingServiceRefused(t *testing.T) {
 	m.snap = snapWith("web")
 	var buf bytes.Buffer
 
-	_, err := rollbackPrep(false, []string{"db"}, &buf)(context.Background(), m)
+	_, _, err := rollbackPrep(false, []string{"db"}, &buf)(context.Background(), m)
 	if err == nil {
 		t.Fatal("expected refusal naming the missing service")
 	}
@@ -350,7 +333,7 @@ func TestRollbackPrep_HappyPathPrintsPlanAndPrepares(t *testing.T) {
 	m.snap = snapWith("web", "db")
 	var buf bytes.Buffer
 
-	cleanup, err := rollbackPrep(true, nil, &buf)(context.Background(), m)
+	cleanup, targets, err := rollbackPrep(true, nil, &buf)(context.Background(), m)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -363,6 +346,11 @@ func TestRollbackPrep_HappyPathPrintsPlanAndPrepares(t *testing.T) {
 	// -a → all snapshot services, sorted.
 	if len(m.prepSvcs) != 2 || m.prepSvcs[0] != "db" || m.prepSvcs[1] != "web" {
 		t.Errorf("PrepareRollback services = %v, want [db web]", m.prepSvcs)
+	}
+	// Q2: the wait phase must gate on the resolved snapshot services (not nil,
+	// which would resolve to every compose service via ListServices).
+	if len(targets) != 2 || targets[0] != "db" || targets[1] != "web" {
+		t.Errorf("wait targets = %v, want [db web] (the resolved snapshot services)", targets)
 	}
 	out := buf.String()
 	if !strings.Contains(out, "Rollback plan:") {
@@ -381,7 +369,7 @@ func TestRollbackPrep_PrepareFailureSurfaced(t *testing.T) {
 	m.prepErr = errors.New("image sha256:deadbeef unavailable (pull failed)")
 	var buf bytes.Buffer
 
-	_, err := rollbackPrep(false, []string{"web"}, &buf)(context.Background(), m)
+	_, _, err := rollbackPrep(false, []string{"web"}, &buf)(context.Background(), m)
 	if err == nil {
 		t.Fatal("expected prepare failure to surface")
 	}
@@ -394,7 +382,7 @@ func TestRollbackPrep_UnsupportedComposer(t *testing.T) {
 	// A composer that satisfies runner.Composer but NOT rollbackPreparer is
 	// rejected with a clear error (never silently skipped).
 	var buf bytes.Buffer
-	_, err := rollbackPrep(false, []string{"web"}, &buf)(context.Background(), &opMockComposer{})
+	_, _, err := rollbackPrep(false, []string{"web"}, &buf)(context.Background(), &opMockComposer{})
 	if err == nil {
 		t.Fatal("expected error for a composer without rollback support")
 	}

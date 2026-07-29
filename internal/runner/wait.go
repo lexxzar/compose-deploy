@@ -59,6 +59,24 @@ func (v WaitVerdict) OK() bool {
 	return v == VerdictHealthy || v == VerdictRunningNoHC
 }
 
+// Icon returns the compact status glyph for a verdict: ♥ for a healthy pass, ●
+// for a no-healthcheck running pass, ~ for still-pending, ✗ for any failure. It
+// is the single source of truth for the glyph (mirroring compose.UpdateGlyph);
+// the CLI verdict table and the TUI progress screen each apply their own color
+// styling around it.
+func (v WaitVerdict) Icon() string {
+	switch v {
+	case VerdictHealthy:
+		return "♥"
+	case VerdictRunningNoHC:
+		return "●"
+	case VerdictPending:
+		return "~"
+	default:
+		return "✗"
+	}
+}
+
 // WaitOptions tunes the health wait. Zero-value fields fall back to the
 // package defaults via normalize().
 type WaitOptions struct {

@@ -426,7 +426,7 @@ npx skills add lexxzar/compose-deploy
 gh skill install lexxzar/compose-deploy
 ```
 
-**What the skill teaches:** setting up `~/.cdeploy/servers.yml` and key-based SSH from scratch (servers, groups, badge colors, ad-hoc `--ssh`/`--identity`/`--project-dir` for CI); read-only inspection (`list --json` with `--stats`/`--updates`, `logs` with tail, and the stale-image sweep for spotting containers running behind the registry); and a safety protocol for mutating operations — restate the target services and server and confirm before deploying/restarting/stopping, never assume `-a`, and verify with `list` afterwards.
+**What the skill teaches:** setting up `~/.cdeploy/servers.yml` and key-based SSH from scratch (servers, groups, badge colors, ad-hoc `--ssh`/`--identity`/`--project-dir` for CI); read-only inspection (`list --json` with `--stats`/`--updates`, `logs` with tail, and the stale-image sweep for spotting containers running behind the registry); and a safety protocol for mutating operations — restate the target services and server and confirm before deploying/restarting/stopping/rolling back, never assume `-a`, and verify with `list` afterwards.
 
 ## License
 

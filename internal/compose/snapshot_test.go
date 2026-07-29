@@ -520,6 +520,161 @@ func TestSnapshotServicesInspectBypassesCompose(t *testing.T) {
 	}
 }
 
+// TestParseRunningContainerIDs exercises the array, NDJSON, empty, and
+// malformed branches plus the running-vs-stopped filter.
+func TestParseRunningContainerIDs(t *testing.T) {
+	t.Run("array", func(t *testing.T) {
+		m, err := parseRunningContainerIDs([]byte(
+			`[{"ID":"c1","Service":"web","State":"running"},{"ID":"c2","Service":"db","State":"exited"}]`))
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if m["web"] != "c1" {
+			t.Errorf("web = %q, want c1", m["web"])
+		}
+		if _, ok := m["db"]; ok {
+			t.Errorf("db should be filtered out (not running)")
+		}
+	})
+	t.Run("ndjson", func(t *testing.T) {
+		m, err := parseRunningContainerIDs([]byte(
+			"{\"ID\":\"c1\",\"Service\":\"web\",\"State\":\"running\"}\n{\"ID\":\"c2\",\"Service\":\"web\",\"State\":\"running\"}\n"))
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		// First running replica wins for a scaled service.
+		if m["web"] != "c1" {
+			t.Errorf("web = %q, want the first running replica c1", m["web"])
+		}
+	})
+	t.Run("empty and bracket-empty", func(t *testing.T) {
+		for _, in := range []string{"", "  ", "[]"} {
+			m, err := parseRunningContainerIDs([]byte(in))
+			if err != nil {
+				t.Fatalf("parse(%q): %v", in, err)
+			}
+			if len(m) != 0 {
+				t.Errorf("parse(%q) = %v, want empty", in, m)
+			}
+		}
+	})
+	t.Run("skips empty service or id", func(t *testing.T) {
+		m, err := parseRunningContainerIDs([]byte(
+			`[{"ID":"","Service":"web","State":"running"},{"ID":"c2","Service":"","State":"running"}]`))
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if len(m) != 0 {
+			t.Errorf("entries with empty ID/Service should be skipped, got %v", m)
+		}
+	})
+	t.Run("malformed array errors", func(t *testing.T) {
+		if _, err := parseRunningContainerIDs([]byte(`[{"ID":`)); err == nil {
+			t.Fatal("expected error for malformed JSON array")
+		}
+	})
+	t.Run("malformed ndjson line errors", func(t *testing.T) {
+		if _, err := parseRunningContainerIDs([]byte("{\"ID\":\"c1\"}\n{bad line")); err == nil {
+			t.Fatal("expected error for malformed NDJSON line")
+		}
+	})
+}
+
+// TestSnapshotServices_FetchImagesError: a `compose config` failure aborts the
+// whole capture (mirrors the remote TestRemoteSnapshotServices_PSError shape).
+func TestSnapshotServices_FetchImagesError(t *testing.T) {
+	c := &Compose{
+		ProjectDir: "/proj",
+		UID:        "1000:1000",
+		outputCmd: func(cmd *exec.Cmd) ([]byte, error) {
+			if argsHave(cmd.Args, "config") {
+				return nil, fmt.Errorf("compose config exploded")
+			}
+			return nil, fmt.Errorf("unexpected cmd: %v", cmd.Args)
+		},
+	}
+	if _, err := c.SnapshotServices(context.Background(), nil); err == nil {
+		t.Fatal("expected an error when compose config fails")
+	}
+}
+
+// TestSnapshotServices_PSError: a `compose ps` failure aborts the whole capture.
+func TestSnapshotServices_PSError(t *testing.T) {
+	c := &Compose{
+		ProjectDir: "/proj",
+		UID:        "1000:1000",
+		outputCmd: func(cmd *exec.Cmd) ([]byte, error) {
+			switch {
+			case argsHave(cmd.Args, "config"):
+				return []byte(`{"services":{"web":{"image":"nginx:latest"}}}`), nil
+			case argsHave(cmd.Args, "ps"):
+				return nil, fmt.Errorf("ps exploded")
+			}
+			return nil, fmt.Errorf("unexpected cmd: %v", cmd.Args)
+		},
+	}
+	_, err := c.SnapshotServices(context.Background(), nil)
+	if err == nil {
+		t.Fatal("expected an error when compose ps fails")
+	}
+	if !strings.Contains(err.Error(), "listing containers for snapshot") {
+		t.Errorf("error = %q, want it to mention listing containers", err.Error())
+	}
+}
+
+// TestSnapshotServices_InspectPartialTolerance (Q3): when a container vanishes
+// between `ps` and the batched `docker inspect` (the batch returns fewer lines
+// than IDs), the capture falls back to per-container inspects and still records
+// the survivor rather than failing the whole snapshot.
+func TestSnapshotServices_InspectPartialTolerance(t *testing.T) {
+	c := &Compose{
+		ProjectDir: "/proj",
+		UID:        "1000:1000",
+		outputCmd: func(cmd *exec.Cmd) ([]byte, error) {
+			args := cmd.Args
+			switch {
+			case argsHave(args, "compose") && argsHave(args, "config"):
+				return []byte(`{"services":{"web":{"image":"nginx:latest"},"db":{"image":"postgres:16"}}}`), nil
+			case argsHave(args, "compose") && argsHave(args, "ps"):
+				return []byte(`[{"ID":"cid-web","Service":"web","State":"running"},{"ID":"cid-db","Service":"db","State":"running"}]`), nil
+			case len(args) >= 3 && args[1] == "inspect" && args[2] == "--format":
+				ids := args[4:]
+				if len(ids) > 1 {
+					// Batched call: db vanished → return only web's line (count
+					// mismatch triggers the per-container fallback).
+					return []byte("sha256:img-web\n"), nil
+				}
+				// Per-container fallback.
+				switch ids[0] {
+				case "cid-web":
+					return []byte("sha256:img-web\n"), nil
+				default:
+					return nil, fmt.Errorf("Error: No such container: %s", ids[0])
+				}
+			case len(args) >= 3 && args[1] == "image" && args[2] == "inspect":
+				if args[len(args)-1] == "sha256:img-web" {
+					return []byte("nginx@sha256:ab12\n"), nil
+				}
+				return []byte(""), nil // db has no image id → no digest
+			}
+			return nil, fmt.Errorf("unexpected cmd: %v", args)
+		},
+	}
+	res, err := c.SnapshotServices(context.Background(), nil)
+	if err != nil {
+		t.Fatalf("SnapshotServices must not fail the whole capture on a partial inspect: %v", err)
+	}
+	if res.Snapshot.Services["web"].Digest != "sha256:ab12" {
+		t.Errorf("web should be captured, got %+v", res.Snapshot.Services["web"])
+	}
+	if _, ok := res.Snapshot.Services["db"]; ok {
+		t.Errorf("db (vanished) should be absent, got %+v", res.Snapshot.Services["db"])
+	}
+	if len(res.Warnings) == 0 {
+		t.Error("expected a warning for the vanished db container")
+	}
+}
+
 // warningsContain reports whether any warning mentions both service and a
 // substring — order-independent so tests don't pin the exact message text.
 func warningsContain(warnings []string, service, substr string) bool {
@@ -645,6 +800,62 @@ func TestWriteSnapshotOverwritesCorruptExisting(t *testing.T) {
 	}
 	if got == nil || got.Services["web"].Digest != "sha256:w" {
 		t.Fatalf("fresh snapshot not written over corrupt file: %+v", got)
+	}
+}
+
+// TestWriteSnapshotRefusesFutureSchema: a future-schema existing file must NOT
+// be clobbered (an older binary downgrading a newer format defeats the "never
+// guess" protection). WriteSnapshot aborts and leaves the file intact.
+func TestWriteSnapshotRefusesFutureSchema(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	c := &Compose{ProjectDir: "/proj"}
+	ctx := context.Background()
+
+	path := filepath.Join(home, ".cdeploy", "state", snapshotKey(localProjectDir("/proj"))+".json")
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	future := []byte(`{"schema":2,"project_dir":"/proj","services":{"db":{"digest":"sha256:keepme"}}}`)
+	if err := os.WriteFile(path, future, 0o644); err != nil {
+		t.Fatalf("seed future schema: %v", err)
+	}
+
+	fresh := &Snapshot{
+		Schema:     snapshotSchemaVersion,
+		ProjectDir: localProjectDir("/proj"),
+		Services:   map[string]SnapshotEntry{"web": {Image: "nginx", Digest: "sha256:w"}},
+	}
+	if err := c.WriteSnapshot(ctx, fresh); err == nil {
+		t.Fatal("WriteSnapshot must refuse to overwrite a future-schema file")
+	}
+	got, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("re-reading state file: %v", err)
+	}
+	if string(got) != string(future) {
+		t.Errorf("future-schema file was modified:\n got %q\nwant %q", got, future)
+	}
+}
+
+// TestWriteSnapshotRefusesUnreadable: a transient read failure (here a state path
+// that is a directory, standing in for an IO/transport hiccup) must abort the
+// write so a flaky read never wipes the existing merge history.
+func TestWriteSnapshotRefusesUnreadable(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	c := &Compose{ProjectDir: "/proj"}
+
+	path := filepath.Join(home, ".cdeploy", "state", snapshotKey(localProjectDir("/proj"))+".json")
+	// Make the state path a directory: os.ReadFile returns a non-ErrNotExist
+	// error, which models a transient/IO read failure (not corrupt JSON).
+	if err := os.MkdirAll(path, 0o755); err != nil {
+		t.Fatalf("mkdir state-as-dir: %v", err)
+	}
+
+	fresh := &Snapshot{Schema: snapshotSchemaVersion, Services: map[string]SnapshotEntry{"web": {Digest: "sha256:w"}}}
+	if err := c.WriteSnapshot(context.Background(), fresh); err == nil {
+		t.Fatal("WriteSnapshot must abort on an unreadable existing state file")
 	}
 }
 
@@ -792,6 +1003,54 @@ func TestPrepareRollback_OverrideAndFieldOrdering(t *testing.T) {
 		"  web:\n    image: nginx@sha256:ab12\n"
 	if string(got) != want {
 		t.Errorf("override content mismatch:\n got %q\nwant %q", got, want)
+	}
+}
+
+// TestPrepareRollback_RelativeProjectDirAbsolutizesMain (I1): with a RELATIVE
+// -C project dir, the discovered main compose file must be stored ABSOLUTE in
+// ExtraComposeFiles. command() sets cmd.Dir = ProjectDir and docker resolves -f
+// against that cwd, so a relative `-f app/compose.yml` would be re-prefixed to
+// ./app/app/compose.yml and the rollback would fail with "no configuration file".
+func TestPrepareRollback_RelativeProjectDirAbsolutizesMain(t *testing.T) {
+	parent := t.TempDir()
+	t.Chdir(parent)
+	if err := os.MkdirAll("app", 0o755); err != nil {
+		t.Fatalf("mkdir app: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join("app", "compose.yml"), []byte("services: {}\n"), 0o644); err != nil {
+		t.Fatalf("seed compose file: %v", err)
+	}
+	c := &Compose{
+		ProjectDir: "./app", // relative — the interaction the abs fix guards
+		UID:        "1000:1000",
+		outputCmd: func(cmd *exec.Cmd) ([]byte, error) {
+			switch {
+			case argsHave(cmd.Args, "{{.Id}}"):
+				return []byte("sha256:present\n"), nil // already cached → no pull
+			case argsHave(cmd.Args, "config"):
+				return []byte(`{"services":{}}`), nil // advisory: no services
+			case argsHave(cmd.Args, "ps"):
+				return []byte(`[]`), nil // advisory: nothing running
+			}
+			return nil, fmt.Errorf("unexpected cmd: %v", cmd.Args)
+		},
+	}
+	entries := map[string]SnapshotEntry{"web": {Image: "nginx:latest", Digest: "sha256:ab12"}}
+	var w strings.Builder
+	cleanup, err := c.PrepareRollback(context.Background(), entries, []string{"web"}, &w)
+	if err != nil {
+		t.Fatalf("PrepareRollback: %v", err)
+	}
+	defer cleanup()
+	if len(c.ExtraComposeFiles) != 2 {
+		t.Fatalf("ExtraComposeFiles = %v, want [main, override]", c.ExtraComposeFiles)
+	}
+	main := c.ExtraComposeFiles[0]
+	if !filepath.IsAbs(main) {
+		t.Errorf("main compose file %q is not absolute; a relative -f is re-prefixed against cmd.Dir", main)
+	}
+	if _, err := os.Stat(main); err != nil {
+		t.Errorf("main compose file %q does not resolve to the real file: %v", main, err)
 	}
 }
 

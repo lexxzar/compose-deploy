@@ -234,6 +234,12 @@ func parseLocalDigest(out, imageRef string) string {
 	return first
 }
 
+// StripTag is the exported form of stripTag. It is the single source of truth
+// for deriving the repo portion of an image reference (used by the digest-pin in
+// rollbackImageRef and by cmd/rollback.go's plan-line rendering), so the repo the
+// plan advertises can never diverge from the repo that actually gets pinned.
+func StripTag(ref string) string { return stripTag(ref) }
+
 // stripTag returns the repo portion of an image reference, removing the tag
 // (`:<tag>`) and any explicit digest (`@sha256:...`). Registry hosts with an
 // explicit port (e.g. `localhost:5000/foo`) preserve the port — only the tag

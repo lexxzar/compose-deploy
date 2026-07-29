@@ -35,6 +35,12 @@ const snapshotSchemaVersion = 1
 // and from a not-found (missing file) condition so callers can refuse clearly.
 var errSnapshotSchema = errors.New("unsupported snapshot schema")
 
+// errSnapshotCorrupt wraps a malformed-JSON parse failure so WriteSnapshot can
+// tell "the existing file is garbage, safe to overwrite" apart from a
+// future-schema file (errSnapshotSchema) or a transient read/transport failure —
+// the latter two must NOT clobber the existing merge history.
+var errSnapshotCorrupt = errors.New("corrupt snapshot")
+
 // SnapshotEntry records the digest of the image a single service's running
 // container used at snapshot time. recorded_at is per-service because merge
 // keeps older entries alive across partial deploys (see mergeSnapshot).
@@ -131,7 +137,7 @@ func mergeSnapshot(existing, fresh *Snapshot) *Snapshot {
 func parseSnapshot(data []byte) (*Snapshot, error) {
 	var snap Snapshot
 	if err := json.Unmarshal(data, &snap); err != nil {
-		return nil, fmt.Errorf("parse snapshot: %w", err)
+		return nil, fmt.Errorf("%w: %v", errSnapshotCorrupt, err)
 	}
 	if snap.Schema != snapshotSchemaVersion {
 		return nil, fmt.Errorf("%w: %d", errSnapshotSchema, snap.Schema)
@@ -377,24 +383,42 @@ func parseRunningContainerIDs(data []byte) (map[string]string, error) {
 // image ID. Bypasses c.command() because `docker inspect` is a top-level docker
 // CLI command, not a compose subcommand (same rationale as runDockerCmd's other
 // callers). `docker inspect` preserves argument order in its output, so the
-// image IDs are zipped back to the input container IDs positionally; a
-// line-count mismatch is treated as an error.
+// image IDs are zipped back to the input container IDs positionally.
+//
+// If the batch fails or returns a mismatched line count — a container that was
+// running at `ps` time vanished before `inspect` (docker then exits non-zero and
+// drops that ID's line, making positional zipping unsafe) — it falls back to
+// inspecting each container individually so a single disappearing container only
+// drops its OWN entry instead of failing the whole capture. Containers still
+// missing are simply absent from the returned map; SnapshotServices warns
+// per-service for those. The returned error is reserved for the (rare) case where
+// even the per-container path can't be attempted; a partial result is not an
+// error, matching the best-effort, warn-and-proceed snapshot contract.
 func (c *Compose) inspectContainerImageIDs(ctx context.Context, containerIDs []string) (map[string]string, error) {
 	if len(containerIDs) == 0 {
 		return map[string]string{}, nil
 	}
 	args := append([]string{"inspect", "--format", "{{.Image}}"}, containerIDs...)
-	out, err := c.runDockerCmd(ctx, args)
-	if err != nil {
-		return nil, err
+	if out, err := c.runDockerCmd(ctx, args); err == nil {
+		if lines := nonEmptyLines(string(out)); len(lines) == len(containerIDs) {
+			m := make(map[string]string, len(containerIDs))
+			for i, id := range containerIDs {
+				m[id] = lines[i]
+			}
+			return m, nil
+		}
 	}
-	lines := nonEmptyLines(string(out))
-	if len(lines) != len(containerIDs) {
-		return nil, fmt.Errorf("docker inspect returned %d image IDs for %d containers", len(lines), len(containerIDs))
-	}
+	// Batch errored or the count didn't line up: a container vanished (or another
+	// per-id error). Re-inspect individually so survivors are still captured.
 	m := make(map[string]string, len(containerIDs))
-	for i, id := range containerIDs {
-		m[id] = lines[i]
+	for _, id := range containerIDs {
+		out, err := c.runDockerCmd(ctx, []string{"inspect", "--format", "{{.Image}}", id})
+		if err != nil {
+			continue
+		}
+		if lines := nonEmptyLines(string(out)); len(lines) == 1 {
+			m[id] = lines[0]
+		}
 	}
 	return m, nil
 }
@@ -451,17 +475,40 @@ func (c *Compose) ReadSnapshot(ctx context.Context) (*Snapshot, error) {
 	return parseSnapshot(data)
 }
 
+// existingForMerge decides how WriteSnapshot treats the result of reading the
+// current on-disk snapshot. A missing file (nil, nil) or a malformed-JSON file
+// (errSnapshotCorrupt) yields a nil existing so the fresh snapshot is written
+// standalone — one garbage state file must not block recording a good one. But a
+// future-schema file (errSnapshotSchema) or a transient read/transport failure is
+// propagated so the write ABORTS rather than clobbering a state file we cannot
+// safely interpret: otherwise an older binary would silently downgrade a
+// newer-schema file, and a single flaky read would wipe the merge history of
+// every service not in the current deploy (defeating merge-not-replace).
+func existingForMerge(existing *Snapshot, err error) (*Snapshot, error) {
+	if err == nil {
+		return existing, nil
+	}
+	if errors.Is(err, errSnapshotCorrupt) {
+		return nil, nil
+	}
+	return nil, err
+}
+
 // WriteSnapshot merges fresh into the existing on-disk snapshot (if any) and
-// writes the result atomically under $HOME/.cdeploy/state/. A corrupt or
-// unreadable existing file is ignored (treated as empty) so a single bad state
-// file never blocks recording a fresh, good snapshot; the per-service merge
-// safety net is best-effort. Not-found is normal (first deploy).
+// writes the result atomically under $HOME/.cdeploy/state/. A missing or
+// malformed-JSON existing file is treated as empty so one bad state file never
+// blocks recording a fresh, good snapshot; a future-schema or transiently
+// unreadable file instead ABORTS the write (see existingForMerge) so the merge
+// history is preserved rather than clobbered. Not-found is normal (first deploy).
 func (c *Compose) WriteSnapshot(ctx context.Context, fresh *Snapshot) error {
 	path, err := c.localStatePath()
 	if err != nil {
 		return err
 	}
-	existing, _ := c.ReadSnapshot(ctx) // ignore read/parse errors: overwrite a corrupt state
+	existing, err := existingForMerge(c.ReadSnapshot(ctx))
+	if err != nil {
+		return fmt.Errorf("refusing to overwrite snapshot state: %w", err)
+	}
 	merged := mergeSnapshot(existing, fresh)
 	return writeSnapshotFile(path, merged)
 }
@@ -549,6 +596,16 @@ func (c *Compose) PrepareRollback(ctx context.Context, entries map[string]Snapsh
 	main, err := c.findComposeFile()
 	if err != nil {
 		return nil, fmt.Errorf("rollback prep: %w", err)
+	}
+	// findComposeFile returns filepath.Join(ProjectDir, name), which stays
+	// RELATIVE when ProjectDir is relative (e.g. `-C ./app`). command() sets
+	// cmd.Dir = ProjectDir and docker resolves `-f` against that cwd, so a
+	// relative `-f app/compose.yml` would be re-prefixed to ./app/app/compose.yml
+	// and fail. Absolutize so the `-f` path is cwd-independent (and the derived
+	// project name stays stable). The remote path uses a bare name + `cd`, so
+	// only the local side needs this.
+	if abs, aerr := filepath.Abs(main); aerr == nil {
+		main = abs
 	}
 
 	// Advisory same-digest check (best-effort, non-fatal).

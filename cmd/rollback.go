@@ -64,24 +64,27 @@ type rollbackPreparer interface {
 // snapshot, applies the refusal rules, prints the plan, and prepares the
 // digest-pinned override. The returned cleanup (removing the override file and
 // resetting ExtraComposeFiles) is handed back to runOperationWithPrep, which
-// defers it. `all` and `containers` are the flag/args captured at command time;
-// out is where the plan lines and pull progress are written (os.Stdout in
-// production, a buffer in tests).
-func rollbackPrep(all bool, containers []string, out io.Writer) func(context.Context, runner.Composer) (func(), error) {
-	return func(ctx context.Context, c runner.Composer) (func(), error) {
+// defers it. The second return value is the resolved snapshot service set, which
+// runOperationWithPrep gates the --wait phase on — for `-a` this is the snapshot
+// services, NOT every compose service (a build-only service that was never rolled
+// back must not be dragged into the health gate). `all` and `containers` are the
+// flag/args captured at command time; out is where the plan lines and pull
+// progress are written (os.Stdout in production, a buffer in tests).
+func rollbackPrep(all bool, containers []string, out io.Writer) func(context.Context, runner.Composer) (func(), []string, error) {
+	return func(ctx context.Context, c runner.Composer) (func(), []string, error) {
 		p, ok := c.(rollbackPreparer)
 		if !ok {
-			return nil, fmt.Errorf("rollback is not supported for this connection")
+			return nil, nil, fmt.Errorf("rollback is not supported for this connection")
 		}
 
 		snap, err := p.ReadSnapshot(ctx)
 		if err != nil {
-			return nil, fmt.Errorf("reading rollback snapshot: %w", err)
+			return nil, nil, fmt.Errorf("reading rollback snapshot: %w", err)
 		}
 
 		targets, err := resolveRollbackTargets(snap, all, containers)
 		if err != nil {
-			return nil, err
+			return nil, nil, err
 		}
 
 		fmt.Fprintln(out, "Rollback plan:")
@@ -89,7 +92,11 @@ func rollbackPrep(all bool, containers []string, out io.Writer) func(context.Con
 			fmt.Fprintf(out, "  %s\n", rollbackPlanLine(svc, snap.Services[svc]))
 		}
 
-		return p.PrepareRollback(ctx, snap.Services, targets, out)
+		cleanup, err := p.PrepareRollback(ctx, snap.Services, targets, out)
+		if err != nil {
+			return nil, nil, err
+		}
+		return cleanup, targets, nil
 	}
 }
 
@@ -142,29 +149,7 @@ func resolveRollbackTargets(snap *compose.Snapshot, all bool, containers []strin
 // a compact preview, and recorded_at is rendered in local-friendly form.
 func rollbackPlanLine(service string, entry compose.SnapshotEntry) string {
 	return fmt.Sprintf("%s  %s@%s (recorded %s)",
-		service, stripImageTag(entry.Image), shortDigest(entry.Digest), formatRecordedAt(entry.RecordedAt))
-}
-
-// stripImageTag drops the tag (and any digest) from a compose image reference,
-// scoping the tag search to the final path component so a registry port like
-// `localhost:5000/foo` is not mistaken for a tag. Mirrors compose.stripTag,
-// re-implemented here to keep the plan-line formatting inside the cmd package.
-func stripImageTag(ref string) string {
-	if at := strings.Index(ref, "@"); at >= 0 {
-		ref = ref[:at]
-	}
-	slash := strings.LastIndex(ref, "/")
-	tail := ref
-	if slash >= 0 {
-		tail = ref[slash+1:]
-	}
-	if colon := strings.LastIndex(tail, ":"); colon >= 0 {
-		if slash >= 0 {
-			return ref[:slash+1+colon]
-		}
-		return tail[:colon]
-	}
-	return ref
+		service, compose.StripTag(entry.Image), shortDigest(entry.Digest), formatRecordedAt(entry.RecordedAt))
 }
 
 // shortDigest truncates the hex portion of a digest for a compact plan preview,

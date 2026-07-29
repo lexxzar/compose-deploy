@@ -1307,9 +1307,25 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 func (m Model) tryQuit() (tea.Model, tea.Cmd) {
 	if m.disconnectFunc != nil {
 		m.quitting = true
-		return m, nil
+		return m, nil // defer cleanup until the confirm ("y") actually quits
 	}
+	// Local session quitting for real: run any pending rollback-prep cleanup
+	// (override temp-file removal + ExtraComposeFiles reset) on the main
+	// goroutine so a hard exit during a rollback wait doesn't leak the file
+	// (the remote /tmp override in particular has no reaper). No-op when no
+	// rollback is in flight. Runs synchronously in Update — never
+	// goroutine-deferred (the documented rollback cleanup-timing race rule).
+	m.runRollbackCleanup()
 	return m, tea.Quit
+}
+
+// runRollbackCleanup invokes and clears the stored rollback-prep cleanup if set.
+// Idempotent (nils the field) so a later leave-progress path can't double-invoke.
+func (m *Model) runRollbackCleanup() {
+	if m.rollbackCleanup != nil {
+		m.rollbackCleanup()
+		m.rollbackCleanup = nil
+	}
 }
 
 func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
@@ -1320,6 +1336,12 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	if m.quitting {
 		switch key {
 		case "y":
+			// Confirmed quit on a remote session: run any pending rollback-prep
+			// cleanup (remote /tmp override rm -f) before tearing down — the
+			// ControlMaster socket is still live here, and Run()'s disconnectFunc
+			// (which closes it) only fires after the tea loop exits. Main
+			// goroutine, never goroutine-deferred (rollback cleanup race rule).
+			m.runRollbackCleanup()
 			return m, tea.Quit
 		case "n", "esc":
 			m.quitting = false
@@ -2336,10 +2358,7 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 				// timing race rule: a concurrent reset would race the wait poll's
 				// ContainerStatus read of ExtraComposeFiles). No-op for non-
 				// rollback ops (cleanup is nil).
-				if m.rollbackCleanup != nil {
-					m.rollbackCleanup()
-					m.rollbackCleanup = nil
-				}
+				m.runRollbackCleanup()
 				// Clear any resolved-but-not-skipped wait verdicts as we leave
 				// the progress screen (esc-skip already cleared them on the
 				// prior press; this covers a natural resolution followed by a
@@ -2654,21 +2673,6 @@ func (m *Model) sweepWaitTimeout() {
 		if !m.waitState.Verdicts[svc].Terminal() {
 			m.waitState.Verdicts[svc] = runner.VerdictTimedOut
 		}
-	}
-}
-
-// waitVerdictIcon maps a verdict to a status glyph, reusing the ♥/●/✗/~
-// vocabulary of the CLI verdict table.
-func waitVerdictIcon(v runner.WaitVerdict) string {
-	switch v {
-	case runner.VerdictHealthy:
-		return "♥"
-	case runner.VerdictRunningNoHC:
-		return "●"
-	case runner.VerdictPending:
-		return "~"
-	default:
-		return "✗"
 	}
 }
 
@@ -4744,7 +4748,7 @@ func (m Model) viewProgress() string {
 				label = "pending"
 			}
 			style := waitVerdictStyle(v)
-			b.WriteString(fmt.Sprintf("  %s %-*s  %s\n", style.Render(waitVerdictIcon(v)), width, svc, style.Render(label)))
+			b.WriteString(fmt.Sprintf("  %s %-*s  %s\n", style.Render(v.Icon()), width, svc, style.Render(label)))
 		}
 
 		// Rollback hint on a failed deploy wait only (a restart/rollback failure
