@@ -150,13 +150,26 @@ func parseSnapshot(data []byte) (*Snapshot, error) {
 }
 
 // buildOverrideYAML renders a minimal compose override pinning each requested
-// service to its snapshot digest (`image: <repo>@<digest>`). The repo is
-// derived from the recorded image reference via stripTag so the tag is dropped
-// and the digest ref is unambiguous. Services are emitted in SORTED order,
-// built from a sorted slice — never by marshaling a map, whose iteration order
-// is random and would make the generated file (and its argv) non-deterministic.
-// Only services present in entries are emitted; a requested service missing
-// from entries is skipped (the caller validates completeness before pinning).
+// service to its snapshot digest (`image: <repo>@<digest>`) AND forcing
+// `pull_policy: never`. The repo is derived from the recorded image reference
+// via stripTag so the tag is dropped and the digest ref is unambiguous.
+//
+// pull_policy: never is load-bearing for offline rollback (AC4). The rollback
+// pipeline has NO Pull step, but its Create step is the shared
+// `docker compose up --no-start`, whose pull behavior is policy-driven. Because
+// this override is stacked as the SECOND `-f` file, its `pull_policy: never`
+// wins the compose merge over whatever the MAIN compose file declares (e.g.
+// `pull_policy: always`), so Create never attempts a registry pull — which
+// would fail during a registry outage, exactly the classic rollback trigger.
+// This is safe because PrepareRollback already presence-checks and pulls the
+// pinned digest blob to the docker host BEFORE the pipeline runs, so the local
+// blob is guaranteed present at Create time.
+//
+// Services are emitted in SORTED order, built from a sorted slice — never by
+// marshaling a map, whose iteration order is random and would make the
+// generated file (and its argv) non-deterministic. Only services present in
+// entries are emitted; a requested service missing from entries is skipped (the
+// caller validates completeness before pinning).
 func buildOverrideYAML(entries map[string]SnapshotEntry, services []string) []byte {
 	names := make([]string, len(services))
 	copy(names, services)
@@ -171,6 +184,7 @@ func buildOverrideYAML(entries map[string]SnapshotEntry, services []string) []by
 		}
 		fmt.Fprintf(&b, "  %s:\n", name)
 		fmt.Fprintf(&b, "    image: %s\n", rollbackImageRef(entry))
+		b.WriteString("    pull_policy: never\n")
 	}
 	return []byte(b.String())
 }
@@ -618,9 +632,12 @@ func (c *Compose) runDockerCmdStream(ctx context.Context, dockerArgs []string, w
 //     touched, so a failed prep never leaves the pipeline half-configured. This
 //     is why offline rollback works: a present blob is never re-pulled.
 //  2. Generates a minimal compose override pinning each service to its snapshot
-//     digest, writes it to a temp file in os.TempDir(), discovers the project's
-//     main compose file, and sets ExtraComposeFiles = [main, override] — main
-//     FIRST because `-f` disables compose's file auto-discovery.
+//     digest AND forcing `pull_policy: never` (so the shared `up --no-start`
+//     Create step never re-pulls during a registry outage — the digest blob is
+//     already present from step 1), writes it to a temp file in os.TempDir(),
+//     discovers the project's main compose file, and sets
+//     ExtraComposeFiles = [main, override] — main FIRST because `-f` disables
+//     compose's file auto-discovery.
 //
 // Best-effort advisory: when a service's CURRENTLY-running container already
 // uses the snapshot digest, an "already at snapshot" line is written to w and

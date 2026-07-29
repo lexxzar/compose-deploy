@@ -339,7 +339,7 @@ Exit `2` lets CI tell "deployed but unhealthy" apart from "pipeline broke midway
 
 ## Rollback
 
-Every `cdeploy deploy` snapshots the image digest each *running* container actually uses to a per-project state file **on the docker host**, before it stops anything. `cdeploy rollback` re-creates the targeted services pinned to those digests via a generated compose override (stop → remove → create → start — **no pull**), so it restores the previous images even when the registry is unreachable, as long as the old image blob is still on the host.
+Every `cdeploy deploy` snapshots the image digest each *running* container actually uses to a per-project state file **on the docker host**, before it stops anything. `cdeploy rollback` re-creates the targeted services pinned to those digests via a generated compose override (stop → remove → create → start — **no pull**), so it restores the previous images even when the registry is unreachable, as long as the old image blob is still on the host. The override also forces `pull_policy: never` on each rolled-back service so the create step can't attempt a registry pull even when the main compose file sets `pull_policy: always`.
 
 ```bash
 # Roll back a single service to its snapshot digest

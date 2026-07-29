@@ -211,7 +211,7 @@ func TestBuildOverrideYAMLSingle(t *testing.T) {
 		"web": {Image: "nginx:latest", Digest: "sha256:ab12"},
 	}
 	got := string(buildOverrideYAML(entries, []string{"web"}))
-	want := "services:\n  web:\n    image: nginx@sha256:ab12\n"
+	want := "services:\n  web:\n    image: nginx@sha256:ab12\n    pull_policy: never\n"
 	if got != want {
 		t.Fatalf("override YAML mismatch:\n got %q\nwant %q", got, want)
 	}
@@ -226,9 +226,9 @@ func TestBuildOverrideYAMLSortedDeterministic(t *testing.T) {
 	// Pass service names in a non-sorted order; output must be sorted.
 	got := string(buildOverrideYAML(entries, []string{"web", "db", "cache"}))
 	want := "services:\n" +
-		"  cache:\n    image: redis@sha256:c\n" +
-		"  db:\n    image: postgres@sha256:d\n" +
-		"  web:\n    image: nginx@sha256:w\n"
+		"  cache:\n    image: redis@sha256:c\n    pull_policy: never\n" +
+		"  db:\n    image: postgres@sha256:d\n    pull_policy: never\n" +
+		"  web:\n    image: nginx@sha256:w\n    pull_policy: never\n"
 	if got != want {
 		t.Fatalf("override YAML not sorted:\n got %q\nwant %q", got, want)
 	}
@@ -247,7 +247,7 @@ func TestBuildOverrideYAMLSubsetSelection(t *testing.T) {
 	}
 	// Only ask for web; db must not appear.
 	got := string(buildOverrideYAML(entries, []string{"web"}))
-	want := "services:\n  web:\n    image: nginx@sha256:w\n"
+	want := "services:\n  web:\n    image: nginx@sha256:w\n    pull_policy: never\n"
 	if got != want {
 		t.Fatalf("subset selection wrong:\n got %q\nwant %q", got, want)
 	}
@@ -259,7 +259,7 @@ func TestBuildOverrideYAMLMissingEntrySkipped(t *testing.T) {
 	}
 	// "api" is requested but absent from entries -> skipped silently.
 	got := string(buildOverrideYAML(entries, []string{"api", "web"}))
-	want := "services:\n  web:\n    image: nginx@sha256:w\n"
+	want := "services:\n  web:\n    image: nginx@sha256:w\n    pull_policy: never\n"
 	if got != want {
 		t.Fatalf("missing entry not skipped:\n got %q\nwant %q", got, want)
 	}
@@ -272,7 +272,7 @@ func TestBuildOverrideYAMLRepoDerivation(t *testing.T) {
 		"web": {Image: "localhost:5000/web:v1", Digest: "sha256:cd34"},
 	}
 	got := string(buildOverrideYAML(entries, []string{"web"}))
-	want := "services:\n  web:\n    image: localhost:5000/web@sha256:cd34\n"
+	want := "services:\n  web:\n    image: localhost:5000/web@sha256:cd34\n    pull_policy: never\n"
 	if got != want {
 		t.Fatalf("repo derivation wrong:\n got %q\nwant %q", got, want)
 	}
@@ -282,6 +282,34 @@ func TestBuildOverrideYAMLEmptySelection(t *testing.T) {
 	got := string(buildOverrideYAML(map[string]SnapshotEntry{"web": {Image: "nginx", Digest: "sha256:w"}}, nil))
 	if got != "services:\n" {
 		t.Fatalf("empty selection = %q, want just the services header", got)
+	}
+}
+
+// TestBuildOverrideYAMLPullPolicyNever pins the offline-rollback guarantee
+// (AC4): every emitted service block MUST carry `pull_policy: never` alongside
+// its digest-pinned image so the shared `up --no-start` Create step can't
+// attempt a registry pull during a rollback (the digest blob is already cached
+// by PrepareRollback). One `pull_policy: never` line per service, right after
+// each `image:` line.
+func TestBuildOverrideYAMLPullPolicyNever(t *testing.T) {
+	entries := map[string]SnapshotEntry{
+		"web":   {Image: "nginx:latest", Digest: "sha256:w"},
+		"db":    {Image: "postgres:16", Digest: "sha256:d"},
+		"cache": {Image: "redis:7", Digest: "sha256:c"},
+	}
+	out := string(buildOverrideYAML(entries, []string{"web", "db", "cache"}))
+
+	if n := strings.Count(out, "pull_policy: never"); n != 3 {
+		t.Fatalf("want exactly 3 pull_policy: never lines (one per service), got %d in:\n%s", n, out)
+	}
+	// Every service block: the image line is immediately followed by the
+	// pull_policy line, so the override wins the compose merge as the 2nd -f.
+	for _, name := range []string{"web", "db", "cache"} {
+		ref := rollbackImageRef(entries[name])
+		block := "  " + name + ":\n    image: " + ref + "\n    pull_policy: never\n"
+		if !strings.Contains(out, block) {
+			t.Errorf("service %q block missing or malformed; want %q in:\n%s", name, block, out)
+		}
 	}
 }
 
@@ -998,10 +1026,10 @@ func TestPrepareRollback_OverrideAndFieldOrdering(t *testing.T) {
 	if err != nil {
 		t.Fatalf("reading override file: %v", err)
 	}
-	// Deterministic, sorted (db before web), digest-pinned.
+	// Deterministic, sorted (db before web), digest-pinned, pull_policy: never.
 	want := "services:\n" +
-		"  db:\n    image: postgres@sha256:cd34\n" +
-		"  web:\n    image: nginx@sha256:ab12\n"
+		"  db:\n    image: postgres@sha256:cd34\n    pull_policy: never\n" +
+		"  web:\n    image: nginx@sha256:ab12\n    pull_policy: never\n"
 	if string(got) != want {
 		t.Errorf("override content mismatch:\n got %q\nwant %q", got, want)
 	}

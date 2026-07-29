@@ -170,7 +170,16 @@ ref (existing `parseLocalDigest`). Not-running service → no entry + warning; n
 services:
   web:
     image: nginx@sha256:ab12...
+    pull_policy: never
 ```
+
+`pull_policy: never` is load-bearing for offline rollback (AC4): rollback has no
+Pull step, but its Create step is the shared `docker compose up --no-start`,
+whose pull is policy-driven — a MAIN-compose `pull_policy: always` would
+otherwise force a registry pull at Create time and fail during an outage. As the
+SECOND `-f` file, the override's `never` wins the compose merge, so Create never
+pulls; the pinned digest blob is already present because `PrepareRollback`
+presence-checks and pulls it before the pipeline.
 
 Delivery: local → file in `os.TempDir()` (via `os.CreateTemp`, unique per process); remote →
 piped stdin over the ControlMaster socket to `/tmp/cdeploy-rollback-<pid>-<rand>.yml` (a

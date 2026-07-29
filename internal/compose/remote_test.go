@@ -3273,7 +3273,7 @@ func TestRemotePrepareRollback_PullAndOverride(t *testing.T) {
 	if !strings.Contains(writeRC, overridePath) {
 		t.Errorf("writeRemoteFile command %q does not reference override path %q", writeRC, overridePath)
 	}
-	if string(overrideWritten) != "services:\n  web:\n    image: nginx@sha256:ab12\n" {
+	if string(overrideWritten) != "services:\n  web:\n    image: nginx@sha256:ab12\n    pull_policy: never\n" {
 		t.Errorf("override content = %q", string(overrideWritten))
 	}
 }
