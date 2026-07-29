@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 // Compile-time check: RemoteCompose implements tui.ConfigProvider shape.
@@ -2613,5 +2614,465 @@ func TestRunRemoteDockerCmd_OutputErrHook(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "Broken pipe") {
 		t.Errorf("got %q, want stderr text included for diagnostic", err.Error())
+	}
+}
+
+// --- RemoteCompose snapshot capture + state IO tests (Task 7) ---
+
+// remoteShellTokens splits a remote shell command string on whitespace and
+// strips the single-quote shellEscape wrapping from each token. Sufficient for
+// the test fixtures (simple container IDs / image refs without embedded
+// whitespace).
+func remoteShellTokens(rc string) []string {
+	fields := strings.Fields(rc)
+	out := make([]string, len(fields))
+	for i, f := range fields {
+		out[i] = strings.Trim(f, "'")
+	}
+	return out
+}
+
+// remoteShellTokensAfter returns the unquoted tokens following the first token
+// equal to marker (used to pull the container IDs after the `{{.Image}}` format
+// arg in a batched `docker inspect` remote command).
+func remoteShellTokensAfter(rc, marker string) []string {
+	toks := remoteShellTokens(rc)
+	for i, t := range toks {
+		if t == marker {
+			return toks[i+1:]
+		}
+	}
+	return nil
+}
+
+// remoteSnapshotComposer builds a RemoteCompose whose outputCmd hook scripts the
+// four remote calls SnapshotServices makes, discriminating by the remote shell
+// command string (the trailing ssh arg): `compose config`, `compose ps`,
+// batched `docker inspect --format {{.Image}}` (container ID → image ID via
+// containerImageID), and `docker image inspect` (image ID → RepoDigests via
+// imageRepoDigests). It mirrors snapshotComposer for the local path.
+func remoteSnapshotComposer(configJSON, psJSON string, containerImageID, imageRepoDigests map[string]string) *RemoteCompose {
+	return &RemoteCompose{
+		Host:       "user@example.com",
+		ProjectDir: "/proj",
+		SocketPath: "/tmp/cdeploy-ctrl-abc-99",
+		outputCmd: func(cmd *exec.Cmd) ([]byte, error) {
+			rc := cmd.Args[len(cmd.Args)-1]
+			switch {
+			case strings.Contains(rc, "compose") && strings.Contains(rc, "'config'"):
+				return []byte(configJSON), nil
+			case strings.Contains(rc, "compose") && strings.Contains(rc, "'ps'"):
+				return []byte(psJSON), nil
+			case strings.Contains(rc, "{{.Image}}"):
+				var b strings.Builder
+				for _, id := range remoteShellTokensAfter(rc, "{{.Image}}") {
+					iid, ok := containerImageID[id]
+					if !ok {
+						return nil, fmt.Errorf("no such container: %s", id)
+					}
+					b.WriteString(iid + "\n")
+				}
+				return []byte(b.String()), nil
+			case strings.Contains(rc, "RepoDigests"):
+				toks := remoteShellTokens(rc)
+				imageID := toks[len(toks)-1]
+				return []byte(imageRepoDigests[imageID]), nil
+			}
+			return nil, fmt.Errorf("unexpected cmd: %v", cmd.Args)
+		},
+	}
+}
+
+func TestRemoteSnapshotServices_HappyPath(t *testing.T) {
+	pinSnapshotClock(t, time.Date(2026, 7, 29, 14, 3, 0, 0, time.UTC))
+	r := remoteSnapshotComposer(
+		`{"services":{"web":{"image":"nginx:latest"},"db":{"image":"postgres:16"}}}`,
+		`[{"ID":"cid-web","Service":"web","State":"running"},{"ID":"cid-db","Service":"db","State":"running"}]`,
+		map[string]string{"cid-web": "sha256:img-web", "cid-db": "sha256:img-db"},
+		map[string]string{
+			"sha256:img-web": "nginx@sha256:ab12\n",
+			"sha256:img-db":  "postgres@sha256:cd34\n",
+		},
+	)
+	res, err := r.SnapshotServices(context.Background(), nil)
+	if err != nil {
+		t.Fatalf("SnapshotServices: %v", err)
+	}
+	if len(res.Warnings) != 0 {
+		t.Fatalf("unexpected warnings: %v", res.Warnings)
+	}
+	if res.Snapshot.ProjectDir != remoteProjectDir("/proj") {
+		t.Errorf("project_dir = %q, want %q", res.Snapshot.ProjectDir, remoteProjectDir("/proj"))
+	}
+	web := res.Snapshot.Services["web"]
+	if web.Image != "nginx:latest" || web.Digest != "sha256:ab12" || web.RecordedAt != "2026-07-29T14:03:00Z" {
+		t.Errorf("web entry wrong: %+v", web)
+	}
+	if db := res.Snapshot.Services["db"]; db.Image != "postgres:16" || db.Digest != "sha256:cd34" {
+		t.Errorf("db entry wrong: %+v", db)
+	}
+}
+
+func TestRemoteSnapshotServices_NotRunning(t *testing.T) {
+	r := remoteSnapshotComposer(
+		`{"services":{"web":{"image":"nginx:latest"},"db":{"image":"postgres:16"}}}`,
+		`[{"ID":"cid-web","Service":"web","State":"running"}]`,
+		map[string]string{"cid-web": "sha256:img-web"},
+		map[string]string{"sha256:img-web": "nginx@sha256:ab12\n"},
+	)
+	res, err := r.SnapshotServices(context.Background(), []string{"web", "db"})
+	if err != nil {
+		t.Fatalf("SnapshotServices: %v", err)
+	}
+	if _, ok := res.Snapshot.Services["db"]; ok {
+		t.Errorf("db should be absent (not running)")
+	}
+	if _, ok := res.Snapshot.Services["web"]; !ok {
+		t.Errorf("web should be present")
+	}
+	if !warningsContain(res.Warnings, "db", "not running") {
+		t.Errorf("expected a 'db not running' warning, got %v", res.Warnings)
+	}
+}
+
+func TestRemoteSnapshotServices_BuildOnlyNoDigest(t *testing.T) {
+	r := remoteSnapshotComposer(
+		`{"services":{"web":{"image":"nginx:latest"},"app":{"image":"myapp:local"}}}`,
+		`[{"ID":"cid-web","Service":"web","State":"running"},{"ID":"cid-app","Service":"app","State":"running"}]`,
+		map[string]string{"cid-web": "sha256:img-web", "cid-app": "sha256:img-app"},
+		map[string]string{
+			"sha256:img-web": "nginx@sha256:ab12\n",
+			"sha256:img-app": "", // no RepoDigests → locally built
+		},
+	)
+	res, err := r.SnapshotServices(context.Background(), nil)
+	if err != nil {
+		t.Fatalf("SnapshotServices: %v", err)
+	}
+	if _, ok := res.Snapshot.Services["app"]; ok {
+		t.Errorf("app should be absent (no registry digest)")
+	}
+	if _, ok := res.Snapshot.Services["web"]; !ok {
+		t.Errorf("web should be present")
+	}
+	if !warningsContain(res.Warnings, "app", "no repository digest") {
+		t.Errorf("expected a 'no repository digest' warning for app, got %v", res.Warnings)
+	}
+}
+
+func TestRemoteSnapshotServices_ScaledOneEntry(t *testing.T) {
+	// web scaled to 2 running replicas → exactly one entry, only the first
+	// replica is inspected.
+	var inspected []string
+	r := &RemoteCompose{
+		Host:       "user@example.com",
+		ProjectDir: "/proj",
+		SocketPath: "/tmp/cdeploy-ctrl-abc-99",
+		outputCmd: func(cmd *exec.Cmd) ([]byte, error) {
+			rc := cmd.Args[len(cmd.Args)-1]
+			switch {
+			case strings.Contains(rc, "compose") && strings.Contains(rc, "'config'"):
+				return []byte(`{"services":{"web":{"image":"nginx:latest"}}}`), nil
+			case strings.Contains(rc, "compose") && strings.Contains(rc, "'ps'"):
+				return []byte(`[{"ID":"cid-web-1","Service":"web","State":"running"},{"ID":"cid-web-2","Service":"web","State":"running"}]`), nil
+			case strings.Contains(rc, "{{.Image}}"):
+				ids := remoteShellTokensAfter(rc, "{{.Image}}")
+				inspected = append(inspected, ids...)
+				var b strings.Builder
+				for range ids {
+					b.WriteString("sha256:img-web\n")
+				}
+				return []byte(b.String()), nil
+			case strings.Contains(rc, "RepoDigests"):
+				return []byte("nginx@sha256:ab12\n"), nil
+			}
+			return nil, fmt.Errorf("unexpected cmd: %v", cmd.Args)
+		},
+	}
+	res, err := r.SnapshotServices(context.Background(), nil)
+	if err != nil {
+		t.Fatalf("SnapshotServices: %v", err)
+	}
+	if len(res.Snapshot.Services) != 1 {
+		t.Fatalf("want exactly 1 service entry, got %d: %+v", len(res.Snapshot.Services), res.Snapshot.Services)
+	}
+	if res.Snapshot.Services["web"].Digest != "sha256:ab12" {
+		t.Errorf("web digest wrong: %+v", res.Snapshot.Services["web"])
+	}
+	if len(inspected) != 1 || inspected[0] != "cid-web-1" {
+		t.Errorf("inspected containers = %v, want only the first replica", inspected)
+	}
+}
+
+func TestRemoteSnapshotServices_InspectBypassesCompose(t *testing.T) {
+	// The top-level docker inspect / image inspect remote commands must NOT
+	// carry the compose subcommand, CURRENT_UID, or a `cd` prefix — they go
+	// through runRemoteDockerCmd, not remoteCommand.
+	var inspectCmds []string
+	r := &RemoteCompose{
+		Host:       "user@example.com",
+		ProjectDir: "/proj",
+		SocketPath: "/tmp/cdeploy-ctrl-abc-99",
+		outputCmd: func(cmd *exec.Cmd) ([]byte, error) {
+			rc := cmd.Args[len(cmd.Args)-1]
+			switch {
+			case strings.Contains(rc, "compose") && strings.Contains(rc, "'config'"):
+				return []byte(`{"services":{"web":{"image":"nginx:latest"}}}`), nil
+			case strings.Contains(rc, "compose") && strings.Contains(rc, "'ps'"):
+				return []byte(`[{"ID":"cid-web","Service":"web","State":"running"}]`), nil
+			case strings.Contains(rc, "{{.Image}}"):
+				inspectCmds = append(inspectCmds, rc)
+				return []byte("sha256:img-web\n"), nil
+			case strings.Contains(rc, "RepoDigests"):
+				inspectCmds = append(inspectCmds, rc)
+				return []byte("nginx@sha256:ab12\n"), nil
+			}
+			return nil, fmt.Errorf("unexpected cmd: %v", cmd.Args)
+		},
+	}
+	if _, err := r.SnapshotServices(context.Background(), nil); err != nil {
+		t.Fatalf("SnapshotServices: %v", err)
+	}
+	if len(inspectCmds) != 2 {
+		t.Fatalf("expected 2 top-level docker inspect calls, got %d", len(inspectCmds))
+	}
+	for _, rc := range inspectCmds {
+		if strings.Contains(rc, "compose") {
+			t.Errorf("inspect remote command leaked 'compose': %q", rc)
+		}
+		if strings.Contains(rc, "CURRENT_UID") {
+			t.Errorf("inspect remote command leaked CURRENT_UID: %q", rc)
+		}
+		if strings.HasPrefix(rc, "cd ") {
+			t.Errorf("inspect remote command has a cd prefix: %q", rc)
+		}
+		if !strings.HasPrefix(rc, "docker ") {
+			t.Errorf("inspect remote command should start with 'docker ': %q", rc)
+		}
+	}
+}
+
+func TestRemoteSnapshotServices_PSError(t *testing.T) {
+	r := &RemoteCompose{
+		Host:       "user@example.com",
+		ProjectDir: "/proj",
+		SocketPath: "/tmp/cdeploy-ctrl-abc-99",
+		outputCmd: func(cmd *exec.Cmd) ([]byte, error) {
+			rc := cmd.Args[len(cmd.Args)-1]
+			if strings.Contains(rc, "compose") && strings.Contains(rc, "'config'") {
+				return []byte(`{"services":{"web":{"image":"nginx:latest"}}}`), nil
+			}
+			return nil, fmt.Errorf("ssh timeout")
+		},
+	}
+	_, err := r.SnapshotServices(context.Background(), nil)
+	if err == nil {
+		t.Fatal("expected error, got nil")
+	}
+	if !strings.Contains(err.Error(), "listing remote containers for snapshot") {
+		t.Errorf("error = %q, want it to mention listing remote containers", err.Error())
+	}
+}
+
+func TestRemoteWriteRemoteFile_Command(t *testing.T) {
+	var captured *exec.Cmd
+	r := &RemoteCompose{
+		Host:       "user@example.com",
+		SocketPath: "/tmp/cdeploy-ctrl-abc-99",
+		runCmd: func(cmd *exec.Cmd) error {
+			captured = cmd
+			return nil
+		},
+	}
+	path := "$HOME/.cdeploy/state/abc123def456.json"
+	if err := r.writeRemoteFile(context.Background(), path, []byte("payload-bytes")); err != nil {
+		t.Fatalf("writeRemoteFile: %v", err)
+	}
+	if captured == nil {
+		t.Fatal("runCmd not called")
+	}
+	if captured.Args[0] != "ssh" {
+		t.Errorf("argv[0] = %q, want ssh", captured.Args[0])
+	}
+	// Reuses the ControlMaster socket.
+	foundSock := false
+	for i, a := range captured.Args {
+		if a == "-S" && i+1 < len(captured.Args) && captured.Args[i+1] == r.SocketPath {
+			foundSock = true
+		}
+	}
+	if !foundSock {
+		t.Errorf("argv missing -S %q: %v", r.SocketPath, captured.Args)
+	}
+	rc := captured.Args[len(captured.Args)-1]
+	for _, want := range []string{
+		`mkdir -p "$(dirname "$HOME/.cdeploy/state/abc123def456.json")"`,
+		`cat > "$HOME/.cdeploy/state/abc123def456.json.$$.tmp"`,
+		`mv "$HOME/.cdeploy/state/abc123def456.json.$$.tmp" "$HOME/.cdeploy/state/abc123def456.json"`,
+	} {
+		if !strings.Contains(rc, want) {
+			t.Errorf("remote command missing %q, got: %q", want, rc)
+		}
+	}
+	// Payload is piped over stdin.
+	if captured.Stdin == nil {
+		t.Fatal("stdin not wired")
+	}
+	got, _ := io.ReadAll(captured.Stdin)
+	if string(got) != "payload-bytes" {
+		t.Errorf("stdin data = %q, want %q", string(got), "payload-bytes")
+	}
+}
+
+func TestRemoteWriteRemoteFile_SSHExtraArgs(t *testing.T) {
+	extras := []string{"-i", "/tmp/key"}
+	host := "user@example.com"
+	var captured *exec.Cmd
+	r := &RemoteCompose{
+		Host:         host,
+		SocketPath:   "/tmp/cdeploy-ctrl-abc-99",
+		SSHExtraArgs: extras,
+		runCmd: func(cmd *exec.Cmd) error {
+			captured = cmd
+			return nil
+		},
+	}
+	if err := r.writeRemoteFile(context.Background(), "/tmp/cdeploy-rollback-1.yml", []byte("x")); err != nil {
+		t.Fatalf("writeRemoteFile: %v", err)
+	}
+	assertExtraBeforeHost(t, "writeRemoteFile", captured.Args, host, extras)
+}
+
+func TestRemoteWriteRemoteFile_Error(t *testing.T) {
+	r := &RemoteCompose{
+		Host:       "user@example.com",
+		SocketPath: "/tmp/cdeploy-ctrl-abc-99",
+		runCmd: func(cmd *exec.Cmd) error {
+			return fmt.Errorf("exit status 1")
+		},
+	}
+	err := r.writeRemoteFile(context.Background(), "/tmp/x.yml", []byte("x"))
+	if err == nil {
+		t.Fatal("expected error, got nil")
+	}
+}
+
+func TestRemoteReadSnapshot_CatCommand(t *testing.T) {
+	var rc string
+	snapJSON := `{"schema":1,"project_dir":"/proj","services":{"web":{"image":"nginx:latest","digest":"sha256:ab12","recorded_at":"2026-07-29T14:03:00Z"}}}`
+	r := &RemoteCompose{
+		Host:       "user@example.com",
+		ProjectDir: "/proj",
+		SocketPath: "/tmp/cdeploy-ctrl-abc-99",
+		outputCmd: func(cmd *exec.Cmd) ([]byte, error) {
+			rc = cmd.Args[len(cmd.Args)-1]
+			return []byte(snapJSON), nil
+		},
+	}
+	snap, err := r.ReadSnapshot(context.Background())
+	if err != nil {
+		t.Fatalf("ReadSnapshot: %v", err)
+	}
+	if snap == nil || snap.Services["web"].Digest != "sha256:ab12" {
+		t.Fatalf("parsed snapshot wrong: %+v", snap)
+	}
+	// Missing-file-tolerant guard + $HOME-expanded state path.
+	if !strings.Contains(rc, "[ -f") {
+		t.Errorf("read command should guard with [ -f ], got: %q", rc)
+	}
+	wantPath := "$HOME/" + stateFileRelPath(remoteProjectDir("/proj"))
+	if !strings.Contains(rc, wantPath) {
+		t.Errorf("read command should reference %q, got: %q", wantPath, rc)
+	}
+}
+
+func TestRemoteReadSnapshot_MissingFileNil(t *testing.T) {
+	r := &RemoteCompose{
+		Host:       "user@example.com",
+		ProjectDir: "/proj",
+		SocketPath: "/tmp/cdeploy-ctrl-abc-99",
+		outputCmd: func(cmd *exec.Cmd) ([]byte, error) {
+			return []byte(""), nil // missing file → empty output, exit 0
+		},
+	}
+	snap, err := r.ReadSnapshot(context.Background())
+	if err != nil {
+		t.Fatalf("ReadSnapshot on missing file should be nil error, got %v", err)
+	}
+	if snap != nil {
+		t.Fatalf("ReadSnapshot on missing file should return nil snapshot, got %+v", snap)
+	}
+}
+
+func TestRemoteReadSnapshot_UnknownSchemaTyped(t *testing.T) {
+	r := &RemoteCompose{
+		Host:       "user@example.com",
+		ProjectDir: "/proj",
+		SocketPath: "/tmp/cdeploy-ctrl-abc-99",
+		outputCmd: func(cmd *exec.Cmd) ([]byte, error) {
+			return []byte(`{"schema":2,"project_dir":"/proj","services":{}}`), nil
+		},
+	}
+	_, err := r.ReadSnapshot(context.Background())
+	if !errors.Is(err, errSnapshotSchema) {
+		t.Fatalf("ReadSnapshot schema-2 err = %v, want errSnapshotSchema", err)
+	}
+}
+
+func TestRemoteReadSnapshot_Error(t *testing.T) {
+	r := &RemoteCompose{
+		Host:       "user@example.com",
+		ProjectDir: "/proj",
+		SocketPath: "/tmp/cdeploy-ctrl-abc-99",
+		outputCmd: func(cmd *exec.Cmd) ([]byte, error) {
+			return nil, fmt.Errorf("ssh timeout")
+		},
+	}
+	_, err := r.ReadSnapshot(context.Background())
+	if err == nil {
+		t.Fatal("expected error, got nil")
+	}
+	if !strings.Contains(err.Error(), "reading remote snapshot") {
+		t.Errorf("error = %q, want it to contain 'reading remote snapshot'", err.Error())
+	}
+}
+
+func TestRemoteWriteSnapshot_MergeAndWrite(t *testing.T) {
+	// ReadSnapshot (outputCmd) returns an existing snapshot with only db;
+	// writeRemoteFile (runCmd) captures the piped merged payload. The merge
+	// must keep db alive (its own recorded_at) and add the fresh web entry.
+	existing := `{"schema":1,"project_dir":"/proj","services":{"db":{"image":"postgres:16","digest":"sha256:old-db","recorded_at":"2026-06-01T00:00:00Z"}}}`
+	var written []byte
+	r := &RemoteCompose{
+		Host:       "user@example.com",
+		ProjectDir: "/proj",
+		SocketPath: "/tmp/cdeploy-ctrl-abc-99",
+		outputCmd: func(cmd *exec.Cmd) ([]byte, error) {
+			return []byte(existing), nil
+		},
+		runCmd: func(cmd *exec.Cmd) error {
+			written, _ = io.ReadAll(cmd.Stdin)
+			return nil
+		},
+	}
+	fresh := &Snapshot{
+		Schema:     snapshotSchemaVersion,
+		ProjectDir: remoteProjectDir("/proj"),
+		Services: map[string]SnapshotEntry{
+			"web": {Image: "nginx:latest", Digest: "sha256:new-web", RecordedAt: "2026-07-29T00:00:00Z"},
+		},
+	}
+	if err := r.WriteSnapshot(context.Background(), fresh); err != nil {
+		t.Fatalf("WriteSnapshot: %v", err)
+	}
+	got, err := parseSnapshot(written)
+	if err != nil {
+		t.Fatalf("parsing written snapshot: %v", err)
+	}
+	if got.Services["web"].Digest != "sha256:new-web" {
+		t.Errorf("web not written from fresh: %+v", got.Services["web"])
+	}
+	if got.Services["db"].Digest != "sha256:old-db" || got.Services["db"].RecordedAt != "2026-06-01T00:00:00Z" {
+		t.Errorf("db not preserved across merge: %+v", got.Services["db"])
 	}
 }

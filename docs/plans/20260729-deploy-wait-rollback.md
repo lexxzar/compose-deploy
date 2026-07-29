@@ -369,21 +369,21 @@ function-scoped `defer cleanup()` — it runs after `WaitHealthy` returns, so no
 - Modify: `internal/compose/snapshot.go` (shared helpers)
 - Modify: `internal/compose/remote_test.go`
 
-- [ ] implement `(*RemoteCompose) SnapshotServices(ctx, services)` mirroring Task 6 — split
+- [x] implement `(*RemoteCompose) SnapshotServices(ctx, services)` mirroring Task 6 — split
       per the CLAUDE.md invariant: `compose ps`/`compose config` go through `remoteCommand`,
       but `docker inspect` / `docker image inspect` are TOP-LEVEL docker commands and MUST
       go through `runRemoteDockerCmd` (image names shell-escaped)
-- [ ] add the remote stdin-pipe write primitive: `writeRemoteFile(ctx, path, data)` building
+- [x] add the remote stdin-pipe write primitive: `writeRemoteFile(ctx, path, data)` building
       `ssh [extra] host 'mkdir -p <dir> && cat > <tmp> && mv <tmp> <path>'` with data on
       stdin; `SSHExtraArgs` spliced immediately before the host arg (existing convention);
       reuse the `-S <SocketPath> -o ControlMaster=no` prefix (as `remoteCommand` does) so
       the write rides the existing ControlMaster socket instead of a fresh connection
-- [ ] implement `(*RemoteCompose) ReadSnapshot(ctx)` via `cat` with missing-file tolerance
+- [x] implement `(*RemoteCompose) ReadSnapshot(ctx)` via `cat` with missing-file tolerance
       (exit-status → not-found, not error)
-- [ ] write argv-construction tests: snapshot capture commands; writeRemoteFile command string
+- [x] write argv-construction tests: snapshot capture commands; writeRemoteFile command string
       (escaping, SSHExtraArgs position, tmp+mv shape); ReadSnapshot cat command; test hooks
       drive outputs for capture parse paths
-- [ ] run tests — must pass before task 8
+- [x] run tests — must pass before task 8
 
 ### Task 8: Rollback prep (`PrepareRollback` on both composers)
 

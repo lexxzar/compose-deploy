@@ -1,8 +1,10 @@
 package compose
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -872,4 +874,240 @@ func (r *RemoteCompose) runRemoteDockerCmd(ctx context.Context, dockerArgs []str
 		return nil, classifySSHError(err, stderr.String())
 	}
 	return out, nil
+}
+
+// SnapshotServices captures the image digest each *running* container of the
+// requested services actually uses on the REMOTE host, so a later rollback can
+// pin those digests. This mirrors Compose.SnapshotServices exactly (see its
+// doc comment for the four-step flow and the not-running / no-digest warning
+// semantics); the only differences are the transport-specific primitives:
+//
+//   - `docker compose config` / `docker compose ps` go through remoteCommand
+//     (compose subcommands) via fetchServiceImages / runningContainerIDs.
+//   - `docker inspect` / `docker image inspect` are TOP-LEVEL docker CLI
+//     commands, so they MUST go through runRemoteDockerCmd (which builds the
+//     SSH argv directly, shell-escapes each arg, and splices SSHExtraArgs
+//     immediately before the host) — the same CLAUDE.md invariant that keeps
+//     CheckUpdates' inspect calls off remoteCommand().
+//
+// The project dir stamped into the snapshot uses remoteProjectDir (POSIX
+// normalization) so `-C ./app` and its absolute spelling key the same file.
+func (r *RemoteCompose) SnapshotServices(ctx context.Context, services []string) (SnapshotResult, error) {
+	images, err := r.fetchServiceImages(ctx)
+	if err != nil {
+		return SnapshotResult{}, err
+	}
+	running, err := r.runningContainerIDs(ctx)
+	if err != nil {
+		return SnapshotResult{}, err
+	}
+
+	targets := services
+	if len(targets) == 0 {
+		targets = sortedStringKeys(images)
+	}
+
+	// Batch a single `docker inspect` over the container IDs we actually need
+	// (targets that both have an image ref AND a running replica).
+	var toInspect []string
+	seen := map[string]bool{}
+	for _, svc := range targets {
+		if _, ok := images[svc]; !ok {
+			continue
+		}
+		cid, ok := running[svc]
+		if !ok || seen[cid] {
+			continue
+		}
+		seen[cid] = true
+		toInspect = append(toInspect, cid)
+	}
+	imageIDs, err := r.inspectContainerImageIDs(ctx, toInspect)
+	if err != nil {
+		return SnapshotResult{}, err
+	}
+
+	snap := &Snapshot{
+		Schema:     snapshotSchemaVersion,
+		ProjectDir: remoteProjectDir(r.ProjectDir),
+		Services:   map[string]SnapshotEntry{},
+	}
+	recordedAt := snapshotClock().Format(time.RFC3339)
+	var warnings []string
+	for _, svc := range targets {
+		imageRef, hasImage := images[svc]
+		if !hasImage {
+			warnings = append(warnings, fmt.Sprintf("%s: no image in compose config (build-only?), skipped", svc))
+			continue
+		}
+		cid, ok := running[svc]
+		if !ok {
+			warnings = append(warnings, fmt.Sprintf("%s: not running, skipped", svc))
+			continue
+		}
+		out, derr := r.runRemoteDockerCmd(ctx, imageInspectArgs(imageIDs[cid]))
+		if derr != nil {
+			warnings = append(warnings, fmt.Sprintf("%s: inspecting image failed: %v, skipped", svc, derr))
+			continue
+		}
+		digest := parseLocalDigest(string(out), imageRef)
+		if digest == "" {
+			warnings = append(warnings, fmt.Sprintf("%s: no repository digest (locally built?), skipped", svc))
+			continue
+		}
+		snap.Services[svc] = SnapshotEntry{
+			Image:      imageRef,
+			Digest:     digest,
+			RecordedAt: recordedAt,
+		}
+	}
+	return SnapshotResult{Snapshot: snap, Warnings: warnings}, nil
+}
+
+// runningContainerIDs runs `docker compose ps --format json` on the remote host
+// and returns a map of service name → the FULL container ID of its first
+// running replica (see Compose.runningContainerIDs for the full-ID rationale).
+// Goes through remoteCommand — regular compose subcommand.
+func (r *RemoteCompose) runningContainerIDs(ctx context.Context) (map[string]string, error) {
+	cmd := r.remoteCommand(ctx, "ps", "--format", "json")
+	var out []byte
+	var err error
+	if r.outputCmd != nil {
+		out, err = r.outputCmd(cmd)
+	} else {
+		out, err = cmd.Output()
+	}
+	if err != nil {
+		return nil, fmt.Errorf("listing remote containers for snapshot: %w", withStderr(err))
+	}
+	return parseRunningContainerIDs(out)
+}
+
+// inspectContainerImageIDs runs a single batched
+// `docker inspect --format '{{.Image}}' <ids...>` on the remote host and
+// returns container ID → image ID. Bypasses remoteCommand() because
+// `docker inspect` is a top-level docker CLI command, not a compose subcommand;
+// runRemoteDockerCmd shell-escapes each arg and splices SSHExtraArgs before the
+// host (same convention as CheckUpdates' inspect calls). Output order is
+// preserved by `docker inspect`, so image IDs are zipped back positionally; a
+// line-count mismatch is treated as an error.
+func (r *RemoteCompose) inspectContainerImageIDs(ctx context.Context, containerIDs []string) (map[string]string, error) {
+	if len(containerIDs) == 0 {
+		return map[string]string{}, nil
+	}
+	args := append([]string{"inspect", "--format", "{{.Image}}"}, containerIDs...)
+	out, err := r.runRemoteDockerCmd(ctx, args)
+	if err != nil {
+		return nil, err
+	}
+	lines := nonEmptyLines(string(out))
+	if len(lines) != len(containerIDs) {
+		return nil, fmt.Errorf("docker inspect returned %d image IDs for %d containers", len(lines), len(containerIDs))
+	}
+	m := make(map[string]string, len(containerIDs))
+	for i, id := range containerIDs {
+		m[id] = lines[i]
+	}
+	return m, nil
+}
+
+// remoteStatePath returns the absolute remote path of this project's state file
+// as a shell expression the remote shell expands. The literal `$HOME` prefix is
+// left UNQUOTED-in-single-quotes (see writeRemoteFile / ReadSnapshot, which wrap
+// it in DOUBLE quotes) so the remote shell resolves the docker host's home
+// directory — the state must live on the HOST so CI deploys and laptop
+// rollbacks share one authoritative history. The key is derived from the
+// POSIX-normalized project dir so `-C ./app` and its absolute spelling collapse
+// to one file.
+func (r *RemoteCompose) remoteStatePath() string {
+	return "$HOME/" + stateFileRelPath(remoteProjectDir(r.ProjectDir))
+}
+
+// writeRemoteFile writes data to a file on the remote host atomically (temp
+// file in the same directory + rename), piping the bytes over the existing
+// ControlMaster socket via stdin. The remote command is
+// `mkdir -p "$(dirname PATH)" && cat > PATH.tmp && mv PATH.tmp PATH`.
+//
+// path is a PROGRAM-GENERATED, shell-safe remote path that may reference
+// `$HOME` (state file) or be an absolute `/tmp/...` path (rollback override,
+// Task 8). It is interpolated inside DOUBLE quotes — not single-quote
+// shellEscape — precisely so the remote shell expands `$HOME`; single-quoting
+// would defeat that. Callers must therefore only pass trusted, generated paths
+// (hex snapshot keys, PIDs, fixed directory names), never user input.
+//
+// SSHExtraArgs is spliced immediately before the host argument via sshArgs()
+// and the `-S <SocketPath> -o ControlMaster=no` prefix reuses the persistent
+// connection (same convention as remoteCommand / runRemoteDockerCmd) rather
+// than opening a fresh SSH session.
+func (r *RemoteCompose) writeRemoteFile(ctx context.Context, path string, data []byte) error {
+	// %[1]s references path in every position; the literal `$$` (remote shell
+	// PID) makes the temp name unique so concurrent deploys don't clash, and
+	// keeps it in the same directory as the final path for an atomic rename.
+	remoteCmd := fmt.Sprintf(
+		`mkdir -p "$(dirname "%[1]s")" && cat > "%[1]s.$$.tmp" && mv "%[1]s.$$.tmp" "%[1]s"`,
+		path,
+	)
+	sshArgv := r.sshArgs(
+		[]string{"-S", r.SocketPath, "-o", "ControlMaster=no"},
+		remoteCmd,
+	)
+	cmd := exec.CommandContext(ctx, "ssh", sshArgv...)
+	cmd.Stdin = bytes.NewReader(data)
+	if r.runCmd != nil {
+		return r.runCmd(cmd)
+	}
+	var stderr strings.Builder
+	cmd.Stderr = &stderr
+	if err := cmd.Run(); err != nil {
+		if s := strings.TrimSpace(stderr.String()); s != "" {
+			return fmt.Errorf("writing remote file: %w: %s", err, s)
+		}
+		return fmt.Errorf("writing remote file: %w", err)
+	}
+	return nil
+}
+
+// ReadSnapshot reads and parses this project's remote state file over SSH.
+// The remote command guards the read with a `[ -f ]` test so a MISSING file
+// yields empty output and exit 0 (the normal first-deploy case → (nil, nil)),
+// while a present-but-unreadable file surfaces cat's non-zero exit as an error.
+// A non-empty payload is parsed strictly via parseSnapshot (schema/JSON errors
+// are returned typed, distinguishable from not-found).
+func (r *RemoteCompose) ReadSnapshot(ctx context.Context) (*Snapshot, error) {
+	remoteCmd := fmt.Sprintf(`f="%s"; if [ -f "$f" ]; then cat "$f"; fi`, r.remoteStatePath())
+	sshArgv := r.sshArgs(
+		[]string{"-S", r.SocketPath, "-o", "ControlMaster=no"},
+		remoteCmd,
+	)
+	cmd := exec.CommandContext(ctx, "ssh", sshArgv...)
+	var out []byte
+	var err error
+	if r.outputCmd != nil {
+		out, err = r.outputCmd(cmd)
+	} else {
+		out, err = cmd.Output()
+	}
+	if err != nil {
+		return nil, fmt.Errorf("reading remote snapshot: %w", withStderr(err))
+	}
+	if len(strings.TrimSpace(string(out))) == 0 {
+		return nil, nil
+	}
+	return parseSnapshot(out)
+}
+
+// WriteSnapshot merges fresh into the existing remote state file (if any) and
+// writes the result atomically over SSH. A corrupt or unreadable existing file
+// is ignored (treated as empty) so a single bad state file never blocks
+// recording a fresh, good snapshot — the per-service merge safety net is
+// best-effort, mirroring Compose.WriteSnapshot. Both composers satisfy the
+// same read+merge+write seam consumed by the deploy/rollback flows.
+func (r *RemoteCompose) WriteSnapshot(ctx context.Context, fresh *Snapshot) error {
+	existing, _ := r.ReadSnapshot(ctx) // ignore read/parse errors: overwrite a corrupt state
+	merged := mergeSnapshot(existing, fresh)
+	data, err := json.MarshalIndent(merged, "", "  ")
+	if err != nil {
+		return fmt.Errorf("marshaling snapshot: %w", err)
+	}
+	return r.writeRemoteFile(ctx, r.remoteStatePath(), data)
 }
