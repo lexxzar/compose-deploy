@@ -465,25 +465,25 @@ function-scoped `defer cleanup()` — it runs after `WaitHealthy` returns, so no
 - Modify: `internal/tui/styles.go`
 - Modify: `internal/tui/app_test.go`
 
-- [ ] define `Snapshotter` optional interface in tui (`SnapshotServices` + write, matching the
+- [x] define `Snapshotter` optional interface in tui (`SnapshotServices` + write, matching the
       cmd seam); in the tea.Cmd that launches Deploy, run snapshot FIRST inside the same
       goroutine (pre-Stop ordering; warnings into the op log writer; warn-and-proceed)
-- [ ] add `waiting`/`waitState`/`waitSession`/`waitDeadline` Model fields; after
+- [x] add `waiting`/`waitState`/`waitSession`/`waitDeadline` Model fields; after
       Deploy/Restart/Rollback pipeline success (`m.done`), enter waiting sub-state and start
       the `waitTickMsg` loop: each tick = one `ContainerStatus` tea.Cmd → `EvaluateWait` →
       re-render → reschedule (singleton, gated on `screen == screenProgress && session ==
       waitSession`); StopOnly never waits
-- [ ] render: verdict line per service under the step list (reuse ♥/✗/~ icons + new
+- [x] render: verdict line per service under the step list (reuse ♥/✗/~ icons + new
       wait styles), countdown from `waitDeadline`; footer `esc skip` while waiting
-- [ ] esc during waiting: bump `waitSession`, clear wait fields, op remains "done" (existing
+- [x] esc during waiting: bump `waitSession`, clear wait fields, op remains "done" (existing
       esc-from-progress flow continues to work); wait failure renders red verdicts + hint
       `press R on the services screen to roll back` (deploy only)
-- [ ] clear new fields at the documented departure sites (esc back-nav chain, entryLocal,
+- [x] clear new fields at the documented departure sites (esc back-nav chain, entryLocal,
       connectResultMsg error path)
-- [ ] write tests: wait starts only after done (not on failed); stale-session tick rejected;
+- [x] write tests: wait starts only after done (not on failed); stale-session tick rejected;
       esc-skip leaves done and clears state; fail-fast tick renders failure + hint gating
       (deploy vs restart); mock without `Snapshotter` → deploy runs exactly as today
-- [ ] run tests — must pass before task 12
+- [x] run tests — must pass before task 12
 
 ### Task 12: TUI — `R` rollback key on services screen
 

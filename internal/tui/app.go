@@ -15,6 +15,7 @@ import (
 	"github.com/charmbracelet/bubbles/textinput"
 	"github.com/charmbracelet/bubbles/viewport"
 	tea "github.com/charmbracelet/bubbletea"
+	"github.com/charmbracelet/lipgloss"
 	"github.com/charmbracelet/x/ansi"
 	"github.com/lexxzar/compose-deploy/internal/compose"
 	"github.com/lexxzar/compose-deploy/internal/config"
@@ -62,6 +63,18 @@ type ConfigProvider interface {
 // and is TUI/CLI-only — not a pipeline operation. Both Compose and RemoteCompose implement it.
 type ExecProvider interface {
 	ExecCommand(ctx context.Context, service string, command []string) (*exec.Cmd, error)
+}
+
+// Snapshotter records the currently-running image digests before a deploy so
+// that `cdeploy rollback` can later restore them. Defined in the tui package
+// (like ConfigProvider/ExecProvider) and type-asserted on the concrete composer
+// — a composer that does not implement it (e.g. a test mock) simply skips
+// snapshotting, so it is a best-effort capability rather than part of the
+// runner.Composer contract. Both *compose.Compose and *compose.RemoteCompose
+// satisfy it; the method set mirrors the cmd package's `snapshotter` seam.
+type Snapshotter interface {
+	SnapshotServices(ctx context.Context, services []string) (compose.SnapshotResult, error)
+	WriteSnapshot(ctx context.Context, fresh *compose.Snapshot) error
 }
 
 // ComposerFactory creates a runner.Composer for the given project directory.
@@ -243,14 +256,27 @@ type Model struct {
 	quitting bool
 
 	// Screen 2: progress
-	steps       []stepState
-	logContent  string
-	logViewport viewport.Model
-	spinner     spinner.Model
-	done        bool
-	failed      bool
-	eventCh     <-chan runner.StepEvent
-	cancel      context.CancelFunc
+	steps        []stepState
+	logContent   string
+	logViewport  viewport.Model
+	spinner      spinner.Model
+	done         bool
+	failed       bool
+	eventCh      <-chan runner.StepEvent
+	cancel       context.CancelFunc
+	opContainers []string // the operation's resolved target services; seeds the wait target set
+
+	// Screen 2: progress — health-wait sub-state. After a Deploy/Restart/Rollback
+	// pipeline completes (m.done), the progress screen enters a waiting sub-state
+	// that polls ContainerStatus and drives runner.EvaluateWait until every
+	// targeted service resolves (or the timeout elapses). StopOnly never waits.
+	// All fields are reset via clearWaitState() at every departure site and on
+	// esc-skip (which also bumps waitSession to invalidate in-flight polls/ticks).
+	waiting          bool             // actively polling for health (esc = skip)
+	waitState        runner.WaitState // per-service verdict accumulator; non-empty Services ⇒ verdicts are rendered
+	waitSession      uint64           // gates waitTickMsg/waitStatusMsg against a stale poll after esc-skip / departure
+	waitDeadline     time.Time        // wall-clock deadline; drives the countdown and the elapsed input to EvaluateWait
+	waitTickOverride func() tea.Cmd   // test seam: replaces tea.Tick in waitTick(); production never sets this
 
 	// Screen: logs
 	logsService  string             // service being viewed
@@ -404,6 +430,22 @@ type updatesMsg struct {
 type refreshTickMsg struct{}
 
 type pipelineDoneMsg struct{}
+
+// waitTickMsg fires after runner.DefaultWaitPoll to schedule the next health
+// poll. session is captured at scheduling time and compared against
+// m.waitSession in the handler so a tick left over from a skipped/departed wait
+// is dropped. Singleton reschedule discipline like refreshTickMsg, but the loop
+// stops once the wait resolves (not an unconditional forever-loop).
+type waitTickMsg struct{ session uint64 }
+
+// waitStatusMsg carries one ContainerStatus poll result into the wait reducer.
+// session mirrors waitTickMsg so a poll from a skipped/departed wait is dropped.
+type waitStatusMsg struct {
+	status  map[string]runner.ServiceStatus
+	err     error
+	session uint64
+}
+
 type logChunkMsg struct {
 	data    []byte
 	session uint64
@@ -897,6 +939,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.updatesErr = ""
 			m.updateInFlight = false
 			m.clearSearch()
+			m.clearWaitState()
 			return m, nil
 		}
 		m.serverErr = nil
@@ -1057,10 +1100,66 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, tea.Batch(cmds...)
 
 	case pipelineDoneMsg:
-		if !m.failed {
-			m.done = true
+		if m.failed {
+			return m, nil
 		}
-		return m, nil
+		m.done = true
+		// StopOnly has no health phase; a failed pipeline never reaches here.
+		// Deploy/Restart/Rollback enter the waiting sub-state and start the
+		// health-poll loop with the first poll firing immediately (containers
+		// were just (re)started).
+		if m.pendingOp == runner.StopOnly {
+			return m, nil
+		}
+		targets := m.opContainers
+		if len(targets) == 0 {
+			targets = m.services
+		}
+		if len(targets) == 0 {
+			return m, nil // nothing to wait on
+		}
+		m.waiting = true
+		m.waitSession++
+		m.waitState = runner.NewWaitState(targets)
+		m.waitDeadline = time.Now().Add(runner.DefaultWaitTimeout)
+		return m, m.pollWaitStatus()
+
+	case waitTickMsg:
+		// Stale ticks (skipped wait, departed screen, or a superseded session)
+		// are dead — drop without rescheduling. A live tick fires the next poll.
+		if m.screen != screenProgress || !m.waiting || msg.session != m.waitSession {
+			return m, nil
+		}
+		return m, m.pollWaitStatus()
+
+	case waitStatusMsg:
+		if m.screen != screenProgress || !m.waiting || msg.session != m.waitSession {
+			return m, nil
+		}
+		elapsed := m.waitElapsed()
+		if msg.err != nil {
+			// Transient poll failure: carry the reducer state forward and keep
+			// polling. Feeding a nil/zero status map into EvaluateWait would
+			// corrupt per-service verdicts (a running service would read as
+			// not-running), so instead we sweep pending → timed out directly
+			// once the deadline passes — guaranteeing termination even if
+			// ContainerStatus keeps failing.
+			if elapsed >= runner.DefaultWaitTimeout {
+				m.sweepWaitTimeout()
+				m.waiting = false
+				return m, nil
+			}
+			return m, m.waitTick()
+		}
+		var done bool
+		m.waitState, done = runner.EvaluateWait(m.waitState, msg.status, runner.WaitOptions{}, elapsed)
+		if done {
+			// Wait resolved: stop polling but KEEP waitState so the verdict
+			// lines (and the rollback hint on a failed deploy) stay rendered.
+			m.waiting = false
+			return m, nil
+		}
+		return m, m.waitTick()
 
 	case spinner.TickMsg:
 		if m.screen == screenProgress && !m.done && !m.failed {
@@ -1183,6 +1282,7 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 				m.projName = ""
 				m.updatesErr = ""
 				m.clearSearch()
+				m.clearWaitState()
 				if m.localComposer != nil {
 					m.composer = m.localComposer
 					m.statsSession++
@@ -1264,6 +1364,7 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 				m.projErr = nil
 				m.showPicker = false
 				m.clearSearch()
+				m.clearWaitState()
 				if disconnectFn != nil {
 					return m, func() tea.Msg {
 						_ = disconnectFn()
@@ -1409,6 +1510,7 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 				// we reach here, but call clearSearch() unconditionally so the
 				// ephemeral-on-departure invariant holds regardless of entry path.
 				m.clearSearch()
+				m.clearWaitState()
 				if m.projects == nil {
 					return m, m.loadProjects()
 				}
@@ -2029,6 +2131,15 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 				return m.tryQuit()
 			}
 		case "esc":
+			if m.waiting {
+				// Skip the health wait: stop polling and drop the (partial)
+				// verdicts, but leave the operation "done". clearWaitState bumps
+				// waitSession so any in-flight poll/tick is discarded. The user
+				// stays on the progress screen in the plain done state; a second
+				// esc falls through to the back-nav cleanup below.
+				m.clearWaitState()
+				return m, nil
+			}
 			if m.done || m.failed {
 				// Invalidate the update-availability cache for the current
 				// project/server on a SUCCESSFUL operation that may have
@@ -2059,6 +2170,11 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 				m.eventCh = nil
 				m.cancel = nil
 				m.logContent = ""
+				// Clear any resolved-but-not-skipped wait verdicts as we leave
+				// the progress screen (esc-skip already cleared them on the
+				// prior press; this covers a natural resolution followed by a
+				// single esc). Bumps waitSession to invalidate stragglers.
+				m.clearWaitState()
 				m.statsSession++
 				m.statusSession++
 				m.updatesSession++
@@ -2141,9 +2257,47 @@ func (m *Model) enterProgress(containers []string) (tea.Model, tea.Cmd) {
 		logW = io.Discard
 	}
 
-	go runner.Run(ctx, m.composer, op, containers, logW, events)
+	// Remember the target set so pipelineDoneMsg can seed the health-wait
+	// reducer without re-deriving it (Rollback in particular does not use the
+	// container-screen selection).
+	m.opContainers = containers
+
+	// For a Deploy, snapshot the currently-running image digests FIRST — inside
+	// the same goroutine, before runner.Run touches anything (pre-Stop ordering)
+	// — so `cdeploy rollback` / the TUI `R` key can restore them. Best-effort:
+	// warnings go to the op log writer and never block the pipeline. Composers
+	// without the capability (test mocks) skip it entirely. Values are captured
+	// into locals so the goroutine never races the returning *Model.
+	composer := m.composer
+	go func() {
+		if op == runner.Deploy {
+			if s, ok := composer.(Snapshotter); ok {
+				recordDeploySnapshot(ctx, s, containers, logW)
+			}
+		}
+		runner.Run(ctx, composer, op, containers, logW, events)
+	}()
 
 	return *m, tea.Batch(m.spinner.Tick, m.waitForEvent())
+}
+
+// recordDeploySnapshot captures the currently-running image digests for the
+// targeted services and merge-writes them to the host state file. Strictly
+// best-effort (mirrors cmd.recordSnapshot): a capture error, per-service
+// warnings, and a write failure are all surfaced to the op log writer without
+// ever aborting — a snapshot problem must never block the deploy that follows.
+func recordDeploySnapshot(ctx context.Context, s Snapshotter, services []string, warn io.Writer) {
+	res, err := s.SnapshotServices(ctx, services)
+	if err != nil {
+		fmt.Fprintf(warn, "Warning: rollback snapshot skipped: %v\n", err)
+		return
+	}
+	for _, msg := range res.Warnings {
+		fmt.Fprintf(warn, "Warning: rollback snapshot: %s\n", msg)
+	}
+	if err := s.WriteSnapshot(ctx, res.Snapshot); err != nil {
+		fmt.Fprintf(warn, "Warning: failed to write rollback snapshot: %v (deploy continues)\n", err)
+	}
 }
 
 // waitForEvent returns a Cmd that waits for the next StepEvent.
@@ -2155,6 +2309,110 @@ func (m Model) waitForEvent() tea.Cmd {
 			return pipelineDoneMsg{}
 		}
 		return stepEventMsg(event)
+	}
+}
+
+// pollWaitStatus returns a Cmd that fetches one ContainerStatus snapshot and
+// delivers it as a waitStatusMsg tagged with the current wait session. It has no
+// delay of its own — the poll cadence comes from waitTick between polls.
+func (m Model) pollWaitStatus() tea.Cmd {
+	ctx := m.ctx
+	c := m.composer
+	session := m.waitSession
+	return func() tea.Msg {
+		status, err := c.ContainerStatus(ctx)
+		return waitStatusMsg{status: status, err: err, session: session}
+	}
+}
+
+// waitTick returns a Cmd that fires a waitTickMsg after runner.DefaultWaitPoll,
+// spacing successive health polls. The session is captured so a tick outliving
+// its wait (esc-skip / departure bumped waitSession) is dropped by the handler.
+// Tests install waitTickOverride to avoid leaving a real timer goroutine behind.
+func (m Model) waitTick() tea.Cmd {
+	if m.waitTickOverride != nil {
+		return m.waitTickOverride()
+	}
+	session := m.waitSession
+	return tea.Tick(runner.DefaultWaitPoll, func(time.Time) tea.Msg {
+		return waitTickMsg{session: session}
+	})
+}
+
+// clearWaitState resets the health-wait sub-state and bumps waitSession so any
+// in-flight poll/tick is invalidated. Called at every departure site and on
+// esc-skip. Idempotent — safe to call when no wait is active (it just re-bumps
+// the session over already-zero fields).
+func (m *Model) clearWaitState() {
+	m.waiting = false
+	m.waitState = runner.WaitState{}
+	m.waitDeadline = time.Time{}
+	m.opContainers = nil
+	m.waitSession++
+}
+
+// waitElapsed returns the time since the wait began, derived from the deadline
+// and the fixed default timeout the TUI always uses (no --wait-timeout in the
+// TUI). Fed to EvaluateWait, which owns the grace and timeout rules.
+func (m Model) waitElapsed() time.Duration {
+	return runner.DefaultWaitTimeout - time.Until(m.waitDeadline)
+}
+
+// waitResolved reports whether a wait ran to completion (verdicts present but no
+// longer actively polling). Distinct from esc-skip, which clears waitState.
+func (m Model) waitResolved() bool {
+	return !m.waiting && len(m.waitState.Services) > 0
+}
+
+// waitFailed reports whether any targeted service holds a non-passing verdict.
+// At resolution no verdict is still pending (the timeout sweep converts pending
+// → timed out), so this is an accurate pass/fail signal once waitResolved().
+func (m Model) waitFailed() bool {
+	for _, svc := range m.waitState.Services {
+		if !m.waitState.Verdicts[svc].OK() {
+			return true
+		}
+	}
+	return false
+}
+
+// sweepWaitTimeout marks every still-pending service as timed out. Used on the
+// poll-error path once the deadline passes, so a persistent ContainerStatus
+// failure resolves the wait instead of hanging (EvaluateWait can't run without
+// a trustworthy status map).
+func (m *Model) sweepWaitTimeout() {
+	for _, svc := range m.waitState.Services {
+		if !m.waitState.Verdicts[svc].Terminal() {
+			m.waitState.Verdicts[svc] = runner.VerdictTimedOut
+		}
+	}
+}
+
+// waitVerdictIcon maps a verdict to a status glyph, reusing the ♥/●/✗/~
+// vocabulary of the CLI verdict table.
+func waitVerdictIcon(v runner.WaitVerdict) string {
+	switch v {
+	case runner.VerdictHealthy:
+		return "♥"
+	case runner.VerdictRunningNoHC:
+		return "●"
+	case runner.VerdictPending:
+		return "~"
+	default:
+		return "✗"
+	}
+}
+
+// waitVerdictStyle picks the lipgloss style for a verdict: green pass, yellow
+// pending, red fail.
+func waitVerdictStyle(v runner.WaitVerdict) lipgloss.Style {
+	switch {
+	case v.OK():
+		return waitPassStyle
+	case v == runner.VerdictPending:
+		return waitPendingStyle
+	default:
+		return waitFailStyle
 	}
 }
 
@@ -4171,9 +4429,52 @@ func (m Model) viewProgress() string {
 		b.WriteString(fmt.Sprintf("  %s %s\n", icon, label))
 	}
 
-	if m.done || m.failed {
+	// Health-wait sub-state: live per-service verdicts (while polling) or the
+	// final verdicts (after natural resolution). esc-skip clears waitState, so
+	// this block is silent once a wait has been skipped.
+	if m.waiting || m.waitResolved() {
+		b.WriteString("\n")
+		if m.waiting {
+			remaining := time.Until(m.waitDeadline).Round(time.Second)
+			if remaining < 0 {
+				remaining = 0
+			}
+			b.WriteString(waitPendingStyle.Render(fmt.Sprintf("  Waiting for health (%s remaining)", remaining)))
+		} else {
+			b.WriteString(descStyle.Render("  Health check:"))
+		}
+		b.WriteString("\n")
+
+		width := 0
+		for _, svc := range m.waitState.Services {
+			if len(svc) > width {
+				width = len(svc)
+			}
+		}
+		for _, svc := range m.waitState.Services {
+			v := m.waitState.Verdicts[svc]
+			label := string(v)
+			if v == runner.VerdictPending {
+				label = "pending"
+			}
+			style := waitVerdictStyle(v)
+			b.WriteString(fmt.Sprintf("  %s %-*s  %s\n", style.Render(waitVerdictIcon(v)), width, svc, style.Render(label)))
+		}
+
+		// Rollback hint on a failed deploy wait only (a restart/rollback failure
+		// has no earlier snapshot to fall back to).
+		if m.waitResolved() && m.waitFailed() && m.pendingOp == runner.Deploy {
+			b.WriteString(waitHintStyle.Render("  press R on the services screen to roll back"))
+			b.WriteString("\n")
+		}
+	}
+
+	switch {
+	case m.waiting:
+		b.WriteString(helpStyle.Render("\n  esc skip"))
+	case m.done || m.failed:
 		b.WriteString(helpStyle.Render("\n  q back"))
-	} else {
+	default:
 		b.WriteString(helpStyle.Render("\n  esc cancel"))
 	}
 
