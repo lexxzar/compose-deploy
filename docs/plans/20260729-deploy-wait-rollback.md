@@ -513,14 +513,42 @@ function-scoped `defer cleanup()` — it runs after `WaitHealthy` returns, so no
 
 ### Task 13: Verify acceptance criteria
 
-- [ ] walk the 6 acceptance criteria from Overview against the implementation
-- [ ] verify edge cases: same-digest rollback warns + proceeds; prep aborts before Stop on
+- [x] walk the 6 acceptance criteria from Overview against the implementation
+      - AC1 (deploy `-a --wait` exit 0/2 + verdict table): `cmd/deploy.go:waitForHealth`
+        calls `runner.WaitHealthy`, prints `formatWaitReport`, wraps a non-OK/errored report
+        in `WaitError`; `main.go` maps it via `errors.As` → `os.Exit(2)`.
+      - AC2 (`running (no healthcheck)` grace pass): `runner.EvaluateWait` rule 6 (grace timer,
+        `wait.go:249-255`) → `VerdictRunningNoHC = "running (no healthcheck)"`.
+      - AC3 (pre-deploy digest snapshot, warn-and-proceed): `cmd/deploy.go:recordSnapshot`
+        runs BEFORE `runner.Run`, Deploy-only (`op == runner.Deploy` gate), all failures warn
+        and never return an error.
+      - AC4 (rollback pins digest, offline-capable, refuses when absent):
+        `cmd/rollback.go:resolveRollbackTargets` refusal rules;
+        `compose.PrepareRollback` pins via override `-f`; Rollback pipeline has NO Pull step
+        (`runner.buildSteps`) so local blobs suffice offline.
+      - AC5 (TUI wait phase + `R` rollback): `internal/tui/app.go` waiting sub-state +
+        `waitTickMsg` loop + `R` key handler (pinned by TestPipelineDone_*/TestRollback*).
+      - AC6 (zero behavior change): see grep-audit below.
+- [x] verify edge cases: same-digest rollback warns + proceeds; prep aborts before Stop on
       unobtainable digest; ctx cancel mid-wait → partial report, exit 2; standalone
       `docker-compose` gets the `-f` splice; scaled services single entry
-- [ ] grep-audit: nil `ExtraComposeFiles` pins present; no `runner.Composer` change
+      - verified: (a) TestPrepareRollback_SameDigestWarning / TestRemotePrepareRollback_SameDigestWarning;
+        (b) TestPrepareRollback_AbortsOnFailedPull (cleanup nil + `ExtraComposeFiles` untouched);
+        (c) TestWaitHealthy_CtxCancelPartialReport (partial report + `context.Canceled`) →
+        `waitForHealth` wraps in `WaitError` → exit 2 (TestWaitError_ErrorsAs);
+        (d) TestCommand_ExtraComposeFiles_Standalone; (e) TestSnapshotServicesScaledOneEntry.
+- [x] grep-audit: nil `ExtraComposeFiles` pins present; no `runner.Composer` change
       (`git diff` on the interface block); 4 mock sets untouched
-- [ ] run full test suite: `go test ./... -count=1`
-- [ ] `go build -o cdeploy .` + `go vet ./...` clean
+      - verified: TestCommand_NilExtraComposeFiles_ByteIdentical +
+        TestRemoteCommand_NilExtraComposeFiles_ByteIdentical present; `git diff main --
+        internal/runner/runner.go` touches only the Operation enum/String/Steps/buildSteps —
+        the Composer interface block (Stop/Remove/Pull/Create/Start/ListServices/
+        ContainerStatus/ContainerStats/CheckUpdates/Logs) is unchanged; the 4 mock sets gained
+        no new Composer methods (scriptedComposer embeds mockComposer, overrides only
+        ListServices/ContainerStatus).
+- [x] run full test suite: `go test ./... -count=1` — all packages pass (also `-race` clean on
+      tui/runner/cmd)
+- [x] `go build -o cdeploy .` + `go vet ./...` clean
 
 ### Task 14: [Final] Update documentation
 
