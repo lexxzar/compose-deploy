@@ -130,6 +130,15 @@ type RemoteCompose struct {
 	// behavior change.
 	SSHExtraArgs []string
 
+	// ExtraComposeFiles, when non-nil, are spliced into every remote compose
+	// invocation as shell-escaped `-f <file>` pairs immediately after the
+	// compose binary (`docker compose` / `docker-compose`), before the
+	// subcommand. Because `-f` disables compose's file auto-discovery, the
+	// discovered main compose file MUST be first in this slice. Default nil =
+	// no `-f` flags, producing a byte-identical remote command string to the
+	// pre-ExtraComposeFiles behavior.
+	ExtraComposeFiles []string
+
 	detected bool // true after Detect() or SetStandalone() has been called
 
 	// testing hooks; nil = use real exec
@@ -295,8 +304,16 @@ func (r *RemoteCompose) remoteCommand(ctx context.Context, args ...string) *exec
 		composeBin = "docker-compose"
 	}
 
-	remoteCmd := fmt.Sprintf("CURRENT_UID=$(id -u):$(id -g) %s %s",
-		composeBin, strings.Join(escaped, " "))
+	// Splice shell-escaped `-f <file>` pairs immediately after the compose
+	// binary, before the subcommand. fileFlags keeps a trailing space so the
+	// nil case ("") reproduces the exact byte-identical command string.
+	var fileFlags string
+	for _, f := range r.ExtraComposeFiles {
+		fileFlags += "-f " + shellEscape(f) + " "
+	}
+
+	remoteCmd := fmt.Sprintf("CURRENT_UID=$(id -u):$(id -g) %s %s%s",
+		composeBin, fileFlags, strings.Join(escaped, " "))
 
 	if r.ProjectDir != "" {
 		remoteCmd = fmt.Sprintf("cd %s && %s", shellEscape(r.ProjectDir), remoteCmd)

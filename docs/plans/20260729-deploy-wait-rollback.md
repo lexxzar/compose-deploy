@@ -301,17 +301,17 @@ function-scoped `defer cleanup()` — it runs after `WaitHealthy` returns, so no
 - Modify: `internal/compose/compose_test.go`
 - Modify: `internal/compose/remote_test.go`
 
-- [ ] add `ExtraComposeFiles []string` to `Compose`; `command()` emits `-f <file>` pairs
+- [x] add `ExtraComposeFiles []string` to `Compose`; `command()` emits `-f <file>` pairs
       immediately after the compose invocation (both plugin `docker compose` and standalone
       `docker-compose` argv shapes), before the subcommand
-- [ ] add the same field to `RemoteCompose`; `remoteCommand()` splices shell-escaped `-f`
+- [x] add the same field to `RemoteCompose`; `remoteCommand()` splices shell-escaped `-f`
       pairs into the remote command string (both modes)
-- [ ] write argv tests local: with 2 files (order preserved, `-f` before subcommand), plugin +
+- [x] write argv tests local: with 2 files (order preserved, `-f` before subcommand), plugin +
       standalone; **regression pin: nil field ⇒ argv byte-identical to today** (all
       subcommands exercised via existing test helpers)
-- [ ] write argv tests remote: shell-escaping of paths with spaces/quotes; nil ⇒ unchanged
+- [x] write argv tests remote: shell-escaping of paths with spaces/quotes; nil ⇒ unchanged
       remote command string; `CURRENT_UID` prefix unaffected
-- [ ] run tests — must pass before task 5
+- [x] run tests — must pass before task 5
 
 ### Task 5: Snapshot schema + pure helpers
 

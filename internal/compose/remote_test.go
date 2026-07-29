@@ -267,6 +267,121 @@ func TestRemoteCommand_AllComposerMethods(t *testing.T) {
 	}
 }
 
+func TestRemoteCommand_ExtraComposeFiles(t *testing.T) {
+	r := &RemoteCompose{
+		Host:              "user@example.com",
+		ProjectDir:        "/app",
+		SocketPath:        "/tmp/cdeploy-ctrl-abc-99",
+		ExtraComposeFiles: []string{"/app/docker-compose.yml", "/tmp/override.yml"},
+	}
+
+	cmd := r.remoteCommand(context.Background(), "up", "--no-start", "web")
+	remoteCmd := cmd.Args[len(cmd.Args)-1]
+
+	// -f pairs are shell-escaped and land immediately after "docker compose",
+	// before the subcommand, main file first.
+	want := "docker compose -f '/app/docker-compose.yml' -f '/tmp/override.yml' 'up' '--no-start' 'web'"
+	if !strings.Contains(remoteCmd, want) {
+		t.Errorf("remote command should contain %q, got: %q", want, remoteCmd)
+	}
+	// CURRENT_UID prefix must be unaffected.
+	if !strings.HasPrefix(remoteCmd, "cd '/app' && CURRENT_UID=$(id -u):$(id -g) docker compose -f ") {
+		t.Errorf("remote command prefix unexpected, got: %q", remoteCmd)
+	}
+}
+
+func TestRemoteCommand_ExtraComposeFiles_Standalone(t *testing.T) {
+	r := &RemoteCompose{
+		Host:              "user@example.com",
+		SocketPath:        "/tmp/cdeploy-ctrl-abc-99",
+		Standalone:        true,
+		ExtraComposeFiles: []string{"/app/compose.yml"},
+	}
+
+	cmd := r.remoteCommand(context.Background(), "start", "web")
+	remoteCmd := cmd.Args[len(cmd.Args)-1]
+
+	want := "docker-compose -f '/app/compose.yml' 'start' 'web'"
+	if !strings.Contains(remoteCmd, want) {
+		t.Errorf("remote command should contain %q, got: %q", want, remoteCmd)
+	}
+}
+
+func TestRemoteCommand_ExtraComposeFiles_Escaping(t *testing.T) {
+	r := &RemoteCompose{
+		Host:              "user@example.com",
+		SocketPath:        "/tmp/cdeploy-ctrl-abc-99",
+		ExtraComposeFiles: []string{"/app/my compose.yml", "/tmp/it's-override.yml"},
+	}
+
+	cmd := r.remoteCommand(context.Background(), "stop")
+	remoteCmd := cmd.Args[len(cmd.Args)-1]
+
+	// Spaces and single quotes must be shell-escaped so the remote shell
+	// receives them as single argv tokens.
+	wantSpace := "-f '/app/my compose.yml'"
+	if !strings.Contains(remoteCmd, wantSpace) {
+		t.Errorf("remote command should contain %q, got: %q", wantSpace, remoteCmd)
+	}
+	wantQuote := "-f '/tmp/it'\\''s-override.yml'"
+	if !strings.Contains(remoteCmd, wantQuote) {
+		t.Errorf("remote command should contain escaped quote %q, got: %q", wantQuote, remoteCmd)
+	}
+}
+
+// TestRemoteCommand_NilExtraComposeFiles_ByteIdentical is the regression pin
+// for acceptance criterion 6 on the remote path: a nil ExtraComposeFiles field
+// must produce a remote command string byte-identical to the pre-feature
+// behavior across compose subcommands, in both plugin and standalone modes.
+func TestRemoteCommand_NilExtraComposeFiles_ByteIdentical(t *testing.T) {
+	subcommands := [][]string{
+		{"stop", "nginx"},
+		{"rm", "-f", "nginx"},
+		{"pull"},
+		{"up", "--no-start", "nginx"},
+		{"start", "nginx"},
+		{"config", "--services"},
+		{"ps", "-a", "--format", "json"},
+	}
+
+	for _, standalone := range []bool{false, true} {
+		composeBin := "docker compose"
+		if standalone {
+			composeBin = "docker-compose"
+		}
+		for _, args := range subcommands {
+			name := "plugin"
+			if standalone {
+				name = "standalone"
+			}
+			name += "/" + strings.Join(args, "_")
+			t.Run(name, func(t *testing.T) {
+				r := &RemoteCompose{
+					Host:       "user@example.com",
+					ProjectDir: "/app",
+					SocketPath: "/tmp/cdeploy-ctrl-abc-99",
+					Standalone: standalone,
+				}
+				cmd := r.remoteCommand(context.Background(), args...)
+				remoteCmd := cmd.Args[len(cmd.Args)-1]
+
+				// Reconstruct the exact pre-feature command string.
+				var escaped []string
+				for _, a := range args {
+					escaped = append(escaped, shellEscape(a))
+				}
+				want := "cd '/app' && " +
+					"CURRENT_UID=$(id -u):$(id -g) " + composeBin + " " +
+					strings.Join(escaped, " ")
+
+				if remoteCmd != want {
+					t.Errorf("remote command\n got: %q\nwant: %q", remoteCmd, want)
+				}
+			})
+		}
+	}
+}
+
 func TestRemoteLogs_ArgsConstruction(t *testing.T) {
 	r := &RemoteCompose{
 		Host:       "user@example.com",
