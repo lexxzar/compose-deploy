@@ -1111,3 +1111,125 @@ func (r *RemoteCompose) WriteSnapshot(ctx context.Context, fresh *Snapshot) erro
 	}
 	return r.writeRemoteFile(ctx, r.remoteStatePath(), data)
 }
+
+// runRemoteDockerCmdStream runs a top-level `docker <args...>` command on the
+// remote host over SSH STREAMING its combined stdout+stderr to w, bypassing
+// remoteCommand() (which is compose-specific). It is the streaming counterpart
+// of runRemoteDockerCmd (which CAPTURES output for parsing) and mirrors that
+// method's argv build exactly: `docker` + shell-escaped args joined into a
+// single remote command, wrapped by sshArgs() so SSHExtraArgs is spliced
+// immediately before the host argument and the `-S <SocketPath> -o
+// ControlMaster=no` prefix rides the existing ControlMaster socket. Used for
+// `docker pull <repo>@<digest>` live progress during rollback prep. The runCmd
+// test hook is honored so the argv is exercised without a real SSH hop.
+func (r *RemoteCompose) runRemoteDockerCmdStream(ctx context.Context, dockerArgs []string, w io.Writer) error {
+	escaped := make([]string, 0, len(dockerArgs)+1)
+	escaped = append(escaped, "docker")
+	for _, a := range dockerArgs {
+		escaped = append(escaped, shellEscape(a))
+	}
+	remoteCmd := strings.Join(escaped, " ")
+	sshArgv := r.sshArgs(
+		[]string{"-S", r.SocketPath, "-o", "ControlMaster=no"},
+		remoteCmd,
+	)
+	cmd := exec.CommandContext(ctx, "ssh", sshArgv...)
+	cmd.Stdout = w
+	cmd.Stderr = w
+	if r.runCmd != nil {
+		return r.runCmd(cmd)
+	}
+	return cmd.Run()
+}
+
+// PrepareRollback readies a digest-pinned rollback on the REMOTE host WITHOUT
+// touching the running pipeline. It mirrors Compose.PrepareRollback (see that
+// doc comment for the full presence-check / pull-by-digest / abort-before-
+// pipeline / same-digest-advisory contract); only the transport-specific
+// primitives differ:
+//
+//   - the presence check (`docker image inspect`) and pull-by-digest go through
+//     runRemoteDockerCmd / runRemoteDockerCmdStream (top-level docker commands,
+//     NOT compose subcommands), matching the CLAUDE.md inspect-bypass invariant.
+//   - the generated override is delivered to /tmp/cdeploy-rollback-<pid>.yml via
+//     writeRemoteFile (atomic stdin pipe over the ControlMaster socket).
+//   - the main compose file is discovered via findRemoteComposeFile (a bare
+//     name relative to ProjectDir, which remoteCommand cd's into), placed FIRST
+//     in ExtraComposeFiles so `-f` auto-discovery disabling keeps the right
+//     project.
+//
+// cleanup `rm -f`s the remote override file over SSH and RESETS
+// ExtraComposeFiles to nil.
+func (r *RemoteCompose) PrepareRollback(ctx context.Context, entries map[string]SnapshotEntry, services []string, w io.Writer) (func(), error) {
+	targets := rollbackTargets(entries, services)
+
+	main, err := r.findRemoteComposeFile(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("rollback prep: %w", err)
+	}
+
+	// Advisory same-digest check (best-effort, non-fatal).
+	r.warnAlreadyAtSnapshot(ctx, entries, targets, w)
+
+	// Ensure each target digest is present on the remote host, pulling by digest
+	// when missing. Abort BEFORE writing the override / mutating the field.
+	for _, svc := range targets {
+		entry, ok := entries[svc]
+		if !ok {
+			continue
+		}
+		ref := rollbackImageRef(entry)
+		if _, ierr := r.runRemoteDockerCmd(ctx, imagePresenceArgs(ref)); ierr != nil {
+			fmt.Fprintf(w, "pulling %s (not cached on host)\n", ref)
+			if perr := r.runRemoteDockerCmdStream(ctx, []string{"pull", ref}, w); perr != nil {
+				return nil, fmt.Errorf("rollback prep: %s: image %s unavailable (not cached on host and pull failed): %w", svc, ref, perr)
+			}
+		}
+	}
+
+	override := buildOverrideYAML(entries, targets)
+	remotePath := fmt.Sprintf("/tmp/cdeploy-rollback-%d.yml", os.Getpid())
+	if err := r.writeRemoteFile(ctx, remotePath, override); err != nil {
+		return nil, fmt.Errorf("rollback prep: writing override: %w", err)
+	}
+
+	r.ExtraComposeFiles = []string{main, remotePath}
+	cleanup := func() {
+		cctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		sshArgv := r.sshArgs(
+			[]string{"-S", r.SocketPath, "-o", "ControlMaster=no"},
+			"rm -f "+shellEscape(remotePath),
+		)
+		cmd := exec.CommandContext(cctx, "ssh", sshArgv...)
+		if r.runCmd != nil {
+			_ = r.runCmd(cmd)
+		} else {
+			_ = cmd.Run()
+		}
+		r.ExtraComposeFiles = nil
+	}
+	return cleanup, nil
+}
+
+// warnAlreadyAtSnapshot writes an "already at snapshot" advisory to w for each
+// target service whose currently-running remote container already uses the
+// snapshot digest. Mirrors Compose.warnAlreadyAtSnapshot: the current digest is
+// the running container's actual digest (via SnapshotServices), and the whole
+// probe is best-effort — any capture error skips the advisory without failing
+// prep.
+func (r *RemoteCompose) warnAlreadyAtSnapshot(ctx context.Context, entries map[string]SnapshotEntry, targets []string, w io.Writer) {
+	cur, err := r.SnapshotServices(ctx, targets)
+	if err != nil {
+		return
+	}
+	for _, svc := range targets {
+		entry, ok := entries[svc]
+		if !ok {
+			continue
+		}
+		if now, ok := cur.Snapshot.Services[svc]; ok && now.Digest == entry.Digest {
+			fmt.Fprintf(w, "%s: already at snapshot digest %s\n", svc, entry.Digest)
+		}
+	}
+}

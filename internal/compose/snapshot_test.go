@@ -665,6 +665,270 @@ func TestReadSnapshotUnknownSchemaTyped(t *testing.T) {
 	}
 }
 
+// argsHave reports whether any element of args contains sub — a small helper
+// for discriminating docker/compose subcommands in PrepareRollback test hooks.
+func argsHave(args []string, sub string) bool {
+	for _, a := range args {
+		if strings.Contains(a, sub) {
+			return true
+		}
+	}
+	return false
+}
+
+func TestRunDockerCmdStream_Argv(t *testing.T) {
+	var captured *exec.Cmd
+	c := &Compose{
+		ProjectDir: "/proj",
+		UID:        "1000:1000",
+		runCmd: func(cmd *exec.Cmd) error {
+			captured = cmd
+			// Verify the writer is wired to both streams and reaches the caller.
+			fmt.Fprint(cmd.Stdout, "pull-progress")
+			return nil
+		},
+	}
+	var buf strings.Builder
+	if err := c.runDockerCmdStream(context.Background(), []string{"pull", "nginx@sha256:ab12"}, &buf); err != nil {
+		t.Fatalf("runDockerCmdStream: %v", err)
+	}
+	if captured == nil {
+		t.Fatal("runCmd not called")
+	}
+	want := []string{"docker", "pull", "nginx@sha256:ab12"}
+	if len(captured.Args) != len(want) {
+		t.Fatalf("argv = %v, want %v", captured.Args, want)
+	}
+	for i, w := range want {
+		if captured.Args[i] != w {
+			t.Errorf("argv[%d] = %q, want %q", i, captured.Args[i], w)
+		}
+	}
+	// Top-level docker command must NOT carry the compose subcommand.
+	if argsHave(captured.Args, "compose") {
+		t.Errorf("streaming docker argv leaked 'compose': %v", captured.Args)
+	}
+	if captured.Stdout == nil || captured.Stderr == nil {
+		t.Error("stdout/stderr not wired to the writer")
+	}
+	if buf.String() != "pull-progress" {
+		t.Errorf("writer got %q, want %q", buf.String(), "pull-progress")
+	}
+}
+
+// prepComposer builds a Compose whose ProjectDir contains a real compose.yml
+// (so findComposeFile succeeds) and whose outputCmd hook scripts the
+// PrepareRollback data-plane calls. presentRefs lists digest refs whose
+// `docker image inspect` presence check succeeds; any other ref errors (→ pull).
+// The advisory same-digest capture is neutralized by an empty compose config +
+// empty ps (no running services → no warning) unless the caller overrides.
+func prepComposer(t *testing.T, presentRefs map[string]bool, runCmd func(*exec.Cmd) error) (*Compose, string) {
+	t.Helper()
+	dir := t.TempDir()
+	mainFile := filepath.Join(dir, "compose.yml")
+	if err := os.WriteFile(mainFile, []byte("services: {}\n"), 0o644); err != nil {
+		t.Fatalf("seed compose file: %v", err)
+	}
+	c := &Compose{
+		ProjectDir: dir,
+		UID:        "1000:1000",
+		runCmd:     runCmd,
+		outputCmd: func(cmd *exec.Cmd) ([]byte, error) {
+			args := cmd.Args
+			switch {
+			case argsHave(args, "{{.Id}}"):
+				// presence check: last arg is the digest ref.
+				ref := args[len(args)-1]
+				if presentRefs[ref] {
+					return []byte("sha256:present\n"), nil
+				}
+				return nil, fmt.Errorf("Error: No such image: %s", ref)
+			case argsHave(args, "config"):
+				return []byte(`{"services":{}}`), nil // advisory: no services
+			case argsHave(args, "ps"):
+				return []byte(`[]`), nil // advisory: nothing running
+			}
+			return nil, fmt.Errorf("unexpected cmd: %v", args)
+		},
+	}
+	return c, mainFile
+}
+
+func TestPrepareRollback_OverrideAndFieldOrdering(t *testing.T) {
+	entries := map[string]SnapshotEntry{
+		"web": {Image: "nginx:latest", Digest: "sha256:ab12"},
+		"db":  {Image: "postgres:16", Digest: "sha256:cd34"},
+	}
+	// Both digests already cached → no pull.
+	present := map[string]bool{"nginx@sha256:ab12": true, "postgres@sha256:cd34": true}
+	c, mainFile := prepComposer(t, present, func(cmd *exec.Cmd) error {
+		t.Errorf("no pull expected, but a command ran: %v", cmd.Args)
+		return nil
+	})
+
+	var w strings.Builder
+	cleanup, err := c.PrepareRollback(context.Background(), entries, nil, &w)
+	if err != nil {
+		t.Fatalf("PrepareRollback: %v", err)
+	}
+	if cleanup == nil {
+		t.Fatal("cleanup is nil on success")
+	}
+	if len(c.ExtraComposeFiles) != 2 {
+		t.Fatalf("ExtraComposeFiles = %v, want [main, override]", c.ExtraComposeFiles)
+	}
+	// Main compose file MUST be first (-f disables auto-discovery).
+	if c.ExtraComposeFiles[0] != mainFile {
+		t.Errorf("main file = %q, want %q (must be first)", c.ExtraComposeFiles[0], mainFile)
+	}
+	overridePath := c.ExtraComposeFiles[1]
+	got, err := os.ReadFile(overridePath)
+	if err != nil {
+		t.Fatalf("reading override file: %v", err)
+	}
+	// Deterministic, sorted (db before web), digest-pinned.
+	want := "services:\n" +
+		"  db:\n    image: postgres@sha256:cd34\n" +
+		"  web:\n    image: nginx@sha256:ab12\n"
+	if string(got) != want {
+		t.Errorf("override content mismatch:\n got %q\nwant %q", got, want)
+	}
+}
+
+func TestPrepareRollback_PullsMissingDigest(t *testing.T) {
+	entries := map[string]SnapshotEntry{
+		"web": {Image: "nginx:latest", Digest: "sha256:ab12"},
+	}
+	var pullCmd *exec.Cmd
+	// Digest NOT present → presence check errors → pull.
+	c, _ := prepComposer(t, map[string]bool{}, func(cmd *exec.Cmd) error {
+		pullCmd = cmd
+		return nil
+	})
+
+	var w strings.Builder
+	cleanup, err := c.PrepareRollback(context.Background(), entries, []string{"web"}, &w)
+	if err != nil {
+		t.Fatalf("PrepareRollback: %v", err)
+	}
+	defer cleanup()
+	if pullCmd == nil {
+		t.Fatal("expected a pull command for the missing digest")
+	}
+	want := []string{"docker", "pull", "nginx@sha256:ab12"}
+	if len(pullCmd.Args) != len(want) {
+		t.Fatalf("pull argv = %v, want %v", pullCmd.Args, want)
+	}
+	for i, ww := range want {
+		if pullCmd.Args[i] != ww {
+			t.Errorf("pull argv[%d] = %q, want %q", i, pullCmd.Args[i], ww)
+		}
+	}
+	if !strings.Contains(w.String(), "pulling nginx@sha256:ab12") {
+		t.Errorf("expected a 'pulling' progress line, got %q", w.String())
+	}
+	if len(c.ExtraComposeFiles) != 2 {
+		t.Errorf("ExtraComposeFiles not set after successful pull: %v", c.ExtraComposeFiles)
+	}
+}
+
+func TestPrepareRollback_AbortsOnFailedPull(t *testing.T) {
+	entries := map[string]SnapshotEntry{
+		"web": {Image: "nginx:latest", Digest: "sha256:ab12"},
+	}
+	// Digest missing AND pull fails (blob pruned + registry down).
+	c, _ := prepComposer(t, map[string]bool{}, func(cmd *exec.Cmd) error {
+		return fmt.Errorf("manifest for nginx@sha256:ab12 not found")
+	})
+
+	var w strings.Builder
+	cleanup, err := c.PrepareRollback(context.Background(), entries, []string{"web"}, &w)
+	if err == nil {
+		t.Fatal("expected an abort error on failed pull")
+	}
+	if cleanup != nil {
+		t.Error("cleanup must be nil when PrepareRollback aborts")
+	}
+	// Aborts BEFORE any pipeline configuration: field untouched.
+	if c.ExtraComposeFiles != nil {
+		t.Errorf("ExtraComposeFiles mutated despite abort: %v", c.ExtraComposeFiles)
+	}
+	if !strings.Contains(err.Error(), "web") || !strings.Contains(err.Error(), "unavailable") {
+		t.Errorf("abort error = %q, want it to name the service and 'unavailable'", err.Error())
+	}
+}
+
+func TestPrepareRollback_CleanupResetsFieldAndRemovesFile(t *testing.T) {
+	entries := map[string]SnapshotEntry{
+		"web": {Image: "nginx:latest", Digest: "sha256:ab12"},
+	}
+	c, _ := prepComposer(t, map[string]bool{"nginx@sha256:ab12": true}, nil)
+
+	var w strings.Builder
+	cleanup, err := c.PrepareRollback(context.Background(), entries, nil, &w)
+	if err != nil {
+		t.Fatalf("PrepareRollback: %v", err)
+	}
+	overridePath := c.ExtraComposeFiles[1]
+	if _, statErr := os.Stat(overridePath); statErr != nil {
+		t.Fatalf("override file missing before cleanup: %v", statErr)
+	}
+
+	cleanup()
+
+	if c.ExtraComposeFiles != nil {
+		t.Errorf("cleanup did not reset ExtraComposeFiles: %v", c.ExtraComposeFiles)
+	}
+	if _, statErr := os.Stat(overridePath); statErr == nil {
+		t.Errorf("cleanup did not remove the override file %q", overridePath)
+	}
+}
+
+func TestPrepareRollback_SameDigestWarning(t *testing.T) {
+	// The currently-running web container uses sha256:ab12 — exactly the
+	// snapshot digest → an "already at snapshot" advisory, prep still proceeds.
+	entries := map[string]SnapshotEntry{
+		"web": {Image: "nginx:latest", Digest: "sha256:ab12"},
+	}
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "compose.yml"), []byte("services: {}\n"), 0o644); err != nil {
+		t.Fatalf("seed compose file: %v", err)
+	}
+	c := &Compose{
+		ProjectDir: dir,
+		UID:        "1000:1000",
+		outputCmd: func(cmd *exec.Cmd) ([]byte, error) {
+			args := cmd.Args
+			switch {
+			case argsHave(args, "{{.Image}}"):
+				return []byte("sha256:img-web\n"), nil
+			case argsHave(args, "RepoDigests"):
+				return []byte("nginx@sha256:ab12\n"), nil // current running digest
+			case argsHave(args, "{{.Id}}"):
+				return []byte("sha256:present\n"), nil // presence: cached, no pull
+			case argsHave(args, "config"):
+				return []byte(`{"services":{"web":{"image":"nginx:latest"}}}`), nil
+			case argsHave(args, "ps"):
+				return []byte(`[{"ID":"cid-web","Service":"web","State":"running"}]`), nil
+			}
+			return nil, fmt.Errorf("unexpected cmd: %v", args)
+		},
+	}
+	var w strings.Builder
+	cleanup, err := c.PrepareRollback(context.Background(), entries, nil, &w)
+	if err != nil {
+		t.Fatalf("PrepareRollback: %v", err)
+	}
+	defer cleanup()
+	if !strings.Contains(w.String(), "already at snapshot") || !strings.Contains(w.String(), "sha256:ab12") {
+		t.Errorf("expected an 'already at snapshot' advisory naming the digest, got %q", w.String())
+	}
+	// Advisory is non-fatal: prep still configured the pipeline.
+	if len(c.ExtraComposeFiles) != 2 {
+		t.Errorf("ExtraComposeFiles not set despite same-digest advisory: %v", c.ExtraComposeFiles)
+	}
+}
+
 func TestWriteSnapshotFileAtomicNoPartial(t *testing.T) {
 	// Force writeSnapshotFile to fail (parent path is a regular file, so
 	// MkdirAll cannot create the state dir) and assert no partial file is left

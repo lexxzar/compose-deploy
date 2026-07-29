@@ -393,26 +393,26 @@ function-scoped `defer cleanup()` — it runs after `WaitHealthy` returns, so no
 - Modify: `internal/compose/remote.go`
 - Modify: `internal/compose/snapshot_test.go`, `internal/compose/remote_test.go`
 
-- [ ] add streaming top-level docker runners — the existing `runDockerCmd`/
+- [x] add streaming top-level docker runners — the existing `runDockerCmd`/
       `runRemoteDockerCmd` CAPTURE output; no primitive today streams a top-level command to
       an `io.Writer`: local `runDockerCmdStream(ctx, args, w)` (`cmd.Stdout/Stderr = w`) and
       remote `runRemoteDockerCmdStream(ctx, args, w)` (direct SSH argv, SocketPath prefix,
       `SSHExtraArgs` before host arg); used for `docker pull <repo>@<digest>` live progress
-- [ ] implement `(*Compose) PrepareRollback(ctx, entries, services, w io.Writer) (cleanup func(), err error)`:
+- [x] implement `(*Compose) PrepareRollback(ctx, entries, services, w io.Writer) (cleanup func(), err error)`:
       per-digest presence check (`docker image inspect <repo>@<digest>`), pull-by-digest for
       missing (via the streaming runners), generate override YAML, write to `os.TempDir()`,
       discover main file via `findComposeFile`, set `ExtraComposeFiles = [main, override]`;
       cleanup removes the temp file and resets the field; abort with per-image error before
       any pipeline step if a required digest is unobtainable
-- [ ] implement `(*RemoteCompose) PrepareRollback(...)` mirroring via remote primitives
+- [x] implement `(*RemoteCompose) PrepareRollback(...)` mirroring via remote primitives
       (override delivered with `writeRemoteFile` to `/tmp/cdeploy-rollback-<pid>.yml`;
       `findRemoteComposeFile`; cleanup `rm -f` over SSH)
-- [ ] detect current == snapshot digest → append `already at snapshot` warning, proceed
-- [ ] write tests: presence-check/pull argv (incl. the streaming runners' argv local +
+- [x] detect current == snapshot digest → append `already at snapshot` warning, proceed
+- [x] write tests: presence-check/pull argv (incl. the streaming runners' argv local +
       remote); abort-before-pipeline on failed pull; override content and `-f` ordering
       (main first); cleanup resets field + removes file (local real-FS, remote argv);
       warning on same-digest
-- [ ] run tests — must pass before task 9
+- [x] run tests — must pass before task 9
 
 ### Task 9: CLI `--wait` on deploy/restart + exit-code contract
 

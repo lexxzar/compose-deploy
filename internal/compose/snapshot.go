@@ -7,7 +7,9 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
+	"os/exec"
 	"path"
 	"path/filepath"
 	"sort"
@@ -160,11 +162,47 @@ func buildOverrideYAML(entries map[string]SnapshotEntry, services []string) []by
 		if !ok {
 			continue
 		}
-		repo := stripTag(entry.Image)
 		fmt.Fprintf(&b, "  %s:\n", name)
-		fmt.Fprintf(&b, "    image: %s@%s\n", repo, entry.Digest)
+		fmt.Fprintf(&b, "    image: %s\n", rollbackImageRef(entry))
 	}
 	return []byte(b.String())
+}
+
+// rollbackImageRef returns the digest-pinned image reference (`repo@digest`) a
+// snapshot entry rolls back to: the repo is derived from the recorded image ref
+// via stripTag (dropping any tag) joined to the recorded digest. It is the
+// single source of truth for the ref used in the local/remote presence check,
+// the pull-by-digest, AND the generated override YAML, so all three always
+// agree on the exact string.
+func rollbackImageRef(entry SnapshotEntry) string {
+	return stripTag(entry.Image) + "@" + entry.Digest
+}
+
+// rollbackTargets resolves the sorted set of services a rollback targets: the
+// explicit services slice when non-empty, otherwise every service present in
+// entries. Sorting makes the pull order, override generation, and
+// ExtraComposeFiles argv deterministic (Go map iteration is randomized).
+func rollbackTargets(entries map[string]SnapshotEntry, services []string) []string {
+	var targets []string
+	if len(services) > 0 {
+		targets = append(targets, services...)
+	} else {
+		for name := range entries {
+			targets = append(targets, name)
+		}
+	}
+	sort.Strings(targets)
+	return targets
+}
+
+// imagePresenceArgs builds a minimal `docker image inspect` argv used only to
+// test whether an image (by digest-pinned ref) is already present locally. It
+// formats just the image ID so the captured output stays small; a missing image
+// makes `docker image inspect` exit non-zero, which the caller treats as
+// "absent, must pull by digest". Bypasses command() — `docker image inspect`
+// is a top-level docker CLI command, not a compose subcommand.
+func imagePresenceArgs(ref string) []string {
+	return []string{"image", "inspect", "--format", "{{.Id}}", ref}
 }
 
 // snapshotClock returns the timestamp stamped into freshly-captured snapshot
@@ -460,4 +498,122 @@ func writeSnapshotFile(path string, snap *Snapshot) error {
 		return fmt.Errorf("renaming snapshot: %w", err)
 	}
 	return nil
+}
+
+// runDockerCmdStream runs a top-level `docker <args...>` command STREAMING its
+// combined stdout+stderr to w, bypassing c.command() (which is compose-
+// specific). Unlike runDockerCmd — which CAPTURES output for parsing — this
+// primitive exists so `docker pull <repo>@<digest>` shows live progress on the
+// op log / progress screen during rollback prep. The runCmd test hook is
+// honored so the argv is exercised without invoking Docker.
+func (c *Compose) runDockerCmdStream(ctx context.Context, dockerArgs []string, w io.Writer) error {
+	cmd := exec.CommandContext(ctx, "docker", dockerArgs...)
+	cmd.Stdout = w
+	cmd.Stderr = w
+	if c.runCmd != nil {
+		return c.runCmd(cmd)
+	}
+	return cmd.Run()
+}
+
+// PrepareRollback readies a digest-pinned rollback for the requested services
+// WITHOUT touching the running pipeline. For each target service present in
+// entries it:
+//
+//  1. Ensures the snapshot digest's image blob is available locally: a
+//     `docker image inspect <repo>@<digest>` presence check and — only when
+//     absent — a `docker pull <repo>@<digest>` (streamed to w for live
+//     progress). A pull that fails (blob pruned AND registry unreachable)
+//     aborts here, BEFORE any override file is written or ExtraComposeFiles is
+//     touched, so a failed prep never leaves the pipeline half-configured. This
+//     is why offline rollback works: a present blob is never re-pulled.
+//  2. Generates a minimal compose override pinning each service to its snapshot
+//     digest, writes it to a temp file in os.TempDir(), discovers the project's
+//     main compose file, and sets ExtraComposeFiles = [main, override] — main
+//     FIRST because `-f` disables compose's file auto-discovery.
+//
+// Best-effort advisory: when a service's CURRENTLY-running container already
+// uses the snapshot digest, an "already at snapshot" line is written to w and
+// prep proceeds (a recreate is still meaningful — e.g. after a crash). The
+// current-digest probe reuses SnapshotServices and is non-fatal.
+//
+// On success the returned cleanup removes the temp override file and RESETS
+// ExtraComposeFiles to nil; the caller invokes it after the rollback pipeline
+// (and, in the TUI, the wait phase) completes — never goroutine-deferred. On
+// error cleanup is nil and no state was mutated.
+func (c *Compose) PrepareRollback(ctx context.Context, entries map[string]SnapshotEntry, services []string, w io.Writer) (func(), error) {
+	targets := rollbackTargets(entries, services)
+
+	// Discover the main compose file first so a project with no compose file
+	// fails fast, before any (potentially slow) pull.
+	main, err := c.findComposeFile()
+	if err != nil {
+		return nil, fmt.Errorf("rollback prep: %w", err)
+	}
+
+	// Advisory same-digest check (best-effort, non-fatal).
+	c.warnAlreadyAtSnapshot(ctx, entries, targets, w)
+
+	// Ensure each target digest is present locally, pulling by digest when
+	// missing. Abort BEFORE writing the override / mutating ExtraComposeFiles.
+	for _, svc := range targets {
+		entry, ok := entries[svc]
+		if !ok {
+			continue
+		}
+		ref := rollbackImageRef(entry)
+		if _, ierr := c.runDockerCmd(ctx, imagePresenceArgs(ref)); ierr != nil {
+			fmt.Fprintf(w, "pulling %s (not cached locally)\n", ref)
+			if perr := c.runDockerCmdStream(ctx, []string{"pull", ref}, w); perr != nil {
+				return nil, fmt.Errorf("rollback prep: %s: image %s unavailable (not cached locally and pull failed): %w", svc, ref, perr)
+			}
+		}
+	}
+
+	override := buildOverrideYAML(entries, targets)
+	tmp, err := os.CreateTemp("", "cdeploy-rollback-*.yml")
+	if err != nil {
+		return nil, fmt.Errorf("rollback prep: creating override file: %w", err)
+	}
+	tmpPath := tmp.Name()
+	if _, err := tmp.Write(override); err != nil {
+		tmp.Close()
+		os.Remove(tmpPath)
+		return nil, fmt.Errorf("rollback prep: writing override file: %w", err)
+	}
+	if err := tmp.Close(); err != nil {
+		os.Remove(tmpPath)
+		return nil, fmt.Errorf("rollback prep: closing override file: %w", err)
+	}
+
+	c.ExtraComposeFiles = []string{main, tmpPath}
+	cleanup := func() {
+		os.Remove(tmpPath)
+		c.ExtraComposeFiles = nil
+	}
+	return cleanup, nil
+}
+
+// warnAlreadyAtSnapshot writes an "already at snapshot" advisory to w for each
+// target service whose CURRENTLY-running container already uses the snapshot
+// digest (the canonical idempotent-rollback case: running rollback twice lands
+// on the same state). The current digest is the running container's actual
+// digest — captured by reusing SnapshotServices, NOT the tag's current digest,
+// so a tag that has since been re-pointed doesn't produce a false negative.
+// Entirely best-effort: any capture error (compose config unavailable, nothing
+// running) skips the advisory without failing prep.
+func (c *Compose) warnAlreadyAtSnapshot(ctx context.Context, entries map[string]SnapshotEntry, targets []string, w io.Writer) {
+	cur, err := c.SnapshotServices(ctx, targets)
+	if err != nil {
+		return
+	}
+	for _, svc := range targets {
+		entry, ok := entries[svc]
+		if !ok {
+			continue
+		}
+		if now, ok := cur.Snapshot.Services[svc]; ok && now.Digest == entry.Digest {
+			fmt.Fprintf(w, "%s: already at snapshot digest %s\n", svc, entry.Digest)
+		}
+	}
 }

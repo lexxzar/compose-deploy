@@ -3076,3 +3076,254 @@ func TestRemoteWriteSnapshot_MergeAndWrite(t *testing.T) {
 		t.Errorf("db not preserved across merge: %+v", got.Services["db"])
 	}
 }
+
+func TestRunRemoteDockerCmdStream_Argv(t *testing.T) {
+	extras := []string{"-i", "/tmp/key"}
+	host := "user@example.com"
+	var captured *exec.Cmd
+	r := &RemoteCompose{
+		Host:         host,
+		SocketPath:   "/tmp/cdeploy-ctrl-abc-99",
+		SSHExtraArgs: extras,
+		runCmd: func(cmd *exec.Cmd) error {
+			captured = cmd
+			fmt.Fprint(cmd.Stdout, "pull-progress")
+			return nil
+		},
+	}
+	var buf strings.Builder
+	if err := r.runRemoteDockerCmdStream(context.Background(), []string{"pull", "nginx@sha256:ab12"}, &buf); err != nil {
+		t.Fatalf("runRemoteDockerCmdStream: %v", err)
+	}
+	if captured == nil {
+		t.Fatal("runCmd not called")
+	}
+	if captured.Args[0] != "ssh" {
+		t.Errorf("argv[0] = %q, want ssh", captured.Args[0])
+	}
+	// SSHExtraArgs spliced immediately before the host (same convention as
+	// runRemoteDockerCmd / writeRemoteFile).
+	assertExtraBeforeHost(t, "runRemoteDockerCmdStream", captured.Args, host, extras)
+	// Reuses the ControlMaster socket.
+	foundSock := false
+	for i, a := range captured.Args {
+		if a == "-S" && i+1 < len(captured.Args) && captured.Args[i+1] == r.SocketPath {
+			foundSock = true
+		}
+	}
+	if !foundSock {
+		t.Errorf("argv missing -S %q: %v", r.SocketPath, captured.Args)
+	}
+	// The remote command is a TOP-LEVEL docker command (no compose), shell-escaped.
+	rc := captured.Args[len(captured.Args)-1]
+	if rc != "docker 'pull' 'nginx@sha256:ab12'" {
+		t.Errorf("remote command = %q, want %q", rc, "docker 'pull' 'nginx@sha256:ab12'")
+	}
+	if strings.Contains(rc, "compose") {
+		t.Errorf("streaming remote docker command leaked 'compose': %q", rc)
+	}
+	if captured.Stdout == nil || captured.Stderr == nil {
+		t.Error("stdout/stderr not wired to the writer")
+	}
+	if buf.String() != "pull-progress" {
+		t.Errorf("writer got %q, want %q", buf.String(), "pull-progress")
+	}
+}
+
+func TestRemotePrepareRollback_PullAndOverride(t *testing.T) {
+	entries := map[string]SnapshotEntry{
+		"web": {Image: "nginx:latest", Digest: "sha256:ab12"},
+	}
+	var pullRC string
+	var overrideWritten []byte
+	r := &RemoteCompose{
+		Host:       "user@example.com",
+		ProjectDir: "/proj",
+		SocketPath: "/tmp/cdeploy-ctrl-abc-99",
+		outputCmd: func(cmd *exec.Cmd) ([]byte, error) {
+			rc := cmd.Args[len(cmd.Args)-1]
+			switch {
+			case strings.Contains(rc, "test -f"):
+				return []byte("compose.yml\n"), nil // findRemoteComposeFile
+			case strings.Contains(rc, "{{.Id}}"):
+				return nil, fmt.Errorf("Error: No such image") // presence: missing → pull
+			case strings.Contains(rc, "'config'"):
+				return []byte(`{"services":{}}`), nil // advisory: no services
+			case strings.Contains(rc, "'ps'"):
+				return []byte(`[]`), nil // advisory: nothing running
+			}
+			return nil, fmt.Errorf("unexpected outputCmd: %q", rc)
+		},
+		runCmd: func(cmd *exec.Cmd) error {
+			rc := cmd.Args[len(cmd.Args)-1]
+			switch {
+			case strings.Contains(rc, "'pull'"):
+				pullRC = rc
+			case strings.Contains(rc, "mkdir -p"):
+				overrideWritten, _ = io.ReadAll(cmd.Stdin)
+			default:
+				return fmt.Errorf("unexpected runCmd: %q", rc)
+			}
+			return nil
+		},
+	}
+
+	var w strings.Builder
+	cleanup, err := r.PrepareRollback(context.Background(), entries, nil, &w)
+	if err != nil {
+		t.Fatalf("PrepareRollback: %v", err)
+	}
+	if cleanup == nil {
+		t.Fatal("cleanup nil on success")
+	}
+	// pull-by-digest over SSH (top-level docker command).
+	if pullRC != "docker 'pull' 'nginx@sha256:ab12'" {
+		t.Errorf("pull remote command = %q, want %q", pullRC, "docker 'pull' 'nginx@sha256:ab12'")
+	}
+	// Override delivered to /tmp/cdeploy-rollback-<pid>.yml, main file first.
+	wantOverridePath := fmt.Sprintf("/tmp/cdeploy-rollback-%d.yml", os.Getpid())
+	want := []string{"compose.yml", wantOverridePath}
+	if len(r.ExtraComposeFiles) != 2 || r.ExtraComposeFiles[0] != want[0] || r.ExtraComposeFiles[1] != want[1] {
+		t.Errorf("ExtraComposeFiles = %v, want %v", r.ExtraComposeFiles, want)
+	}
+	if string(overrideWritten) != "services:\n  web:\n    image: nginx@sha256:ab12\n" {
+		t.Errorf("override content = %q", string(overrideWritten))
+	}
+}
+
+func TestRemotePrepareRollback_AbortsOnFailedPull(t *testing.T) {
+	entries := map[string]SnapshotEntry{
+		"web": {Image: "nginx:latest", Digest: "sha256:ab12"},
+	}
+	r := &RemoteCompose{
+		Host:       "user@example.com",
+		ProjectDir: "/proj",
+		SocketPath: "/tmp/cdeploy-ctrl-abc-99",
+		outputCmd: func(cmd *exec.Cmd) ([]byte, error) {
+			rc := cmd.Args[len(cmd.Args)-1]
+			switch {
+			case strings.Contains(rc, "test -f"):
+				return []byte("compose.yml\n"), nil
+			case strings.Contains(rc, "{{.Id}}"):
+				return nil, fmt.Errorf("Error: No such image") // missing → pull
+			case strings.Contains(rc, "'config'"):
+				return []byte(`{"services":{}}`), nil
+			case strings.Contains(rc, "'ps'"):
+				return []byte(`[]`), nil
+			}
+			return nil, fmt.Errorf("unexpected outputCmd: %q", rc)
+		},
+		runCmd: func(cmd *exec.Cmd) error {
+			return fmt.Errorf("manifest unknown") // pull fails → abort
+		},
+	}
+	var w strings.Builder
+	cleanup, err := r.PrepareRollback(context.Background(), entries, nil, &w)
+	if err == nil {
+		t.Fatal("expected abort error on failed remote pull")
+	}
+	if cleanup != nil {
+		t.Error("cleanup must be nil when PrepareRollback aborts")
+	}
+	if r.ExtraComposeFiles != nil {
+		t.Errorf("ExtraComposeFiles mutated despite abort: %v", r.ExtraComposeFiles)
+	}
+	if !strings.Contains(err.Error(), "web") || !strings.Contains(err.Error(), "unavailable") {
+		t.Errorf("abort error = %q, want it to name the service and 'unavailable'", err.Error())
+	}
+}
+
+func TestRemotePrepareRollback_CleanupRemovesFileAndResetsField(t *testing.T) {
+	entries := map[string]SnapshotEntry{
+		"web": {Image: "nginx:latest", Digest: "sha256:ab12"},
+	}
+	var rmRC string
+	r := &RemoteCompose{
+		Host:       "user@example.com",
+		ProjectDir: "/proj",
+		SocketPath: "/tmp/cdeploy-ctrl-abc-99",
+		outputCmd: func(cmd *exec.Cmd) ([]byte, error) {
+			rc := cmd.Args[len(cmd.Args)-1]
+			switch {
+			case strings.Contains(rc, "test -f"):
+				return []byte("compose.yml\n"), nil
+			case strings.Contains(rc, "{{.Id}}"):
+				return []byte("sha256:present\n"), nil // cached → no pull
+			case strings.Contains(rc, "'config'"):
+				return []byte(`{"services":{}}`), nil
+			case strings.Contains(rc, "'ps'"):
+				return []byte(`[]`), nil
+			}
+			return nil, fmt.Errorf("unexpected outputCmd: %q", rc)
+		},
+		runCmd: func(cmd *exec.Cmd) error {
+			rc := cmd.Args[len(cmd.Args)-1]
+			if strings.Contains(rc, "rm -f") {
+				rmRC = rc
+			}
+			return nil // writeRemoteFile + rm both succeed
+		},
+	}
+	var w strings.Builder
+	cleanup, err := r.PrepareRollback(context.Background(), entries, nil, &w)
+	if err != nil {
+		t.Fatalf("PrepareRollback: %v", err)
+	}
+	if len(r.ExtraComposeFiles) != 2 {
+		t.Fatalf("ExtraComposeFiles not set: %v", r.ExtraComposeFiles)
+	}
+
+	cleanup()
+
+	if r.ExtraComposeFiles != nil {
+		t.Errorf("cleanup did not reset ExtraComposeFiles: %v", r.ExtraComposeFiles)
+	}
+	wantPath := fmt.Sprintf("/tmp/cdeploy-rollback-%d.yml", os.Getpid())
+	if !strings.Contains(rmRC, "rm -f") || !strings.Contains(rmRC, wantPath) {
+		t.Errorf("cleanup rm command = %q, want it to rm -f %q", rmRC, wantPath)
+	}
+}
+
+func TestRemotePrepareRollback_SameDigestWarning(t *testing.T) {
+	// Currently-running web container uses sha256:ab12 == snapshot digest →
+	// "already at snapshot" advisory, prep proceeds.
+	entries := map[string]SnapshotEntry{
+		"web": {Image: "nginx:latest", Digest: "sha256:ab12"},
+	}
+	r := &RemoteCompose{
+		Host:       "user@example.com",
+		ProjectDir: "/proj",
+		SocketPath: "/tmp/cdeploy-ctrl-abc-99",
+		outputCmd: func(cmd *exec.Cmd) ([]byte, error) {
+			rc := cmd.Args[len(cmd.Args)-1]
+			switch {
+			case strings.Contains(rc, "test -f"):
+				return []byte("compose.yml\n"), nil
+			case strings.Contains(rc, "{{.Image}}"):
+				return []byte("sha256:img-web\n"), nil
+			case strings.Contains(rc, "RepoDigests"):
+				return []byte("nginx@sha256:ab12\n"), nil // current running digest
+			case strings.Contains(rc, "{{.Id}}"):
+				return []byte("sha256:present\n"), nil // cached → no pull
+			case strings.Contains(rc, "'config'"):
+				return []byte(`{"services":{"web":{"image":"nginx:latest"}}}`), nil
+			case strings.Contains(rc, "'ps'"):
+				return []byte(`[{"ID":"cid-web","Service":"web","State":"running"}]`), nil
+			}
+			return nil, fmt.Errorf("unexpected outputCmd: %q", rc)
+		},
+		runCmd: func(cmd *exec.Cmd) error { return nil }, // writeRemoteFile
+	}
+	var w strings.Builder
+	cleanup, err := r.PrepareRollback(context.Background(), entries, nil, &w)
+	if err != nil {
+		t.Fatalf("PrepareRollback: %v", err)
+	}
+	defer cleanup()
+	if !strings.Contains(w.String(), "already at snapshot") || !strings.Contains(w.String(), "sha256:ab12") {
+		t.Errorf("expected an 'already at snapshot' advisory, got %q", w.String())
+	}
+	if len(r.ExtraComposeFiles) != 2 {
+		t.Errorf("prep did not proceed past the advisory: %v", r.ExtraComposeFiles)
+	}
+}
