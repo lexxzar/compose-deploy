@@ -141,7 +141,7 @@ func TestEvaluateWait_ExitedAfterRunningFailFast(t *testing.T) {
 	opts := testWaitOpts()
 	polls := []map[string]ServiceStatus{
 		{"web": {Running: true, Health: "starting"}}, // observed running
-		{"web": {Running: false}},                     // then exited
+		{"web": {Running: false}},                    // then exited
 	}
 	st, done, _ := feedPolls([]string{"web"}, opts, polls)
 	if !done {
