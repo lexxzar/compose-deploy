@@ -185,6 +185,28 @@ func (s WaitState) Report(elapsed time.Duration) WaitReport {
 	return WaitReport{Verdicts: verdicts, Elapsed: elapsed, OK: ok}
 }
 
+// reportTimedOut snapshots the verdicts like Report but forces every still-
+// pending service to VerdictTimedOut. It is used at a wait-deadline expiry when
+// the final poll was cut off by the deadline and no fresh status is available:
+// feeding a nil status map through EvaluateWait would misread a running service
+// as exited (rule 3), so pending verdicts are swept to timed-out directly here.
+// Any pass or fail-fast verdict already recorded on an earlier poll is preserved.
+func (s WaitState) reportTimedOut(elapsed time.Duration) WaitReport {
+	verdicts := make(map[string]WaitVerdict, len(s.Services))
+	ok := true
+	for _, svc := range s.Services {
+		v := s.Verdicts[svc]
+		if !v.Terminal() {
+			v = VerdictTimedOut
+		}
+		verdicts[svc] = v
+		if !v.OK() {
+			ok = false
+		}
+	}
+	return WaitReport{Verdicts: verdicts, Elapsed: elapsed, OK: ok}
+}
+
 // EvaluateWait is the pure step function holding ALL pass/fail rules. It takes
 // the previous state, the latest ContainerStatus snapshot, the (normalized)
 // options, and the elapsed time since the wait began; it returns the next state
@@ -319,16 +341,27 @@ func EvaluateWait(prev WaitState, status map[string]ServiceStatus, opts WaitOpti
 // timed-out service returns (report, nil) with report.OK == false — the caller
 // decides how to map a non-OK report (the CLI wraps it in a WaitError → exit 2).
 // A non-nil error is returned only when the wait could not run to a verdict:
-//   - context cancellation: the current (partial) report plus ctx.Err().
-//   - pollErrorThreshold consecutive ContainerStatus errors: the partial report
-//     plus the wrapped underlying error. A run of fewer consecutive errors is
-//     transient — the poll is skipped and the state carried forward.
+//   - parent-context cancellation (user Ctrl-C): the current (partial) report
+//     plus ctx.Err() (context.Canceled). The CLI maps this to exit 1 — NOT the
+//     exit-2 health-timeout path — so a deliberate abort is never misread as
+//     "deployed but unhealthy".
+//   - pollErrorThreshold consecutive ContainerStatus errors WHILE INSIDE the
+//     deadline: the partial report plus the wrapped underlying error. A run of
+//     fewer consecutive errors is transient — the poll is skipped and the state
+//     carried forward.
 //   - ListServices failure when the target set must be resolved.
 //
-// The first poll fires immediately (containers were just started); subsequent
-// polls are spaced by opts.Poll. Elapsed time is measured from the first poll's
-// scheduling via a monotonic clock and handed to EvaluateWait, which owns the
-// timeout rule — so the loop always terminates by opts.Timeout at the latest.
+// A wait-DEADLINE expiry is NOT an operational error: it returns a timed-out
+// (non-OK) report with a nil error, which the CLI wraps into a WaitError → exit 2.
+//
+// Firm deadline: the polls run under a wait-scoped context whose deadline is
+// start+Timeout (a CHILD of ctx), so a HUNG ContainerStatus (stuck Docker daemon
+// or dead SSH hop) is interrupted at the deadline rather than blocking far past
+// --wait-timeout, and the error-retry sleep is capped to the remaining budget so
+// retries can't overrun either. The first poll fires immediately (containers
+// were just started); subsequent polls are spaced by opts.Poll (capped at the
+// remaining budget). Elapsed time is measured from the first poll's scheduling
+// via a monotonic clock and handed to EvaluateWait, which owns the timeout rule.
 func WaitHealthy(ctx context.Context, c Composer, services []string, opts WaitOptions) (WaitReport, error) {
 	opts = opts.normalize()
 
@@ -342,33 +375,64 @@ func WaitHealthy(ctx context.Context, c Composer, services []string, opts WaitOp
 
 	state := NewWaitState(services)
 	start := time.Now()
+	deadline := start.Add(opts.Timeout)
+
+	// Derive a wait-scoped context bounded by the timeout and use it for the
+	// ContainerStatus polls, so a hung Docker daemon or a stalled SSH status call
+	// is interrupted AT the deadline instead of blocking far past --wait-timeout.
+	// waitCtx is a CHILD of ctx: a genuine parent cancellation (user Ctrl-C) also
+	// cancels the poll, and is distinguished from a pure deadline expiry after the
+	// select via ctx.Err() — a parent cancel returns ctx.Err() raw (→ CLI exit 1),
+	// a deadline expiry returns a timed-out report with a nil error (→ exit 2).
+	waitCtx, cancel := context.WithDeadline(ctx, deadline)
+	defer cancel()
+
 	var pollErrs int
 
-	// Fire the first poll immediately, then re-arm for opts.Poll each tick.
+	// Fire the first poll immediately, then re-arm each tick.
 	timer := time.NewTimer(0)
 	defer timer.Stop()
 
 	for {
-		// Give cancellation priority so a cancelled context can't be starved by
-		// a poll timer that is also ready.
+		// Parent cancellation takes priority: return the raw ctx.Err() so a user
+		// interrupt maps to exit 1, never the exit-2 health-timeout path. Checked
+		// before the deadline handling so a Ctrl-C that races the deadline is still
+		// classified as a cancellation.
 		if err := ctx.Err(); err != nil {
 			return state.Report(time.Since(start)), err
 		}
 
 		select {
-		case <-ctx.Done():
-			return state.Report(time.Since(start)), ctx.Err()
+		case <-waitCtx.Done():
+			// waitCtx fired. If the PARENT was cancelled, loop so the ctx.Err()
+			// check above returns the cancel. Otherwise it is a pure deadline
+			// expiry: sweep every still-pending service to timed-out and return a
+			// non-OK report with a nil error (→ exit 2). No fresh status is fed to
+			// the reducer here — the poll was cut off by the deadline.
+			if ctx.Err() != nil {
+				continue
+			}
+			return state.reportTimedOut(time.Since(start)), nil
 		case <-timer.C:
 		}
 
-		status, err := c.ContainerStatus(ctx)
+		status, err := c.ContainerStatus(waitCtx)
 		if err != nil {
+			// A poll cut off by the wait deadline is not a fault: fall through to
+			// the waitCtx.Done() branch (next iteration) which produces the timed-
+			// out report. Only accumulate the poll-error strike count while still
+			// inside the deadline.
+			if waitCtx.Err() != nil {
+				continue
+			}
 			pollErrs++
 			if pollErrs >= pollErrorThreshold {
 				return state.Report(time.Since(start)),
 					fmt.Errorf("health poll failed %d consecutive times: %w", pollErrs, err)
 			}
-			timer.Reset(opts.Poll)
+			// Cap the retry sleep at the remaining budget so error retries can't
+			// overrun the deadline either.
+			timer.Reset(remainingPoll(opts.Poll, deadline))
 			continue
 		}
 		pollErrs = 0
@@ -385,12 +449,22 @@ func WaitHealthy(ctx context.Context, c Composer, services []string, opts WaitOp
 		// PAST the timeout, letting a service that only becomes healthy after the
 		// deadline still be observed and (before the firm-boundary fix) pass. The
 		// reducer's firm >Timeout boundary relies on a poll landing at ~deadline
-		// rather than a Poll-interval late. remaining is > 0 here (done would be
-		// true otherwise), so the timer never resets to a non-positive duration.
-		nextPoll := opts.Poll
-		if remaining := opts.Timeout - elapsed; remaining < nextPoll {
-			nextPoll = remaining
-		}
-		timer.Reset(nextPoll)
+		// rather than a Poll-interval late.
+		timer.Reset(remainingPoll(opts.Poll, deadline))
 	}
+}
+
+// remainingPoll returns the poll interval capped so the next poll lands no later
+// than the deadline. It never returns a negative duration (which would panic
+// time.Timer.Reset); a zero floor just means "poll one last time immediately",
+// and the wait-context deadline preempts a same-instant poll regardless.
+func remainingPoll(poll time.Duration, deadline time.Time) time.Duration {
+	remaining := time.Until(deadline)
+	if remaining < 0 {
+		return 0
+	}
+	if remaining < poll {
+		return remaining
+	}
+	return poll
 }

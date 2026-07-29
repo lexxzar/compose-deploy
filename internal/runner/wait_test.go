@@ -712,3 +712,95 @@ func TestWaitHealthy_ListServicesError(t *testing.T) {
 		t.Errorf("err = %v, want wrapped %v", err, listErr)
 	}
 }
+
+// blockingComposer's ContainerStatus blocks until the (wait-scoped) context is
+// done, simulating a hung Docker daemon or a stalled SSH status call. When retErr
+// is set it returns that error after the context fires (a poll that errors past
+// the deadline); otherwise it returns ctx.Err().
+type blockingComposer struct {
+	mockComposer
+	retErr error
+	calls  int
+}
+
+func (b *blockingComposer) ListServices(ctx context.Context) ([]string, error) {
+	return []string{"web"}, nil
+}
+
+func (b *blockingComposer) ContainerStatus(ctx context.Context) (map[string]ServiceStatus, error) {
+	b.calls++
+	<-ctx.Done()
+	if b.retErr != nil {
+		return nil, b.retErr
+	}
+	return nil, ctx.Err()
+}
+
+func TestWaitHealthy_HungPollInterruptedAtDeadline(t *testing.T) {
+	// C5(a): a ContainerStatus that never returns must not block past the timeout.
+	// The wait-scoped deadline context interrupts the hung poll AT the deadline and
+	// the wait resolves to a non-OK timed-out report with a NIL error (the CLI maps
+	// that to exit 2), rather than hanging on the unbounded parent context.
+	opts := WaitOptions{Timeout: 40 * time.Millisecond, Grace: time.Hour, Poll: time.Second}
+	c := &blockingComposer{}
+	start := time.Now()
+	rep, err := WaitHealthy(context.Background(), c, []string{"web"}, opts)
+	elapsed := time.Since(start)
+	if err != nil {
+		t.Fatalf("WaitHealthy err = %v, want nil (deadline expiry is not an operational error)", err)
+	}
+	if rep.OK {
+		t.Errorf("report OK = true, want false")
+	}
+	if rep.Verdicts["web"] != VerdictTimedOut {
+		t.Errorf("verdict = %q, want %q", rep.Verdicts["web"], VerdictTimedOut)
+	}
+	if elapsed > 500*time.Millisecond {
+		t.Errorf("wait took %v — a hung poll was not interrupted at the deadline", elapsed)
+	}
+}
+
+func TestWaitHealthy_HungPollParentCancelIsCanceled(t *testing.T) {
+	// C5(b): a parent cancellation (user Ctrl-C) while a poll is hung must still
+	// return context.Canceled RAW (→ exit 1), NOT a timed-out report (→ exit 2).
+	// The wait-scoped deadline context must not swallow the parent cancel — the
+	// Q4/C4 exit-1-vs-exit-2 distinction is preserved.
+	opts := WaitOptions{Timeout: time.Hour, Grace: time.Hour, Poll: time.Second}
+	c := &blockingComposer{}
+	ctx, cancel := context.WithCancel(context.Background())
+	go func() {
+		time.Sleep(20 * time.Millisecond)
+		cancel()
+	}()
+	rep, err := WaitHealthy(ctx, c, []string{"web"}, opts)
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("WaitHealthy err = %v, want context.Canceled (exit 1)", err)
+	}
+	if rep.OK {
+		t.Errorf("report OK = true, want false (partial report)")
+	}
+	if rep.Verdicts["web"] != VerdictPending {
+		t.Errorf("verdict = %q, want pending — a cancel is not a timeout", rep.Verdicts["web"])
+	}
+}
+
+func TestWaitHealthy_PollErrorPastDeadlineTimesOut(t *testing.T) {
+	// C5(c): a poll that ERRORS past the deadline yields a timed-out report (nil
+	// error → exit 2) and terminates at ~deadline — the 3-strike operational-error
+	// path only accumulates while INSIDE the deadline, so a slow/failing poll can
+	// never overrun into an infinite loop.
+	opts := WaitOptions{Timeout: 40 * time.Millisecond, Grace: time.Hour, Poll: time.Second}
+	c := &blockingComposer{retErr: errors.New("ssh: connection reset")}
+	start := time.Now()
+	rep, err := WaitHealthy(context.Background(), c, []string{"web"}, opts)
+	elapsed := time.Since(start)
+	if err != nil {
+		t.Fatalf("WaitHealthy err = %v, want nil (deadline reached before 3-strike)", err)
+	}
+	if rep.Verdicts["web"] != VerdictTimedOut {
+		t.Errorf("verdict = %q, want %q", rep.Verdicts["web"], VerdictTimedOut)
+	}
+	if elapsed > 500*time.Millisecond {
+		t.Errorf("wait took %v — a failing poll overran the deadline", elapsed)
+	}
+}

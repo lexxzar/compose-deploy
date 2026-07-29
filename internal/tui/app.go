@@ -481,9 +481,15 @@ type waitStatusMsg struct {
 // rollbackSnapshotMsg carries the result of the async ReadSnapshot fired by the
 // `R` key. session is captured at fetch time and compared against
 // m.rollbackFetchSession so a fetch that outlived its container-screen visit
-// (the user navigated away, or pressed `R` again) is dropped.
+// (the user navigated away, or pressed `R` again) is dropped. live is the CURRENT
+// compose service set (from ListServices), fetched alongside the snapshot so the
+// handler can drop a selected target that has since been removed from the compose
+// file — mirroring the CLI's filterLiveTargets so a stale snapshot entry can't
+// resurrect a removed service as an image-only override. It is populated only when
+// err == nil and the snapshot is non-empty.
 type rollbackSnapshotMsg struct {
 	snap    *compose.Snapshot
+	live    []string
 	err     error
 	session uint64
 }
@@ -1252,6 +1258,29 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if len(missing) > 0 {
 			slices.Sort(missing)
 			m.warning = fmt.Sprintf("no rollback snapshot for: %s", strings.Join(missing, ", "))
+			m.fixSvcOffset()
+			return m, nil
+		}
+		// Every selected service must ALSO still exist in the current compose file.
+		// Rollback pins images only against the live compose file, so a snapshot
+		// entry for a since-removed service must not resurrect it as a minimal
+		// image-only override (mirrors the CLI filterLiveTargets named-target
+		// refusal — the TUI selection is explicit, so a stale target refuses rather
+		// than silently proceeding with a subset). msg.live is the fresh
+		// ListServices result captured alongside the snapshot.
+		liveSet := make(map[string]bool, len(msg.live))
+		for _, svc := range msg.live {
+			liveSet[svc] = true
+		}
+		var removed []string
+		for _, svc := range targets {
+			if !liveSet[svc] {
+				removed = append(removed, svc)
+			}
+		}
+		if len(removed) > 0 {
+			slices.Sort(removed)
+			m.warning = fmt.Sprintf("no longer in the compose file: %s", strings.Join(removed, ", "))
 			m.fixSvcOffset()
 			return m, nil
 		}
@@ -2492,11 +2521,31 @@ func (m Model) fetchRollbackSnapshot() tea.Cmd {
 	if !ok {
 		return nil
 	}
+	composer := m.composer
 	ctx := m.ctx
 	session := m.rollbackFetchSession
 	return func() tea.Msg {
 		snap, err := p.ReadSnapshot(ctx)
-		return rollbackSnapshotMsg{snap: snap, err: err, session: session}
+		if err != nil {
+			return rollbackSnapshotMsg{err: err, session: session}
+		}
+		// No snapshot to restore — the handler shows the warning; skip the
+		// live-service fetch (nothing to intersect), matching the CLI ordering
+		// which refuses on a missing snapshot before calling ListServices.
+		if snap == nil || len(snap.Services) == 0 {
+			return rollbackSnapshotMsg{snap: snap, session: session}
+		}
+		// Fetch the CURRENT compose service set so the handler can drop any
+		// selected target that has since been removed from the compose file
+		// (mirrors the CLI filterLiveTargets — a stale snapshot entry must not
+		// resurrect a removed service as an image-only override). Runs in the same
+		// off-UI goroutine as ReadSnapshot; a ListServices failure fails closed via
+		// the shared err path (the handler shows "rollback unavailable: ...").
+		live, err := composer.ListServices(ctx)
+		if err != nil {
+			return rollbackSnapshotMsg{err: fmt.Errorf("listing current compose services: %w", err), session: session}
+		}
+		return rollbackSnapshotMsg{snap: snap, live: live, session: session}
 	}
 }
 

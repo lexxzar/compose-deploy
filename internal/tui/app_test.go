@@ -13533,6 +13533,85 @@ func TestRollbackSnapshotMsg_TargetedMissingWarns(t *testing.T) {
 	}
 }
 
+// TestRollbackSnapshotMsg_ComposeRemovedWarns (C6): a selected service that is in
+// the snapshot but has since been REMOVED from the compose file must not proceed
+// to PrepareRollback — the generated override would otherwise resurrect it as an
+// image-only service. It is filtered out (refused with a naming warning),
+// mirroring the CLI filterLiveTargets.
+func TestRollbackSnapshotMsg_ComposeRemovedWarns(t *testing.T) {
+	// Snapshot still records both web + db, but the live compose file only has web.
+	snap := rollbackTestSnapshot()
+	m := Model{
+		screen:               screenSelectContainers,
+		services:             []string{"web", "db"},
+		selected:             map[int]bool{0: true, 1: true}, // both selected
+		rollbackFetchSession: 2,
+	}
+	updated, _ := m.Update(rollbackSnapshotMsg{snap: snap, live: []string{"web"}, session: 2})
+	m = updated.(Model)
+	if m.confirming {
+		t.Error("a target removed from the compose file must not enter the confirm flow")
+	}
+	if m.pendingOp == runner.Rollback {
+		t.Error("pendingOp must not be set to Rollback when a target is stale")
+	}
+	if m.rollbackSnapshot != nil {
+		t.Error("the snapshot must not be stored when a target is refused")
+	}
+	if !strings.Contains(m.warning, "db") {
+		t.Errorf("warning = %q, want it to name the removed service 'db'", m.warning)
+	}
+	if !strings.Contains(m.warning, "compose file") {
+		t.Errorf("warning = %q, want a 'no longer in the compose file' message", m.warning)
+	}
+}
+
+// TestFetchRollbackSnapshot_PopulatesLiveServices (C6): the async fetch reads the
+// snapshot AND the current compose service set (ListServices) in one goroutine so
+// the handler can intersect them. A non-empty snapshot triggers the live fetch.
+func TestFetchRollbackSnapshot_PopulatesLiveServices(t *testing.T) {
+	snap := rollbackTestSnapshot()
+	mc := &mockRollbackComposer{mockComposer: mockComposer{services: []string{"web", "db"}}, snap: snap}
+	m := Model{composer: mc, ctx: context.Background(), rollbackFetchSession: 1}
+	cmd := m.fetchRollbackSnapshot()
+	if cmd == nil {
+		t.Fatal("fetchRollbackSnapshot returned nil cmd")
+	}
+	rm, ok := cmd().(rollbackSnapshotMsg)
+	if !ok {
+		t.Fatalf("want rollbackSnapshotMsg, got different msg")
+	}
+	if rm.err != nil {
+		t.Fatalf("unexpected err: %v", rm.err)
+	}
+	if strings.Join(rm.live, ",") != "web,db" {
+		t.Errorf("live = %v, want [web db] from ListServices", rm.live)
+	}
+}
+
+// TestFetchRollbackSnapshot_ListServicesErrorFailsClosed (C6): a ListServices
+// failure during the fetch fails closed — it surfaces as the shared err (the
+// handler shows "rollback unavailable: ..."), never proceeding without the
+// live-compose intersection.
+func TestFetchRollbackSnapshot_ListServicesErrorFailsClosed(t *testing.T) {
+	snap := rollbackTestSnapshot()
+	mc := &mockRollbackComposer{
+		mockComposer: mockComposer{err: errors.New("compose config --services failed")},
+		snap:         snap,
+	}
+	m := Model{composer: mc, ctx: context.Background(), rollbackFetchSession: 1}
+	rm := m.fetchRollbackSnapshot()().(rollbackSnapshotMsg)
+	if rm.err == nil {
+		t.Fatal("want a ListServices error surfaced, got nil")
+	}
+	if !strings.Contains(rm.err.Error(), "current compose services") {
+		t.Errorf("err = %v, want it to mention listing compose services", rm.err)
+	}
+	if rm.live != nil {
+		t.Errorf("live = %v, want nil on ListServices failure", rm.live)
+	}
+}
+
 func TestRollbackSnapshotMsg_PresentEntersConfirm(t *testing.T) {
 	snap := rollbackTestSnapshot()
 	m := Model{
@@ -13541,7 +13620,8 @@ func TestRollbackSnapshotMsg_PresentEntersConfirm(t *testing.T) {
 		selected:             map[int]bool{0: true},
 		rollbackFetchSession: 1,
 	}
-	updated, _ := m.Update(rollbackSnapshotMsg{snap: snap, session: 1})
+	// live includes the selected target, so the live-compose intersection passes.
+	updated, _ := m.Update(rollbackSnapshotMsg{snap: snap, live: []string{"web", "db"}, session: 1})
 	m = updated.(Model)
 	if !m.confirming || m.pendingOp != runner.Rollback {
 		t.Fatalf("confirming=%v pendingOp=%v, want confirming with Rollback", m.confirming, m.pendingOp)
