@@ -286,12 +286,12 @@ function-scoped `defer cleanup()` — it runs after `WaitHealthy` returns, so no
 - Modify: `internal/runner/runner.go`
 - Modify: `internal/runner/runner_test.go`
 
-- [ ] add `Rollback` to the `Operation` enum; `String()` → "Rollback"; `Steps()` and
+- [x] add `Rollback` to the `Operation` enum; `String()` → "Rollback"; `Steps()` and
       `buildSteps()` → Stop→Remove→Create→Start (Restart shape, NO Pull)
-- [ ] write sequence test: Rollback emits exactly Stopping/Removing/Creating/Starting events
+- [x] write sequence test: Rollback emits exactly Stopping/Removing/Creating/Starting events
       in order via the existing mock
-- [ ] write failure-propagation test for Rollback (step fails → StatusFailed + channel closed)
-- [ ] run tests — must pass before task 4
+- [x] write failure-propagation test for Rollback (step fails → StatusFailed + channel closed)
+- [x] run tests — must pass before task 4
 
 ### Task 4: `ExtraComposeFiles` splice (local + remote)
 
