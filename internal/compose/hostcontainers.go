@@ -143,6 +143,14 @@ type HostContainers struct {
 	docker dockerRunner
 }
 
+// HostContainers implements every runner.Composer method: the five reads are
+// real, the five writes refuse with ErrReadOnly. It also satisfies
+// tui.ExecProvider (asserted in internal/tui/app_test.go, since compose cannot
+// import tui) but deliberately NOT tui.ConfigProvider or tui.RollbackPreparer —
+// a container with no compose file has no config to show and no snapshot to
+// roll back to, so the c and R keys gate themselves.
+var _ runner.Composer = (*HostContainers)(nil)
+
 // localDockerRunner adapts *Compose. run and stream reuse the existing
 // top-level docker primitives (which already bypass command(), since
 // `docker ps` is not a compose subcommand); tty builds the argv directly,
@@ -334,4 +342,39 @@ func (h *HostContainers) ContainerStats(ctx context.Context) (map[string]runner.
 		pairs = append(pairs, psIDService{ID: shortContainerID(e.ID), Service: hostContainerName(e.Names)})
 	}
 	return aggregateStatsByService(pairs, all), nil
+}
+
+// Logs streams the logs of one host container to w. It goes through the
+// stream seam, which wires BOTH Stdout and Stderr to w: `docker logs` writes
+// the container's stderr to its own stderr, and that is where most application
+// logs land (matching Compose.run).
+//
+// The stream seam must NOT allocate a TTY — a pseudo-terminal would let docker
+// line-buffer and echo, corrupting the chunked reads the TUI log viewer makes.
+func (h *HostContainers) Logs(ctx context.Context, service string, follow bool, tail int, w io.Writer) error {
+	args := []string{"logs"}
+	if follow {
+		args = append(args, "--follow")
+	}
+	if tail > 0 {
+		args = append(args, "--tail", fmt.Sprintf("%d", tail))
+	}
+	args = append(args, service)
+	return h.docker.stream(ctx, w, args...)
+}
+
+// ExecCommand returns an exec.Cmd that runs `docker exec -it <container> <command...>`.
+// When command is empty it defaults to DefaultExecCommand, which tries bash and
+// falls back to sh. Unlike `docker compose exec`, the plain `docker exec` form
+// allocates no TTY of its own, so -it is explicit here.
+//
+// The caller attaches stdin/stdout/stderr and runs the command; the TUI does
+// that through tea.ExecProcess. This is the tui.ExecProvider capability, not a
+// runner.Composer method.
+func (h *HostContainers) ExecCommand(ctx context.Context, service string, command []string) (*exec.Cmd, error) {
+	if len(command) == 0 {
+		command = DefaultExecCommand
+	}
+	args := append([]string{"exec", "-it", service}, command...)
+	return h.docker.tty(ctx, args...)
 }

@@ -731,3 +731,189 @@ func TestHostContainers_ContainerStats_StatsParseError(t *testing.T) {
 		t.Errorf("error = %v, want a stats parse error", err)
 	}
 }
+
+func TestHostContainers_Logs_Args(t *testing.T) {
+	tests := []struct {
+		name   string
+		follow bool
+		tail   int
+		want   string
+	}{
+		{"plain", false, 0, "logs web"},
+		{"follow", true, 0, "logs --follow web"},
+		{"tail", false, 50, "logs --tail 50 web"},
+		{"follow and tail", true, 50, "logs --follow --tail 50 web"},
+		{"negative tail is dropped", false, -1, "logs web"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			f := &fakeDockerRunner{streamOut: "hello\n"}
+			h := &HostContainers{docker: f}
+			var buf strings.Builder
+			if err := h.Logs(context.Background(), "web", tt.follow, tt.tail, &buf); err != nil {
+				t.Fatalf("Logs() error = %v", err)
+			}
+			if len(f.streamCalls) != 1 {
+				t.Fatalf("stream calls = %d, want 1", len(f.streamCalls))
+			}
+			if got := strings.Join(f.streamCalls[0], " "); got != tt.want {
+				t.Errorf("stream args = %q, want %q", got, tt.want)
+			}
+			if buf.String() != "hello\n" {
+				t.Errorf("writer got %q, want the streamed output", buf.String())
+			}
+			if len(f.runCalls) != 0 {
+				t.Errorf("Logs() must not capture through run: %v", f.runCalls)
+			}
+		})
+	}
+}
+
+func TestHostContainers_Logs_StreamError(t *testing.T) {
+	f := &fakeDockerRunner{streamErr: errors.New("no such container")}
+	h := &HostContainers{docker: f}
+
+	if err := h.Logs(context.Background(), "ghost", false, 0, io.Discard); err == nil {
+		t.Fatal("expected an error")
+	} else if !strings.Contains(err.Error(), "no such container") {
+		t.Errorf("error = %v, want the stream failure", err)
+	}
+}
+
+// TestHostContainers_Logs_LocalWiresStdoutAndStderr pins the R2 requirement:
+// `docker logs` writes the container's stderr to its OWN stderr, and that is
+// where most application logs land. Both streams must reach w or the log
+// viewer silently drops half the output.
+func TestHostContainers_Logs_LocalWiresStdoutAndStderr(t *testing.T) {
+	var stdout, stderr io.Writer
+	var captured []string
+	c := New(t.TempDir())
+	c.SetTestHooks(func(cmd *exec.Cmd) error {
+		captured = append([]string(nil), cmd.Args...)
+		stdout, stderr = cmd.Stdout, cmd.Stderr
+		return nil
+	}, nil)
+
+	var buf strings.Builder
+	if err := NewLocalHostContainers(c).Logs(context.Background(), "web", true, 50, &buf); err != nil {
+		t.Fatalf("Logs() error = %v", err)
+	}
+	want := []string{"docker", "logs", "--follow", "--tail", "50", "web"}
+	if strings.Join(captured, " ") != strings.Join(want, " ") {
+		t.Fatalf("argv = %v, want %v", captured, want)
+	}
+	if stdout != io.Writer(&buf) {
+		t.Errorf("Stdout = %v, want the caller's writer", stdout)
+	}
+	if stderr != io.Writer(&buf) {
+		t.Errorf("Stderr = %v, want the caller's writer", stderr)
+	}
+}
+
+// TestHostContainers_Logs_RemoteEscapesAndHasNoTTY pins that the remote log
+// stream shell-escapes the container name and allocates no pseudo-terminal.
+func TestHostContainers_Logs_RemoteEscapesAndHasNoTTY(t *testing.T) {
+	var captured []string
+	var stdout, stderr io.Writer
+	extras := []string{"-p", "2222"}
+	r := &RemoteCompose{Host: "user@example.com", SocketPath: "/tmp/cdeploy-ctrl-abc-99", SSHExtraArgs: extras}
+	r.SetTestHooks(func(cmd *exec.Cmd) error {
+		captured = append([]string(nil), cmd.Args...)
+		stdout, stderr = cmd.Stdout, cmd.Stderr
+		return nil
+	}, nil)
+
+	var buf strings.Builder
+	if err := NewRemoteHostContainers(r).Logs(context.Background(), "we;rm -rf /", true, 50, &buf); err != nil {
+		t.Fatalf("Logs() error = %v", err)
+	}
+	assertExtraBeforeHost(t, "HostContainers Logs", captured, "user@example.com", extras)
+	if slices.Contains(captured, "-t") {
+		t.Errorf("log stream argv %v allocates a TTY", captured)
+	}
+	remoteCmd := captured[len(captured)-1]
+	want := `docker 'logs' '--follow' '--tail' '50' 'we;rm -rf /'`
+	if remoteCmd != want {
+		t.Errorf("remote command = %q, want %q", remoteCmd, want)
+	}
+	if stdout != io.Writer(&buf) || stderr != io.Writer(&buf) {
+		t.Errorf("Stdout/Stderr = %v/%v, want the caller's writer", stdout, stderr)
+	}
+}
+
+func TestHostContainers_ExecCommand_DefaultCommand(t *testing.T) {
+	f := &fakeDockerRunner{}
+	h := &HostContainers{docker: f}
+
+	if _, err := h.ExecCommand(context.Background(), "web", nil); err != nil {
+		t.Fatalf("ExecCommand() error = %v", err)
+	}
+	if len(f.ttyCalls) != 1 {
+		t.Fatalf("tty calls = %d, want 1", len(f.ttyCalls))
+	}
+	want := append([]string{"exec", "-it", "web"}, DefaultExecCommand...)
+	if strings.Join(f.ttyCalls[0], "\x00") != strings.Join(want, "\x00") {
+		t.Errorf("tty args = %v, want %v", f.ttyCalls[0], want)
+	}
+	if len(f.runCalls) != 0 || len(f.streamCalls) != 0 {
+		t.Error("ExecCommand() must go through the tty seam only")
+	}
+}
+
+func TestHostContainers_ExecCommand_ExplicitCommand(t *testing.T) {
+	f := &fakeDockerRunner{}
+	h := &HostContainers{docker: f}
+
+	if _, err := h.ExecCommand(context.Background(), "web", []string{"ls", "-la"}); err != nil {
+		t.Fatalf("ExecCommand() error = %v", err)
+	}
+	want := []string{"exec", "-it", "web", "ls", "-la"}
+	if strings.Join(f.ttyCalls[0], " ") != strings.Join(want, " ") {
+		t.Errorf("tty args = %v, want %v", f.ttyCalls[0], want)
+	}
+}
+
+func TestHostContainers_ExecCommand_TTYError(t *testing.T) {
+	f := &fakeDockerRunner{ttyErr: errors.New("no socket")}
+	h := &HostContainers{docker: f}
+
+	if cmd, err := h.ExecCommand(context.Background(), "web", nil); err == nil {
+		t.Fatalf("expected an error, got %v", cmd)
+	}
+}
+
+func TestHostContainers_ExecCommand_LocalArgv(t *testing.T) {
+	c := New(t.TempDir())
+	cmd, err := NewLocalHostContainers(c).ExecCommand(context.Background(), "web", []string{"sh"})
+	if err != nil {
+		t.Fatalf("ExecCommand() error = %v", err)
+	}
+	want := []string{"docker", "exec", "-it", "web", "sh"}
+	if strings.Join(cmd.Args, " ") != strings.Join(want, " ") {
+		t.Errorf("argv = %v, want %v", cmd.Args, want)
+	}
+}
+
+// TestHostContainers_ExecCommand_RemoteAllocatesTTY pins the other half of the
+// three-method seam: the interactive exec path MUST allocate a TTY, or the
+// remote shell has no job control, prompt, or line editing.
+func TestHostContainers_ExecCommand_RemoteAllocatesTTY(t *testing.T) {
+	extras := []string{"-p", "2222"}
+	r := &RemoteCompose{Host: "user@example.com", SocketPath: "/tmp/cdeploy-ctrl-abc-99", SSHExtraArgs: extras}
+
+	cmd, err := NewRemoteHostContainers(r).ExecCommand(context.Background(), "web", nil)
+	if err != nil {
+		t.Fatalf("ExecCommand() error = %v", err)
+	}
+	assertExtraBeforeHost(t, "HostContainers ExecCommand", cmd.Args, "user@example.com", extras)
+	if !slices.Contains(cmd.Args, "-t") {
+		t.Errorf("exec argv %v has no -t; the remote exec path must allocate a TTY", cmd.Args)
+	}
+	remoteCmd := cmd.Args[len(cmd.Args)-1]
+	if !strings.HasPrefix(remoteCmd, `docker 'exec' '-it' 'web' `) {
+		t.Errorf("remote command = %q", remoteCmd)
+	}
+	if !strings.Contains(remoteCmd, "exec bash") {
+		t.Errorf("remote command = %q, want the DefaultExecCommand fallback shell", remoteCmd)
+	}
+}

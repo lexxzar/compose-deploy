@@ -381,15 +381,15 @@ ten methods exist. `CheckUpdates` is a `(nil, nil)` stub here so the type is usa
 - Modify: `internal/compose/hostcontainers_test.go`
 - Modify: `internal/tui/app_test.go`
 
-- [ ] implement `Logs(ctx, name, follow, tail, w)` over `stream`, building `docker logs [--follow] [--tail N] <name>`
-- [ ] wire **both** Stdout and Stderr to `w` — `docker logs` writes container stderr to process stderr, where most application logs land (matches `compose.go:934-936`) **[R2]**
-- [ ] implement `ExecCommand(ctx, name, command)` over `tty`, building `docker exec -it <name> <command...>`, defaulting to `DefaultExecCommand`
-- [ ] add `var _ runner.Composer = (*HostContainers)(nil)` now that all ten methods exist **[R2]**
-- [ ] add `var _ tui.ExecProvider = (*compose.HostContainers)(nil)` in `internal/tui/app_test.go` — `internal/tui` imports `internal/compose` (`app.go:20`), so the assertion cannot live in the `compose` package **[R2]**
-- [ ] add negative assertions in the same test file that `HostContainers` does NOT satisfy `ConfigProvider` or `RollbackPreparer`
-- [ ] write tests for `Logs` argv (follow on/off, tail value, remote escaping, no `-t`)
-- [ ] write tests for `ExecCommand` argv (default command, explicit command, remote `-t` present)
-- [ ] run tests - must pass before task 5
+- [x] implement `Logs(ctx, name, follow, tail, w)` over `stream`, building `docker logs [--follow] [--tail N] <name>`
+- [x] wire **both** Stdout and Stderr to `w` — `docker logs` writes container stderr to process stderr, where most application logs land (matches `compose.go:934-936`) **[R2]**
+- [x] implement `ExecCommand(ctx, name, command)` over `tty`, building `docker exec -it <name> <command...>`, defaulting to `DefaultExecCommand`
+- [x] add `var _ runner.Composer = (*HostContainers)(nil)` now that all ten methods exist **[R2]**
+- [x] add `var _ tui.ExecProvider = (*compose.HostContainers)(nil)` in `internal/tui/app_test.go` — `internal/tui` imports `internal/compose` (`app.go:20`), so the assertion cannot live in the `compose` package **[R2]**
+- [x] add negative assertions in the same test file that `HostContainers` does NOT satisfy `ConfigProvider` or `RollbackPreparer`
+- [x] write tests for `Logs` argv (follow on/off, tail value, remote escaping, no `-t`)
+- [x] write tests for `ExecCommand` argv (default command, explicit command, remote `-t` present)
+- [x] run tests - must pass before task 5
 
 ### Task 5: Surface the unmanaged row in the project picker
 

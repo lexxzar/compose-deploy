@@ -14234,3 +14234,33 @@ func TestViewProgress_RollbackPrepErrorRendered(t *testing.T) {
 		t.Errorf("progress view should render the rollback prep error, got:\n%s", v)
 	}
 }
+
+// HostContainers satisfies tui.ExecProvider, so the `x` key works on the
+// read-only unmanaged screen. The assertion lives here rather than in the
+// compose package because internal/tui imports internal/compose, not the
+// other way round.
+var _ ExecProvider = (*compose.HostContainers)(nil)
+
+// TestHostContainers_CapabilityInterfaces pins both halves of the read-only
+// capability contract. The positive half is the compile-time assertion above;
+// the negative half must be a runtime check, because Go cannot express "does
+// NOT implement" at compile time. ConfigProvider and RollbackPreparer are the
+// self-gating pair from design decision 8: a container with no compose file
+// has no config to show and no deploy snapshot to roll back to, so the `c` and
+// `R` keys no-op through the same type-assert guards the mocks rely on.
+func TestHostContainers_CapabilityInterfaces(t *testing.T) {
+	var c runner.Composer = compose.NewLocalHostContainers(compose.New(t.TempDir()))
+
+	if _, ok := c.(ExecProvider); !ok {
+		t.Error("HostContainers must satisfy ExecProvider so the x key works")
+	}
+	if _, ok := c.(ConfigProvider); ok {
+		t.Error("HostContainers must NOT satisfy ConfigProvider; the c key has to gate itself")
+	}
+	if _, ok := c.(RollbackPreparer); ok {
+		t.Error("HostContainers must NOT satisfy RollbackPreparer; the R key has to gate itself")
+	}
+	if _, ok := c.(Snapshotter); ok {
+		t.Error("HostContainers must NOT satisfy Snapshotter; there is no compose project to snapshot")
+	}
+}
