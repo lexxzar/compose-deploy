@@ -24,10 +24,11 @@ type helpGroup struct {
 }
 
 // helpGroups returns the key reference for the current screen, with the LEAVE
-// group resolved from the same back-navigation predicate the footer uses and
-// the progress table resolved from the operation's phase.
+// group resolved from the same back-navigation predicate the footer uses, the
+// container table resolved from the same read-only predicate that gates the
+// write keys, and the progress table resolved from the operation's phase.
 func (m Model) helpGroups() []helpGroup {
-	return helpGroupsFor(m.screen, m.canGoBack(), m.progressPhase())
+	return helpGroupsFor(m.screen, m.canGoBack(), m.readOnly(), m.progressPhase())
 }
 
 // progressPhase names the three key regimes of screenProgress. The predicate
@@ -103,6 +104,40 @@ func leaveGroup(canGoBack bool) helpGroup {
 	}}
 }
 
+// readOnlyContainerGroups is the container table for a composer that refuses
+// every write (compose.HostContainers). SELECT and OPERATE are gone whole, and
+// c leaves INSPECT: space, a, d, r, s, R and c all early-return on a read-only
+// composer, and a table that still named them would advertise a no-op — the
+// exact failure the overlay exists to prevent.
+//
+// enter moves into INSPECT because the x prompt still binds it and OPERATE was
+// its only home; the description names that sub-state, matching the convention
+// for every key bound only inside one.
+//
+// Group ORDER carries the same load as the writable table: LEAVE sits 3rd of 4
+// so splitHelpGroups leaves it in the left column, and the actions flags still
+// drive singleColumnOrder's truncation order.
+func readOnlyContainerGroups(canGoBack bool) []helpGroup {
+	return []helpGroup{
+		{title: "MOVE", entries: []helpEntry{
+			{"↑ k", "up"},
+			{"↓ j", "down"},
+		}},
+		{title: "FIND", actions: true, entries: []helpEntry{
+			{"/", "search"},
+			{"n N", "next / prev match"},
+			{"esc", "clear an active search"},
+		}},
+		leaveGroup(canGoBack),
+		{title: "INSPECT", actions: true, entries: []helpEntry{
+			{"l", "logs"},
+			{"x", "exec"},
+			{"U", "check updates"},
+			{"enter", "confirm the exec prompt"},
+		}},
+	}
+}
+
 // helpGroupsFor returns the key reference for one screen. Data only — the
 // layout (one column or two) is decided by layoutHelpColumns from the terminal
 // width. Every key a screen's handleKey case binds must be named here; the
@@ -110,10 +145,10 @@ func leaveGroup(canGoBack bool) helpGroup {
 //
 // Group ORDER is load-bearing, not cosmetic: splitHelpGroups cuts the slice
 // sequentially, so where a group sits decides which column it lands in. LEAVE
-// is 4th of 6 on screenSelectContainers and 3rd of 4 on screenLogs to keep it
-// in the left column; every other screen ends with it. Reordering a group for
-// readability changes the rendered layout.
-func helpGroupsFor(s screen, canGoBack bool, phase progressPhase) []helpGroup {
+// is 4th of 6 on screenSelectContainers, 3rd of 4 in readOnlyContainerGroups
+// and 3rd of 4 on screenLogs to keep it in the left column; every other screen
+// ends with it. Reordering a group for readability changes the rendered layout.
+func helpGroupsFor(s screen, canGoBack, readOnly bool, phase progressPhase) []helpGroup {
 	switch s {
 	case screenSelectServer:
 		return []helpGroup{
@@ -144,6 +179,9 @@ func helpGroupsFor(s screen, canGoBack bool, phase progressPhase) []helpGroup {
 		}
 
 	case screenSelectContainers:
+		if readOnly {
+			return readOnlyContainerGroups(canGoBack)
+		}
 		return []helpGroup{
 			{title: "MOVE", entries: []helpEntry{
 				{"↑ k", "up"},

@@ -63,24 +63,26 @@ func TestAllScreens_Complete(t *testing.T) {
 
 func TestHelpGroups_EveryScreen(t *testing.T) {
 	for _, s := range allScreens {
-		groups := helpGroupsFor(s, true, progressRunning)
-		if len(groups) == 0 {
-			t.Errorf("screen %d: helpGroups returned no groups", s)
-			continue
-		}
-		if screenName(s) == "" {
-			t.Errorf("screen %d: screenName returned empty", s)
-		}
-		for _, g := range groups {
-			if g.title == "" {
-				t.Errorf("screen %d: group with empty title", s)
+		for _, readOnly := range []bool{false, true} {
+			groups := helpGroupsFor(s, true, readOnly, progressRunning)
+			if len(groups) == 0 {
+				t.Errorf("screen %d readOnly=%v: helpGroups returned no groups", s, readOnly)
+				continue
 			}
-			if len(g.entries) == 0 {
-				t.Errorf("screen %d: group %q has no entries", s, g.title)
+			if screenName(s) == "" {
+				t.Errorf("screen %d: screenName returned empty", s)
 			}
-			for _, e := range g.entries {
-				if e.keys == "" || e.desc == "" {
-					t.Errorf("screen %d: group %q has an incomplete entry %+v", s, g.title, e)
+			for _, g := range groups {
+				if g.title == "" {
+					t.Errorf("screen %d readOnly=%v: group with empty title", s, readOnly)
+				}
+				if len(g.entries) == 0 {
+					t.Errorf("screen %d readOnly=%v: group %q has no entries", s, readOnly, g.title)
+				}
+				for _, e := range g.entries {
+					if e.keys == "" || e.desc == "" {
+						t.Errorf("screen %d readOnly=%v: group %q has an incomplete entry %+v", s, readOnly, g.title, e)
+					}
 				}
 			}
 		}
@@ -97,14 +99,15 @@ var helpKeyAliases = map[string]string{
 	"space": " ",
 }
 
-// helpKeyTokensFor unions the tokens over every progressPhase. Only
-// screenProgress varies by phase, so for the other seven this is the same set
-// three times — but it means the drift pin below covers all three progress
-// tables instead of whichever one it happened to sample.
-func helpKeyTokensFor(s screen, canGoBack bool) map[string]bool {
+// helpKeyTokens unions the tokens one variant of a screen's table names over
+// every progressPhase. Only screenProgress varies by phase, so for the other
+// seven this is the same set three times — but it means the drift pin below
+// covers all three progress tables instead of whichever one it happened to
+// sample.
+func helpKeyTokens(s screen, canGoBack, readOnly bool) map[string]bool {
 	out := map[string]bool{}
 	for _, phase := range allProgressPhases {
-		for _, g := range helpGroupsFor(s, canGoBack, phase) {
+		for _, g := range helpGroupsFor(s, canGoBack, readOnly, phase) {
 			for _, e := range g.entries {
 				for _, tok := range strings.Fields(e.keys) {
 					if alias, ok := helpKeyAliases[tok]; ok {
@@ -114,6 +117,19 @@ func helpKeyTokensFor(s screen, canGoBack bool) map[string]bool {
 				}
 			}
 		}
+	}
+	return out
+}
+
+// helpKeyTokensFor unions helpKeyTokens over both readOnly values, the same way
+// helpKeyTokens unions over the phases. Only screenSelectContainers varies by
+// readOnly, and the read-only table is a strict subset, so the union equals the
+// writable set today — but a key added to the read-only table alone still has to
+// pass the names-nothing-unbound direction of the drift pin.
+func helpKeyTokensFor(s screen, canGoBack bool) map[string]bool {
+	out := helpKeyTokens(s, canGoBack, false)
+	for k := range helpKeyTokens(s, canGoBack, true) {
+		out[k] = true
 	}
 	return out
 }
@@ -176,6 +192,70 @@ func TestHelpGroups_NamesEveryBoundKey(t *testing.T) {
 	}
 }
 
+// TestHelpGroups_ReadOnlyNamesEveryBoundKey is the same drift pin for the
+// container table a read-only composer gets. The set below is what survives the
+// gates in handleKey: d, r, s, R, c, space and a early-return, so naming any of
+// them would advertise a no-op — and enter, bound only by the x prompt, must
+// survive the loss of OPERATE, which was its only home.
+func TestHelpGroups_ReadOnlyNamesEveryBoundKey(t *testing.T) {
+	bound := []string{
+		"q", "ctrl+c", "esc", "enter", "up", "k", "down", "j",
+		"n", "N", "/", "l", "x", "U",
+	}
+	boundSet := map[string]bool{}
+	for _, k := range bound {
+		boundSet[k] = true
+	}
+
+	named := helpKeyTokens(screenSelectContainers, true, true)
+	for _, k := range bound {
+		if !named[k] {
+			t.Errorf("read-only services table does not name bound key %q", k)
+		}
+	}
+	for k := range named {
+		if !boundSet[k] {
+			t.Errorf("read-only services table names %q, which a read-only composer gates or does not bind", k)
+		}
+	}
+	// The standalone variant is pinned in the names-nothing-unbound direction
+	// only, for the same reason as the writable table: esc stays bound (it
+	// clears a committed search) but leaveGroup(false) must not offer it as a
+	// way out.
+	for k := range helpKeyTokens(screenSelectContainers, false, true) {
+		if !boundSet[k] {
+			t.Errorf("read-only services table (standalone) names %q, which a read-only composer gates or does not bind", k)
+		}
+	}
+}
+
+// TestHelpGroups_ReadOnlyDropsGatedKeys states the AC5 half the drift pin above
+// proves only by arithmetic: the seven gated keys, their group titles and their
+// descriptions are absent from the read-only table entirely.
+func TestHelpGroups_ReadOnlyDropsGatedKeys(t *testing.T) {
+	gated := []string{"d", "r", "s", "R", "c", " ", "a"}
+	for _, canGoBack := range []bool{true, false} {
+		named := helpKeyTokens(screenSelectContainers, canGoBack, true)
+		for _, k := range gated {
+			if named[k] {
+				t.Errorf("canGoBack=%v: read-only table names gated key %q", canGoBack, k)
+			}
+		}
+		for _, g := range readOnlyContainerGroups(canGoBack) {
+			if g.title == "SELECT" || g.title == "OPERATE" {
+				t.Errorf("canGoBack=%v: read-only table still carries the %q group", canGoBack, g.title)
+			}
+			for _, e := range g.entries {
+				for _, dead := range []string{"toggle", "all", "deploy", "restart", "stop", "rollback", "config"} {
+					if strings.Contains(e.desc, dead) {
+						t.Errorf("canGoBack=%v: read-only entry %+v describes the gated action %q", canGoBack, e, dead)
+					}
+				}
+			}
+		}
+	}
+}
+
 // TestHelpGroups_LeaveGroupMatchesFooter pins the two screens whose LEAVE
 // binding is conditional. On a standalone run q QUITS and esc does nothing, so
 // an overlay that says "back" would tell the user to press the key that exits
@@ -208,6 +288,21 @@ func TestHelpGroups_LeaveGroupMatchesFooter(t *testing.T) {
 		{
 			name:     "containers standalone",
 			m:        Model{screen: screenSelectContainers},
+			wantKeys: "q", wantDesc: "quit",
+			wantFoot: "q quit", checkFoot: true,
+		},
+		// The read-only footer drops `space toggle` from line1, so the back
+		// label is the first token on it. The overlay reads the same predicate
+		// and must not disagree.
+		{
+			name:     "read-only containers from the picker",
+			m:        Model{screen: screenSelectContainers, showPicker: true, composer: &readOnlyMockComposer{}},
+			wantKeys: "q esc", wantDesc: "back",
+			wantFoot: "q back", checkFoot: true,
+		},
+		{
+			name:     "read-only containers standalone",
+			m:        Model{screen: screenSelectContainers, composer: &readOnlyMockComposer{}},
 			wantKeys: "q", wantDesc: "quit",
 			wantFoot: "q quit", checkFoot: true,
 		},
@@ -261,6 +356,123 @@ func TestViewHelp_ReplacesScreen(t *testing.T) {
 	}
 	if !strings.Contains(view, "close") {
 		t.Errorf("overlay should show the close hint, got: %q", view)
+	}
+}
+
+// readOnlyOverlayModel builds a read-only container model with the overlay
+// open. The composer is readOnlyMockComposer, not the real HostContainers, so
+// no test here shells out to docker.
+func readOnlyOverlayModel(width, height int) Model {
+	return Model{
+		screen:     screenSelectContainers,
+		services:   []string{"watchtower", "portainer"},
+		selected:   make(map[int]bool),
+		showPicker: true,
+		composer:   &readOnlyMockComposer{},
+		width:      width,
+		height:     height,
+		helpOpen:   true,
+	}
+}
+
+// TestViewHelp_ReadOnlyOverlay renders the read-only table end to end: INSPECT
+// survives with enter folded into it, and the two write groups are gone.
+func TestViewHelp_ReadOnlyOverlay(t *testing.T) {
+	view := ansi.Strip(readOnlyOverlayModel(120, 24).View())
+	for _, want := range []string{"INSPECT", "confirm the exec prompt", "logs", "exec", "check updates"} {
+		if !strings.Contains(view, want) {
+			t.Errorf("read-only overlay is missing %q, got:\n%s", want, view)
+		}
+	}
+	for _, unwanted := range []string{"OPERATE", "SELECT"} {
+		if strings.Contains(view, unwanted) {
+			t.Errorf("read-only overlay still shows the %q group, got:\n%s", unwanted, view)
+		}
+	}
+}
+
+// TestReadOnly_NoGatedKeyAdvertised is the AC5 pin across both surfaces a user
+// reads keys from. The overlay is checked at token level (a rendered key and
+// its description are separated by variable padding) AND by the group titles
+// and the descriptions unique to the gated actions; "deploy" is deliberately
+// not among them, because the overlay title reads "cdeploy > keys > services".
+func TestReadOnly_NoGatedKeyAdvertised(t *testing.T) {
+	gatedTokens := []string{"d", "r", "s", "R", "c", " ", "a"}
+	gatedFooter := []string{
+		"space toggle", "d deploy", "r restart", "s stop",
+		"R rollback", "c config", "a all", "/ search",
+	}
+	gatedOverlay := []string{"OPERATE", "SELECT", "toggle", "rollback", "config", "restart"}
+
+	for _, picker := range []bool{true, false} {
+		m := readOnlyOverlayModel(120, 24)
+		m.showPicker = picker
+
+		named := map[string]bool{}
+		for _, g := range m.helpGroups() {
+			for _, e := range g.entries {
+				for _, tok := range strings.Fields(e.keys) {
+					if alias, ok := helpKeyAliases[tok]; ok {
+						tok = alias
+					}
+					named[tok] = true
+				}
+			}
+		}
+		for _, k := range gatedTokens {
+			if named[k] {
+				t.Errorf("showPicker=%v: read-only overlay names gated key %q", picker, k)
+			}
+		}
+		overlay := ansi.Strip(m.View())
+		for _, tok := range gatedOverlay {
+			if strings.Contains(overlay, tok) {
+				t.Errorf("showPicker=%v: read-only overlay advertises %q, got:\n%s", picker, tok, overlay)
+			}
+		}
+
+		m.helpOpen = false
+		footer := ansi.Strip(m.containerFooter())
+		for _, tok := range gatedFooter {
+			if strings.Contains(footer, tok) {
+				t.Errorf("showPicker=%v: read-only footer advertises %q, got: %q", picker, tok, footer)
+			}
+		}
+	}
+}
+
+// TestViewHelp_ReadOnlyNeverExceedsBudget sweeps the new render path through the
+// same width and height clamps the writable table is pinned against: the
+// read-only table is a different group list, so a different column split and a
+// different truncation point.
+func TestViewHelp_ReadOnlyNeverExceedsBudget(t *testing.T) {
+	for _, w := range helpWidths {
+		for _, h := range []int{24, 18, 12, 6, 5} {
+			m := readOnlyOverlayModel(w, h)
+			view := m.View()
+			if lines := strings.Split(view, "\n"); len(lines) > h {
+				t.Errorf("width %d height %d: read-only overlay is %d lines, want <= %d", w, h, len(lines), h)
+			}
+			if strings.HasSuffix(view, "\n") {
+				t.Errorf("width %d height %d: read-only overlay ends in a newline", w, h)
+			}
+			for i, line := range strings.Split(view, "\n") {
+				if got := ansi.StringWidth(line); w > 0 && got > w {
+					t.Errorf("width %d height %d: row %d is %d cells: %q", w, h, i, got, line)
+				}
+			}
+		}
+	}
+	// The read-only table is short enough that a 24-line pane keeps every key
+	// that lives nowhere but the overlay — the discoverability contract the
+	// writable table needs singleColumnOrder for.
+	for _, w := range []int{30, 40, 50, 59} {
+		view := ansi.Strip(readOnlyOverlayModel(w, 24).View())
+		for _, want := range []string{"search", "next / prev match", "logs", "exec", "check updates"} {
+			if !strings.Contains(view, want) {
+				t.Errorf("width %d: truncated read-only overlay dropped %q:\n%s", w, want, view)
+			}
+		}
 	}
 }
 
@@ -406,7 +618,7 @@ func TestViewHelp_NeverExceedsWidth(t *testing.T) {
 }
 
 func TestLayoutHelpColumns_SingleColumnFallback(t *testing.T) {
-	groups := helpGroupsFor(screenSelectContainers, true, progressRunning)
+	groups := helpGroupsFor(screenSelectContainers, true, false, progressRunning)
 
 	wide := layoutHelpColumns(groups, 120)
 	narrow := layoutHelpColumns(groups, 40)
@@ -497,7 +709,7 @@ func TestLayoutHelpColumns_Empty(t *testing.T) {
 // disagree by one per column and only the rendered count decides the overlay's
 // height.
 func TestSplitHelpGroups_Balances(t *testing.T) {
-	left, right := splitHelpGroups(helpGroupsFor(screenSelectContainers, true, progressRunning))
+	left, right := splitHelpGroups(helpGroupsFor(screenSelectContainers, true, false, progressRunning))
 	if len(left) == 0 || len(right) == 0 {
 		t.Fatalf("container groups should split into two columns, got %d/%d", len(left), len(right))
 	}

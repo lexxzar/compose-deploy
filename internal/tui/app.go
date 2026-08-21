@@ -4332,10 +4332,19 @@ func (m Model) readOnly() bool {
 
 // containerHelpLines returns the IDLE container footer, the pair every other
 // footer state is measured against.
+//
+// A read-only composer gets a different pair: `space toggle` leaves line1
+// because multi-select is gated, and line2 swaps the three write-path tokens
+// for the two inspection keys that still work. containerFooterLines and
+// containerFooter both read this one helper, so the height math and the render
+// follow the variant for free.
 func (m Model) containerHelpLines() (line1, line2 string) {
 	back := "q quit"
 	if m.canGoBack() {
 		back = "q back"
+	}
+	if m.readOnly() {
+		return fmt.Sprintf("  %s  •  ? keys", back), "  l logs  •  x exec"
 	}
 	return fmt.Sprintf("  space toggle  •  %s  •  ? keys", back),
 		"  d deploy  •  r restart  •  l logs"
@@ -4361,8 +4370,9 @@ func (m Model) containerFooterLines() int {
 
 // containerFooter renders the container screen's help footer: six tokens —
 // `space toggle`, the back key and `? keys` on line1, `d deploy`, `r restart`
-// and `l logs` on line2. Every other binding on the screen lives only in the
-// `?` overlay (help.go).
+// and `l logs` on line2, or the read-only pair containerHelpLines returns for a
+// composer that refuses every write. Every other binding on the screen lives
+// only in the `?` overlay (help.go).
 //
 // line1 carries what must stay visible while line2 is replaced: a COMMITTED
 // search swaps line2 wholesale, and q and `?` still work in that state. While

@@ -473,19 +473,19 @@ pad is silently coupled to the row checkbox and a mismatch misaligns every colum
 - Modify: `internal/tui/help_test.go`
 - Modify: `internal/tui/footer_reservation_test.go`
 
-- [ ] make `containerHelpLines()` read-only aware — `line1` drops `space toggle`, `line2` becomes `l logs` and `x exec`
-- [ ] confirm `containerFooterLines()` and `containerFooter()` stay correct by construction, since both read `containerHelpLines()`
-- [ ] add a `readOnly bool` parameter to `helpGroupsFor` and supply it from `Model.helpGroups()` via `m.readOnly()`
-- [ ] drop the SELECT and OPERATE groups in the read-only table, and drop `c` from INSPECT; keep MOVE, FIND, LEAVE
-- [ ] move `enter` into the read-only INSPECT group as `{"enter", "confirm the exec prompt"}` — it is still bound via the `x` prompt **[R2, design decision 9]**
-- [ ] preserve the load-bearing group ORDER so LEAVE still lands in the left column, and keep the `actions` flags that drive `singleColumnOrder()`
-- [ ] union over both `readOnly` values in `helpKeyTokensFor`, matching how it unions over `allProgressPhases`
-- [ ] extend `TestHelpGroups_NamesEveryBoundKey` with a read-only expected set, running BOTH directions
-- [ ] extend `TestContainerFooter_AdvertisesOnlyWorkingKeys` (`footer_reservation_test.go:525`) with the read-only state **[R2]**
-- [ ] extend `TestContainerFooterReservation` to sweep widths 40-180 for the read-only variant too
-- [ ] extend `TestHelpGroups_LeaveGroupMatchesFooter` so the overlay cannot contradict the read-only footer
-- [ ] write a test asserting no gated key (`d`, `r`, `s`, `R`, `c`, `space`, `a`) appears in the read-only footer or overlay
-- [ ] run tests - must pass before task 10
+- [x] make `containerHelpLines()` read-only aware — `line1` drops `space toggle`, `line2` becomes `l logs` and `x exec`
+- [x] confirm `containerFooterLines()` and `containerFooter()` stay correct by construction, since both read `containerHelpLines()`
+- [x] add a `readOnly bool` parameter to `helpGroupsFor` and supply it from `Model.helpGroups()` via `m.readOnly()`
+- [x] drop the SELECT and OPERATE groups in the read-only table, and drop `c` from INSPECT; keep MOVE, FIND, LEAVE
+- [x] move `enter` into the read-only INSPECT group as `{"enter", "confirm the exec prompt"}` — it is still bound via the `x` prompt **[R2, design decision 9]**
+- [x] preserve the load-bearing group ORDER so LEAVE still lands in the left column, and keep the `actions` flags that drive `singleColumnOrder()`
+- [x] union over both `readOnly` values in `helpKeyTokensFor`, matching how it unions over `allProgressPhases`
+- [x] extend `TestHelpGroups_NamesEveryBoundKey` with a read-only expected set, running BOTH directions
+- [x] extend `TestContainerFooter_AdvertisesOnlyWorkingKeys` (`footer_reservation_test.go:525`) with the read-only state **[R2]**
+- [x] extend `TestContainerFooterReservation` to sweep widths 40-180 for the read-only variant too
+- [x] extend `TestHelpGroups_LeaveGroupMatchesFooter` so the overlay cannot contradict the read-only footer
+- [x] write a test asserting no gated key (`d`, `r`, `s`, `R`, `c`, `space`, `a`) appears in the read-only footer or overlay
+- [x] run tests - must pass before task 10
 
 ---
 
