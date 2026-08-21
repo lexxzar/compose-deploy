@@ -528,13 +528,14 @@ while `CheckUpdates` was still a mandatory interface method.]**
 **Files:**
 - Modify: `internal/compose/hostcontainers.go`
 - Modify: `internal/compose/hostcontainers_test.go`
+- Modify: `internal/tui/app_test.go` (the ⇧-glyph render pin has to live beside the read-only render tests)
 
-- [ ] replace the task-2 stub, sourcing the name-to-image map from the `Image` field already returned by `docker ps` — no second call
-- [ ] confirm an untagged image (where `Image` is an image ID, so `stripTag` and `imagetools inspect` fail) is absorbed as the tri-state absent, not an error **[R2]**
-- [ ] write tests for a present verdict, a per-image failure absorbed as absent, and the registry cascade
-- [ ] write a test for the untagged-image case
-- [ ] write a test asserting the `⇧` glyph hydrates onto the read-only screen
-- [ ] run tests - must pass before task 13
+- [x] replace the task-2 stub, sourcing the name-to-image map from the `Image` field already returned by `docker ps` — no second call
+- [x] confirm an untagged image (where `Image` is an image ID, so `stripTag` and `imagetools inspect` fail) is absorbed as the tri-state absent, not an error **[R2]**
+- [x] write tests for a present verdict, a per-image failure absorbed as absent, and the registry cascade
+- [x] write a test for the untagged-image case
+- [x] write a test asserting the `⇧` glyph hydrates onto the read-only screen
+- [x] run tests - must pass before task 13
 
 ### Task 13: Verify acceptance criteria
 

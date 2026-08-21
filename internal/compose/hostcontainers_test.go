@@ -3,6 +3,7 @@ package compose
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"os"
 	"os/exec"
@@ -468,14 +469,275 @@ func TestHostContainers_WriteMethodsAreReadOnly(t *testing.T) {
 	}
 }
 
-func TestHostContainers_CheckUpdatesStub(t *testing.T) {
-	h := &HostContainers{docker: &fakeDockerRunner{}}
+// --- CheckUpdates ---
+
+// hostPsUpdates is a two-container discovery fixture: one compose-managed row
+// (which must never reach a registry) and two unmanaged ones.
+const hostPsUpdates = `{"ID":"aaa111222333","Names":"web","Image":"nginx:1.27","State":"running","Status":"Up 3 hours","Labels":"com.docker.compose.project=my-app"}
+{"ID":"bbb444555666","Names":"watchtower","Image":"containrrr/watchtower:1.7","State":"running","Status":"Up 2 days","Labels":""}
+{"ID":"ccc777888999","Names":"pg-scratch","Image":"postgres:16","State":"running","Status":"Up 4 hours","Labels":"maintainer=nobody"}`
+
+var (
+	digestOld = "sha256:" + strings.Repeat("a", 64)
+	digestNew = "sha256:" + strings.Repeat("b", 64)
+)
+
+// hostUpdatesRunner replays a discovery output plus per-image local and remote
+// digests. A local or remote entry may be an error, which the seam returns
+// verbatim so the classification in scanImageUpdates sees a real error shape.
+type hostDigests struct {
+	local    string
+	localErr error
+	remote   string
+	remErr   error
+}
+
+func hostUpdatesRunner(ps string, imgs map[string]hostDigests) *fakeDockerRunner {
+	return &fakeDockerRunner{runFunc: func(args []string) ([]byte, error) {
+		switch args[0] {
+		case "ps":
+			return []byte(ps), nil
+		case "image":
+			d, ok := imgs[args[len(args)-1]]
+			if !ok {
+				return nil, fmt.Errorf("unexpected image inspect: %v", args)
+			}
+			if d.localErr != nil {
+				return nil, d.localErr
+			}
+			return []byte(d.local), nil
+		case "buildx", "manifest":
+			d, ok := imgs[args[len(args)-1]]
+			if !ok {
+				return nil, fmt.Errorf("unexpected registry inspect: %v", args)
+			}
+			if d.remErr != nil {
+				return nil, d.remErr
+			}
+			return []byte("Name:      docker.io/" + args[len(args)-1] + "\nDigest:    " + d.remote + "\n"), nil
+		}
+		return nil, fmt.Errorf("unexpected argv: %v", args)
+	}}
+}
+
+// TestHostContainers_CheckUpdates_Verdicts pins the happy path: the image map
+// comes from the Image field docker ps already returned, so there is exactly
+// one discovery call and no compose config call, and a managed container is
+// never inspected.
+func TestHostContainers_CheckUpdates_Verdicts(t *testing.T) {
+	f := hostUpdatesRunner(hostPsUpdates, map[string]hostDigests{
+		"containrrr/watchtower:1.7": {local: "containrrr/watchtower@" + digestOld, remote: digestNew},
+		"postgres:16":               {local: "postgres@" + digestOld, remote: digestOld},
+	})
+	h := &HostContainers{docker: f}
+
 	got, err := h.CheckUpdates(context.Background(), nil)
 	if err != nil {
 		t.Fatalf("CheckUpdates() error = %v", err)
 	}
-	if got != nil {
-		t.Errorf("CheckUpdates() = %v, want nil until task 12", got)
+	want := map[string]bool{"watchtower": true, "pg-scratch": false}
+	if len(got) != len(want) {
+		t.Fatalf("CheckUpdates() = %v, want %v", got, want)
+	}
+	for k, v := range want {
+		if got[k] != v {
+			t.Fatalf("CheckUpdates() = %v, want %v", got, want)
+		}
+	}
+
+	var psCalls int
+	for _, call := range f.runCalls {
+		if call[0] == "ps" {
+			psCalls++
+		}
+		if call[0] == "compose" || call[0] == "config" {
+			t.Errorf("CheckUpdates reached compose config: %v", call)
+		}
+		if slices.Contains(call, "nginx:1.27") {
+			t.Errorf("a compose-managed image was inspected: %v", call)
+		}
+	}
+	if psCalls != 1 {
+		t.Errorf("discovery calls = %d, want 1", psCalls)
+	}
+}
+
+// TestHostContainers_CheckUpdates_FiltersServices pins the "no filter = all"
+// contract and its complement: a named subset inspects only that image.
+func TestHostContainers_CheckUpdates_FiltersServices(t *testing.T) {
+	f := hostUpdatesRunner(hostPsUpdates, map[string]hostDigests{
+		"containrrr/watchtower:1.7": {local: "containrrr/watchtower@" + digestOld, remote: digestNew},
+	})
+	h := &HostContainers{docker: f}
+
+	got, err := h.CheckUpdates(context.Background(), []string{"watchtower"})
+	if err != nil {
+		t.Fatalf("CheckUpdates() error = %v", err)
+	}
+	if len(got) != 1 || !got["watchtower"] {
+		t.Fatalf("CheckUpdates() = %v, want {watchtower:true}", got)
+	}
+	for _, call := range f.runCalls {
+		if slices.Contains(call, "postgres:16") {
+			t.Errorf("an unrequested image was inspected: %v", call)
+		}
+	}
+}
+
+// TestHostContainers_CheckUpdates_PerImageFailureAbsorbed pins the tri-state:
+// one image failing must not blank the container that did resolve, and must
+// not surface as an error.
+func TestHostContainers_CheckUpdates_PerImageFailureAbsorbed(t *testing.T) {
+	f := hostUpdatesRunner(hostPsUpdates, map[string]hostDigests{
+		"containrrr/watchtower:1.7": {local: "containrrr/watchtower@" + digestOld, remote: digestNew},
+		"postgres:16":               {localErr: errors.New("Error: No such image: postgres:16")},
+	})
+	h := &HostContainers{docker: f}
+
+	got, err := h.CheckUpdates(context.Background(), nil)
+	if err != nil {
+		t.Fatalf("CheckUpdates() error = %v, want the failure absorbed", err)
+	}
+	if len(got) != 1 || !got["watchtower"] {
+		t.Fatalf("CheckUpdates() = %v, want only the resolved verdict", got)
+	}
+	if _, ok := got["pg-scratch"]; ok {
+		t.Error("a failed comparison must stay ABSENT, not be a false verdict")
+	}
+}
+
+// TestHostContainers_CheckUpdates_RegistryCascade pins the one diagnostic this
+// path enables: every registry fetch failing with no verdict at all must name
+// the cause instead of blanking the glyph column silently.
+func TestHostContainers_CheckUpdates_RegistryCascade(t *testing.T) {
+	f := hostUpdatesRunner(hostPsUpdates, map[string]hostDigests{
+		"containrrr/watchtower:1.7": {
+			local:  "containrrr/watchtower@" + digestOld,
+			remErr: errors.New("dial tcp 1.2.3.4:443: connect: connection refused"),
+		},
+		"postgres:16": {
+			local:  "postgres@" + digestOld,
+			remErr: errors.New("lookup registry-1.docker.io: no such host"),
+		},
+	})
+	h := &HostContainers{docker: f}
+
+	got, err := h.CheckUpdates(context.Background(), nil)
+	if err == nil || !strings.Contains(err.Error(), "registry unreachable") {
+		t.Fatalf("err = %v, want registry unreachable", err)
+	}
+	if len(got) != 0 {
+		t.Errorf("results = %v, want empty alongside the cascade", got)
+	}
+}
+
+// TestHostContainers_CheckUpdates_NoDaemonCascade pins design decision: the
+// daemon knob is off on this path. A daemon-shaped local failure is absorbed
+// as absent rather than surfacing "local docker unavailable" — a dead local
+// daemon fails the docker ps discovery call first, so the cascade would only
+// ever mislabel a remote host's failure.
+func TestHostContainers_CheckUpdates_NoDaemonCascade(t *testing.T) {
+	daemonDown := errors.New("Cannot connect to the Docker daemon at unix:///var/run/docker.sock")
+	f := hostUpdatesRunner(hostPsUpdates, map[string]hostDigests{
+		"containrrr/watchtower:1.7": {localErr: daemonDown},
+		"postgres:16":               {localErr: daemonDown},
+	})
+	h := &HostContainers{docker: f}
+
+	got, err := h.CheckUpdates(context.Background(), nil)
+	if err != nil {
+		t.Fatalf("err = %v, want the daemon cascade to stay off", err)
+	}
+	if len(got) != 0 {
+		t.Errorf("results = %v, want empty", got)
+	}
+}
+
+// TestHostContainers_CheckUpdates_TransportAbort pins the remote knob: a dead
+// SSH hop fails every remaining image the same way, so the scan returns on the
+// first errSSHTransport rather than burning the rest of the round-trips.
+func TestHostContainers_CheckUpdates_TransportAbort(t *testing.T) {
+	f := &fakeDockerRunner{runFunc: func(args []string) ([]byte, error) {
+		if args[0] == "ps" {
+			return []byte(hostPsUpdates), nil
+		}
+		return nil, fmt.Errorf("%w: ssh: connect to host db1 port 22: no route to host", errSSHTransport)
+	}}
+	h := &HostContainers{docker: f}
+
+	_, err := h.CheckUpdates(context.Background(), nil)
+	if err == nil || !strings.Contains(err.Error(), "transport failure") {
+		t.Fatalf("err = %v, want the transport abort", err)
+	}
+	var inspects int
+	for _, call := range f.runCalls {
+		if call[0] != "ps" {
+			inspects++
+		}
+	}
+	if inspects != 1 {
+		t.Errorf("inspect calls = %d, want 1 — the scan must abort on the first transport failure", inspects)
+	}
+}
+
+// TestHostContainers_CheckUpdates_UntaggedImage pins the untagged case both
+// ways. docker ps reports a bare image ID for an untagged image, which either
+// yields no RepoDigests (nothing to compare) or fails the registry inspect
+// with a reference error. Both must be absorbed as the tri-state absent, and
+// neither may trip the registry cascade.
+func TestHostContainers_CheckUpdates_UntaggedImage(t *testing.T) {
+	const ps = `{"ID":"aaa111222333","Names":"scratch-build","Image":"9f1c2b3d4e5f","State":"running","Status":"Up 1 hour","Labels":""}`
+
+	t.Run("no repo digests", func(t *testing.T) {
+		f := hostUpdatesRunner(ps, map[string]hostDigests{"9f1c2b3d4e5f": {local: ""}})
+		got, err := (&HostContainers{docker: f}).CheckUpdates(context.Background(), nil)
+		if err != nil {
+			t.Fatalf("err = %v, want the untagged image absorbed", err)
+		}
+		if len(got) != 0 {
+			t.Errorf("results = %v, want empty", got)
+		}
+	})
+
+	t.Run("registry rejects the reference", func(t *testing.T) {
+		f := hostUpdatesRunner(ps, map[string]hostDigests{"9f1c2b3d4e5f": {
+			local:  "some/repo@" + digestOld,
+			remErr: errors.New("invalid reference format"),
+		}})
+		got, err := (&HostContainers{docker: f}).CheckUpdates(context.Background(), nil)
+		if err != nil {
+			t.Fatalf("err = %v, want the untagged image absorbed", err)
+		}
+		if len(got) != 0 {
+			t.Errorf("results = %v, want empty", got)
+		}
+	})
+}
+
+// TestHostContainers_CheckUpdates_DiscoveryError pins the fail-closed path: a
+// failed docker ps returns the error and reaches no registry.
+func TestHostContainers_CheckUpdates_DiscoveryError(t *testing.T) {
+	f := &fakeDockerRunner{runErr: errors.New("Cannot connect to the Docker daemon")}
+	h := &HostContainers{docker: f}
+
+	if _, err := h.CheckUpdates(context.Background(), nil); err == nil {
+		t.Fatal("CheckUpdates() error = nil, want the discovery failure")
+	}
+	if len(f.runCalls) != 1 {
+		t.Errorf("run calls = %d, want 1 — no image may be inspected without a discovery", len(f.runCalls))
+	}
+}
+
+// TestHostImageMap_DropsEmptyImage pins the guard: an entry with no image
+// reference would turn `docker image inspect` into a malformed call whose
+// failure would pollute the cascade counters.
+func TestHostImageMap_DropsEmptyImage(t *testing.T) {
+	got := hostImageMap([]hostPsEntry{
+		{Names: "keeper", Image: "nginx:1.27"},
+		{Names: "ghost", Image: ""},
+	})
+	if len(got) != 1 || got["keeper"] != "nginx:1.27" {
+		t.Fatalf("hostImageMap() = %v, want only the entry with an image", got)
 	}
 }
 

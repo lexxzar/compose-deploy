@@ -231,12 +231,62 @@ func (h *HostContainers) Start(ctx context.Context, containers []string, w io.Wr
 	return ErrReadOnly
 }
 
-// CheckUpdates is a stub: it returns no verdicts, which the tri-state contract
-// reads as "unknown" for every container, so the ⇧ column stays blank.
-// TODO(task 12): source the name-to-image map from the Image field already
-// returned by docker ps and reuse the extracted digest-compare loop.
+// CheckUpdates reports per-container "image update available" verdicts. See
+// Compose.CheckUpdates for the full tri-state contract — a container is absent
+// from the map whenever no definitive answer was reached, which the caller
+// renders as a blank cell rather than a false negative.
+//
+// The name-to-image map comes from the Image field that `docker ps` already
+// returns, so there is no second discovery call and no `docker compose config`
+// (an unmanaged container has no compose file to read).
+//
+// Cascade knobs, all three deliberate:
+//
+//   - registry: on. A registry outage must surface as "registry unreachable"
+//     rather than a silently blank glyph column, on both paths.
+//   - daemon: OFF, and the nil localErrWrap below is what keeps it that way.
+//     The cascade could never fire here anyway: a dead local daemon fails the
+//     `docker ps` discovery call above first, so the error returns from
+//     unmanagedEntries long before any image inspect runs. On the remote path
+//     there is no local daemon to diagnose, matching RemoteCompose.
+//   - transportAbort: on. Necessary for the remote runner, and inert for the
+//     local one, which never emits errSSHTransport.
+//
+// An untagged image is absorbed as absent rather than an error: `docker ps`
+// reports an image ID for it, which either yields no RepoDigests (so the
+// comparison is not definitive) or fails the registry inspect with a reference
+// error that no cascade classifier matches.
 func (h *HostContainers) CheckUpdates(ctx context.Context, services []string) (map[string]bool, error) {
-	return nil, nil
+	entries, err := h.unmanagedEntries(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return scanImageUpdates(ctx, filterServices(hostImageMap(entries), services), h.compareImageDigest,
+		updateCascades{registry: true, transportAbort: true})
+}
+
+// hostImageMap builds the container-name → image map that scanImageUpdates
+// consumes. Entries with no image reference are dropped — an empty ref would
+// turn `docker image inspect` into a malformed call whose failure would pollute
+// the cascade counters.
+func hostImageMap(entries []hostPsEntry) map[string]string {
+	out := make(map[string]string, len(entries))
+	for _, e := range entries {
+		name := hostContainerName(e.Names)
+		if name == "" || e.Image == "" {
+			continue
+		}
+		out[name] = e.Image
+	}
+	return out
+}
+
+// compareImageDigest is HostContainers' binding of compareImageDigestVia: the
+// dockerRunner seam plus a nil local-error wrapper, which is the local/remote
+// difference collapsing into one binding. See CheckUpdates for why the daemon
+// cascade the wrapper would drive is off on both paths.
+func (h *HostContainers) compareImageDigest(ctx context.Context, image string) (bool, bool, error) {
+	return compareImageDigestVia(ctx, h.docker, image, nil)
 }
 
 // hostPsArgs is the discovery argv. The `{{json .}}` template form is used

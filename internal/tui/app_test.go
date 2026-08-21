@@ -14701,3 +14701,39 @@ func TestReadOnly_CaptionAlignment(t *testing.T) {
 		})
 	}
 }
+
+// TestReadOnly_UpdateGlyphHydrates pins task 12's user-visible half: the ⇧
+// column is the one thing HostContainers.CheckUpdates delivers, and it must
+// survive the read-only render path, which drops the checkbox the writable
+// path pads around.
+func TestReadOnly_UpdateGlyphHydrates(t *testing.T) {
+	mc := readOnlyTestComposer()
+	m := newReadOnlyModel(t, mc)
+
+	result, _ := m.Update(updatesMsg{
+		results: map[string]bool{"watchtower": true, "portainer": false},
+		session: m.updatesSession,
+	})
+	model := result.(Model)
+
+	if av := model.svcStatus["watchtower"].UpdateAvailable; av == nil || !*av {
+		t.Fatalf("watchtower UpdateAvailable = %v, want &true", av)
+	}
+	if av := model.svcStatus["portainer"].UpdateAvailable; av == nil || *av {
+		t.Fatalf("portainer UpdateAvailable = %v, want &false", av)
+	}
+
+	view := model.viewSelectContainers()
+	if !strings.Contains(view, compose.UpdateGlyph) {
+		t.Fatalf("read-only view shows no update glyph:\n%s", ansi.Strip(view))
+	}
+	for _, line := range strings.Split(view, "\n") {
+		if !strings.Contains(line, compose.UpdateGlyph) {
+			continue
+		}
+		plain := ansi.Strip(line)
+		if !strings.Contains(plain, "watchtower") {
+			t.Errorf("update glyph rendered on the wrong row: %q", plain)
+		}
+	}
+}
