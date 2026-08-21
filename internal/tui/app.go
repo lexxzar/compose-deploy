@@ -90,6 +90,16 @@ type RollbackPreparer interface {
 	PrepareRollback(ctx context.Context, entries map[string]compose.SnapshotEntry, services []string, w io.Writer) (func(), error)
 }
 
+// ReadOnlyComposer marks a composer whose write methods refuse. The method is
+// NAMED and returns a bool rather than being a marker: a method-less interface
+// is interface{}, which every composer satisfies, so m.readOnly() would be true
+// everywhere. Only *compose.HostContainers implements it; the TUI uses it to
+// gate the write keys (d/r/s/R/c/space/a), the selection widgets, the footer
+// and the `?` overlay.
+type ReadOnlyComposer interface {
+	ReadOnlyComposer() bool
+}
+
 // ComposerFactory creates a runner.Composer for the given project. It takes the
 // whole Project rather than a directory string because the synthetic unmanaged
 // row carries Unmanaged: true and an empty ConfigDir, and the factory must
@@ -257,6 +267,7 @@ type Model struct {
 	updateInFlight bool   // mirror of refreshInFlight for refreshUpdates — prevents a slow CheckUpdates from stacking on the next screen entry / `U` press
 	updatesErr     string // last error from CheckUpdates; rendered as soft warning below statsErr (priority: svcErr > statsErr > updatesErr)
 	projDir        string // active project's config dir; used for the updateCache key
+	projUnmanaged  bool   // true when the active "project" is the synthetic unmanaged row; folded into updatesCacheKey because its ConfigDir is empty and would otherwise collide with the local-fast-track slot
 	selected       map[int]bool
 	svcCursor      int
 	svcOffset      int // index of first visible service in scroll window
@@ -1544,6 +1555,7 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 				// slot. updatesErr left over from a prior remote session
 				// would leak into the local view's soft-warning slot.
 				m.projDir = ""
+				m.projUnmanaged = false
 				m.projName = ""
 				m.updatesErr = ""
 				m.rollbackSnapshot = nil
@@ -1629,6 +1641,7 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 				m.updatesErr = ""
 				m.projName = ""
 				m.projDir = ""
+				m.projUnmanaged = false
 				m.projects = nil
 				m.projCursor = 0
 				m.projErr = nil
@@ -1658,6 +1671,7 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			proj := m.projects[m.projCursor]
 			m.projName = proj.Name
 			m.projDir = proj.ConfigDir
+			m.projUnmanaged = proj.Unmanaged
 			m.composer = m.composerFactory(proj)
 			m.statsSession++
 			m.statusSession++
@@ -1778,6 +1792,7 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 				m.updatesErr = ""
 				m.projName = ""
 				m.projDir = ""
+				m.projUnmanaged = false
 				m.services = nil
 				m.svcStatus = nil
 				m.stats = nil
@@ -1808,15 +1823,27 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			}
 			m.fixSvcOffset()
 		case " ":
+			// Multi-select exists only to feed d/r/s/R. On a read-only composer
+			// those are gated, so toggling would arm nothing — and the row
+			// checkbox is not rendered either (see viewSelectContainers).
+			if m.readOnly() {
+				return m, nil
+			}
 			if len(m.services) > 0 {
 				m.selected[m.svcCursor] = !m.selected[m.svcCursor]
 			}
 		case "a":
+			if m.readOnly() {
+				return m, nil
+			}
 			allSel := m.allSelected()
 			for i := range m.services {
 				m.selected[i] = !allSel
 			}
 		case "r":
+			if m.readOnly() {
+				return m, nil
+			}
 			if m.selectedCount() > 0 {
 				m.pendingOp = runner.Restart
 				m.confirming = true
@@ -1825,6 +1852,9 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			}
 			m.fixSvcOffset()
 		case "d":
+			if m.readOnly() {
+				return m, nil
+			}
 			if m.selectedCount() > 0 {
 				m.pendingOp = runner.Deploy
 				m.confirming = true
@@ -1833,6 +1863,9 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			}
 			m.fixSvcOffset()
 		case "s":
+			if m.readOnly() {
+				return m, nil
+			}
 			if m.selectedCount() > 0 {
 				m.pendingOp = runner.StopOnly
 				m.confirming = true
@@ -1847,6 +1880,13 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			// the c/x type-assert guards). Guards mirror the action keys: an empty
 			// list is ignored (like l/x), an empty selection warns (like r/d/s).
 			// A fresh async ReadSnapshot decides warning vs confirmation.
+			// The readOnly gate is explicit rather than relying on the type
+			// assertion below (HostContainers is not a RollbackPreparer): an
+			// inert key that a help table still names is the failure mode this
+			// gate pairs with, so the gate and the table move together.
+			if m.readOnly() {
+				return m, nil
+			}
 			if _, ok := m.composer.(RollbackPreparer); !ok {
 				return m, nil
 			}
@@ -1905,6 +1945,12 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			}
 			return m.enterLogs()
 		case "c":
+			// Explicit gate for the same reason as R: HostContainers is not a
+			// ConfigProvider, so c already no-ops, but the gate keeps the key's
+			// absence from the read-only help table honest.
+			if m.readOnly() {
+				return m, nil
+			}
 			if _, ok := m.composer.(ConfigProvider); ok {
 				return m.enterConfig()
 			}
@@ -3537,11 +3583,22 @@ func (m Model) refreshUpdates() tea.Cmd {
 }
 
 // updatesCacheKey returns the cache key for the current context. The format
-// is projDir + "|" + serverName. Empty serverName means local. For the
-// local-fast-track entry (no project picker), projDir is empty too, so the
-// key is just "|".
+// is projDir + "|" + serverName, prefixed with "unmanaged|" for the synthetic
+// unmanaged row. Empty serverName means local. For the local-fast-track entry
+// (no project picker), projDir is empty too, so the key is just "|".
+//
+// The prefix is load-bearing: the unmanaged row has an empty ConfigDir, so a
+// local unmanaged view would key "|" as well — a direct collision with the
+// fast-track slot. A fresh entry from either context would then suppress the
+// other's CheckUpdates for the full TTL, and hydrateUpdates would write one
+// context's verdicts onto any colliding service name (the phantom guard drops
+// only unknown names, not colliding ones).
 func (m Model) updatesCacheKey() string {
-	return m.projDir + "|" + m.serverName
+	key := m.projDir + "|" + m.serverName
+	if m.projUnmanaged {
+		return "unmanaged|" + key
+	}
+	return key
 }
 
 // hydrateUpdates writes the verdicts from results into m.svcStatus, mutating
@@ -4259,6 +4316,18 @@ func (m Model) canGoBack() bool {
 		return m.showPicker
 	}
 	return true
+}
+
+// readOnly reports whether the active composer refuses every write. It gates
+// the write keys, the selection widgets, the footer and the `?` overlay, so
+// nothing advertises a no-op. Nil-safe: a Model{} test literal has no composer
+// and is not read-only, matching the compose path.
+func (m Model) readOnly() bool {
+	if m.composer == nil {
+		return false
+	}
+	ro, ok := m.composer.(ReadOnlyComposer)
+	return ok && ro.ReadOnlyComposer()
 }
 
 // containerHelpLines returns the IDLE container footer, the pair every other

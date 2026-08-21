@@ -14346,3 +14346,256 @@ func TestHostContainers_CapabilityInterfaces(t *testing.T) {
 		t.Error("HostContainers must NOT satisfy Snapshotter; there is no compose project to snapshot")
 	}
 }
+
+// readOnlyMockComposer is a mockComposer that also satisfies ReadOnlyComposer
+// and ExecProvider — the exact capability set of *compose.HostContainers. The
+// real type is used for the interface pins above; this mock is used for key
+// dispatch so no test ever shells out to docker.
+type readOnlyMockComposer struct {
+	mockComposer
+	execErr error
+}
+
+func (m *readOnlyMockComposer) ReadOnlyComposer() bool { return true }
+
+func (m *readOnlyMockComposer) ExecCommand(ctx context.Context, service string, command []string) (*exec.Cmd, error) {
+	if m.execErr != nil {
+		return nil, m.execErr
+	}
+	return exec.CommandContext(ctx, "true"), nil
+}
+
+func newReadOnlyModel(t *testing.T, mc *readOnlyMockComposer) Model {
+	t.Helper()
+	m := NewModel(mc, io.Discard, mockFactory(&mc.mockComposer), nil, nil)
+	m.screen = screenSelectContainers
+	m.services = mc.services
+	m.svcStatus = mc.status
+	m.width, m.height = 120, 24
+	m.updateInFlight = false
+	m.refreshInFlight = false
+	installFakeTick(&m)
+	return m
+}
+
+func readOnlyTestComposer() *readOnlyMockComposer {
+	return &readOnlyMockComposer{mockComposer: mockComposer{
+		services: []string{"watchtower", "portainer"},
+		status: map[string]runner.ServiceStatus{
+			"watchtower": {Running: true},
+			"portainer":  {Running: true},
+		},
+	}}
+}
+
+// TestReadOnly_Predicate pins the three cases the gate depends on: a zero-value
+// Model (the ~18 Model{} test literals) and a normal compose composer are both
+// writable, and only a composer that answers the named ReadOnlyComposer method
+// is read-only. A method-less marker interface would make all three true.
+func TestReadOnly_Predicate(t *testing.T) {
+	if (Model{}).readOnly() {
+		t.Error("zero-value Model must not be read-only (nil composer)")
+	}
+
+	mc := &mockComposer{}
+	if (Model{composer: mc}).readOnly() {
+		t.Error("a normal compose composer must not be read-only")
+	}
+
+	ro := &readOnlyMockComposer{}
+	if !(Model{composer: ro}).readOnly() {
+		t.Error("a ReadOnlyComposer must be read-only")
+	}
+
+	hc := compose.NewLocalHostContainers(compose.New(t.TempDir()))
+	if !(Model{composer: hc}).readOnly() {
+		t.Error("HostContainers must be read-only")
+	}
+}
+
+// TestReadOnly_GatesWriteKeys asserts every gated key is fully inert: no
+// confirmation armed, no pendingOp, no selection change, no warning, no cmd.
+// A key that changed state while the footer and the `?` overlay hide it would
+// be a silent surprise; a key that warned would be advertising a no-op.
+func TestReadOnly_GatesWriteKeys(t *testing.T) {
+	for _, key := range []string{"d", "r", "s", "R", "c", " ", "a"} {
+		t.Run(key, func(t *testing.T) {
+			mc := readOnlyTestComposer()
+			m := newReadOnlyModel(t, mc)
+
+			updated, cmd := m.Update(keyMsgFor(key))
+			got := updated.(Model)
+
+			if cmd != nil {
+				t.Errorf("key %q returned a command; want nil", key)
+			}
+			if got.screen != screenSelectContainers {
+				t.Errorf("key %q changed screen to %d", key, got.screen)
+			}
+			if got.confirming {
+				t.Errorf("key %q armed a confirmation", key)
+			}
+			if got.pendingOp != m.pendingOp {
+				t.Errorf("key %q set pendingOp = %v", key, got.pendingOp)
+			}
+			if got.pendingExec {
+				t.Errorf("key %q armed pendingExec", key)
+			}
+			if got.warning != "" {
+				t.Errorf("key %q set warning %q; a gated key must not advertise itself", key, got.warning)
+			}
+			if got.selectedCount() != 0 {
+				t.Errorf("key %q selected %d services", key, got.selectedCount())
+			}
+			if got.rollbackTargets != nil {
+				t.Errorf("key %q captured rollback targets", key)
+			}
+		})
+	}
+}
+
+// TestReadOnly_KeepsReadKeys is the other half of AC4/AC5: the read keys must
+// still work on a read-only composer. Without this, gating by composer type
+// could over-reach and silently disable the whole screen.
+func TestReadOnly_KeepsReadKeys(t *testing.T) {
+	t.Run("l opens logs", func(t *testing.T) {
+		mc := readOnlyTestComposer()
+		m := newReadOnlyModel(t, mc)
+		updated, cmd := m.Update(keyMsgFor("l"))
+		got := updated.(Model)
+		if got.screen != screenLogs {
+			t.Errorf("screen = %d, want screenLogs", got.screen)
+		}
+		if cmd == nil {
+			t.Error("l should return the readLogChunk command")
+		}
+		if got.logsCancel != nil {
+			got.logsCancel()
+		}
+	})
+
+	t.Run("x arms the exec prompt", func(t *testing.T) {
+		mc := readOnlyTestComposer()
+		m := newReadOnlyModel(t, mc)
+		updated, _ := m.Update(keyMsgFor("x"))
+		got := updated.(Model)
+		if !got.confirming || !got.pendingExec {
+			t.Errorf("x should arm the exec prompt; confirming=%v pendingExec=%v", got.confirming, got.pendingExec)
+		}
+	})
+
+	t.Run("enter confirms the exec prompt", func(t *testing.T) {
+		mc := readOnlyTestComposer()
+		m := newReadOnlyModel(t, mc)
+		updated, _ := m.Update(keyMsgFor("x"))
+		updated, cmd := updated.(Model).Update(tea.KeyMsg{Type: tea.KeyEnter})
+		got := updated.(Model)
+		if cmd == nil {
+			t.Error("enter after x should return the exec command")
+		}
+		if got.warning != "" {
+			t.Errorf("exec should not warn, got %q", got.warning)
+		}
+	})
+
+	t.Run("/ opens search and n cycles", func(t *testing.T) {
+		mc := readOnlyTestComposer()
+		m := newReadOnlyModel(t, mc)
+		updated, _ := m.Update(keyMsgFor("/"))
+		got := updated.(Model)
+		if !got.searching {
+			t.Fatal("/ should open the search bar")
+		}
+		updated, _ = got.Update(keyMsgFor("p"))
+		updated, _ = updated.(Model).Update(tea.KeyMsg{Type: tea.KeyEnter})
+		got = updated.(Model)
+		if got.searchQuery != "p" || len(got.searchMatches) == 0 {
+			t.Fatalf("search should commit; query=%q matches=%v", got.searchQuery, got.searchMatches)
+		}
+		if got.svcCursor != got.searchMatches[0] {
+			t.Errorf("cursor = %d, want %d", got.svcCursor, got.searchMatches[0])
+		}
+		updated, _ = got.Update(keyMsgFor("n"))
+		if updated.(Model).searchQuery != "p" {
+			t.Error("n must not clear the committed search")
+		}
+	})
+
+	t.Run("U forces an update refresh", func(t *testing.T) {
+		mc := readOnlyTestComposer()
+		m := newReadOnlyModel(t, mc)
+		updated, cmd := m.Update(keyMsgFor("U"))
+		got := updated.(Model)
+		if cmd == nil {
+			t.Error("U should return a refreshUpdates command")
+		}
+		if !got.updateInFlight {
+			t.Error("U should mark updateInFlight")
+		}
+	})
+}
+
+// TestUpdatesCacheKey_UnmanagedIsolated is AC8. The unmanaged row has an empty
+// ConfigDir, so without the projUnmanaged component a local unmanaged view and
+// the local-fast-track entry would share the bare "|" slot.
+func TestUpdatesCacheKey_UnmanagedIsolated(t *testing.T) {
+	fastTrack := Model{}
+	unmanaged := Model{projUnmanaged: true}
+	if fastTrack.updatesCacheKey() == unmanaged.updatesCacheKey() {
+		t.Fatalf("unmanaged and local-fast-track share the cache key %q", fastTrack.updatesCacheKey())
+	}
+
+	// The same isolation must hold per server, and against a real project dir.
+	remoteUnmanaged := Model{projUnmanaged: true, serverName: "prod"}
+	remoteProject := Model{projDir: "/srv/app", serverName: "prod"}
+	if remoteUnmanaged.updatesCacheKey() == remoteProject.updatesCacheKey() {
+		t.Error("unmanaged and a remote project share a cache key")
+	}
+	if remoteUnmanaged.updatesCacheKey() == unmanaged.updatesCacheKey() {
+		t.Error("local and remote unmanaged share a cache key")
+	}
+}
+
+// TestUpdatesCache_UnmanagedDoesNotReplayFastTrackVerdicts is the behavioural
+// half of AC8: a colliding service name must not pick up the other context's
+// verdict. hydrateUpdates' phantom guard drops only UNKNOWN names, so a shared
+// key would write "web is out of date" straight onto the unmanaged web row.
+func TestUpdatesCache_UnmanagedDoesNotReplayFastTrackVerdicts(t *testing.T) {
+	mc := readOnlyTestComposer()
+	m := newReadOnlyModel(t, mc)
+	m.projUnmanaged = true
+	m.services = []string{"web"}
+	m.svcStatus = map[string]runner.ServiceStatus{"web": {Running: true}}
+	m.updateCache = map[string]updateEntry{
+		// The local-fast-track slot, populated by a previous compose context.
+		"|": {fetchedAt: time.Now(), results: map[string]bool{"web": true}},
+	}
+
+	updated, cmd := m.Update(statusMsg{
+		status:  map[string]runner.ServiceStatus{"web": {Running: true}},
+		session: m.statusSession,
+	})
+	got := updated.(Model)
+
+	if ua := got.svcStatus["web"].UpdateAvailable; ua != nil {
+		t.Errorf("UpdateAvailable = %v, want nil; the fast-track verdict leaked into the unmanaged view", *ua)
+	}
+
+	// The miss must also queue a fresh fetch (the statusMsg self-heal) rather
+	// than leaving the unmanaged view suppressed for the fast-track TTL.
+	if cmd == nil || !got.updateInFlight {
+		t.Error("a cache miss on the unmanaged key should queue a refreshUpdates")
+	}
+
+	// Control: with projUnmanaged cleared, the SAME cache entry does replay —
+	// proving the isolation above comes from the key, not from a dead lookup.
+	m.projUnmanaged = false
+	updated, _ = m.Update(statusMsg{
+		status:  map[string]runner.ServiceStatus{"web": {Running: true}},
+		session: m.statusSession,
+	})
+	ua := updated.(Model).svcStatus["web"].UpdateAvailable
+	if ua == nil || !*ua {
+		t.Error("the fast-track context must still replay its own cached verdict")
+	}
+}

@@ -205,6 +205,12 @@ func NewRemoteHostContainers(r *RemoteCompose) *HostContainers {
 	return &HostContainers{docker: remoteDockerRunner{r: r}}
 }
 
+// ReadOnlyComposer reports that every write method refuses. It satisfies
+// tui.ReadOnlyComposer, which the TUI type-asserts to gate the write keys and
+// the selection widgets. The method is named (rather than the interface being a
+// method-less marker) because an empty interface is satisfied by every composer.
+func (h *HostContainers) ReadOnlyComposer() bool { return true }
+
 func (h *HostContainers) Stop(ctx context.Context, containers []string, w io.Writer) error {
 	return ErrReadOnly
 }

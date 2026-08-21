@@ -438,16 +438,16 @@ The append is extracted to a package-level helper because `cmd/root.go` has no t
 - Modify: `internal/compose/hostcontainers.go`
 - Modify: `internal/tui/app_test.go`
 
-- [ ] declare `ReadOnlyComposer` in `app.go` beside `ConfigProvider` and `ExecProvider`, with a **named** method — `ReadOnlyComposer() bool`. A method-less marker is `interface{}`, which every composer satisfies and would make `m.readOnly()` always true **[R2]**
-- [ ] implement that method on `HostContainers`
-- [ ] add `Model.readOnly() bool` type-asserting `m.composer`, nil-safe for `Model{}` test literals
-- [ ] early-return from the `d`, `r`, `s`, `R`, `c`, `space` and `a` cases when `m.readOnly()`
-- [ ] add `projUnmanaged bool` to Model, fold it into `updatesCacheKey()`, and set or clear it at exactly the four `m.projDir` assignment sites — `app.go:1543`, `:1628`, `:1657`, `:1777` **[R2, design decision 7]**
-- [ ] write tests asserting each gated key produces no state change and no `pendingOp`
-- [ ] write tests asserting `l`, `x`, `enter`-after-`x`, `/`, `U` still work on a read-only composer
-- [ ] write a test asserting `m.readOnly()` is false for a normal composer and for a zero-value Model
-- [ ] write a test asserting the unmanaged and local-fast-track contexts produce **different** `updatesCacheKey()` values, and that navigating between them does not replay one's verdicts onto the other
-- [ ] run tests - must pass before task 8
+- [x] declare `ReadOnlyComposer` in `app.go` beside `ConfigProvider` and `ExecProvider`, with a **named** method — `ReadOnlyComposer() bool`. A method-less marker is `interface{}`, which every composer satisfies and would make `m.readOnly()` always true **[R2]**
+- [x] implement that method on `HostContainers`
+- [x] add `Model.readOnly() bool` type-asserting `m.composer`, nil-safe for `Model{}` test literals
+- [x] early-return from the `d`, `r`, `s`, `R`, `c`, `space` and `a` cases when `m.readOnly()`
+- [x] add `projUnmanaged bool` to Model, fold it into `updatesCacheKey()`, and set or clear it at exactly the four `m.projDir` assignment sites — `app.go:1543`, `:1628`, `:1657`, `:1777` **[R2, design decision 7]**
+- [x] write tests asserting each gated key produces no state change and no `pendingOp`
+- [x] write tests asserting `l`, `x`, `enter`-after-`x`, `/`, `U` still work on a read-only composer
+- [x] write a test asserting `m.readOnly()` is false for a normal composer and for a zero-value Model
+- [x] write a test asserting the unmanaged and local-fast-track contexts produce **different** `updatesCacheKey()` values, and that navigating between them does not replay one's verdicts onto the other
+- [x] run tests - must pass before task 8
 
 ### Task 8: Remove the selection affordances
 
