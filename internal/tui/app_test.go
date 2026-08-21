@@ -5720,6 +5720,25 @@ func TestViewConfig_ValidationStatus(t *testing.T) {
 	}
 }
 
+// helpOverlayNamesKey reports whether the `?` overlay for m's screen shows the
+// given key on the same row as the given description fragment.
+func helpOverlayNamesKey(m Model, key, desc string) bool {
+	m.helpOpen = true
+	for _, line := range strings.Split(m.View(), "\n") {
+		if !strings.Contains(line, desc) {
+			continue
+		}
+		for _, f := range strings.Fields(line) {
+			if f == key {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// TestViewSelectContainers_ShowsConfigKey pins that `c config` stays
+// discoverable. The token moved out of the trimmed footer into the `?` overlay.
 func TestViewSelectContainers_ShowsConfigKey(t *testing.T) {
 	mc := &mockComposer{
 		services: []string{"web"},
@@ -5732,9 +5751,8 @@ func TestViewSelectContainers_ShowsConfigKey(t *testing.T) {
 	m.width = 120
 	m.height = 24
 
-	view := m.viewSelectContainers()
-	if !strings.Contains(view, "c config") {
-		t.Errorf("container screen help should mention 'c config', got: %q", view)
+	if !helpOverlayNamesKey(m, "c", "config") {
+		t.Errorf("`?` overlay should mention the 'c' config key, got: %q", m.viewHelp())
 	}
 }
 
@@ -8889,6 +8907,8 @@ func TestExec_ViewShowsExecConfirmation(t *testing.T) {
 	}
 }
 
+// TestViewSelectContainers_ShowsExecKey pins that `x exec` stays discoverable.
+// The token moved out of the trimmed footer into the `?` overlay.
 func TestViewSelectContainers_ShowsExecKey(t *testing.T) {
 	mc := &mockComposer{
 		services: []string{"web"},
@@ -8901,9 +8921,8 @@ func TestViewSelectContainers_ShowsExecKey(t *testing.T) {
 	m.width = 120
 	m.height = 24
 
-	view := m.viewSelectContainers()
-	if !strings.Contains(view, "x exec") {
-		t.Errorf("container screen help should mention 'x exec', got: %q", view)
+	if !helpOverlayNamesKey(m, "x", "exec") {
+		t.Errorf("`?` overlay should mention the 'x' exec key, got: %q", m.viewHelp())
 	}
 }
 
@@ -11191,7 +11210,8 @@ func TestViewSelectContainers_UpdateAlignment_PreservesColumns(t *testing.T) {
 }
 
 // TestViewSelectContainers_HelpFooterIncludesUpdates verifies the `U updates`
-// token is present in the footer on the container-select screen.
+// key stays discoverable. The token moved out of the trimmed footer into the
+// `?` overlay.
 func TestViewSelectContainers_HelpFooterIncludesUpdates(t *testing.T) {
 	mc := &mockComposer{}
 	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
@@ -11201,9 +11221,8 @@ func TestViewSelectContainers_HelpFooterIncludesUpdates(t *testing.T) {
 	m.width = 200 // comfortably wide so one-line help fits
 	m.height = 24
 
-	v := m.View()
-	if !strings.Contains(v, "U updates") {
-		t.Errorf("View() footer should contain 'U updates' token; got:\n%s", v)
+	if !helpOverlayNamesKey(m, "U", "updates") {
+		t.Errorf("`?` overlay should mention the 'U' updates key; got:\n%s", m.viewHelp())
 	}
 }
 
@@ -14183,6 +14202,8 @@ func TestEscFromProgress_RollbackInvalidatesUpdateCache(t *testing.T) {
 	}
 }
 
+// TestViewSelectContainers_FooterIncludesRollback pins that `R rollback` stays
+// discoverable. The token moved out of the trimmed footer into the `?` overlay.
 func TestViewSelectContainers_FooterIncludesRollback(t *testing.T) {
 	mc := &mockComposer{services: []string{"web"}}
 	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
@@ -14190,9 +14211,8 @@ func TestViewSelectContainers_FooterIncludesRollback(t *testing.T) {
 	m.services = []string{"web"}
 	m.width = 200
 	m.height = 24
-	v := m.View()
-	if !strings.Contains(v, "R rollback") {
-		t.Errorf("container-screen footer should contain 'R rollback', got:\n%s", v)
+	if !helpOverlayNamesKey(m, "R", "rollback") {
+		t.Errorf("`?` overlay should mention the 'R' rollback key, got:\n%s", m.viewHelp())
 	}
 }
 

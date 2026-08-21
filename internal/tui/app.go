@@ -48,11 +48,19 @@ const updatesCacheTTL = 10 * time.Minute
 // session resets and U keypress just like success entries.
 const updatesErrorTTL = 30 * time.Second
 
-// containerHelpLine2 is the action-key legend on the container screen's help
-// footer. Shared by viewSelectContainers (rendering) and svcVisibleCount
-// (footer-height math) so the two can never drift on width — a divergence would
-// miscount visible rows and let the list overflow the terminal.
-const containerHelpLine2 = "  r restart  •  d deploy  •  s stop  •  R rollback  •  l logs  •  c config  •  x exec  •  U updates"
+// containerHelpLines builds the container screen's two-line help footer.
+// Shared by viewSelectContainers (rendering) and svcVisibleCount (footer-height
+// math) so the two can never drift on width — a divergence would miscount
+// visible rows and let the list overflow the terminal.
+//
+// line1 carries everything that must ALWAYS stay visible. Both call sites
+// replace line2 wholesale while a search is open or committed, so `back` and
+// `? keys` would vanish in exactly the state where the overlay matters most.
+// The full key reference lives in the `?` overlay (help.go).
+func containerHelpLines(back string) (line1, line2 string) {
+	return fmt.Sprintf("  space toggle  •  %s  •  ? keys", back),
+		"  d deploy  •  r restart  •  l logs"
+}
 
 // ConfigProvider provides access to docker-compose configuration files.
 // Defined in the tui package (not runner) because it returns *exec.Cmd and
@@ -273,6 +281,11 @@ type Model struct {
 
 	// Quit confirmation state (for remote connections)
 	quitting bool
+
+	// Key-reference overlay (`?`). A flag, not a screen: no back-navigation,
+	// no session counter, no departure checklist. View() renders viewHelp()
+	// for m.screen while it is set.
+	helpOpen bool
 
 	// Screen 2: progress
 	steps        []stepState
@@ -994,6 +1007,10 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.projectsSession++
 			m.disconnectFunc = nil
 			m.quitting = false
+			// This is one of only two non-key-driven m.screen assignments. An
+			// overlay open here would silently switch its key table to the new
+			// screen, so close it alongside the quit prompt.
+			m.helpOpen = false
 			// Clear ALL transient state from the failed connect attempt: name,
 			// host, color, and update-detection flags. Without these, a
 			// subsequent connect attempt to a different server would inherit
@@ -1399,6 +1416,34 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.quitting = false
 			return m, nil
 		}
+		return m, nil
+	}
+
+	// Key-reference overlay (`?`) intercept. It must precede the open block
+	// below, or a `?` pressed while the overlay is open would re-open it and
+	// never close it.
+	if m.helpOpen {
+		switch key {
+		case "?", "esc", "q":
+			m.helpOpen = false
+			return m, nil
+		case "ctrl+c":
+			// Clear the flag and FALL THROUGH rather than return. That makes
+			// each screen's existing ctrl+c semantics apply unchanged: the
+			// local quit, the remote disconnect prompt, and the mid-progress
+			// no-op. ctrl+c is NOT a hard exit from every screen.
+			m.helpOpen = false
+		default:
+			return m, nil
+		}
+	}
+
+	// Open the overlay. Skipped while a text input is capturing runes (`?` is
+	// a regex metacharacter) and while a destructive confirmation is armed —
+	// the overlay would hide the prompt, and the single esc that closes the
+	// overlay would leave it armed underneath.
+	if key == "?" && !m.typingInInput() && !m.confirming && !m.settingsDelete {
+		m.helpOpen = true
 		return m, nil
 	}
 
@@ -3837,15 +3882,16 @@ func (m Model) svcVisibleCount() int {
 		if m.showPicker {
 			back = "q back"
 		}
-		line1 := fmt.Sprintf("  space toggle  •  a all  •  / search  •  %s", back)
-		line2 := containerHelpLine2
+		line1, line2 := containerHelpLines(back)
 		if m.searching {
 			line2 = "  enter jump  •  esc cancel"
 		} else if m.searchQuery != "" {
 			line2 = "  n/N cycle  •  esc clear"
 		}
 		oneLine := line1 + "  •  " + line2[2:]
-		if m.width >= len(oneLine)+2 {
+		// ansi.StringWidth, not len: each • is 3 bytes but one display cell, so
+		// len() over-counts by 2 per separator and splits a footer that fits.
+		if m.width >= ansi.StringWidth(oneLine)+2 {
 			footerLines = 3
 		} else {
 			// two-line help adds one more = 4.
@@ -3985,6 +4031,9 @@ func cycleColor(current string, dir int) string {
 func (m Model) View() string {
 	if m.quitting {
 		return m.viewQuitConfirm()
+	}
+	if m.helpOpen {
+		return m.viewHelp()
 	}
 
 	switch m.screen {
@@ -4500,8 +4549,7 @@ func (m Model) viewSelectContainers() string {
 	if m.showPicker {
 		back = "q back"
 	}
-	line1 := fmt.Sprintf("  space toggle  •  a all  •  / search  •  %s", back)
-	line2 := containerHelpLine2
+	line1, line2 := containerHelpLines(back)
 	if m.searching {
 		line2 = "  enter jump  •  esc cancel"
 	} else if m.searchQuery != "" {
@@ -4509,8 +4557,9 @@ func (m Model) viewSelectContainers() string {
 	}
 	oneLine := line1 + "  •  " + line2[2:]
 	// helpStyle's MarginTop supplies the single blank line between the reserved
-	// bar (or warning) line and the help text.
-	if m.width >= len(oneLine)+2 {
+	// bar (or warning) line and the help text. ansi.StringWidth, not len — see
+	// the matching guard in svcVisibleCount.
+	if m.width >= ansi.StringWidth(oneLine)+2 {
 		b.WriteString(helpStyle.Render(oneLine))
 	} else {
 		b.WriteString(helpStyle.Render(line1 + "\n" + line2))

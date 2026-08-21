@@ -277,39 +277,47 @@ Because `handleKey` is a value method returning `(tea.Model, tea.Cmd)` (`app.go:
 ### Task 1: Add `helpOpen` state and the `viewHelp()` renderer
 
 **Files:**
-- Modify: `internal/tui/app.go`
-- Modify: `internal/tui/app_test.go`
+- Modify: `internal/tui/app.go` (`helpOpen` field, `View()` early check)
+- Add: `internal/tui/help.go` (types, `helpGroups`, `layoutHelpColumns`, `viewHelp`)
+- Add: `internal/tui/help_test.go` (all Task 1 tests)
+- Modify: `internal/tui/styles.go` (`helpGroupTitleStyle`, `helpKeyStyle`)
 
-- [ ] add `helpOpen bool` to Model, beside `quitting`
-- [ ] add `helpEntry` / `helpGroup` types and the pure `helpGroups(s screen) []helpGroup` covering all 8 screens, including `q esc back` in the container screen's LEAVE group
-- [ ] add `layoutHelpColumns(groups []helpGroup, width int) string` with a single-column fallback below the two-column threshold, clamping each row with `clampToWidth`
-- [ ] add `viewHelp()` composing title, layout, and close hint, mirroring `viewQuitConfirm()` at `app.go:4011`
-- [ ] add the `helpOpen` early check in `View()` at `app.go:3985`, directly after the existing `quitting` check
-- [ ] write a table test asserting `helpGroups()` returns a non-empty table for every one of the 8 screen constants
-- [ ] write the drift pin: for each screen, assert the help table names every key that screen's `handleKey` case binds (hand-maintained expected set per screen)
-- [ ] write a test that `helpOpen = true` makes `View()` render the overlay (contains "OPERATE") instead of the container list
-- [ ] write a test that the container-screen overlay is at most 24 lines tall
-- [ ] write a width test asserting no rendered row exceeds `m.width` at widths 120, 80, 60 and 40
-- [ ] run `go test ./internal/tui/ -count=1` — must pass before Task 2
+> Deviation: the overlay lives in its own `help.go` / `help_test.go` rather than inside the 5000-line `app.go` / `app_test.go`, matching the package's existing `format.go` / `logfilter.go` split. Only the Model field and the `View()` check landed in `app.go`.
+
+- [x] add `helpOpen bool` to Model, beside `quitting`
+- [x] add `helpEntry` / `helpGroup` types and the pure `helpGroups(s screen) []helpGroup` covering all 8 screens, including `q esc back` in the container screen's LEAVE group
+- [x] add `layoutHelpColumns(groups []helpGroup, width int) string` with a single-column fallback below the two-column threshold, clamping each row with `clampToWidth`
+- [x] add `viewHelp()` composing title, layout, and close hint, mirroring `viewQuitConfirm()` at `app.go:4011`
+- [x] add the `helpOpen` early check in `View()` at `app.go:3985`, directly after the existing `quitting` check
+- [x] write a table test asserting `helpGroups()` returns a non-empty table for every one of the 8 screen constants
+- [x] write the drift pin: for each screen, assert the help table names every key that screen's `handleKey` case binds (hand-maintained expected set per screen)
+- [x] write a test that `helpOpen = true` makes `View()` render the overlay (contains "OPERATE") instead of the container list
+- [x] write a test that the container-screen overlay is at most 24 lines tall
+- [x] write a width test asserting no rendered row exceeds `m.width` at widths 120, 80, 60 and 40
+- [x] run `go test ./internal/tui/ -count=1` — must pass before Task 2
 
 ### Task 2: Add the `?` open/close intercept with typing and confirmation exceptions
 
 **Files:**
-- Modify: `internal/tui/app.go`
-- Modify: `internal/tui/app_test.go`
+- Modify: `internal/tui/app.go` (the two intercept blocks, the `connectResultMsg` clear)
+- Modify: `internal/tui/help.go` (`typingInInput()`)
+- Modify: `internal/tui/help_test.go` (all Task 2 tests)
 
-- [ ] add `typingInInput()` using `m.settingsField < 4`, covering `screenSelectContainers`, `screenLogs` and `screenSettingsForm`
-- [ ] add the `helpOpen` swallow block in `handleKey()` at `app.go:1404`: `?`/`esc`/`q` close and return; `ctrl+c` clears the flag and falls through; every other key is swallowed
-- [ ] add the `?` open block immediately after it, gated on `!m.typingInInput() && !m.confirming && !m.settingsDelete`
-- [ ] clear `m.helpOpen` in the `connectResultMsg` error path at `app.go:1020`
-- [ ] write a test that `?` on the container screen sets `helpOpen`
-- [ ] write a table test that `?`, `esc` and `q` each close the overlay
-- [ ] write a test that `d` while the overlay is open does NOT set `pendingOp` (the swallow works)
-- [ ] write a test that `ctrl+c` while the overlay is open still produces `tea.QuitMsg` on a local session
-- [ ] write a test that `ctrl+c` while the overlay is open mid-progress stays a no-op (the fall-through preserves per-screen semantics)
-- [ ] write the three typing regression pins: `?` reaches the open log-filter input, the container search input and settings-form field 0 — asserting `helpOpen` stays false AND the input value contains `?`
-- [ ] write two confirmation tests: `?` while `m.confirming` and while `m.settingsDelete` leaves the prompt intact and `helpOpen` false
-- [ ] run `go test ./internal/tui/ -count=1` — must pass before Task 3
+> Deviation: `typingInInput()` and the intercept tests live in `help.go` / `help_test.go` rather than `app.go` / `app_test.go`. Both belong to the `?` overlay feature, and Task 1 already put that feature in its own file pair. Only the two intercept blocks and the `connectResultMsg` clear landed in `app.go`.
+
+- [x] add `typingInInput()` using `m.settingsField < 4`, covering `screenSelectContainers`, `screenLogs` and `screenSettingsForm`
+- [x] add the `helpOpen` swallow block in `handleKey()` at `app.go:1404`: `?`/`esc`/`q` close and return; `ctrl+c` clears the flag and falls through; every other key is swallowed
+- [x] add the `?` open block immediately after it, gated on `!m.typingInInput() && !m.confirming && !m.settingsDelete`
+- [x] clear `m.helpOpen` in the `connectResultMsg` error path at `app.go:1020`
+- [x] write a test that `?` on the container screen sets `helpOpen`
+- [x] write a table test that `?`, `esc` and `q` each close the overlay
+- [x] write a test that `d` while the overlay is open does NOT set `pendingOp` (the swallow works)
+- [x] write a test that `ctrl+c` while the overlay is open still produces `tea.QuitMsg` on a local session
+- [x] write a test that `ctrl+c` while the overlay is open mid-progress stays a no-op (the fall-through preserves per-screen semantics)
+- [x] write the three typing regression pins: `?` reaches the open log-filter input, the container search input and settings-form field 0 — asserting `helpOpen` stays false AND the input value contains `?` (➕ a fourth pin covers the log *search* input, the second `screenLogs` typing condition)
+- [x] write two confirmation tests: `?` while `m.confirming` and while `m.settingsDelete` leaves the prompt intact and `helpOpen` false
+- [x] ➕ write a test that a failed `connectResultMsg` clears `helpOpen`, and a table test for `typingInInput()` across all 8 screens
+- [x] run `go test ./internal/tui/ -count=1` — must pass before Task 3
 
 ### Task 3: Trim the container footer and fix the width guard
 
@@ -318,25 +326,40 @@ Because `handleKey` is a value method returning `(tea.Model, tea.Cmd)` (`app.go:
 - Modify: `internal/tui/app_test.go`
 - Modify: `internal/tui/footer_reservation_test.go`
 
-- [ ] replace the `containerHelpLine2` const at `app.go:51-55` with `containerHelpLines(back string) (line1, line2 string)`, carrying over the anti-drift comment
-- [ ] call the helper from both `viewSelectContainers()` (`app.go:4503`) and `svcVisibleCount()` (`app.go:3840`), leaving the search-state `line2` overrides at each site
-- [ ] replace `len(oneLine)` with `ansi.StringWidth(oneLine)` at both guards (`app.go:3848`, `:4513`)
-- [ ] redirect the four token assertions (app_test.go:5736, :8905, :11205, :14194) from the footer to the `?` overlay, keeping each test's original intent and name
-- [ ] write the three-state footer test: `? keys` and the `back` token are present when idle, while searching, and with a committed search
-- [ ] write a test that the one-line footer's `ansi.StringWidth` plus 2 is at most 80 in all three states
-- [ ] add an 80-column case to `TestContainerFooterReservation` and correct the stale `160 /* one-line help */` comment at `footer_reservation_test.go:92`
-- [ ] run `go test ./internal/tui/ -count=1` — must pass before Task 4
+> Deviation: the two new footer tests landed in `internal/tui/footer_reservation_test.go` (the package's footer-test home) rather than `app_test.go`. Only the four redirected token assertions and a shared `helpOverlayNamesKey` test helper landed in `app_test.go`.
+
+- [x] replace the `containerHelpLine2` const at `app.go:51-55` with `containerHelpLines(back string) (line1, line2 string)`, carrying over the anti-drift comment
+- [x] call the helper from both `viewSelectContainers()` (`app.go:4503`) and `svcVisibleCount()` (`app.go:3840`), leaving the search-state `line2` overrides at each site
+- [x] replace `len(oneLine)` with `ansi.StringWidth(oneLine)` at both guards (`app.go:3848`, `:4513`)
+- [x] redirect the four token assertions (app_test.go:5736, :8905, :11205, :14194) from the footer to the `?` overlay, keeping each test's original intent and name
+- [x] write the three-state footer test: `? keys` and the `back` token are present when idle, while searching, and with a committed search (➕ also parametrized over `showPicker`, so both `q back` and `q quit` are covered)
+- [x] write a test that the one-line footer's `ansi.StringWidth` plus 2 is at most 80 in all three states
+- [x] add an 80-column case to `TestContainerFooterReservation` and correct the stale `160 /* one-line help */` comment at `footer_reservation_test.go:92`
+- [x] run `go test ./internal/tui/ -count=1` — must pass before Task 4
 
 ### Task 4: Verify acceptance criteria
 
-- [ ] `?` opens the overlay from all 8 screens, and the content matches the screen it was opened from
-- [ ] `?` typed into an open log filter, container search or settings text field inserts a literal `?`
-- [ ] `?` at a deploy/stop/rollback confirm prompt and at a server-delete confirm prompt does nothing
-- [ ] `ctrl+c` from the overlay reproduces each screen's existing behavior: quits locally, prompts on remote, no-ops mid-progress
-- [ ] the container footer renders on one line at width 80 in all three search states
-- [ ] the service list gains one row at widths between 76 and 173 versus the previous build
-- [ ] run the full suite: `go test ./... -count=1`
-- [ ] run `go vet ./...` and `gofmt -l .`
+**Files:**
+- Modify: `internal/tui/help_test.go` (overlay acceptance pins)
+- Modify: `internal/tui/footer_reservation_test.go` (footer acceptance pins)
+
+> Every criterion is proven by a test, not by reading the code. Criteria already
+> covered by a Task 1-3 test cite it; the rest gained a new test. Each new test
+> was mutation-checked (the guard it pins was reverted, the test failed, the
+> guard was restored).
+
+- [x] `?` opens the overlay from all 8 screens, and the content matches the screen it was opened from — new `TestHelpOverlay_OpensFromEveryScreen` drives the real `?` keypress through `Update()` on each of the 8 screens and asserts `helpOpen`, an unchanged `m.screen`, the screen name in the title, a screen-specific token present, and another screen's token absent. `screenSettingsForm` is driven at `settingsField == 4` (fields 0-3 are text inputs where `?` types instead — the next criterion)
+- [x] `?` typed into an open log filter, container search or settings text field inserts a literal `?` — `TestHelpOverlay_QuestionReachesLogFilterInput`, `...LogSearchInput`, `...ContainerSearchInput` and `...SettingsFormInput` (widened here to loop all four settings text fields). ➕ new `TestHelpOverlay_RegexFilterAcceptsQuestionMark` automates the plan's worked example: `f`, `ctrl+r`, then `(?:web|db)` typed rune by rune lands in the filter input with `helpOpen` false throughout
+- [x] `?` at a deploy/stop/rollback confirm prompt and at a server-delete confirm prompt does nothing — new `TestHelpOverlay_SwallowedAtEveryConfirmPrompt` tables Deploy/Restart/StopOnly/Rollback plus the exec confirmation, asserting the prompt stays armed and the overlay never replaces it; the server-delete case is `TestHelpOverlay_SwallowedAtSettingsDeletePrompt`
+- [x] `ctrl+c` from the overlay reproduces each screen's existing behavior: quits locally, prompts on remote, no-ops mid-progress — `TestHelpOverlay_CtrlCQuitsLocal` and `TestHelpOverlay_CtrlCMidProgressIsNoOp`, plus new `TestHelpOverlay_CtrlCPromptsOnRemote` (`disconnectFunc` set → `quitting` true, no `QuitMsg`, `View()` renders "Disconnect from prod-server")
+- [x] the container footer renders on one line at width 80 in all three search states — new `TestContainerFooter_RendersOneLineAtEighty` renders `viewSelectContainers()` at width 80 for both `showPicker` values and asserts `? keys` (from line1) and the line2 opening token share ONE physical line, of at most 80 cells. `TestContainerFooter_OneLineFitsEighty` measures the budget; this measures the render
+- [x] the service list gains one row at widths between 76 and 173 versus the previous build — new `TestSvcVisibleCount_GainsRowVersusOldFooter` replays the old footer math in the test (`oldContainerHelpLine2` verbatim + the old `len()` byte guard) and asserts `svcVisibleCount()` is exactly old+1 at 76/80/100/120/160/173 and exactly old at 40/60/75/174/200, then sweeps widths 20-200 across all three search states asserting the count never regresses
+- [x] run the full suite: `go test ./... -count=1` — all 7 packages pass; `go build` clean
+- [x] run `go vet ./...` and `gofmt -l .` — vet clean. `gofmt -l .` reports ONE file, `cmd/list_test.go`, which is **pre-existing and excluded**: it is unformatted on `main` too (`git show main:cmd/list_test.go` fails gofmt identically) and this branch never touches it (`git diff --name-only main...HEAD` does not list it). Comment-alignment only. Left alone per CLAUDE.md working-style rule 2; see Residuals
+
+#### Residuals (out of scope, recorded not fixed)
+
+- ⚠️ `cmd/list_test.go` fails `gofmt -l .` (comment alignment at lines ~1775 and ~2509). Pre-existing on `main` and untouched by this branch. Not fixed here — unrelated to the overlay work. Worth a one-line `gofmt -w cmd/list_test.go` commit on its own.
 
 ### Task 5: [Final] Update documentation
 
@@ -344,16 +367,20 @@ Because `handleKey` is a value method returning `(tea.Model, tea.Cmd)` (`app.go:
 - Modify: `CLAUDE.md`
 - Modify: `README.md`
 
-- [ ] add a CLAUDE.md section for the `?` overlay next to "Exit confirmation for remote connections", covering the flag-not-a-screen decision, the intercept order, the confirmation exception, and the `ctrl+c` fall-through
-- [ ] state the `ctrl+c` rationale correctly: the fall-through makes each screen's existing semantics apply unchanged, including the mid-progress no-op — NOT "ctrl+c is a hard exit from any screen"
-- [ ] document the `typingInInput()` duplication rule: a new text-input screen must be added to BOTH that helper and the `q`→`esc` rewrite
-- [ ] document why `line1` carries `back` and `? keys` — the search-state override of `line2` makes the split forced
-- [ ] record the byte-versus-cell width fix so the `len()` form is not reintroduced
-- [ ] fix `CLAUDE.md:42` ("Help footer adds `/ search`") — `/ search` now lives in the overlay
-- [ ] fix `CLAUDE.md:104` ("Footer adds `U updates` token") — `U updates` now lives in the overlay
-- [ ] update `README.md:63` — the container-screen key prose still enumerates the old footer tokens
-- [ ] add a `?` row to the key table at `README.md:70-75`
-- [ ] move this plan to `docs/plans/completed/`
+> Deviation: the CLAUDE.md addition is TWO paragraphs, not one — `**`?` key-reference overlay**` and `**Container footer and the one-line width guard**` — because the footer/width-guard material belongs to the container screen rather than to the overlay, and one paragraph carrying both would have been unreadable at this file's density. Both were written against the shipped code, not the plan's prose: the renderer lives in `internal/tui/help.go` (`helpEntry`/`helpGroup`, `helpGroups`, `screenName`, `splitHelpGroups`, `helpColumnRows`, `joinHelpColumns`, `layoutHelpColumns`, `viewHelp`, `typingInInput`), and only the `helpOpen` field, the `View()` check, the two `handleKey()` intercepts and the `connectResultMsg` clear are in `app.go`.
+
+- [x] add a CLAUDE.md section for the `?` overlay next to "Exit confirmation for remote connections", covering the flag-not-a-screen decision, the intercept order, the confirmation exception, and the `ctrl+c` fall-through
+- [x] state the `ctrl+c` rationale correctly: the fall-through makes each screen's existing semantics apply unchanged, including the mid-progress no-op — NOT "ctrl+c is a hard exit from any screen"
+- [x] document the `typingInInput()` duplication rule: a new text-input screen must be added to BOTH that helper and the `q`→`esc` rewrite
+- [x] document why `line1` carries `back` and `? keys` — the search-state override of `line2` makes the split forced
+- [x] record the byte-versus-cell width fix so the `len()` form is not reintroduced
+- [x] fix `CLAUDE.md:42` ("Help footer adds `/ search`") — `/ search` now lives in the overlay (the line had shifted; located by content)
+- [x] fix `CLAUDE.md:104` ("Footer adds `U updates` token") — `U updates` now lives in the overlay (line shifted; located by content)
+- [x] update `README.md:63` — the container-screen key prose still enumerates the old footer tokens
+- [x] add a `?` row to the key table at `README.md:70-75`
+- [x] ➕ fix the `q`-as-back-key opening sentence in CLAUDE.md, which claimed the `q`→`esc` rewrite sits "immediately after the `quitting` intercept" — the two `?` intercepts now sit between them
+- [x] ➕ add a README paragraph next to the existing `q`-typeability note: `?` is typeable inside the container search bar, the log filter/search bars and the settings-form text fields, and does nothing while a confirmation prompt is armed
+- [x] moved by the orchestrator at end of run
 
 ## Post-Completion
 
