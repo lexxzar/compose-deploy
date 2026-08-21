@@ -125,6 +125,15 @@ var (
 			Foreground(lipgloss.Color("8")).
 			MarginTop(1)
 
+	// helpGroupTitleStyle and helpKeyStyle paint the `?` overlay. Foreground
+	// and Bold only, so ansi.StringWidth still measures the column math.
+	helpGroupTitleStyle = lipgloss.NewStyle().
+				Bold(true).
+				Foreground(lipgloss.Color("8"))
+
+	helpKeyStyle = lipgloss.NewStyle().
+			Foreground(lipgloss.Color("12"))
+
 	logBorder = lipgloss.NewStyle().
 			BorderStyle(lipgloss.NormalBorder()).
 			BorderForeground(lipgloss.Color("8")).

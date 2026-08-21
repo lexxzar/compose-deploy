@@ -93,8 +93,13 @@ func TestContainerFooterReservation(t *testing.T) {
 		}},
 	}
 
-	for _, width := range []int{160 /* one-line help */, 40 /* two-line help */} {
-		var firstPhys int
+	// Swept, not spot-checked: the one-line/two-line threshold moves with the
+	// footer text, so a drift of a few cells would otherwise slip between three
+	// sample widths (76 is the current boundary; 160 only became one-line with
+	// the byte-vs-cell width fix). Every width from 40 to 180 is cheap and pins
+	// the honest-reservation invariant across the whole boundary band.
+	for width := 40; width <= 180; width++ {
+		var firstPhys, firstRows int
 		for i, st := range states {
 			m := newModel(width)
 			st.setup(&m)
@@ -108,10 +113,107 @@ func TestContainerFooterReservation(t *testing.T) {
 					width, st.name, rows, want)
 			}
 			if i == 0 {
-				firstPhys = phys
-			} else if phys != firstPhys {
+				firstPhys, firstRows = phys, rows
+				continue
+			}
+			if phys != firstPhys {
 				t.Errorf("width=%d state=%s: physical line count %d differs from idle %d (list height must stay constant across search states)",
 					width, st.name, phys, firstPhys)
+			}
+			// The VISIBLE-row count is the invariant a user sees. The physical
+			// count above is trivially constant (svcVisibleCount absorbs any
+			// footer delta by growing the list), so it cannot catch a footer
+			// whose line count varies by search state — which is exactly how a
+			// search-only footer once grew the list by a row below width 76.
+			if rows != firstRows {
+				t.Errorf("width=%d state=%s: %d visible service rows vs idle %d (the list must not re-flow when the search bar opens)",
+					width, st.name, rows, firstRows)
+			}
+		}
+	}
+}
+
+// TestContainerView_ExcessLineWidthIsPaddingOnly closes the gap an external
+// review raised: containerFooter() is appended to the reserved search-bar row
+// with NO newline between them, and lipgloss's MarginTop(1) renders as a run of
+// spaces followed by "\n" (applyMargins prepends strings.Repeat(" ", width)+"\n").
+// So the bar row in the View() string really does measure wider than m.width
+// whenever the bar is full — the question is whether any of the excess is
+// CONTENT, which would be pushed off screen.
+//
+// It is not, and this sweep proves it: at every width and search state the
+// excess is trailing whitespace only. bubbletea's standardRenderer.flush()
+// truncates each line with ansi.Truncate(line, r.width, "") before writing, so
+// that padding never reaches the terminal and cannot wrap the row. The second
+// assertion pins the consequence the reservation math cares about — the frame
+// stays exactly m.height physical lines.
+//
+// The existing reservation sweep uses queries that MATCH a service; this one
+// drives a maximally long query so the bar clamps to exactly m.width, the
+// worst case for the merge.
+func TestContainerView_ExcessLineWidthIsPaddingOnly(t *testing.T) {
+	const nServices = 30
+	svcs := make([]string, nServices)
+	for i := range svcs {
+		svcs[i] = fmt.Sprintf("svc%02d", i)
+	}
+	longQuery := strings.Repeat("z", 200)
+
+	states := []struct {
+		name  string
+		setup func(m *Model)
+	}{
+		{"idle", func(m *Model) {}},
+		{"typing-overlong-no-match", func(m *Model) {
+			m.searchInput.SetValue(longQuery)
+			m.searchInput.Focus()
+			m.searching = true
+			m.searchQuery = longQuery
+		}},
+		{"typing-overlong-match", func(m *Model) {
+			q := "svc1" + longQuery[:100]
+			m.searchInput.SetValue(q)
+			m.searchInput.Focus()
+			m.searching = true
+			m.searchQuery = "svc1"
+			m.searchMatches = computeMatches(m.services, "svc1")
+			m.svcCursor = m.searchMatches[0]
+		}},
+		{"committed", func(m *Model) {
+			m.searchQuery = "svc1"
+			m.searchMatches = computeMatches(m.services, "svc1")
+			m.svcCursor = m.searchMatches[0]
+		}},
+	}
+
+	// The confirming state is deliberately absent: its prompt is built with a
+	// bare fmt.Sprintf and no clampToWidth, so it overflows below ~46 columns.
+	// That predates the search bar and the footer trim alike (same code on
+	// main) and is out of scope here.
+	for width := 40; width <= 180; width++ {
+		for _, st := range states {
+			m := Model{}
+			m.screen = screenSelectContainers
+			m.services = svcs
+			m.selected = map[int]bool{}
+			m.height = 24
+			m.width = width
+			m.showPicker = true
+			m.searchInput = textinput.New()
+			st.setup(&m)
+
+			out := m.viewSelectContainers()
+			lines := strings.Split(out, "\n")
+			if len(lines) != m.height {
+				t.Fatalf("width=%d state=%s: %d physical lines, want %d",
+					width, st.name, len(lines), m.height)
+			}
+			for i, ln := range lines {
+				visible := strings.TrimRight(ansi.Strip(ln), " ")
+				if w := ansi.StringWidth(visible); w > width {
+					t.Errorf("width=%d state=%s: line %d carries %d cells of CONTENT past the width: %q",
+						width, st.name, i, w, visible)
+				}
 			}
 		}
 	}
@@ -371,5 +473,230 @@ func TestSearchInputWidthTracksResize(t *testing.T) {
 				newWidth, rm.searchInput.Width, want)
 		}
 		om = rm // carry forward so widening-after-narrowing is exercised
+	}
+}
+
+// containerFooterSearchStates drives the container footer through its three
+// search states. line2 is replaced wholesale once a search is committed, so
+// anything that must survive that state has to live in line1; while the input
+// is OPEN the footer drops both lines for a search-specific one.
+var containerFooterSearchStates = []struct {
+	name  string
+	setup func(m *Model)
+}{
+	{"idle", func(m *Model) {}},
+	{"searching", func(m *Model) {
+		m.searchInput = textinput.New()
+		m.searchInput.SetValue("web")
+		m.searchInput.Focus()
+		m.searching = true
+		m.searchQuery = "web"
+		m.searchMatches = computeMatches(m.services, "web")
+	}},
+	{"committed", func(m *Model) {
+		m.searchInput = textinput.New()
+		m.searchQuery = "web"
+		m.searchMatches = computeMatches(m.services, "web")
+	}},
+}
+
+// containerFooterModel is the 80x24 two-service model both footer-token pins
+// drive through containerFooterSearchStates.
+func containerFooterModel(picker bool) Model {
+	m := Model{}
+	m.screen = screenSelectContainers
+	m.services = []string{"web", "db"}
+	m.selected = map[int]bool{}
+	m.showPicker = picker
+	m.width, m.height = 80, 24
+	return m
+}
+
+// TestContainerFooter_AdvertisesOnlyWorkingKeys pins the footer against what
+// the keymap actually binds in each search state.
+//
+// Idle and committed: line2 is replaced wholesale once a search commits, so the
+// back key and the `?` pointer must live in line1 — `q` and `?` both work
+// there, and that is exactly when the overlay is most useful.
+//
+// Searching: the typing intercept routes every key except enter/esc/ctrl+c into
+// the query, so `space`, `q` and `?` are literal runes. The footer must NOT
+// name them; it names enter and esc instead.
+func TestContainerFooter_AdvertisesOnlyWorkingKeys(t *testing.T) {
+	want := map[string][]string{
+		"idle":      {"? keys"},
+		"committed": {"? keys"},
+		"searching": {"enter jump", "esc cancel"},
+	}
+	unwanted := map[string][]string{
+		"searching": {"? keys", "space toggle", "q back", "q quit"},
+	}
+
+	for _, picker := range []bool{true, false} {
+		back := "q quit"
+		if picker {
+			back = "q back"
+		}
+		for _, st := range containerFooterSearchStates {
+			m := containerFooterModel(picker)
+			st.setup(&m)
+
+			out := m.viewSelectContainers()
+			toks := want[st.name]
+			if st.name != "searching" {
+				toks = append(append([]string{}, toks...), back)
+			}
+			for _, tok := range toks {
+				if !strings.Contains(out, tok) {
+					t.Errorf("showPicker=%v state=%s: footer missing %q; got:\n%s", picker, st.name, tok, out)
+				}
+			}
+			for _, tok := range unwanted[st.name] {
+				if strings.Contains(out, tok) {
+					t.Errorf("showPicker=%v state=%s: footer advertises %q, which types a literal rune here; got:\n%s",
+						picker, st.name, tok, out)
+				}
+			}
+		}
+	}
+}
+
+// TestContainerFooter_RendersOneLineAtEighty proves the criterion the trim was
+// made for: at width 80 the footer is ONE physical line in every search state.
+// It measures the actual render, not the budget. anchor opens the footer and
+// probe closes it, so finding both on one physical line proves the one-line
+// branch was taken. Idle and committed span line1+line2 (`? keys` -> the line2
+// head); while searching the footer is a single search-specific line, so the
+// pair is its own two ends.
+func TestContainerFooter_RendersOneLineAtEighty(t *testing.T) {
+	ends := map[string]struct{ anchor, probe string }{
+		"idle":      {"? keys", "d deploy"},
+		"committed": {"? keys", "n/N cycle"},
+		"searching": {"enter jump", "esc cancel"},
+	}
+
+	for _, picker := range []bool{true, false} {
+		for _, st := range containerFooterSearchStates {
+			m := containerFooterModel(picker)
+			st.setup(&m)
+
+			end := ends[st.name]
+			var found bool
+			for _, line := range strings.Split(m.viewSelectContainers(), "\n") {
+				if !strings.Contains(line, end.anchor) {
+					continue
+				}
+				found = true
+				if !strings.Contains(line, end.probe) {
+					t.Errorf("showPicker=%v state=%s: footer split into two lines at width 80 (%q missing from the %q line): %q",
+						picker, st.name, end.probe, end.anchor, line)
+				}
+				if w := ansi.StringWidth(line); w > 80 {
+					t.Errorf("showPicker=%v state=%s: footer line is %d cells, exceeds width 80: %q",
+						picker, st.name, w, line)
+				}
+			}
+			if !found {
+				t.Errorf("showPicker=%v state=%s: no footer line contains %q", picker, st.name, end.anchor)
+			}
+		}
+	}
+}
+
+// oldContainerHelpLine2 is the pre-trim 12-token footer legend, copied verbatim
+// from the const it replaced. Kept here — and only here — so the row gain below
+// is proven against the previous build instead of asserted from memory.
+const oldContainerHelpLine2 = "  r restart  •  d deploy  •  s stop  •  R rollback  •  l logs  •  c config  •  x exec  •  U updates"
+
+// oldContainerFooterLines replays the pre-change footer-height math: the old
+// line1, the old line2 legend, and the old BYTE-counting width guard (each `•`
+// is 3 bytes but one display cell, so len() over-counted 2 per separator).
+func oldContainerFooterLines(m Model) int {
+	back := "q quit"
+	if m.showPicker {
+		back = "q back"
+	}
+	line1 := fmt.Sprintf("  space toggle  •  a all  •  / search  •  %s", back)
+	line2 := oldContainerHelpLine2
+	if m.searching {
+		line2 = "  enter jump  •  esc cancel"
+	} else if m.searchQuery != "" {
+		line2 = "  n/N cycle  •  esc clear"
+	}
+	oneLine := line1 + "  •  " + line2[2:]
+	if m.width >= len(oneLine)+2 {
+		return 3
+	}
+	return 4
+}
+
+// TestSvcVisibleCount_GainsRowVersusOldFooter proves the "the service list
+// gains one row at widths between 76 and 173" criterion. The header math is
+// identical in both builds (3 lines, no status columns here), so the visible
+// count differs only by the footer height — which oldContainerFooterLines
+// reproduces exactly. 76 is the new one-line threshold (74 cells + the 2-cell
+// guard margin); 174 is the old byte-counting one.
+func TestSvcVisibleCount_GainsRowVersusOldFooter(t *testing.T) {
+	// Both builds share the header math, so the comparison below only needs the
+	// footer delta. headerLines is asserted rather than assumed: an unrelated
+	// header change would otherwise turn this red with a message blaming the
+	// footer.
+	const headerLines = 3
+
+	svcs := make([]string, 30)
+	for i := range svcs {
+		svcs[i] = fmt.Sprintf("svc%02d", i)
+	}
+	svcs[0] = "web" // so the committed-search state has a real match
+
+	build := func(width int, picker bool) Model {
+		m := Model{}
+		m.screen = screenSelectContainers
+		m.services = svcs
+		m.selected = map[int]bool{}
+		m.height = 24
+		m.width = width
+		m.showPicker = picker
+		return m
+	}
+
+	// Self-check: svcVisibleCount() must equal height - headerLines - the new
+	// footer height for the plain idle model this test builds.
+	{
+		m := build(120, true)
+		if want := m.height - headerLines - (2 + m.containerFooterLines()); m.svcVisibleCount() != want {
+			t.Fatalf("header math changed: svcVisibleCount()=%d, height-%d-footer=%d — update headerLines here",
+				m.svcVisibleCount(), headerLines, want)
+		}
+	}
+
+	// Idle: the exact boundary. gain 1 from 76 through 173, 0 outside.
+	for _, tc := range []struct{ width, gain int }{
+		{40, 0}, {60, 0}, {75, 0},
+		{76, 1}, {80, 1}, {100, 1}, {120, 1}, {160, 1}, {173, 1},
+		{174, 0}, {200, 0},
+	} {
+		for _, picker := range []bool{true, false} {
+			m := build(tc.width, picker)
+			old := m.height - headerLines - oldContainerFooterLines(m)
+			got := m.svcVisibleCount()
+			if got != old+tc.gain {
+				t.Errorf("width=%d showPicker=%v: svcVisibleCount()=%d, old build=%d, want a gain of %d",
+					tc.width, picker, got, old, tc.gain)
+			}
+		}
+	}
+
+	// Across every width and search state the new footer must never cost a row.
+	for _, st := range containerFooterSearchStates {
+		for width := 20; width <= 200; width++ {
+			m := build(width, true)
+			st.setup(&m)
+			old := m.height - headerLines - oldContainerFooterLines(m)
+			if got := m.svcVisibleCount(); got < old {
+				t.Errorf("width=%d state=%s: svcVisibleCount()=%d regressed below the old build's %d",
+					width, st.name, got, old)
+			}
+		}
 	}
 }
