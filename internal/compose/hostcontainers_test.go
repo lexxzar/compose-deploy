@@ -584,3 +584,150 @@ func TestRemoteDockerRunner_StreamHasNoTTY(t *testing.T) {
 		t.Errorf("stream argv %v allocates a TTY", captured)
 	}
 }
+
+// hostRunFunc dispatches a fakeDockerRunner by subcommand so a single fake can
+// serve both the `ps` and the `stats` call that ContainerStats makes.
+func hostRunFunc(ps, stats string, statsErr error) func(args []string) ([]byte, error) {
+	return func(args []string) ([]byte, error) {
+		if len(args) > 0 && args[0] == "stats" {
+			return []byte(stats), statsErr
+		}
+		return []byte(ps), nil
+	}
+}
+
+const hostStatsMixed = `{"ID":"bbb444555666","Name":"watchtower","CPUPerc":"4.20%","MemUsage":"124MiB / 512MiB"}
+{"ID":"ddd000111222","Name":"agent","CPUPerc":"1.00%","MemUsage":"64MiB / 512MiB"}
+{"ID":"aaa111222333","Name":"web","CPUPerc":"9.00%","MemUsage":"200MiB / 512MiB"}`
+
+func TestHostContainers_ContainerStats(t *testing.T) {
+	f := &fakeDockerRunner{runFunc: hostRunFunc(hostPsMixed, hostStatsMixed, nil)}
+	h := &HostContainers{docker: f}
+
+	got, err := h.ContainerStats(context.Background())
+	if err != nil {
+		t.Fatalf("ContainerStats() error = %v", err)
+	}
+	if len(got) != 2 {
+		t.Fatalf("ContainerStats() = %+v, want 2 entries", got)
+	}
+	if _, ok := got["web"]; ok {
+		t.Error("compose-managed container leaked into the stats map")
+	}
+	// pg-scratch is in `ps` but not in `stats` (it is exited): skipped, not an error.
+	if _, ok := got["pg-scratch"]; ok {
+		t.Error("a container absent from docker stats must be skipped, not zero-filled")
+	}
+
+	wt := got["watchtower"]
+	if wt.CPUPercent != 4.2 {
+		t.Errorf("watchtower CPUPercent = %v, want 4.2", wt.CPUPercent)
+	}
+	if wt.MemoryUsed != 124*1024*1024 {
+		t.Errorf("watchtower MemoryUsed = %d, want %d", wt.MemoryUsed, 124*1024*1024)
+	}
+	if wt.MemoryLimit != 512*1024*1024 {
+		t.Errorf("watchtower MemoryLimit = %d, want %d", wt.MemoryLimit, 512*1024*1024)
+	}
+	if ag := got["agent"]; ag.CPUPercent != 1 || ag.MemoryUsed != 64*1024*1024 {
+		t.Errorf("agent stats = %+v", ag)
+	}
+
+	if len(f.runCalls) != 2 {
+		t.Fatalf("run calls = %v, want a ps call and a stats call", f.runCalls)
+	}
+	wantStats := "stats --no-stream --format json"
+	if got := strings.Join(f.runCalls[1], " "); got != wantStats {
+		t.Errorf("stats argv = %q, want %q", got, wantStats)
+	}
+}
+
+// TestHostContainers_ContainerStats_JoinsOnShortID pins the ID normalization:
+// `docker stats` keys by the 12-char short form, so a full-length ID from `ps`
+// must be truncated before the join.
+func TestHostContainers_ContainerStats_JoinsOnShortID(t *testing.T) {
+	longID := "bbb444555666" + strings.Repeat("f", 52)
+	ps := `{"ID":"` + longID + `","Names":"watchtower","State":"running","Labels":""}`
+	stats := `{"ID":"bbb444555666","Name":"watchtower","CPUPerc":"2.50%","MemUsage":"10MiB / 20MiB"}`
+
+	h := &HostContainers{docker: &fakeDockerRunner{runFunc: hostRunFunc(ps, stats, nil)}}
+	got, err := h.ContainerStats(context.Background())
+	if err != nil {
+		t.Fatalf("ContainerStats() error = %v", err)
+	}
+	if got["watchtower"].CPUPercent != 2.5 {
+		t.Errorf("ContainerStats() = %+v, want the long ID joined on its short form", got)
+	}
+}
+
+func TestHostContainers_ContainerStats_NoneRunning(t *testing.T) {
+	ps := `{"ID":"ccc777888999","Names":"pg-scratch","State":"exited","Labels":""}`
+	h := &HostContainers{docker: &fakeDockerRunner{runFunc: hostRunFunc(ps, "", nil)}}
+
+	got, err := h.ContainerStats(context.Background())
+	if err != nil {
+		t.Fatalf("ContainerStats() error = %v", err)
+	}
+	if len(got) != 0 {
+		t.Errorf("ContainerStats() = %+v, want empty", got)
+	}
+}
+
+func TestHostContainers_ContainerStats_SkipsUnnamedAndUnidentified(t *testing.T) {
+	ps := `{"ID":"","Names":"ghost","State":"running","Labels":""}
+{"ID":"bbb444555666","Names":"","State":"running","Labels":""}
+{"ID":"ddd000111222","Names":"agent","State":"running","Labels":""}`
+	stats := `{"ID":"bbb444555666","Name":"nameless","CPUPerc":"5.00%","MemUsage":"1MiB / 2MiB"}
+{"ID":"ddd000111222","Name":"agent","CPUPerc":"1.00%","MemUsage":"1MiB / 2MiB"}`
+
+	h := &HostContainers{docker: &fakeDockerRunner{runFunc: hostRunFunc(ps, stats, nil)}}
+	got, err := h.ContainerStats(context.Background())
+	if err != nil {
+		t.Fatalf("ContainerStats() error = %v", err)
+	}
+	if len(got) != 1 {
+		t.Fatalf("ContainerStats() = %+v, want only the named, identified container", got)
+	}
+	if _, ok := got["agent"]; !ok {
+		t.Errorf("ContainerStats() = %+v, want agent", got)
+	}
+}
+
+func TestHostContainers_ContainerStats_StatsError(t *testing.T) {
+	f := &fakeDockerRunner{runFunc: hostRunFunc(hostPsMixed, "", errors.New("cannot connect to the docker daemon"))}
+	h := &HostContainers{docker: f}
+
+	got, err := h.ContainerStats(context.Background())
+	if err == nil {
+		t.Fatalf("expected an error, got %+v", got)
+	}
+	if !strings.Contains(err.Error(), "fetching host container stats") ||
+		!strings.Contains(err.Error(), "cannot connect to the docker daemon") {
+		t.Errorf("error = %v, want it to wrap the stats failure", err)
+	}
+}
+
+func TestHostContainers_ContainerStats_PsError(t *testing.T) {
+	f := &fakeDockerRunner{runErr: errors.New("boom")}
+	h := &HostContainers{docker: f}
+
+	if _, err := h.ContainerStats(context.Background()); err == nil {
+		t.Fatal("expected an error")
+	} else if !strings.Contains(err.Error(), "listing host containers") {
+		t.Errorf("error = %v, want it to wrap the ps failure", err)
+	}
+	if len(f.runCalls) != 1 {
+		t.Errorf("run calls = %v, want the stats call skipped after a failed ps", f.runCalls)
+	}
+}
+
+func TestHostContainers_ContainerStats_StatsParseError(t *testing.T) {
+	f := &fakeDockerRunner{runFunc: hostRunFunc(hostPsMixed, "not json", nil)}
+	h := &HostContainers{docker: f}
+
+	if _, err := h.ContainerStats(context.Background()); err == nil {
+		t.Fatal("expected an error")
+	} else if !strings.Contains(err.Error(), "parsing stats output") {
+		t.Errorf("error = %v, want a stats parse error", err)
+	}
+}

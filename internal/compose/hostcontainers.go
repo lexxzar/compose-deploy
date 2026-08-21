@@ -295,3 +295,43 @@ func (h *HostContainers) ContainerStatus(ctx context.Context) (map[string]runner
 	}
 	return status, nil
 }
+
+// hostStatsArgs is the host-wide stats argv. It keeps the bare `json` keyword
+// that AllContainerStats already uses, rather than the ps template form: only
+// `docker ps` needed the template workaround for legacy CLIs.
+var hostStatsArgs = []string{"stats", "--no-stream", "--format", "json"}
+
+// ContainerStats returns CPU and memory usage for each unmanaged container,
+// keyed by container name.
+//
+// It goes through the dockerRunner seam directly rather than through
+// AllContainerStats / AllContainerStatsRemote: those take a concrete *Compose
+// or *RemoteCompose, which a seam-held HostContainers cannot supply without a
+// type switch that would defeat the seam. Only the two-line argv build is
+// duplicated; the pure parser and the join helper are reused.
+//
+// A container that `docker ps` reports but `docker stats` omits (stopped, or
+// stopped between the two calls) is silently skipped, matching
+// Compose.ContainerStats.
+func (h *HostContainers) ContainerStats(ctx context.Context) (map[string]runner.ServiceStats, error) {
+	entries, err := h.unmanagedEntries(ctx)
+	if err != nil {
+		return nil, err
+	}
+	out, err := h.docker.run(ctx, hostStatsArgs...)
+	if err != nil {
+		return nil, fmt.Errorf("fetching host container stats: %w", err)
+	}
+	all, err := parseStatsOutput(out)
+	if err != nil {
+		return nil, err
+	}
+	pairs := make([]psIDService, 0, len(entries))
+	for _, e := range entries {
+		if e.ID == "" {
+			continue
+		}
+		pairs = append(pairs, psIDService{ID: shortContainerID(e.ID), Service: hostContainerName(e.Names)})
+	}
+	return aggregateStatsByService(pairs, all), nil
+}

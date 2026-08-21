@@ -367,12 +367,12 @@ ten methods exist. `CheckUpdates` is a `(nil, nil)` stub here so the type is usa
 - Modify: `internal/compose/hostcontainers.go`
 - Modify: `internal/compose/hostcontainers_test.go`
 
-- [ ] implement `ContainerStats` as `run(ctx, "stats", "--no-stream", "--format", "json")` then `parseStatsOutput`, per design decision 4
-- [ ] join the parsed map against unmanaged container IDs by 12-char ID and aggregate
-- [ ] confirm a container present in `ps` but absent from `stats` is skipped, not an error
-- [ ] write tests for the ID join, including the present-in-ps-absent-from-stats case
-- [ ] write tests for a failed `docker stats` surfacing as an error, not a panic
-- [ ] run tests - must pass before task 4
+- [x] implement `ContainerStats` as `run(ctx, "stats", "--no-stream", "--format", "json")` then `parseStatsOutput`, per design decision 4
+- [x] join the parsed map against unmanaged container IDs by 12-char ID and aggregate
+- [x] confirm a container present in `ps` but absent from `stats` is skipped, not an error
+- [x] write tests for the ID join, including the present-in-ps-absent-from-stats case
+- [x] write tests for a failed `docker stats` surfacing as an error, not a panic
+- [x] run tests - must pass before task 4
 
 ### Task 4: Implement `Logs` and `ExecCommand`, and assert the interface
 
