@@ -550,11 +550,11 @@ while `CheckUpdates` was still a mandatory interface method.]**
 
 ### Task 14: [Final] Update documentation
 
-- [ ] update `README.md` with the unmanaged-container view and its read-only limits
-- [ ] add a CLAUDE.md architecture paragraph covering `HostContainers`, the three-method `dockerRunner` seam, the widened `ComposerFactory`, the `projUnmanaged` cache-key component, and the read-only footer/overlay/checkbox contract
-- [ ] update the `Adding New Operations` checklist in CLAUDE.md to mention the read-only help variant
-- [ ] update `skills/cdeploy/SKILL.md` if the view changes user-facing guidance, keeping the `skills/skills_test.go` pins satisfied
-- [ ] move this plan to `docs/plans/completed/`
+- [x] update `README.md` with the unmanaged-container view and its read-only limits
+- [x] add a CLAUDE.md architecture paragraph covering `HostContainers`, the three-method `dockerRunner` seam, the widened `ComposerFactory`, the `projUnmanaged` cache-key component, and the read-only footer/overlay/checkbox contract (split into three `**Unmanaged containers — …**` paragraphs, matching the `Update detection — …` convention; also refreshed the `Key abstraction`, `Update detection — systemic-failure cascades`, `Package Coupling` and `Testing Approach` paragraphs that the feature made stale)
+- [x] update the `Adding New Operations` checklist in CLAUDE.md to mention the read-only help variant (new step 4: gate the key on `m.readOnly()` and keep it out of `readOnlyContainerGroups()`)
+- [x] update `skills/cdeploy/SKILL.md` — no change needed: the skill drives the non-interactive CLI only and tells agents never to launch the TUI, and this view is TUI-only (`cdeploy list` still covers compose projects only). `go test ./skills/ -count=1` passes unchanged
+- [x] move this plan to `docs/plans/completed/` (deferred to orchestrator - runs after review phases)
 
 ## Post-Completion
 

@@ -59,7 +59,7 @@ After you select a remote server, the server name is shown in the breadcrumb on 
 The TUI has six main screens, plus an inline settings editor reachable from screen 1:
 
 1. **Server select** — choose a remote server or "Local" (only shown when servers are configured); press `s` to open the settings editor for managing servers
-2. **Project select** — pick a Docker Compose project (auto-skipped if the current directory has a compose file)
+2. **Project select** — pick a Docker Compose project (auto-skipped if the current directory has a compose file). When the host also runs containers that no compose project owns, an extra `(unmanaged)` row appears at the end of the list with the container count — see [Unmanaged containers](#unmanaged-containers-read-only)
 3. **Service select** — pick services (`space` toggles one, `a` toggles all) and choose an action (`r` restart, `d` deploy, `s` stop, `R` rollback, `l` logs, `c` config, `x` exec, `U` re-check updates); press `/` to search-and-jump to a service by name substring and `n`/`N` to cycle through matches (search moves the cursor and highlights matches without filtering the list or touching your selection); also shows CPU% and Mem (used/limit) columns for running services, refreshed on screen entry and after every operation. Services whose registry image is newer than the local copy get a yellow `⇧` marker next to the service name; the indicator is cached for 10 minutes and `U` forces a refresh. `R` reads the host-side deploy snapshot and, when one exists, asks to confirm a digest-pinned rollback of the selected services (the prompt shows how long ago the snapshot was recorded). The footer shows only the most-used keys; press `?` for the full key list for the current screen.
 4. **Progress** — watch step-by-step execution with status indicators. After a deploy, restart, or rollback the screen enters a **health-wait** sub-state: it polls each targeted service and shows a live per-service verdict (`♥` healthy, `●` running with no healthcheck, `✗` failed, `~` pending) with a countdown to the timeout. Press `esc` to skip the wait (the operation stays "done"). A failed deploy wait shows the hint `press R on the services screen to roll back`.
 5. **Logs** — live-stream logs for the selected service. `w` toggles soft-wrap, `p` toggles JSON pretty-print, and scrolling up pauses the auto-follow (`G` jumps back to the live tail). Press `f` to open a live **filter** (a grep that hides non-matching lines while the stream keeps buffering underneath; a leading `!` excludes matching lines) and `/` to open a **search** that highlights and jumps within the (possibly filtered) view (`n`/`N` cycle through matches). Both use case-insensitive substring matching by default; `ctrl+r` toggles Go regular-expression (RE2) mode. `esc` peels back one layer at a time — closing an open search or filter input, then clearing a committed search, then a committed filter, and finally leaving the screen.
@@ -77,6 +77,32 @@ The TUI has six main screens, plus an inline settings editor reachable from scre
 `q` is typeable inside settings-form text inputs and is a no-op on the progress screen while an operation is in flight — use `esc` to cancel.
 
 `?` is typeable inside the container search bar, the log filter and search bars, and settings-form text inputs, so a regular expression such as `(?:web|db)` reaches the input instead of opening the key list. `?` does nothing while a confirmation prompt is armed. On a very narrow or very short terminal the key list is trimmed to fit and ends with a `▼ N more` marker — resize the window to see the rest.
+
+#### Unmanaged containers (read-only)
+
+Containers started outside Docker Compose — a `docker run` postgres, a watchtower, a monitoring agent — carry no `com.docker.compose.project` label and belong to no project. The project picker gathers them into one synthetic row:
+
+```
+cdeploy > prod > select project
+
+> my-app        /srv/my-app
+  other-stack   /srv/other
+  (unmanaged)   3 containers
+```
+
+Select it to get the usual service screen over those containers: status dot, health icon, Created, Uptime, Ports, CPU, Mem, and the `⇧` update indicator, in the same columns as a compose project. This works against a remote server through the existing SSH connection, so you can inspect hand-started containers on production without installing anything there and without opening a second SSH session.
+
+The row appears only when the host has at least one such container, and the count is a snapshot taken when the project list was loaded — it does not refresh when you navigate back to the picker. Re-enter the TUI for a fresh count.
+
+**The screen is read-only.** A container with no compose file cannot be deployed, rolled back, or shown a config, so those keys are not merely refused — they are absent from the footer and from the `?` key list, and the rows carry no selection checkbox:
+
+| Key | On the unmanaged screen |
+|-----|-------------------------|
+| `l` `x` `U` | Work as usual — logs, exec, force an update check |
+| `/` `n` `N` `esc` `q` `?` arrows | Work as usual — search, navigate, back, key list |
+| `d` `r` `s` `R` `c` `space` `a` | Inert and unadvertised — deploy, restart, stop, rollback, config, and multi-select need a compose project |
+
+To start, stop, or replace an unmanaged container, use the docker CLI on the host. `cdeploy list` covers compose projects only — unmanaged containers are a TUI view.
 
 ### CLI Mode
 
