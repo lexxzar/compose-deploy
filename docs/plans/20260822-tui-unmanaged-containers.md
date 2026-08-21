@@ -326,15 +326,15 @@ screen), and `hasStatusColumns()` needs no change.
 - Create: `internal/compose/hostcontainers_test.go`
 - Create: `internal/compose/testdata/docker_ps_host.json`
 
-- [ ] add `hostPsEntry` and `parseHostContainers(data []byte) ([]hostPsEntry, error)`, tolerant of both NDJSON and JSON-array forms
-- [ ] add `isComposeManaged(labels string) bool` — token scan for the `com.docker.compose.project=` prefix, no split-and-map
-- [ ] add `parseHealthFromStatus(status string) string` returning `healthy` / `unhealthy` / `starting` / `""`
-- [ ] add `hostContainerName(names string) string` returning the first comma-separated element
-- [ ] capture a real `docker ps -a --format '{{json .}}'` sample into the testdata file
-- [ ] write tests for `parseHostContainers` (NDJSON, array form, empty input, malformed line)
-- [ ] write tests for `isComposeManaged` (managed, unmanaged, and a label value containing a comma)
-- [ ] write tests for `parseHealthFromStatus` (all four outcomes, plus `Exited (0) 2 hours ago`)
-- [ ] run tests - must pass before task 2
+- [x] add `hostPsEntry` and `parseHostContainers(data []byte) ([]hostPsEntry, error)`, tolerant of both NDJSON and JSON-array forms
+- [x] add `isComposeManaged(labels string) bool` — token scan for the `com.docker.compose.project=` prefix, no split-and-map
+- [x] add `parseHealthFromStatus(status string) string` returning `healthy` / `unhealthy` / `starting` / `""`
+- [x] add `hostContainerName(names string) string` returning the first comma-separated element
+- [x] capture a real `docker ps -a --format '{{json .}}'` sample into the testdata file
+- [x] write tests for `parseHostContainers` (NDJSON, array form, empty input, malformed line)
+- [x] write tests for `isComposeManaged` (managed, unmanaged, and a label value containing a comma)
+- [x] write tests for `parseHealthFromStatus` (all four outcomes, plus `Exited (0) 2 hours ago`)
+- [x] run tests - must pass before task 2
 
 ### Task 2: Add the three-method `dockerRunner` seam and the `HostContainers` core
 
