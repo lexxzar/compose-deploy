@@ -4211,7 +4211,11 @@ func (m Model) viewSelectProject() string {
 		name := fmt.Sprintf("%-*s", maxNameLen, proj.Name)
 		b.WriteString(style.Render(cursor + name))
 		b.WriteString("   ")
-		b.WriteString(descStyle.Render(shortenPath(proj.ConfigDir)))
+		desc := shortenPath(proj.ConfigDir)
+		if proj.Unmanaged {
+			desc = proj.Status
+		}
+		b.WriteString(descStyle.Render(desc))
 		b.WriteString("\n")
 	}
 

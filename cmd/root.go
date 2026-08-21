@@ -141,7 +141,11 @@ Remote server configuration (~/.cdeploy/servers.yml):
 						if err := rc.Detect(ctx); err != nil {
 							return nil, err
 						}
-						return rc.ListProjects(ctx)
+						projects, err := rc.ListProjects(ctx)
+						if err != nil {
+							return nil, err
+						}
+						return compose.WithUnmanagedRow(ctx, compose.NewRemoteHostContainers(rc), projects), nil
 					}
 					return connectCmd, remoteFactory, loader, rc.Close
 				}
@@ -152,7 +156,11 @@ Remote server configuration (~/.cdeploy/servers.yml):
 				if err := detectLocal(ctx); err != nil {
 					return nil, err
 				}
-				return localDetector.ListProjects(ctx)
+				projects, err := localDetector.ListProjects(ctx)
+				if err != nil {
+					return nil, err
+				}
+				return compose.WithUnmanagedRow(ctx, compose.NewLocalHostContainers(localDetector), projects), nil
 			}
 
 			logger, err := logging.NewLogger(logDir)

@@ -34,10 +34,15 @@ type portKey struct {
 }
 
 // Project represents a running Docker Compose project discovered via `docker compose ls`.
+//
+// Unmanaged marks the synthetic row that stands for the host containers carrying no
+// com.docker.compose.project label. That row has no compose file, so ConfigDir is
+// empty and Status holds the container count instead of a compose status.
 type Project struct {
 	Name      string
-	Status    string // e.g. "running(3)"
-	ConfigDir string // directory containing the compose file
+	Status    string // e.g. "running(3)", or "3 containers" when Unmanaged
+	ConfigDir string // directory containing the compose file; empty when Unmanaged
+	Unmanaged bool
 }
 
 // Compile-time interface satisfaction checks.

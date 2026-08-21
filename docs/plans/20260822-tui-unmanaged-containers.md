@@ -406,15 +406,15 @@ The append is extracted to a package-level helper because `cmd/root.go` has no t
 - Modify: `internal/tui/app_test.go`
 - Modify: `cmd/root.go`
 
-- [ ] add `Unmanaged bool` to `compose.Project`, documenting that `ConfigDir` is empty and `Status` holds the count when it is set
-- [ ] add `CountUnmanaged(ctx) (int, error)` on `HostContainers`
-- [ ] add `WithUnmanagedRow(ctx, hc *HostContainers, projects []Project) []Project` — appends after `ListProjects` (bypassing `sortProjects`, per Processing flow step 1) and swallows a count error as zero
-- [ ] call the helper from both `ProjectLoader` literals in `cmd/root.go` as a one-line call
-- [ ] branch `viewSelectProject`'s description column on `proj.Unmanaged` to render `proj.Status` instead of `shortenPath(proj.ConfigDir)`
-- [ ] write tests for `CountUnmanaged` (some unmanaged, none, all managed)
-- [ ] write tests for `WithUnmanagedRow` (appended when non-zero, absent when zero, absent on error, always last)
-- [ ] write a render test asserting the row shows `(unmanaged)` and `N containers`
-- [ ] run tests - must pass before task 6
+- [x] add `Unmanaged bool` to `compose.Project`, documenting that `ConfigDir` is empty and `Status` holds the count when it is set
+- [x] add `CountUnmanaged(ctx) (int, error)` on `HostContainers`
+- [x] add `WithUnmanagedRow(ctx, hc *HostContainers, projects []Project) []Project` — appends after `ListProjects` (bypassing `sortProjects`, per Processing flow step 1) and swallows a count error as zero
+- [x] call the helper from both `ProjectLoader` literals in `cmd/root.go` as a one-line call
+- [x] branch `viewSelectProject`'s description column on `proj.Unmanaged` to render `proj.Status` instead of `shortenPath(proj.ConfigDir)`
+- [x] write tests for `CountUnmanaged` (some unmanaged, none, all managed)
+- [x] write tests for `WithUnmanagedRow` (appended when non-zero, absent when zero, absent on error, always last)
+- [x] write a render test asserting the row shows `(unmanaged)` and `N containers`
+- [x] run tests - must pass before task 6
 
 ### Task 6: Widen `ComposerFactory` to take the whole `Project`
 

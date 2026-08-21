@@ -845,6 +845,40 @@ func TestViewSelectProject_EmptyWithPicker(t *testing.T) {
 	}
 }
 
+func TestViewSelectProject_UnmanagedRow(t *testing.T) {
+	mc := &mockComposer{}
+	m := NewModel(nil, io.Discard, mockFactory(mc), nil, nil)
+	m.projects = []compose.Project{
+		{Name: "my-app", Status: "running(3)", ConfigDir: "/srv/my-app"},
+		{Name: compose.UnmanagedProjectName, Status: "3 containers", Unmanaged: true},
+	}
+
+	v := m.View()
+	if !strings.Contains(v, compose.UnmanagedProjectName) {
+		t.Errorf("view should show %q:\n%s", compose.UnmanagedProjectName, v)
+	}
+	if !strings.Contains(v, "3 containers") {
+		t.Errorf("unmanaged row should show its count in the description column:\n%s", v)
+	}
+	if !strings.Contains(v, shortenPath("/srv/my-app")) {
+		t.Errorf("compose row should still show its config dir:\n%s", v)
+	}
+}
+
+func TestViewSelectProject_UnmanagedRowIsLast(t *testing.T) {
+	mc := &mockComposer{}
+	m := NewModel(nil, io.Discard, mockFactory(mc), nil, nil)
+	m.projects = []compose.Project{
+		{Name: "zebra", Status: "running(1)", ConfigDir: "/srv/zebra"},
+		{Name: compose.UnmanagedProjectName, Status: "1 container", Unmanaged: true},
+	}
+
+	v := m.View()
+	if strings.Index(v, "zebra") > strings.Index(v, compose.UnmanagedProjectName) {
+		t.Errorf("unmanaged row should render last:\n%s", v)
+	}
+}
+
 func TestBreadcrumb_WithProjectName(t *testing.T) {
 	mc := &mockComposer{}
 	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
