@@ -14599,3 +14599,105 @@ func TestUpdatesCache_UnmanagedDoesNotReplayFastTrackVerdicts(t *testing.T) {
 		t.Error("the fast-track context must still replay its own cached verdict")
 	}
 }
+
+// TestReadOnly_NoSelectionAffordances pins task 8: with d/r/s/R gated, both the
+// per-row checkbox and the title's (n/m selected) counter would advertise a dead
+// key. The writable control proves the assertions are not vacuous.
+func TestReadOnly_NoSelectionAffordances(t *testing.T) {
+	mc := readOnlyTestComposer()
+	m := newReadOnlyModel(t, mc)
+
+	view := ansi.Strip(m.viewSelectContainers())
+	if strings.Contains(view, "selected") {
+		t.Errorf("read-only view shows the selection counter:\n%s", view)
+	}
+	if strings.Contains(view, "[ ]") || strings.Contains(view, "[x]") {
+		t.Errorf("read-only view shows a row checkbox:\n%s", view)
+	}
+
+	wc := &mockComposer{services: mc.services, status: mc.status}
+	w := NewModel(wc, io.Discard, mockFactory(wc), nil, nil)
+	w.screen = screenSelectContainers
+	w.services = wc.services
+	w.svcStatus = wc.status
+	w.width, w.height = 120, 24
+	control := ansi.Strip(w.viewSelectContainers())
+	if !strings.Contains(control, "selected") || !strings.Contains(control, "[ ]") {
+		t.Errorf("the writable control must keep both affordances:\n%s", control)
+	}
+}
+
+// TestReadOnly_CaptionAlignment pins the caption pad against the row checkbox.
+// The pad is 10 cells with the checkbox and 7 without it, so dropping one
+// without the other misaligns every column against its caption.
+func TestReadOnly_CaptionAlignment(t *testing.T) {
+	status := map[string]runner.ServiceStatus{
+		"watchtower": {Running: true, Created: "2026-08-20 09:30", Uptime: "3h"},
+		"portainer":  {Running: true, Created: "2026-08-19 11:00", Uptime: "1d"},
+	}
+
+	for _, tt := range []struct {
+		name     string
+		readOnly bool
+	}{
+		{"read-only", true},
+		{"writable", false},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			var m Model
+			if tt.readOnly {
+				mc := readOnlyTestComposer()
+				mc.status = status
+				m = newReadOnlyModel(t, mc)
+			} else {
+				wc := &mockComposer{services: []string{"watchtower", "portainer"}, status: status}
+				m = NewModel(wc, io.Discard, mockFactory(wc), nil, nil)
+				m.screen = screenSelectContainers
+				m.services = wc.services
+				m.svcStatus = status
+				m.width, m.height = 120, 24
+			}
+
+			view := m.viewSelectContainers()
+			var caption string
+			rows := map[string]string{}
+			for _, line := range strings.Split(view, "\n") {
+				plain := ansi.Strip(line)
+				if strings.Contains(plain, "Service") && strings.Contains(plain, "Created") {
+					caption = plain
+					continue
+				}
+				if !strings.Contains(plain, "●") {
+					continue
+				}
+				for _, svc := range m.services {
+					if strings.Contains(plain, svc) {
+						rows[svc] = plain
+					}
+				}
+			}
+			if caption == "" {
+				t.Fatalf("no captions row rendered:\n%s", view)
+			}
+			if len(rows) != len(m.services) {
+				t.Fatalf("found %d data rows, want %d:\n%s", len(rows), len(m.services), view)
+			}
+
+			want := ansi.StringWidth(caption[:strings.Index(caption, "Service")])
+			wantPad := 10
+			if tt.readOnly {
+				wantPad = 7
+			}
+			if want != wantPad {
+				t.Errorf("caption pad = %d cells, want %d", want, wantPad)
+			}
+			for svc, row := range rows {
+				got := ansi.StringWidth(row[:strings.Index(row, svc)])
+				if got != want {
+					t.Errorf("%s starts at column %d; the Service caption is at %d\ncaption: %q\nrow:     %q",
+						svc, got, want, caption, row)
+				}
+			}
+		})
+	}
+}

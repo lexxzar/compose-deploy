@@ -458,12 +458,12 @@ pad is silently coupled to the row checkbox and a mismatch misaligns every colum
 - Modify: `internal/tui/app.go`
 - Modify: `internal/tui/app_test.go`
 
-- [ ] drop the `(n/m selected)` counter from the container title when `m.readOnly()`
-- [ ] drop the per-row `[ ]`/`[x]` checkbox (`app.go:4495-4498`) when `m.readOnly()`
-- [ ] change the caption pad (`app.go:4466`) from 10 to 7 when `m.readOnly()`, and update its arithmetic comment to show both budgets
-- [ ] write a render test asserting the read-only caption row aligns with its data columns
-- [ ] write a render test asserting no `[ ]` appears on any read-only row
-- [ ] run tests - must pass before task 9
+- [x] drop the `(n/m selected)` counter from the container title when `m.readOnly()`
+- [x] drop the per-row `[ ]`/`[x]` checkbox (`app.go:4495-4498`) when `m.readOnly()`
+- [x] change the caption pad (`app.go:4466`) from 10 to 7 when `m.readOnly()`, and update its arithmetic comment to show both budgets
+- [x] write a render test asserting the read-only caption row aligns with its data columns
+- [x] write a render test asserting no `[ ]` appears on any read-only row
+- [x] run tests - must pass before task 9
 
 ### Task 9: Read-only footer and `?` overlay
 

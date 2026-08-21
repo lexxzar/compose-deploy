@@ -4392,12 +4392,12 @@ func (m Model) containerFooter() string {
 
 func (m Model) viewSelectContainers() string {
 	var b strings.Builder
-	b.WriteString(titleStyle.Render(fmt.Sprintf(
-		"%s > services (%d/%d selected)",
-		m.breadcrumb(),
-		m.selectedCount(),
-		len(m.services),
-	)))
+	readOnly := m.readOnly()
+	title := fmt.Sprintf("%s > services (%d/%d selected)", m.breadcrumb(), m.selectedCount(), len(m.services))
+	if readOnly {
+		title = m.breadcrumb() + " > services"
+	}
+	b.WriteString(titleStyle.Render(title))
 
 	if m.services == nil && m.svcErr == nil {
 		b.WriteString("\n\n")
@@ -4538,8 +4538,13 @@ func (m Model) viewSelectContainers() string {
 			maxPorts = len("Ports")
 		}
 		// Left padding: cursor(2) + checkbox(3) + space(1) + health(1) + space(1) + dot(1) + space(1) = 10
+		// Read-only drops the checkbox but keeps the space that follows it: 10 - 3 = 7.
 		// Then the "Service" caption sits in the same column as service names.
-		header := strings.Repeat(" ", 10) + fmt.Sprintf("%-*s", maxName, "Service")
+		namePad := 10
+		if readOnly {
+			namePad = 7
+		}
+		header := strings.Repeat(" ", namePad) + fmt.Sprintf("%-*s", maxName, "Service")
 		if maxCreated > 0 {
 			header += fmt.Sprintf("  %-*s", maxCreated, "Created")
 		}
@@ -4568,9 +4573,14 @@ func (m Model) viewSelectContainers() string {
 			cursor = "> "
 		}
 
-		checkbox := checkboxOff.Render("[ ]")
-		if m.selected[i] {
-			checkbox = checkboxOn.Render("[x]")
+		// Read-only: no checkbox, and the space that follows it in the line format
+		// below keeps the 7-cell caption pad in lockstep.
+		checkbox := ""
+		if !readOnly {
+			checkbox = checkboxOff.Render("[ ]")
+			if m.selected[i] {
+				checkbox = checkboxOn.Render("[x]")
+			}
 		}
 
 		st := m.svcStatus[svc]
