@@ -513,14 +513,15 @@ while `CheckUpdates` was still a mandatory interface method.]**
 
 **Files:**
 - Modify: `internal/compose/remote.go`
+- Modify: `internal/compose/updates.go` (the task 10 helper lives here — the `transportAbort` knob is added to `updateCascades`)
 - Modify: `internal/compose/remote_test.go`
 
-- [ ] extend the task 10 helper with the `errSSHTransport` early-abort knob, which the remote loop has and the local one does not (`remote.go:680-713`)
-- [ ] confirm the remote path has **no** daemon cascade and that the knob defaults keep it that way
-- [ ] reduce `RemoteCompose.CheckUpdates` to a delegation
-- [ ] verify every existing test in `remote_test.go` passes **unchanged**
-- [ ] write tests for the transport-abort knob (abort on first transport error, per-image failure absorbed)
-- [ ] run tests - must pass before task 12
+- [x] extend the task 10 helper with the `errSSHTransport` early-abort knob, which the remote loop has and the local one does not (`remote.go:680-713`)
+- [x] confirm the remote path has **no** daemon cascade and that the knob defaults keep it that way
+- [x] reduce `RemoteCompose.CheckUpdates` to a delegation
+- [x] verify every existing test in `remote_test.go` passes **unchanged**
+- [x] write tests for the transport-abort knob (abort on first transport error, per-image failure absorbed)
+- [x] run tests - must pass before task 12
 
 ### Task 12: Implement `HostContainers.CheckUpdates`
 

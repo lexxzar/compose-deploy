@@ -2460,6 +2460,127 @@ func TestRemoteCheckUpdates_FallbackPath_ShellEscapesImage(t *testing.T) {
 	}
 }
 
+// --- transport-abort knob (updateCascades.transportAbort) ---
+//
+// The knob is declared in updates.go beside the two cascades, but only the
+// remote path enables it, so its tests live here with the rest of the SSH
+// contract.
+
+// TestScanImageUpdates_TransportAbortStopsOnFirstError pins the early return:
+// a dead SSH hop fails every remaining image the same way, so the loop must
+// stop rather than burn the rest of the round-trips. The failure is injected
+// on the third call regardless of image, so the assertion does not depend on
+// Go's randomised map iteration order.
+func TestScanImageUpdates_TransportAbortStopsOnFirstError(t *testing.T) {
+	wanted := map[string]string{
+		"web":   "nginx:latest",
+		"db":    "postgres:16",
+		"cache": "redis:7",
+		"queue": "rabbitmq:3",
+		"proxy": "traefik:v3",
+	}
+	calls := 0
+	compare := func(_ context.Context, _ string) (bool, bool, error) {
+		calls++
+		if calls == 3 {
+			return false, false, fmt.Errorf("%w: exit status 255: ssh: connection lost", errSSHTransport)
+		}
+		return true, true, nil
+	}
+
+	got, err := scanImageUpdates(context.Background(), wanted, compare,
+		updateCascades{registry: true, transportAbort: true})
+	if err == nil {
+		t.Fatal("expected an error when the transport dies")
+	}
+	if !errors.Is(err, errSSHTransport) {
+		t.Errorf("err = %q, want errSSHTransport wrapped", err)
+	}
+	if !strings.Contains(err.Error(), "remote update check transport failure") {
+		t.Errorf("err = %q, want the remote transport diagnostic", err)
+	}
+	if calls != 3 {
+		t.Errorf("comparer called %d times, want 3 (abort on the failing call)", calls)
+	}
+	// The two verdicts collected before the abort still come back — the
+	// caller treats a partial map as untrusted, it is not discarded here.
+	if len(got) != 2 {
+		t.Errorf("partial map = %#v, want the 2 verdicts collected before the abort", got)
+	}
+}
+
+// TestScanImageUpdates_TransportAbortAbsorbsPerImageFailure is the negative
+// half: only errSSHTransport aborts. A per-image docker failure on the far
+// host (image not pulled, manifest auth) stays absorbed as the tri-state
+// absent, so a fresh deploy does not blank the column with a false transport
+// diagnostic.
+func TestScanImageUpdates_TransportAbortAbsorbsPerImageFailure(t *testing.T) {
+	wanted := map[string]string{"web": "nginx:latest", "db": "postgres:16"}
+	compare := scanFunc(t, map[string]scanOutcome{
+		"nginx:latest": {updated: true, ok: true},
+		"postgres:16":  {err: fmt.Errorf("exit status 1: Error: No such image: postgres:16")},
+	})
+
+	got, err := scanImageUpdates(context.Background(), wanted, compare,
+		updateCascades{registry: true, transportAbort: true})
+	if err != nil {
+		t.Fatalf("per-image failure aborted the batch: %v", err)
+	}
+	want := map[string]bool{"web": true}
+	if len(got) != len(want) || got["web"] != want["web"] {
+		t.Fatalf("results = %#v, want %#v (db absent → unknown)", got, want)
+	}
+}
+
+// TestScanImageUpdates_TransportAbortOffAbsorbsTransportError pins the knob
+// default. Compose never emits errSSHTransport, so the local path leaves the
+// knob off; with it off the sentinel must carry no special meaning and be
+// absorbed like any other per-image failure.
+func TestScanImageUpdates_TransportAbortOffAbsorbsTransportError(t *testing.T) {
+	wanted := map[string]string{"web": "nginx:latest", "db": "postgres:16"}
+	compare := scanFunc(t, map[string]scanOutcome{
+		"nginx:latest": {updated: true, ok: true},
+		"postgres:16":  {err: fmt.Errorf("%w: exit status 255: ssh: connection lost", errSSHTransport)},
+	})
+
+	got, err := scanImageUpdates(context.Background(), wanted, compare,
+		updateCascades{registry: true, daemon: true})
+	if err != nil {
+		t.Fatalf("the transport sentinel aborted with the knob off: %v", err)
+	}
+	if len(got) != 1 || !got["web"] {
+		t.Fatalf("results = %#v, want {web: true}", got)
+	}
+}
+
+// TestRemoteCheckUpdates_NoDaemonCascade pins the knob RemoteCompose must
+// leave OFF. The docker CLI runs on the far side of the SSH hop, so a
+// daemon-shaped stderr there is just a per-image docker failure — surfacing it
+// as "local docker unavailable" would name the wrong machine. Every image
+// fails with a daemon-shaped stderr and no service gets a verdict, which is
+// exactly the condition that fires the cascade on the local path.
+func TestRemoteCheckUpdates_NoDaemonCascade(t *testing.T) {
+	configJSON := `{"services":{"web":{"image":"nginx:latest"},"db":{"image":"postgres:16"}}}`
+	r := &RemoteCompose{
+		Host:       "user@example.com",
+		ProjectDir: "/app",
+		SocketPath: "/tmp/cdeploy-ctrl-abc-99",
+		outputCmd: func(cmd *exec.Cmd) ([]byte, error) {
+			if isRemoteShellCmd(cmd.Args, "compose") && isRemoteShellCmd(cmd.Args, "config") {
+				return []byte(configJSON), nil
+			}
+			return nil, fmt.Errorf("exit status 1: Cannot connect to the Docker daemon at unix:///var/run/docker.sock. Is the docker daemon running?")
+		},
+	}
+	got, err := r.CheckUpdates(context.Background(), nil)
+	if err != nil {
+		t.Fatalf("CheckUpdates: %v (the remote path must not run the daemon cascade)", err)
+	}
+	if len(got) != 0 {
+		t.Errorf("got = %#v, want empty map (every service unknown)", got)
+	}
+}
+
 // TestClassifySSHError_ControlMasterPatterns is the iteration-3 regression
 // for ControlMaster (persistent socket) failure modes: when the SSH mux
 // socket dies mid-batch, the stderr matches one of mux_client / client_loop /

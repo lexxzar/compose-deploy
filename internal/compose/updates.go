@@ -363,17 +363,27 @@ func (c *Compose) CheckUpdates(ctx context.Context, services []string) (map[stri
 type imageComparer func(ctx context.Context, image string) (bool, bool, error)
 
 // updateCascades selects which systemic-failure diagnostics scanImageUpdates
-// may return in place of an all-blank verdict map. Both are opt-in, so the
-// zero value scans with no cascade at all.
+// may return in place of an all-blank verdict map. Every knob is opt-in, so
+// the zero value scans with no diagnostic at all.
 //
 // registry drives "registry unreachable" and both callers enable it. daemon
 // drives "local docker unavailable" and only Compose enables it: on the remote
 // path the docker CLI runs on the far side of the SSH hop, where a failed
 // image inspect is indistinguishable from any other per-image docker error and
 // there is no local daemon to diagnose.
+//
+// transportAbort drives "remote update check transport failure" and only
+// RemoteCompose enables it. Unlike the two cascades it fires IMMEDIATELY on the
+// first errSSHTransport rather than after the whole scan: a dead SSH hop fails
+// every remaining image the same way, so the remaining round-trips are wasted.
+// The partial map accumulated so far still comes back with the error, matching
+// the "partial map is untrusted" half of the Composer.CheckUpdates contract.
+// Compose never emits errSSHTransport, so the knob is inert on the local path
+// and stays off by default.
 type updateCascades struct {
-	registry bool
-	daemon   bool
+	registry       bool
+	daemon         bool
+	transportAbort bool
 }
 
 // scanImageUpdates compares every image in wanted and folds the per-image
@@ -382,15 +392,17 @@ type updateCascades struct {
 // the map so the caller renders the tri-state blank cell rather than a false
 // negative.
 //
-// The two callers differ only in the cascades they enable and in the error
+// The two callers differ only in the knobs they enable and in the error
 // shapes their comparer emits. Compose wraps a failed local `docker image
 // inspect` in errLocalImageInspect, which routes the failure to the daemon
 // counters instead of the registry ones; RemoteCompose never emits that
-// sentinel, so every non-verdict error there feeds the registry counters.
+// sentinel, so every non-verdict error there feeds the registry counters, and
+// it alone enables transportAbort.
 //
 // A cascade fires only when NO service got a verdict — a partial hiccup (one
 // image not pulled while the rest resolve) must not blank an otherwise
-// correct screen.
+// correct screen. transportAbort is the one exception: it returns as soon as
+// the first errSSHTransport lands, verdicts collected so far included.
 func scanImageUpdates(ctx context.Context, wanted map[string]string, compare imageComparer, cascades updateCascades) (map[string]bool, error) {
 	out := make(map[string]bool, len(wanted))
 	var (
@@ -406,6 +418,13 @@ func scanImageUpdates(ctx context.Context, wanted map[string]string, compare ima
 		localAttempts++
 		updated, ok, rerr := compare(ctx, img)
 		if rerr != nil {
+			// Transport first: a dead SSH hop poisons every remaining
+			// image, so abort before any classification. Checked ahead of
+			// the sentinel dispatch below because the two buckets are
+			// independent and transport is the terminal one.
+			if cascades.transportAbort && errors.Is(rerr, errSSHTransport) {
+				return out, fmt.Errorf("remote update check transport failure: %w", rerr)
+			}
 			// Distinguish local-side vs remote-side errors. Local errors
 			// carry the errLocalImageInspect sentinel; everything else
 			// reached the remote fetch and failed there.
