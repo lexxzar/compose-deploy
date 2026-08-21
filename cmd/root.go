@@ -98,8 +98,11 @@ Remote server configuration (~/.cdeploy/servers.yml):
 				return nil
 			}
 
-			factory := func(d string) runner.Composer {
-				lc := compose.New(d)
+			factory := func(proj compose.Project) runner.Composer {
+				if proj.Unmanaged {
+					return compose.NewLocalHostContainers(localDetector)
+				}
+				lc := compose.New(proj.ConfigDir)
 				if localDetected {
 					lc.SetStandalone(localDetector.Standalone)
 				}
@@ -132,8 +135,11 @@ Remote server configuration (~/.cdeploy/servers.yml):
 					}
 					rc := compose.NewRemote(server.Host, projDir)
 					connectCmd := rc.ConnectCmd(cmd.Context())
-					remoteFactory := func(d string) runner.Composer {
-						newRC := compose.NewRemote(server.Host, d)
+					remoteFactory := func(proj compose.Project) runner.Composer {
+						if proj.Unmanaged {
+							return compose.NewRemoteHostContainers(rc)
+						}
+						newRC := compose.NewRemote(server.Host, proj.ConfigDir)
 						newRC.SetStandalone(rc.Standalone)
 						return newRC
 					}

@@ -90,15 +90,18 @@ type RollbackPreparer interface {
 	PrepareRollback(ctx context.Context, entries map[string]compose.SnapshotEntry, services []string, w io.Writer) (func(), error)
 }
 
-// ComposerFactory creates a runner.Composer for the given project directory.
-type ComposerFactory func(projectDir string) runner.Composer
+// ComposerFactory creates a runner.Composer for the given project. It takes the
+// whole Project rather than a directory string because the synthetic unmanaged
+// row carries Unmanaged: true and an empty ConfigDir, and the factory must
+// branch on that to build a read-only *compose.HostContainers instead.
+type ComposerFactory func(proj compose.Project) runner.Composer
 
 // ProjectLoader loads the list of projects (local or remote).
 type ProjectLoader func(ctx context.Context) ([]compose.Project, error)
 
 // ConnectCallback is called when a remote server is selected. It returns
-// the SSH connect command (for tea.ExecProcess), a ComposerFactory,
-// a ProjectLoader, and a disconnect function.
+// the SSH connect command (for tea.ExecProcess), a ComposerFactory that takes
+// the selected compose.Project, a ProjectLoader, and a disconnect function.
 type ConnectCallback func(server config.Server) (connectCmd *exec.Cmd, factory ComposerFactory, loader ProjectLoader, disconnect func() error)
 
 const warnNoSelection = "No service is selected"
@@ -1655,7 +1658,7 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			proj := m.projects[m.projCursor]
 			m.projName = proj.Name
 			m.projDir = proj.ConfigDir
-			m.composer = m.composerFactory(proj.ConfigDir)
+			m.composer = m.composerFactory(proj)
 			m.statsSession++
 			m.statusSession++
 			m.updatesSession++

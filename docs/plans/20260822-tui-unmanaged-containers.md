@@ -423,13 +423,13 @@ The append is extracted to a package-level helper because `cmd/root.go` has no t
 - Modify: `cmd/root.go`
 - Modify: `internal/tui/app_test.go`
 
-- [ ] change `ComposerFactory` to `func(proj compose.Project) runner.Composer` and update its doc comment
-- [ ] update the `ConnectCallback` doc comment (`app.go:100-102`), which names the factory
-- [ ] update the call site at `app.go:1658` to pass `proj`
-- [ ] update the local factory literal (`cmd/root.go:101`) and the remote factory literal (`cmd/root.go:135`) to branch on `proj.Unmanaged` and call the matching exported constructor
-- [ ] update the five factory literals in `internal/tui/app_test.go`
-- [ ] write a test asserting the factory receives `Unmanaged: true` for the synthetic row and a real `ConfigDir` otherwise
-- [ ] run tests - must pass before task 7
+- [x] change `ComposerFactory` to `func(proj compose.Project) runner.Composer` and update its doc comment
+- [x] update the `ConnectCallback` doc comment (`app.go:100-102`), which names the factory
+- [x] update the call site at `app.go:1658` to pass `proj`
+- [x] update the local factory literal (`cmd/root.go:101`) and the remote factory literal (`cmd/root.go:135`) to branch on `proj.Unmanaged` and call the matching exported constructor
+- [x] update the five factory literals in `internal/tui/app_test.go`
+- [x] write a test asserting the factory receives `Unmanaged: true` for the synthetic row and a real `ConfigDir` otherwise
+- [x] run tests - must pass before task 7
 
 ### Task 7: Gate the write keys and isolate the update cache
 

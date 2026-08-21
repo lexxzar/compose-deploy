@@ -26,7 +26,7 @@ import (
 )
 
 func mockFactory(mc *mockComposer) ComposerFactory {
-	return func(string) runner.Composer { return mc }
+	return func(compose.Project) runner.Composer { return mc }
 }
 
 type mockComposer struct {
@@ -110,7 +110,7 @@ func (m *mockConfigComposer) ValidateConfig(ctx context.Context) error {
 }
 
 func mockConfigFactory(mc *mockConfigComposer) ComposerFactory {
-	return func(string) runner.Composer { return mc }
+	return func(compose.Project) runner.Composer { return mc }
 }
 
 // mockExecComposer implements both runner.Composer and ExecProvider.
@@ -127,7 +127,7 @@ func (m *mockExecComposer) ExecCommand(ctx context.Context, service string, comm
 }
 
 func mockExecFactory(mc *mockExecComposer) ComposerFactory {
-	return func(string) runner.Composer { return mc }
+	return func(compose.Project) runner.Composer { return mc }
 }
 
 func TestNewModel_InitialState(t *testing.T) {
@@ -879,6 +879,54 @@ func TestViewSelectProject_UnmanagedRowIsLast(t *testing.T) {
 	}
 }
 
+func TestComposerFactory_ReceivesWholeProject(t *testing.T) {
+	projects := []compose.Project{
+		{Name: "my-app", Status: "running(3)", ConfigDir: "/srv/my-app"},
+		{Name: compose.UnmanagedProjectName, Status: "3 containers", Unmanaged: true},
+	}
+
+	tests := []struct {
+		name      string
+		cursor    int
+		wantDir   string
+		wantUnman bool
+	}{
+		{"compose project", 0, "/srv/my-app", false},
+		{"unmanaged row", 1, "", true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			mc := &mockComposer{}
+			var got compose.Project
+			factory := func(proj compose.Project) runner.Composer {
+				got = proj
+				return mc
+			}
+			m := NewModel(nil, io.Discard, factory, nil, nil)
+			m.screen = screenSelectProject
+			m.projects = projects
+			m.projCursor = tt.cursor
+
+			updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+			m = updated.(Model)
+
+			if got.Name != projects[tt.cursor].Name {
+				t.Errorf("factory got Name = %q, want %q", got.Name, projects[tt.cursor].Name)
+			}
+			if got.ConfigDir != tt.wantDir {
+				t.Errorf("factory got ConfigDir = %q, want %q", got.ConfigDir, tt.wantDir)
+			}
+			if got.Unmanaged != tt.wantUnman {
+				t.Errorf("factory got Unmanaged = %v, want %v", got.Unmanaged, tt.wantUnman)
+			}
+			if m.composer != runner.Composer(mc) {
+				t.Error("composer should be the one the factory returned")
+			}
+		})
+	}
+}
+
 func TestBreadcrumb_WithProjectName(t *testing.T) {
 	mc := &mockComposer{}
 	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
@@ -1431,7 +1479,7 @@ var testServers = []config.Server{
 func mockConnectCb(mc *mockComposer) ConnectCallback {
 	return func(server config.Server) (*exec.Cmd, ComposerFactory, ProjectLoader, func() error) {
 		cmd := exec.Command("echo", "connected")
-		factory := func(d string) runner.Composer { return mc }
+		factory := func(compose.Project) runner.Composer { return mc }
 		loader := func(ctx context.Context) ([]compose.Project, error) {
 			return []compose.Project{{Name: "remote-app", ConfigDir: "/remote"}}, nil
 		}
@@ -13518,7 +13566,7 @@ func (m *mockRollbackComposer) PrepareRollback(_ context.Context, _ map[string]c
 }
 
 func mockRollbackFactory(mc *mockRollbackComposer) ComposerFactory {
-	return func(string) runner.Composer { return mc }
+	return func(compose.Project) runner.Composer { return mc }
 }
 
 func rollbackTestSnapshot() *compose.Snapshot {
