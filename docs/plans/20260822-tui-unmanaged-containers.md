@@ -539,14 +539,14 @@ while `CheckUpdates` was still a mandatory interface method.]**
 
 ### Task 13: Verify acceptance criteria
 
-- [ ] verify AC1-AC8 from the Overview, one by one
-- [ ] verify the empty case: a host with zero unmanaged containers shows no extra row
-- [ ] verify a failed `CountUnmanaged` is swallowed in the picker path and does not surface or crash **[R2: split from the next item]**
-- [ ] verify a failed `ListServices`/`ContainerStatus` on the container screen surfaces in `svcErr`
-- [ ] verify no gated key and no selection widget advertises a no-op anywhere in the UI
-- [ ] run the full suite uncached: `go test ./... -count=1`
-- [ ] run `go test ./... -race` — the plan adds no goroutine, so this must stay clean
-- [ ] run `go vet ./...` and `go mod tidy`
+- [x] verify AC1-AC8 from the Overview, one by one
+- [x] verify the empty case: a host with zero unmanaged containers shows no extra row
+- [x] verify a failed `CountUnmanaged` is swallowed in the picker path and does not surface or crash **[R2: split from the next item]**
+- [x] verify a failed `ListServices`/`ContainerStatus` on the container screen surfaces in `svcErr`
+- [x] verify no gated key and no selection widget advertises a no-op anywhere in the UI
+- [x] run the full suite uncached: `go test ./... -count=1`
+- [x] run `go test ./... -race` — the plan adds no goroutine, so this must stay clean
+- [x] run `go vet ./...` and `go mod tidy`
 
 ### Task 14: [Final] Update documentation
 

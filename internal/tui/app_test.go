@@ -14737,3 +14737,114 @@ func TestReadOnly_UpdateGlyphHydrates(t *testing.T) {
 		}
 	}
 }
+
+// TestReadOnly_RendersAllStatusColumns is AC3a. The row builder is shared with
+// the writable path — only the checkbox and the caption pad branch on readOnly
+// — but "shared today" is exactly the kind of claim that rots silently, so the
+// full column set is pinned against the rendered read-only screen: name, status
+// dot, health icon, Created, Uptime, Ports, CPU and Mem.
+func TestReadOnly_RendersAllStatusColumns(t *testing.T) {
+	mc := readOnlyTestComposer()
+	mc.status = map[string]runner.ServiceStatus{
+		"watchtower": {
+			Running: true,
+			Health:  "healthy",
+			Created: "2026-08-20 09:30",
+			Uptime:  "3h",
+			Ports:   []runner.Port{{Host: "0.0.0.0", HostPort: 8080, ContainerPort: 80, Protocol: "tcp"}},
+		},
+		"portainer": {Running: false, Health: "unhealthy", Created: "2026-08-19 11:00"},
+	}
+	m := newReadOnlyModel(t, mc)
+	m.statsRequested = true
+	m.stats = map[string]runner.ServiceStats{
+		"watchtower": {CPUPercent: 12.5, MemoryUsed: 130023424, MemoryLimit: 2147483648},
+	}
+
+	view := ansi.Strip(m.viewSelectContainers())
+
+	var caption, running, stopped string
+	for _, line := range strings.Split(view, "\n") {
+		switch {
+		case strings.Contains(line, "Service") && strings.Contains(line, "Created"):
+			caption = line
+		case strings.Contains(line, "watchtower"):
+			running = line
+		case strings.Contains(line, "portainer"):
+			stopped = line
+		}
+	}
+	if caption == "" || running == "" || stopped == "" {
+		t.Fatalf("missing rows — caption=%q running=%q stopped=%q\n%s", caption, running, stopped, view)
+	}
+
+	for _, want := range []string{"Service", "Created", "Uptime", "CPU", "Mem", "Ports"} {
+		if !strings.Contains(caption, want) {
+			t.Errorf("caption row is missing the %q column: %q", want, caption)
+		}
+	}
+
+	for _, tt := range []struct{ what, want string }{
+		{"name", "watchtower"},
+		{"status dot", "●"},
+		{"health icon", "♥"},
+		{"Created", "2026-08-20 09:30"},
+		{"Uptime", "3h"},
+		{"Ports", compose.FormatPort(runner.Port{Host: "0.0.0.0", HostPort: 8080, ContainerPort: 80, Protocol: "tcp"})},
+		{"CPU", "12.5%"},
+		{"Mem", compose.FormatBytes(130023424)},
+	} {
+		if !strings.Contains(running, tt.want) {
+			t.Errorf("read-only row is missing %s (%q): %q", tt.what, tt.want, running)
+		}
+	}
+
+	// The unhealthy icon and the stopped dot share the row builder too, and a
+	// stopped container must still render its Created cell.
+	if !strings.Contains(stopped, "✗") {
+		t.Errorf("stopped row is missing the unhealthy icon: %q", stopped)
+	}
+	if !strings.Contains(stopped, "2026-08-19 11:00") {
+		t.Errorf("stopped row is missing its Created cell: %q", stopped)
+	}
+}
+
+// TestReadOnly_FetchErrorSurfacesInSvcErr pins the container screen's error
+// path for a read-only composer end to end: loadServices folds a ListServices
+// OR a ContainerStatus failure into servicesMsg.err, the handler stores it in
+// svcErr, and the renderer shows it. Without this the unmanaged view could fail
+// silently against an unreachable daemon or a dead SSH hop.
+func TestReadOnly_FetchErrorSurfacesInSvcErr(t *testing.T) {
+	for _, tt := range []struct {
+		name string
+		set  func(*readOnlyMockComposer)
+		want string
+	}{
+		{"ListServices fails", func(c *readOnlyMockComposer) { c.err = errors.New("docker ps failed") }, "docker ps failed"},
+		{"ContainerStatus fails", func(c *readOnlyMockComposer) { c.statusErr = errors.New("ssh hop down") }, "ssh hop down"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			mc := readOnlyTestComposer()
+			tt.set(mc)
+			m := newReadOnlyModel(t, mc)
+
+			msg := m.loadServices()()
+			sm, ok := msg.(servicesMsg)
+			if !ok {
+				t.Fatalf("loadServices returned %T, want servicesMsg", msg)
+			}
+			if sm.err == nil || sm.err.Error() != tt.want {
+				t.Fatalf("servicesMsg.err = %v, want %q", sm.err, tt.want)
+			}
+
+			updated, _ := m.Update(sm)
+			got := updated.(Model)
+			if got.svcErr == nil || got.svcErr.Error() != tt.want {
+				t.Fatalf("svcErr = %v, want %q", got.svcErr, tt.want)
+			}
+			if view := ansi.Strip(got.viewSelectContainers()); !strings.Contains(view, tt.want) {
+				t.Errorf("the error is not rendered on the container screen:\n%s", view)
+			}
+		})
+	}
+}
