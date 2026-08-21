@@ -38,7 +38,7 @@ func NewRootCmd() *cobra.Command {
 		Long: `A TUI/CLI tool for managing Docker Compose container deployments and restarts.
 
 Run without arguments to launch the interactive TUI.
-Run with a subcommand (deploy, restart, stop, list, logs) for non-interactive CLI usage.
+Run with a subcommand (deploy, restart, stop, rollback, list, logs) for non-interactive CLI usage.
 
 Remote server configuration (~/.cdeploy/servers.yml):
 
@@ -195,7 +195,7 @@ Remote server configuration (~/.cdeploy/servers.yml):
 	rootCmd.PersistentFlags().StringVarP(&sshTarget, "ssh", "S", "", "ad-hoc SSH connection string [user@]host[:port] (mutually exclusive with --server)")
 	rootCmd.PersistentFlags().StringVarP(&identityFile, "identity", "i", "", "path to SSH private key (requires --ssh)")
 
-	rootCmd.AddCommand(newDeployCmd(), newRestartCmd(), newStopCmd(), newListCmd(), newLogsCmd(), newExecCmd(), newSkillCmd())
+	rootCmd.AddCommand(newDeployCmd(), newRestartCmd(), newStopCmd(), newRollbackCmd(), newListCmd(), newLogsCmd(), newExecCmd(), newSkillCmd())
 
 	return rootCmd
 }

@@ -104,6 +104,7 @@ const (
 	Restart  Operation = iota // stop → rm → create → start
 	Deploy                    // stop → rm → pull → create → start
 	StopOnly                  // stop
+	Rollback                  // stop → rm → create → start (Restart shape, NO pull)
 )
 
 func (o Operation) String() string {
@@ -114,6 +115,8 @@ func (o Operation) String() string {
 		return "Deploy"
 	case StopOnly:
 		return "Stop"
+	case Rollback:
+		return "Rollback"
 	default:
 		return "Unknown"
 	}
@@ -149,7 +152,7 @@ func Steps(op Operation) []string {
 		return []string{StepStopping, StepRemoving, StepPulling, StepCreating, StepStarting}
 	case StopOnly:
 		return []string{StepStopping}
-	default: // Restart
+	default: // Restart, Rollback (same shape: no Pull)
 		return []string{StepStopping, StepRemoving, StepCreating, StepStarting}
 	}
 }
@@ -183,12 +186,12 @@ func buildSteps(c Composer, op Operation) []step {
 	switch op {
 	case StopOnly:
 		return []step{{StepStopping, c.Stop}}
-	default:
+	default: // Restart, Rollback, Deploy
 		base := []step{
 			{StepStopping, c.Stop},
 			{StepRemoving, c.Remove},
 		}
-		if op == Deploy {
+		if op == Deploy { // Rollback deliberately has NO Pull step
 			base = append(base, step{StepPulling, c.Pull})
 		}
 		base = append(base,

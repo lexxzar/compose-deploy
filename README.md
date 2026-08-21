@@ -60,8 +60,8 @@ The TUI has six main screens, plus an inline settings editor reachable from scre
 
 1. **Server select** — choose a remote server or "Local" (only shown when servers are configured); press `s` to open the settings editor for managing servers
 2. **Project select** — pick a Docker Compose project (auto-skipped if the current directory has a compose file)
-3. **Service select** — pick services and choose an action (`r` restart, `d` deploy, `s` stop, `l` logs, `c` config, `x` exec, `U` re-check updates); press `/` to search-and-jump to a service by name substring and `n`/`N` to cycle through matches (search moves the cursor and highlights matches without filtering the list or touching your selection); also shows CPU% and Mem (used/limit) columns for running services, refreshed on screen entry and after every operation. Services whose registry image is newer than the local copy get a yellow `⇧` marker next to the service name; the indicator is cached for 10 minutes and `U` forces a refresh.
-4. **Progress** — watch step-by-step execution with status indicators
+3. **Service select** — pick services and choose an action (`r` restart, `d` deploy, `s` stop, `R` rollback, `l` logs, `c` config, `x` exec, `U` re-check updates); press `/` to search-and-jump to a service by name substring and `n`/`N` to cycle through matches (search moves the cursor and highlights matches without filtering the list or touching your selection); also shows CPU% and Mem (used/limit) columns for running services, refreshed on screen entry and after every operation. Services whose registry image is newer than the local copy get a yellow `⇧` marker next to the service name; the indicator is cached for 10 minutes and `U` forces a refresh. `R` reads the host-side deploy snapshot and, when one exists, asks to confirm a digest-pinned rollback of the selected services (the prompt shows how long ago the snapshot was recorded).
+4. **Progress** — watch step-by-step execution with status indicators. After a deploy, restart, or rollback the screen enters a **health-wait** sub-state: it polls each targeted service and shows a live per-service verdict (`♥` healthy, `●` running with no healthcheck, `✗` failed, `~` pending) with a countdown to the timeout. Press `esc` to skip the wait (the operation stays "done"). A failed deploy wait shows the hint `press R on the services screen to roll back`.
 5. **Logs** — live-stream logs for the selected service. `w` toggles soft-wrap, `p` toggles JSON pretty-print, and scrolling up pauses the auto-follow (`G` jumps back to the live tail). Press `f` to open a live **filter** (a grep that hides non-matching lines while the stream keeps buffering underneath; a leading `!` excludes matching lines) and `/` to open a **search** that highlights and jumps within the (possibly filtered) view (`n`/`N` cycle through matches). Both use case-insensitive substring matching by default; `ctrl+r` toggles Go regular-expression (RE2) mode. `esc` peels back one layer at a time — closing an open search or filter input, then clearing a committed search, then a committed filter, and finally leaving the screen.
 6. **Config** — inspect or edit the compose file, toggle between raw and resolved config, and see validation status
 
@@ -84,11 +84,19 @@ cdeploy deploy nginx postgres
 # Deploy all containers
 cdeploy deploy -a
 
+# Deploy and wait for services to become healthy (exit 2 if any fail)
+cdeploy deploy -a --wait
+cdeploy deploy web --wait --wait-timeout 90s
+
 # Restart specific containers (stop → remove → create → start)
 cdeploy restart nginx
 
 # Restart all containers
 cdeploy restart -a
+
+# Roll services back to the previously-deployed image digests
+cdeploy rollback web
+cdeploy rollback -a --wait
 
 # Stop specific containers
 cdeploy stop nginx
@@ -291,7 +299,75 @@ In TUI mode, the SSH connect command runs with full terminal access so interacti
 |-----------|-------|
 | **Deploy** | stop → remove → pull → create → start |
 | **Restart** | stop → remove → create → start |
+| **Rollback** | stop → remove → create → start (no pull; pinned to the snapshot digests) |
 | **Stop** | stop |
+
+## Health-gated deploys (`--wait`)
+
+`deploy`, `restart`, and `rollback` accept `--wait`: after the pipeline finishes, cdeploy polls container health until every targeted service is healthy (or has run continuously past a short grace window when it has no healthcheck), then prints a per-service verdict table.
+
+```bash
+cdeploy deploy -a --wait                    # wait up to 2m (default)
+cdeploy deploy web --wait --wait-timeout 90s
+cdeploy restart -a --wait
+cdeploy rollback -a --wait
+```
+
+Flags: `--wait` (enable the health gate), `--wait-timeout <dur>` (default `2m`). The poll interval and no-healthcheck grace window are fixed internally (2s / 10s). `--wait-timeout` is a firm deadline: a service that only becomes healthy *after* it elapses is reported as timed out, and the wait never runs more than the timeout (the final poll is scheduled to land at the deadline rather than a poll-interval past it).
+
+Each service resolves to one verdict:
+
+- **healthy** — a healthcheck passed.
+- **running (no healthcheck)** — no healthcheck defined, but the container ran continuously past the 10s grace window.
+- **unhealthy** — a healthcheck reported unhealthy (fail fast).
+- **exited** — the container was running and then stopped (fail fast).
+- **exited (never started)** — the container never came up (fail fast after a short debounce).
+- **restarting** — the container is stuck in a restart loop (fail fast after 3 consecutive observations).
+- **timed out (still starting)** — still not resolved when `--wait-timeout` elapsed.
+
+**Exit codes** (deploy / restart / rollback):
+
+| Code | Meaning |
+|------|---------|
+| `0` | Success (all services passed, or `--wait` not used and the pipeline finished) |
+| `1` | A pipeline step failed (stop/remove/pull/create/start) |
+| `2` | The pipeline finished but the `--wait` health gate failed (a service went unhealthy/exited/looped/timed out) |
+
+Exit `2` lets CI tell "deployed but unhealthy" apart from "pipeline broke midway". A failed deploy wait also prints the hint `run 'cdeploy rollback' to restore the previous images`. Automation that treats any non-zero exit as "pipeline failed" should learn to distinguish code `2`.
+
+> **Caveat — long-running services only.** `--wait` assumes every targeted service is long-running. A run-to-completion service in the target set (a migration or seed job that starts, does its work, and exits) is indistinguishable from a crash and will fail the wait as `exited` — `docker compose ps` carries no exit code to tell them apart. Don't `--wait` on one-shot services.
+
+## Rollback
+
+Every `cdeploy deploy` snapshots the image digest each *running* container actually uses to a per-project state file **on the docker host**, before it stops anything. `cdeploy rollback` re-creates the targeted services pinned to those digests via a generated compose override (stop → remove → create → start — **no pull**), so it restores the previous images even when the registry is unreachable, as long as the old image blob is still on the host. The override also forces `pull_policy: never` on each rolled-back service so the create step can't attempt a registry pull even when the main compose file sets `pull_policy: always`.
+
+```bash
+# Roll back a single service to its snapshot digest
+cdeploy rollback web
+
+# Roll back everything in the snapshot, then wait for health
+cdeploy rollback -a --wait
+
+# Roll back on a remote server / ad-hoc host
+cdeploy rollback web -s prod -C /opt/myapp
+cdeploy rollback web --ssh deploy@host -C /opt/myapp
+```
+
+**How the snapshot works:**
+
+- Recorded on **deploy only** — never on restart or rollback, so a bad deploy followed by a restart can't overwrite the good snapshot, and rolling back twice lands on the same state.
+- Captured **before** the pipeline stops anything, from the digest each running container is actually using (not the local tag's current digest — a pulled-but-not-deployed newer image never poisons the snapshot).
+- **Merge-not-replace**: `deploy web` updates only `web`'s entry and keeps the rest of the project's services in the snapshot, each with its own `recorded_at`.
+- Stored on the docker host at `~/.cdeploy/state/<hash-of-project-dir>.json` (`sha256(project dir)`, first 12 hex chars), so a CI deploy and a laptop rollback share one authoritative history.
+- Snapshot failure **warns but never blocks the deploy** — a missing digest (a locally-built image with no registry digest) or a not-running service is skipped with a warning, the deploy proceeds.
+
+**Rollback refuses (rather than guessing) when** no snapshot exists for the project, the state file is unreadable or has an unknown schema, or a named service is absent from the snapshot (the error names exactly which services are missing). If the snapshot digest's blob is no longer cached on the host, rollback pulls it by digest first; if that pull fails (blob pruned *and* registry down), it aborts before touching any container.
+
+**Only services still in the compose file are touched.** Rollback intersects the snapshot with the current `docker compose config --services`: a snapshot entry for a service that has since been removed from the compose file is skipped with a warning under `-a`, or refused with a clear error when named explicitly — the generated override never resurrects a removed service.
+
+> **Caveat — images only.** Rollback pins **images only** against the *current* compose file. Other config drift (changed env, ports, volumes) is not rewound. It restores which image runs, not the whole compose configuration.
+
+> **Caveat — concurrent deploys of the same project.** The per-project state file is written with a read-modify-merge. Locally, an advisory file lock serializes concurrent deploys of the same project so their snapshots can't clobber each other. For a **remote** host, two deploys of the same project running at the same time from different machines can race — the merge is host-local between two SSH round-trips and there is no cross-host lock in v1 — so the later write can drop the earlier deploy's fresh entry for an overlapping service. Snapshotting is best-effort, so this only affects rollback precision for that narrow overlap.
 
 ## Health Checks
 
@@ -354,7 +430,7 @@ npx skills add lexxzar/compose-deploy
 gh skill install lexxzar/compose-deploy
 ```
 
-**What the skill teaches:** setting up `~/.cdeploy/servers.yml` and key-based SSH from scratch (servers, groups, badge colors, ad-hoc `--ssh`/`--identity`/`--project-dir` for CI); read-only inspection (`list --json` with `--stats`/`--updates`, `logs` with tail, and the stale-image sweep for spotting containers running behind the registry); and a safety protocol for mutating operations — restate the target services and server and confirm before deploying/restarting/stopping, never assume `-a`, and verify with `list` afterwards.
+**What the skill teaches:** setting up `~/.cdeploy/servers.yml` and key-based SSH from scratch (servers, groups, badge colors, ad-hoc `--ssh`/`--identity`/`--project-dir` for CI); read-only inspection (`list --json` with `--stats`/`--updates`, `logs` with tail, and the stale-image sweep for spotting containers running behind the registry); and a safety protocol for mutating operations — restate the target services and server and confirm before deploying/restarting/stopping/rolling back, never assume `-a`, and verify with `list` afterwards.
 
 ## License
 

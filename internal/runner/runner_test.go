@@ -119,6 +119,99 @@ func TestRun_DeploySequence(t *testing.T) {
 	}
 }
 
+func TestRun_RollbackSequence(t *testing.T) {
+	mc := &mockComposer{}
+	events := make(chan StepEvent, 20)
+
+	Run(context.Background(), mc, Rollback, []string{"nginx"}, io.Discard, events)
+
+	// Rollback shares the Restart shape: Stop → Remove → Create → Start, NO Pull.
+	wantCalls := []string{StepStopping, StepRemoving, StepCreating, StepStarting}
+	if len(mc.calls) != len(wantCalls) {
+		t.Fatalf("calls = %v, want %v", mc.calls, wantCalls)
+	}
+	for i, want := range wantCalls {
+		if mc.calls[i] != want {
+			t.Errorf("call[%d] = %q, want %q", i, mc.calls[i], want)
+		}
+	}
+}
+
+func TestRun_RollbackEvents(t *testing.T) {
+	mc := &mockComposer{}
+	events := make(chan StepEvent, 20)
+
+	Run(context.Background(), mc, Rollback, []string{"nginx"}, io.Discard, events)
+
+	evts := collectEvents(events)
+
+	// Rollback has 4 steps, each produces running + done = 8 events.
+	if len(evts) != 8 {
+		t.Fatalf("got %d events, want 8: %+v", len(evts), evts)
+	}
+
+	wantSteps := []string{StepStopping, StepRemoving, StepCreating, StepStarting}
+	for i, e := range evts {
+		wantStep := wantSteps[i/2]
+		if e.Step != wantStep {
+			t.Errorf("event[%d] step = %q, want %q", i, e.Step, wantStep)
+		}
+		if i%2 == 0 {
+			if e.Status != StatusRunning {
+				t.Errorf("event[%d] status = %q, want %q", i, e.Status, StatusRunning)
+			}
+		} else {
+			if e.Status != StatusDone {
+				t.Errorf("event[%d] status = %q, want %q", i, e.Status, StatusDone)
+			}
+		}
+	}
+}
+
+func TestRun_RollbackFailurePropagates(t *testing.T) {
+	testErr := fmt.Errorf("create failed: image not found")
+	mc := &mockComposer{failAt: StepCreating, failErr: testErr}
+	events := make(chan StepEvent, 20)
+
+	Run(context.Background(), mc, Rollback, []string{"nginx"}, io.Discard, events)
+
+	// Should have called: stop, remove, create (failed). NOT start.
+	wantCalls := []string{StepStopping, StepRemoving, StepCreating}
+	if len(mc.calls) != len(wantCalls) {
+		t.Fatalf("calls = %v, want %v", mc.calls, wantCalls)
+	}
+
+	evts := collectEvents(events)
+
+	// stop running, stop done, remove running, remove done,
+	// create running, create failed = 6 events.
+	if len(evts) != 6 {
+		t.Fatalf("got %d events, want 6: %+v", len(evts), evts)
+	}
+
+	lastEvent := evts[len(evts)-1]
+	if lastEvent.Status != StatusFailed {
+		t.Errorf("last event status = %q, want %q", lastEvent.Status, StatusFailed)
+	}
+	if lastEvent.Err != testErr {
+		t.Errorf("last event error = %v, want %v", lastEvent.Err, testErr)
+	}
+}
+
+func TestSteps_Rollback(t *testing.T) {
+	steps := Steps(Rollback)
+	// Same shape as Restart: no Pull step.
+	want := []string{StepStopping, StepRemoving, StepCreating, StepStarting}
+	if len(steps) != len(want) {
+		t.Fatalf("steps = %v, want %v", steps, want)
+	}
+	for i, w := range want {
+		if steps[i] != w {
+			t.Errorf("step[%d] = %q, want %q", i, steps[i], w)
+		}
+	}
+}
+
 func TestRun_DeployEvents(t *testing.T) {
 	mc := &mockComposer{}
 	events := make(chan StepEvent, 20)
@@ -292,6 +385,7 @@ func TestOperation_String(t *testing.T) {
 		{Restart, "Restart"},
 		{Deploy, "Deploy"},
 		{StopOnly, "Stop"},
+		{Rollback, "Rollback"},
 	}
 	for _, tt := range tests {
 		if got := tt.op.String(); got != tt.want {

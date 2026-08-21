@@ -1,6 +1,6 @@
 ---
 name: cdeploy
-description: Drive the cdeploy CLI to manage Docker Compose deployments on the local host or a remote server over SSH. Use for operations — deploy, restart, or stop compose services; list service status, health, ports, CPU/memory stats, or check for available image updates; stream or tail service logs; exec into a running container. Also use for setup and configuration — installing the cdeploy binary, creating or editing ~/.cdeploy/servers.yml (remote servers, groups, and badge colors), setting up key-based SSH access, and ad-hoc --ssh / --identity / --project-dir connections for CI. Triggers include "deploy my app", "restart the nginx container", "check the servers", "are there any image updates", "show me the logs", "set up cdeploy", "add a server to cdeploy", "configure servers.yml".
+description: Drive the cdeploy CLI to manage Docker Compose deployments on the local host or a remote server over SSH. Use for operations — deploy, restart, stop, or roll back compose services; health-gate a deploy or restart with --wait; list service status, health, ports, CPU/memory stats, or check for available image updates; stream or tail service logs; exec into a running container. Also use for setup and configuration — installing the cdeploy binary, creating or editing ~/.cdeploy/servers.yml (remote servers, groups, and badge colors), setting up key-based SSH access, and ad-hoc --ssh / --identity / --project-dir connections for CI. Triggers include "deploy my app", "restart the nginx container", "roll back the last deploy", "wait until the services are healthy", "check the servers", "are there any image updates", "show me the logs", "set up cdeploy", "add a server to cdeploy", "configure servers.yml".
 ---
 
 # cdeploy
@@ -155,6 +155,51 @@ cdeploy deploy  web --ssh user@host --project-dir /opt/myapp --identity /run/sec
 - **deploy** pulls fresh images then recreates — use for "ship the new image".
 - **restart** recreates with the current image (no pull) — use for "bounce it".
 - **stop** just stops. `-a/--all` operates on every service (needs explicit "all").
+
+**Health-gated deploys (`--wait`).** Add `--wait` to `deploy` or `restart` to make
+cdeploy poll container health after the pipeline and print a per-service verdict
+table. Prefer it for CI / unattended deploys — it turns "deployed but unhealthy"
+into a distinct exit code.
+
+```
+cdeploy deploy web --wait                       # wait up to 2m (default)
+cdeploy deploy -a --wait --wait-timeout 90s
+cdeploy restart web -s prod -C /opt/myapp --wait
+```
+
+- **Exit codes (deploy/restart/rollback):** `0` = success, `1` = a pipeline step
+  failed, **`2` = the pipeline finished but the `--wait` health gate failed**
+  (a service went unhealthy / exited / restart-looped / timed out). Treat `2` as
+  "deployed but not healthy", not as a pipeline error. A failed deploy wait also
+  prints `run 'cdeploy rollback' to restore the previous images`.
+- Verdicts: `healthy`, `running (no healthcheck)` (ran past a 10s grace window),
+  `unhealthy`, `exited`, `exited (never started)`, `restarting`,
+  `timed out (still starting)`.
+- **Caveat:** `--wait` assumes targeted services are long-running. A one-shot
+  run-to-completion service (a migration/seed job that exits after finishing) in
+  the target set will fail the wait as `exited`. Don't `--wait` on those.
+
+**Rollback (`cdeploy rollback [services...|-a]`).** Every `deploy` snapshots the
+image digest each running container uses to a state file on the docker host
+**before** stopping anything. `rollback` re-creates the targeted services pinned
+to those digests via a generated compose override (stop → remove → create →
+start — **no pull**), so it works even with the registry unreachable as long as
+the old image blob is still on the host. Use it to undo a bad deploy.
+
+```
+cdeploy rollback web                            # restore one service
+cdeploy rollback -a --wait                       # restore all + health-gate
+cdeploy rollback web -s prod -C /opt/myapp
+```
+
+- Follow the same SAFETY PROTOCOL as deploy/restart: confirm the exact services
+  and target first, never assume `-a`, verify with `list` after.
+- Rollback **refuses clearly** (does not guess) when no snapshot exists for the
+  project or a named service is absent from it — the error names what's missing.
+  Report that to the user; it usually means the service was never deployed with
+  this cdeploy on that host.
+- **Restores images only** against the *current* compose file — env/ports/volumes
+  drift is not rewound. It changes which image runs, not the whole config.
 
 **`cdeploy exec <service> [-- command...]`** opens an interactive shell in a
 running container (tries bash, falls back to sh) or runs a one-off command. It is

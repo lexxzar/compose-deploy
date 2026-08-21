@@ -5945,7 +5945,7 @@ func TestSvcVisibleCount_NormalHeight(t *testing.T) {
 	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
 	m.statsRequested = false // exercise the "no columns" branch
 	m.services = []string{"a", "b", "c", "d", "e", "f", "g", "h", "i", "j"}
-	m.width = 160 // wide enough for one-line help
+	m.width = 200 // wide enough for one-line help
 	m.height = 10
 
 	// header=3, footer=3 (one-line help; reserved search bar merges onto the
@@ -5992,7 +5992,7 @@ func TestSvcVisibleCount_Warning(t *testing.T) {
 	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
 	m.statsRequested = false
 	m.services = []string{"a", "b", "c", "d", "e", "f", "g", "h", "i", "j"}
-	m.width = 160
+	m.width = 200
 	m.height = 10
 	m.warning = "something wrong"
 
@@ -6034,7 +6034,7 @@ func TestSvcVisibleCount_WithStatusColumns(t *testing.T) {
 	mc := &mockComposer{}
 	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
 	m.services = []string{"a", "b", "c", "d", "e", "f", "g", "h", "i", "j"}
-	m.width = 160
+	m.width = 200
 	m.height = 10
 	m.svcStatus = map[string]runner.ServiceStatus{
 		"a": {Running: true, Created: "2024-01-15 09:30", Uptime: "3h"},
@@ -6139,7 +6139,7 @@ func TestFixSvcOffset_CursorBelowWindow(t *testing.T) {
 	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
 	m.statsRequested = false
 	m.services = []string{"a", "b", "c", "d", "e"}
-	m.width = 160
+	m.width = 200
 	m.height = 9 // visible = 9-3-3 = 3
 	m.svcCursor = 4
 	m.svcOffset = 0
@@ -6203,7 +6203,7 @@ func TestFixSvcOffset_ClampsMaxOffset(t *testing.T) {
 	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
 	m.statsRequested = false
 	m.services = []string{"a", "b", "c", "d", "e"}
-	m.width = 160
+	m.width = 200
 	m.height = 9 // visible = 9-3-3 = 3
 	m.svcCursor = 4
 	m.svcOffset = 10 // way too high
@@ -6221,11 +6221,11 @@ func TestScrollDown_PastVisibleWindow(t *testing.T) {
 	m.statsRequested = false // isolate scroll math from the captions row
 	m.screen = screenSelectContainers
 	m.services = mc.services
-	m.width = 160
+	m.width = 200
 	m.height = 9 // visible = 9-3-3 = 3
 
 	// Set initial size
-	updated, _ := m.Update(tea.WindowSizeMsg{Width: 160, Height: 9})
+	updated, _ := m.Update(tea.WindowSizeMsg{Width: 200, Height: 9})
 	m = updated.(Model)
 
 	// Press down 4 times to reach index 4
@@ -6359,7 +6359,7 @@ func TestViewSelectContainers_DownIndicator(t *testing.T) {
 	m.screen = screenSelectContainers
 	m.services = mc.services
 	m.svcStatus = map[string]runner.ServiceStatus{}
-	m.width = 160
+	m.width = 200
 	m.height = 8 // visible = 8-3-3 = 2
 	m.svcCursor = 0
 	m.svcOffset = 0
@@ -6397,7 +6397,7 @@ func TestViewSelectContainers_BothIndicators(t *testing.T) {
 	m.screen = screenSelectContainers
 	m.services = mc.services
 	m.svcStatus = map[string]runner.ServiceStatus{}
-	m.width = 160
+	m.width = 200
 	m.height = 8 // visible = 8-3-3 = 2
 	m.svcCursor = 2
 	m.svcOffset = 1
@@ -6438,7 +6438,7 @@ func TestViewSelectContainers_WindowedOnlyShowsVisibleServices(t *testing.T) {
 	m.screen = screenSelectContainers
 	m.services = mc.services
 	m.svcStatus = map[string]runner.ServiceStatus{}
-	m.width = 160
+	m.width = 200
 	m.height = 9 // visible = 9-3-3 = 3
 	m.svcCursor = 2
 	m.svcOffset = 1 // showing bbb, ccc, ddd
@@ -10097,7 +10097,7 @@ func TestSvcVisibleCount_withStatsColumns(t *testing.T) {
 	mc := &mockComposer{}
 	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
 	m.services = []string{"a", "b", "c", "d", "e", "f", "g", "h", "i", "j"}
-	m.width = 160
+	m.width = 200
 	m.height = 10
 	m.svcStatus = map[string]runner.ServiceStatus{
 		"a": {Running: true},
@@ -11547,12 +11547,12 @@ func TestUpdatesMsg_OffScreenErrorFixesOffset(t *testing.T) {
 	m.screen = screenConfig  // off-screen — user is in config viewer
 	m.updatesSession = 7
 	m.updateInFlight = true
-	// Geometry: width=160 (forces one-line help => footerLines=3 baseline; the
+	// Geometry: width=200 (forces one-line help => footerLines=3 baseline; the
 	// reserved search-bar line merges onto the helpStyle MarginTop blank and
 	// adds no physical row), height=9 → visible = 9-3-3 = 3 when no updatesErr;
 	// visible = 9-3-4 = 2 once updatesErr is set. Cursor=2 with offset=0 sits at
 	// the last visible row pre-error; post-error it falls outside the new window.
-	m.width = 160
+	m.width = 200
 	m.height = 9
 	m.services = []string{"a", "b", "c", "d", "e"}
 	m.svcStatus = map[string]runner.ServiceStatus{
@@ -12815,4 +12815,1419 @@ func TestSearchClearedOnEnterExec(t *testing.T) {
 	m = updated.(Model)
 
 	assertSearchCleared(t, m, "after enterExec")
+}
+
+// ---------------------------------------------------------------------------
+// Task 11: snapshot-on-deploy + health-wait phase on the progress screen.
+// ---------------------------------------------------------------------------
+
+// recordingSnapshotter is a minimal Snapshotter for exercising the
+// recordDeploySnapshot best-effort helper in isolation.
+type recordingSnapshotter struct {
+	res        compose.SnapshotResult
+	snapErr    error
+	writeErr   error
+	snapCalls  int
+	writeCalls int
+	wrote      *compose.Snapshot
+}
+
+func (r *recordingSnapshotter) SnapshotServices(ctx context.Context, services []string) (compose.SnapshotResult, error) {
+	r.snapCalls++
+	return r.res, r.snapErr
+}
+
+func (r *recordingSnapshotter) WriteSnapshot(ctx context.Context, fresh *compose.Snapshot) error {
+	r.writeCalls++
+	r.wrote = fresh
+	return r.writeErr
+}
+
+// mockSnapshotComposer implements runner.Composer AND Snapshotter, recording the
+// order of the snapshot vs the pipeline Stop step so the pre-Stop ordering can be
+// asserted. Reads happen after the events channel closes (a happens-before edge),
+// so the plain order slice is race-free under `go test -race`.
+type mockSnapshotComposer struct {
+	mockComposer
+	snapResult compose.SnapshotResult
+	snapErr    error
+	writeErr   error
+	snapCalls  int
+	writeCalls int
+	order      []string
+}
+
+func (m *mockSnapshotComposer) SnapshotServices(ctx context.Context, services []string) (compose.SnapshotResult, error) {
+	m.snapCalls++
+	m.order = append(m.order, "snapshot")
+	return m.snapResult, m.snapErr
+}
+
+func (m *mockSnapshotComposer) WriteSnapshot(ctx context.Context, fresh *compose.Snapshot) error {
+	m.writeCalls++
+	return m.writeErr
+}
+
+func (m *mockSnapshotComposer) Stop(ctx context.Context, containers []string, w io.Writer) error {
+	m.order = append(m.order, "stop")
+	return nil
+}
+
+type fakeWaitTickMsg struct{}
+
+// installFakeWaitTick swaps the wait-tick timer for a non-blocking Cmd so a
+// not-yet-resolved wait in a test does not leave a real DefaultWaitPoll tea.Tick
+// goroutine running.
+func installFakeWaitTick(m *Model) {
+	m.waitTickOverride = func() tea.Cmd {
+		return func() tea.Msg { return fakeWaitTickMsg{} }
+	}
+}
+
+func TestRecordDeploySnapshot_HappyPath(t *testing.T) {
+	snap := &compose.Snapshot{Schema: 1, Services: map[string]compose.SnapshotEntry{"web": {}}}
+	s := &recordingSnapshotter{res: compose.SnapshotResult{Snapshot: snap}}
+	var buf strings.Builder
+
+	recordDeploySnapshot(context.Background(), s, []string{"web"}, &buf)
+
+	if s.snapCalls != 1 {
+		t.Errorf("SnapshotServices calls = %d, want 1", s.snapCalls)
+	}
+	if s.writeCalls != 1 {
+		t.Errorf("WriteSnapshot calls = %d, want 1", s.writeCalls)
+	}
+	if s.wrote != snap {
+		t.Error("WriteSnapshot should receive the captured snapshot")
+	}
+	if buf.Len() != 0 {
+		t.Errorf("no warnings expected on the happy path, got %q", buf.String())
+	}
+}
+
+func TestRecordDeploySnapshot_CaptureError_SkipsWrite(t *testing.T) {
+	s := &recordingSnapshotter{snapErr: errors.New("boom")}
+	var buf strings.Builder
+
+	recordDeploySnapshot(context.Background(), s, nil, &buf)
+
+	if s.writeCalls != 0 {
+		t.Errorf("WriteSnapshot must not run when capture fails, calls = %d", s.writeCalls)
+	}
+	if !strings.Contains(buf.String(), "rollback snapshot skipped") {
+		t.Errorf("expected skip warning, got %q", buf.String())
+	}
+}
+
+func TestRecordDeploySnapshot_WriteError_WarnsAndProceeds(t *testing.T) {
+	s := &recordingSnapshotter{
+		res:      compose.SnapshotResult{Snapshot: &compose.Snapshot{Schema: 1}},
+		writeErr: errors.New("disk full"),
+	}
+	var buf strings.Builder
+
+	recordDeploySnapshot(context.Background(), s, nil, &buf)
+
+	if !strings.Contains(buf.String(), "failed to write rollback snapshot") {
+		t.Errorf("expected write-failure warning, got %q", buf.String())
+	}
+}
+
+func TestRecordDeploySnapshot_PerServiceWarnings(t *testing.T) {
+	s := &recordingSnapshotter{res: compose.SnapshotResult{
+		Snapshot: &compose.Snapshot{Schema: 1},
+		Warnings: []string{"web not running", "db built locally"},
+	}}
+	var buf strings.Builder
+
+	recordDeploySnapshot(context.Background(), s, nil, &buf)
+
+	out := buf.String()
+	if !strings.Contains(out, "web not running") || !strings.Contains(out, "db built locally") {
+		t.Errorf("expected both per-service warnings, got %q", out)
+	}
+	if s.writeCalls != 1 {
+		t.Errorf("write should still run after warnings, calls = %d", s.writeCalls)
+	}
+}
+
+// TestEnterProgress_DeploySnapshotsBeforeStop verifies the launch goroutine runs
+// the snapshot FIRST (pre-Stop) for a Deploy. Draining the events channel to
+// close establishes a happens-before edge, so reading the order slice is safe.
+func TestEnterProgress_DeploySnapshotsBeforeStop(t *testing.T) {
+	mc := &mockSnapshotComposer{
+		mockComposer: mockComposer{services: []string{"web"}},
+		snapResult:   compose.SnapshotResult{Snapshot: &compose.Snapshot{Schema: 1}},
+	}
+	m := NewModel(mc, io.Discard, mockFactory(&mc.mockComposer), nil, nil)
+	m.screen = screenSelectContainers
+	m.services = mc.services
+	m.composer = mc
+	m.selected[0] = true
+	m.pendingOp = runner.Deploy
+	m.width = 80
+	m.height = 24
+
+	updated, _ := m.enterProgress([]string{"web"})
+	m = updated.(Model)
+
+	// Drain the pipeline events to completion (channel close = goroutine done).
+	for range m.eventCh { //nolint:revive // draining for synchronization
+	}
+
+	if mc.snapCalls != 1 {
+		t.Fatalf("SnapshotServices calls = %d, want 1", mc.snapCalls)
+	}
+	if mc.writeCalls != 1 {
+		t.Errorf("WriteSnapshot calls = %d, want 1", mc.writeCalls)
+	}
+	if len(mc.order) < 2 || mc.order[0] != "snapshot" || mc.order[1] != "stop" {
+		t.Errorf("order = %v, want snapshot before stop", mc.order)
+	}
+}
+
+// TestEnterProgress_NonSnapshotterMockRunsAsToday verifies a composer without the
+// Snapshotter capability deploys exactly as before — no snapshot attempted, the
+// pipeline runs to completion.
+func TestEnterProgress_NonSnapshotterMockRunsAsToday(t *testing.T) {
+	mc := &mockComposer{services: []string{"web"}}
+	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
+	m.screen = screenSelectContainers
+	m.services = mc.services
+	m.composer = mc
+	m.selected[0] = true
+	m.pendingOp = runner.Deploy
+	m.width = 80
+	m.height = 24
+
+	updated, _ := m.enterProgress([]string{"web"})
+	m = updated.(Model)
+
+	if m.screen != screenProgress {
+		t.Fatalf("screen = %d, want screenProgress", m.screen)
+	}
+	// Draining without panic confirms the pipeline ran normally.
+	for range m.eventCh { //nolint:revive // draining for synchronization
+	}
+}
+
+func TestPipelineDone_StartsWaitAfterDone(t *testing.T) {
+	mc := &mockComposer{services: []string{"web"}}
+	m := Model{
+		screen:       screenProgress,
+		pendingOp:    runner.Deploy,
+		services:     []string{"web"},
+		opContainers: []string{"web"},
+		composer:     mc,
+		ctx:          context.Background(),
+	}
+
+	updated, cmd := m.Update(pipelineDoneMsg{})
+	m = updated.(Model)
+
+	if !m.done {
+		t.Error("done should be true after pipelineDoneMsg")
+	}
+	if !m.waiting {
+		t.Error("waiting should be true after a successful non-stop pipeline")
+	}
+	if len(m.waitState.Services) != 1 || m.waitState.Services[0] != "web" {
+		t.Errorf("waitState.Services = %v, want [web]", m.waitState.Services)
+	}
+	if m.waitDeadline.IsZero() {
+		t.Error("waitDeadline should be set when the wait starts")
+	}
+	if cmd == nil {
+		t.Error("expected a poll cmd to be returned to kick off the wait")
+	}
+}
+
+func TestPipelineDone_NoWaitOnFailed(t *testing.T) {
+	m := Model{screen: screenProgress, pendingOp: runner.Deploy, failed: true, services: []string{"web"}, opContainers: []string{"web"}}
+
+	updated, cmd := m.Update(pipelineDoneMsg{})
+	m = updated.(Model)
+
+	if m.done {
+		t.Error("done should NOT be set on a failed pipeline")
+	}
+	if m.waiting {
+		t.Error("waiting must never start after a failed pipeline")
+	}
+	if cmd != nil {
+		t.Error("no cmd expected on the failed path")
+	}
+}
+
+func TestPipelineDone_StopOnlyNeverWaits(t *testing.T) {
+	m := Model{screen: screenProgress, pendingOp: runner.StopOnly, services: []string{"web"}, opContainers: []string{"web"}}
+
+	updated, cmd := m.Update(pipelineDoneMsg{})
+	m = updated.(Model)
+
+	if !m.done {
+		t.Error("StopOnly should still mark the op done")
+	}
+	if m.waiting {
+		t.Error("StopOnly must never enter the health-wait phase")
+	}
+	if cmd != nil {
+		t.Error("StopOnly should return no wait cmd")
+	}
+}
+
+func TestPipelineDone_EmptyTargetsFallsBackToServices(t *testing.T) {
+	mc := &mockComposer{}
+	m := Model{
+		screen:    screenProgress,
+		pendingOp: runner.Restart,
+		services:  []string{"web", "db"},
+		composer:  mc,
+		ctx:       context.Background(),
+	} // opContainers deliberately nil
+
+	updated, _ := m.Update(pipelineDoneMsg{})
+	m = updated.(Model)
+
+	if !m.waiting {
+		t.Fatal("waiting should start with a services fallback target set")
+	}
+	// The fallback target set must be exactly m.services, in order.
+	want := []string{"web", "db"}
+	if len(m.waitState.Services) != len(want) {
+		t.Fatalf("waitState.Services = %v, want %v", m.waitState.Services, want)
+	}
+	for i, svc := range want {
+		if m.waitState.Services[i] != svc {
+			t.Errorf("waitState.Services[%d] = %q, want %q", i, m.waitState.Services[i], svc)
+		}
+	}
+}
+
+func TestWaitStatusMsg_HealthyResolves(t *testing.T) {
+	m := Model{screen: screenProgress, waiting: true, pendingOp: runner.Deploy, waitSession: 5}
+	m.waitState = runner.NewWaitState([]string{"web"})
+	m.waitDeadline = time.Now().Add(runner.DefaultWaitTimeout)
+
+	updated, cmd := m.Update(waitStatusMsg{
+		status:  map[string]runner.ServiceStatus{"web": {Running: true, Health: "healthy"}},
+		session: 5,
+	})
+	m = updated.(Model)
+
+	if m.waiting {
+		t.Error("waiting should be false once every service resolved")
+	}
+	if m.waitState.Verdicts["web"] != runner.VerdictHealthy {
+		t.Errorf("verdict = %q, want healthy", m.waitState.Verdicts["web"])
+	}
+	if cmd != nil {
+		t.Error("a resolved wait should return no further tick cmd")
+	}
+}
+
+func TestWaitStatusMsg_StaleSessionRejected(t *testing.T) {
+	m := Model{screen: screenProgress, waiting: true, pendingOp: runner.Deploy, waitSession: 9}
+	m.waitState = runner.NewWaitState([]string{"web"})
+	m.waitDeadline = time.Now().Add(runner.DefaultWaitTimeout)
+
+	updated, _ := m.Update(waitStatusMsg{
+		status:  map[string]runner.ServiceStatus{"web": {Running: true, Health: "healthy"}},
+		session: 8, // stale
+	})
+	m = updated.(Model)
+
+	if !m.waiting {
+		t.Error("a stale-session poll must not resolve the wait")
+	}
+	if m.waitState.Verdicts["web"] != runner.VerdictPending {
+		t.Errorf("verdict = %q, want pending (stale poll ignored)", m.waitState.Verdicts["web"])
+	}
+}
+
+func TestWaitStatusMsg_NotDoneReschedulesTick(t *testing.T) {
+	m := Model{screen: screenProgress, waiting: true, pendingOp: runner.Deploy, waitSession: 1}
+	m.waitState = runner.NewWaitState([]string{"web"})
+	m.waitDeadline = time.Now().Add(runner.DefaultWaitTimeout)
+	installFakeWaitTick(&m)
+
+	updated, cmd := m.Update(waitStatusMsg{
+		status:  map[string]runner.ServiceStatus{"web": {Running: true, Health: "starting"}},
+		session: 1,
+	})
+	m = updated.(Model)
+
+	if !m.waiting {
+		t.Error("a still-starting service should keep the wait active")
+	}
+	if m.waitState.Verdicts["web"] != runner.VerdictPending {
+		t.Errorf("verdict = %q, want pending", m.waitState.Verdicts["web"])
+	}
+	if cmd == nil {
+		t.Fatal("expected a reschedule tick cmd")
+	}
+	if _, ok := cmd().(fakeWaitTickMsg); !ok {
+		t.Errorf("cmd should produce a wait tick, got %T", cmd())
+	}
+}
+
+func TestWaitTickMsg_StaleSessionRejected(t *testing.T) {
+	m := Model{screen: screenProgress, waiting: true, waitSession: 7}
+
+	_, cmd := m.Update(waitTickMsg{session: 6})
+
+	if cmd != nil {
+		t.Error("a stale wait tick should be dropped without rescheduling")
+	}
+}
+
+func TestWaitTickMsg_LiveFiresPoll(t *testing.T) {
+	mc := &mockComposer{status: map[string]runner.ServiceStatus{"web": {Running: true, Health: "healthy"}}}
+	m := Model{screen: screenProgress, waiting: true, waitSession: 3, composer: mc, ctx: context.Background()}
+	m.waitState = runner.NewWaitState([]string{"web"})
+
+	_, cmd := m.Update(waitTickMsg{session: 3})
+	if cmd == nil {
+		t.Fatal("a live tick should fire a status poll")
+	}
+	msg := cmd()
+	ws, ok := msg.(waitStatusMsg)
+	if !ok {
+		t.Fatalf("cmd should produce waitStatusMsg, got %T", msg)
+	}
+	if ws.session != 3 {
+		t.Errorf("poll session = %d, want 3", ws.session)
+	}
+}
+
+func TestEscSkip_LeavesDoneClearsState(t *testing.T) {
+	m := Model{screen: screenProgress, waiting: true, done: true, pendingOp: runner.Deploy, waitSession: 3}
+	m.waitState = runner.NewWaitState([]string{"web"})
+	m.waitDeadline = time.Now().Add(runner.DefaultWaitTimeout)
+
+	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyEsc})
+	m = updated.(Model)
+
+	if m.waiting {
+		t.Error("esc should stop the wait")
+	}
+	if !m.done {
+		t.Error("the op must remain done after esc-skip")
+	}
+	if m.screen != screenProgress {
+		t.Errorf("screen = %d, want screenProgress (esc-skip stays)", m.screen)
+	}
+	if len(m.waitState.Services) != 0 {
+		t.Errorf("waitState should be cleared on skip, got %v", m.waitState.Services)
+	}
+	if m.waitSession != 4 {
+		t.Errorf("waitSession = %d, want 4 (bumped to invalidate in-flight polls)", m.waitSession)
+	}
+}
+
+// TestEscSkip_ThenEscGoesBack verifies the two-stage esc: first esc skips the
+// wait (stays on progress), a second esc navigates back to the container screen.
+func TestEscSkip_ThenEscGoesBack(t *testing.T) {
+	mc := &mockComposer{}
+	m := Model{screen: screenProgress, waiting: true, done: true, pendingOp: runner.Deploy, composer: mc, ctx: context.Background()}
+	m.waitState = runner.NewWaitState([]string{"web"})
+	m.waitDeadline = time.Now().Add(runner.DefaultWaitTimeout)
+	installFakeTick(&m)
+
+	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyEsc})
+	m = updated.(Model)
+	if m.screen != screenProgress {
+		t.Fatalf("after first esc screen = %d, want screenProgress", m.screen)
+	}
+
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyEsc})
+	m = updated.(Model)
+	if m.screen != screenSelectContainers {
+		t.Errorf("after second esc screen = %d, want screenSelectContainers", m.screen)
+	}
+}
+
+func TestEscFromProgress_ClearsWaitState(t *testing.T) {
+	mc := &mockComposer{}
+	m := Model{screen: screenProgress, done: true, pendingOp: runner.Deploy, composer: mc, ctx: context.Background(), waitSession: 2}
+	m.waitState = runner.NewWaitState([]string{"web"}) // resolved verdicts still on screen
+	installFakeTick(&m)
+
+	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyEsc})
+	m = updated.(Model)
+
+	if m.screen != screenSelectContainers {
+		t.Fatalf("screen = %d, want screenSelectContainers", m.screen)
+	}
+	if len(m.waitState.Services) != 0 {
+		t.Errorf("waitState should be cleared on leaving progress, got %v", m.waitState.Services)
+	}
+	if m.waitSession != 3 {
+		t.Errorf("waitSession = %d, want 3 (bumped on departure)", m.waitSession)
+	}
+}
+
+func TestViewProgress_WaitingShowsCountdownAndEscSkip(t *testing.T) {
+	m := Model{screen: screenProgress, waiting: true, done: true, pendingOp: runner.Deploy}
+	m.waitState = runner.NewWaitState([]string{"web"})
+	m.waitDeadline = time.Now().Add(90 * time.Second)
+	m.width = 80
+	m.height = 24
+
+	view := m.viewProgress()
+
+	if !strings.Contains(view, "Waiting for health") {
+		t.Errorf("view should show the wait countdown, got:\n%s", view)
+	}
+	if !strings.Contains(view, "esc skip") {
+		t.Errorf("view should show the esc-skip footer while waiting, got:\n%s", view)
+	}
+}
+
+func TestViewProgress_FailedDeployShowsRollbackHint(t *testing.T) {
+	m := Model{screen: screenProgress, waiting: false, done: true, pendingOp: runner.Deploy}
+	m.waitState = runner.NewWaitState([]string{"web"})
+	m.waitState.Verdicts["web"] = runner.VerdictUnhealthy
+	m.width = 80
+	m.height = 24
+
+	view := m.viewProgress()
+
+	if !strings.Contains(view, "roll back") {
+		t.Errorf("a failed Deploy wait should render the rollback hint, got:\n%s", view)
+	}
+	if !strings.Contains(view, string(runner.VerdictUnhealthy)) {
+		t.Errorf("the unhealthy verdict label should be rendered, got:\n%s", view)
+	}
+}
+
+func TestViewProgress_FailedRestartNoRollbackHint(t *testing.T) {
+	m := Model{screen: screenProgress, waiting: false, done: true, pendingOp: runner.Restart}
+	m.waitState = runner.NewWaitState([]string{"web"})
+	m.waitState.Verdicts["web"] = runner.VerdictUnhealthy
+	m.width = 80
+	m.height = 24
+
+	view := m.viewProgress()
+
+	if strings.Contains(view, "roll back") {
+		t.Errorf("a Restart wait failure must NOT show the deploy-only rollback hint, got:\n%s", view)
+	}
+}
+
+func TestWaitStatusMsg_PollErrorTimesOut(t *testing.T) {
+	m := Model{screen: screenProgress, waiting: true, pendingOp: runner.Deploy, waitSession: 1}
+	m.waitState = runner.NewWaitState([]string{"web"})
+	m.waitDeadline = time.Now().Add(-time.Second) // already past the deadline
+
+	updated, cmd := m.Update(waitStatusMsg{err: errors.New("ssh dead"), session: 1})
+	m = updated.(Model)
+
+	if m.waiting {
+		t.Error("a poll error past the deadline should finalize the wait")
+	}
+	if m.waitState.Verdicts["web"] != runner.VerdictTimedOut {
+		t.Errorf("verdict = %q, want timed out", m.waitState.Verdicts["web"])
+	}
+	if cmd != nil {
+		t.Error("no reschedule after the timeout sweep")
+	}
+}
+
+func TestWaitStatusMsg_PollErrorBeforeDeadlineRetries(t *testing.T) {
+	m := Model{screen: screenProgress, waiting: true, pendingOp: runner.Deploy, waitSession: 1}
+	m.waitState = runner.NewWaitState([]string{"web"})
+	m.waitDeadline = time.Now().Add(runner.DefaultWaitTimeout)
+	installFakeWaitTick(&m)
+
+	updated, cmd := m.Update(waitStatusMsg{err: errors.New("transient"), session: 1})
+	m = updated.(Model)
+
+	if !m.waiting {
+		t.Error("a transient poll error before the deadline should keep waiting")
+	}
+	if cmd == nil {
+		t.Fatal("expected a retry tick after a transient poll error")
+	}
+	if _, ok := cmd().(fakeWaitTickMsg); !ok {
+		t.Errorf("cmd should produce a wait tick, got %T", cmd())
+	}
+}
+
+// hangingStatusComposer blocks ContainerStatus until its context is cancelled,
+// simulating a hung Docker daemon or a stalled SSH status call during the TUI
+// wait poll. It records whether the received context carried a deadline and
+// returns ctx.Err() once the context fires. The channel handoff in the test
+// establishes a happens-before edge for reading sawDeadline, so no lock is needed.
+type hangingStatusComposer struct {
+	mockComposer
+	sawDeadline bool
+}
+
+func (h *hangingStatusComposer) ContainerStatus(ctx context.Context) (map[string]runner.ServiceStatus, error) {
+	if _, ok := ctx.Deadline(); ok {
+		h.sawDeadline = true
+	}
+	<-ctx.Done()
+	return nil, ctx.Err()
+}
+
+func TestPollWaitStatus_BoundedByDeadline(t *testing.T) {
+	// C8: the TUI health poll must bound each ContainerStatus by m.waitDeadline. A
+	// HUNG Docker/SSH call under the raw m.ctx would never deliver a waitStatusMsg,
+	// so the reducer's timeout sweep would never run and the progress screen would
+	// wait indefinitely. With the deadline bound, the hung poll returns a deadline
+	// error at ~m.waitDeadline and the wait can resolve.
+	c := &hangingStatusComposer{}
+	m := Model{
+		screen:       screenProgress,
+		waiting:      true,
+		composer:     c,
+		ctx:          context.Background(),
+		waitSession:  3,
+		waitDeadline: time.Now().Add(40 * time.Millisecond),
+	}
+	m.waitState = runner.NewWaitState([]string{"web"})
+
+	cmd := m.pollWaitStatus()
+	if cmd == nil {
+		t.Fatal("pollWaitStatus returned nil cmd")
+	}
+
+	done := make(chan tea.Msg, 1)
+	go func() { done <- cmd() }()
+
+	select {
+	case msg := <-done:
+		ws, ok := msg.(waitStatusMsg)
+		if !ok {
+			t.Fatalf("poll produced %T, want waitStatusMsg", msg)
+		}
+		if ws.err == nil {
+			t.Error("a hung poll cut off at the deadline should carry a (deadline) error")
+		}
+		if ws.session != 3 {
+			t.Errorf("waitStatusMsg session = %d, want 3", ws.session)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("pollWaitStatus never returned — the poll was NOT bounded by the wait deadline (C8)")
+	}
+
+	if !c.sawDeadline {
+		t.Error("ContainerStatus received a context WITHOUT a deadline — poll not deadline-bound")
+	}
+}
+
+func TestPollWaitStatus_HungPollResolvesAsTimedOut(t *testing.T) {
+	// C8 end-to-end: a hung poll bounded by the deadline returns a deadline error at
+	// ~m.waitDeadline; feeding that waitStatusMsg (deadline already past) into
+	// Update() must sweep the pending verdicts to timed out and finalize the wait,
+	// NOT stall.
+	m := Model{screen: screenProgress, waiting: true, pendingOp: runner.Deploy, waitSession: 1}
+	m.waitState = runner.NewWaitState([]string{"web"})
+	m.waitDeadline = time.Now().Add(-time.Millisecond) // deadline reached
+
+	updated, cmd := m.Update(waitStatusMsg{err: context.DeadlineExceeded, session: 1})
+	m = updated.(Model)
+
+	if m.waiting {
+		t.Error("a deadline-error poll at/after the deadline must finalize the wait")
+	}
+	if m.waitState.Verdicts["web"] != runner.VerdictTimedOut {
+		t.Errorf("verdict = %q, want timed out", m.waitState.Verdicts["web"])
+	}
+	if cmd != nil {
+		t.Error("no reschedule after the timeout sweep")
+	}
+}
+
+// --- Task 12: TUI `R` rollback key ---------------------------------------
+
+// The `R` key type-asserts m.composer to RollbackPreparer at runtime; pin that
+// both real composers satisfy it so a signature drift is a compile error, not a
+// silently-ignored key press in production.
+var (
+	_ RollbackPreparer = (*compose.Compose)(nil)
+	_ RollbackPreparer = (*compose.RemoteCompose)(nil)
+)
+
+// mockRollbackComposer implements runner.Composer AND RollbackPreparer, driving
+// the `R`-key snapshot fetch + prep flow without a real composer.
+type mockRollbackComposer struct {
+	mockComposer
+	snap        *compose.Snapshot
+	readErr     error
+	readCalls   int
+	prepCleanup func()
+	prepErr     error
+	prepCalls   int
+	prepSvcs    []string
+}
+
+func (m *mockRollbackComposer) ReadSnapshot(_ context.Context) (*compose.Snapshot, error) {
+	m.readCalls++
+	return m.snap, m.readErr
+}
+
+func (m *mockRollbackComposer) PrepareRollback(_ context.Context, _ map[string]compose.SnapshotEntry, services []string, _ io.Writer) (func(), error) {
+	m.prepCalls++
+	m.prepSvcs = append([]string(nil), services...)
+	if m.prepErr != nil {
+		return nil, m.prepErr
+	}
+	return m.prepCleanup, nil
+}
+
+func mockRollbackFactory(mc *mockRollbackComposer) ComposerFactory {
+	return func(string) runner.Composer { return mc }
+}
+
+func rollbackTestSnapshot() *compose.Snapshot {
+	return &compose.Snapshot{
+		Schema: 1,
+		Services: map[string]compose.SnapshotEntry{
+			"web": {Image: "nginx:latest", Digest: "sha256:ab", RecordedAt: time.Now().Add(-3 * time.Hour).Format(time.RFC3339)},
+			"db":  {Image: "postgres:16", Digest: "sha256:cd", RecordedAt: time.Now().Add(-9 * time.Hour).Format(time.RFC3339)},
+		},
+	}
+}
+
+func TestRollbackKey_NonPreparerIgnored(t *testing.T) {
+	mc := &mockComposer{services: []string{"web"}}
+	m := Model{
+		screen:   screenSelectContainers,
+		services: []string{"web"},
+		composer: mc,
+		selected: map[int]bool{0: true},
+	}
+	updated, cmd := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'R'}})
+	m = updated.(Model)
+	if m.confirming {
+		t.Error("R must be a no-op for a composer without RollbackPreparer")
+	}
+	if cmd != nil {
+		t.Error("R should fire no fetch cmd for a non-Preparer composer")
+	}
+}
+
+func TestRollbackKey_EmptyListIgnored(t *testing.T) {
+	mc := &mockRollbackComposer{}
+	m := Model{screen: screenSelectContainers, services: nil, composer: mc, selected: map[int]bool{}}
+	updated, cmd := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'R'}})
+	m = updated.(Model)
+	if cmd != nil || m.warning != "" {
+		t.Error("R on an empty service list must be a silent no-op")
+	}
+}
+
+func TestRollbackKey_NoSelectionWarns(t *testing.T) {
+	mc := &mockRollbackComposer{mockComposer: mockComposer{services: []string{"web"}}}
+	m := Model{screen: screenSelectContainers, services: []string{"web"}, composer: mc, selected: map[int]bool{}}
+	updated, cmd := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'R'}})
+	m = updated.(Model)
+	if m.warning != warnNoSelection {
+		t.Errorf("warning = %q, want %q", m.warning, warnNoSelection)
+	}
+	if cmd != nil {
+		t.Error("R with no selection must not fire a fetch cmd")
+	}
+}
+
+func TestRollbackKey_FiresFetch(t *testing.T) {
+	snap := rollbackTestSnapshot()
+	mc := &mockRollbackComposer{mockComposer: mockComposer{services: []string{"web"}}, snap: snap}
+	m := Model{
+		screen:               screenSelectContainers,
+		services:             []string{"web"},
+		composer:             mc,
+		selected:             map[int]bool{0: true},
+		ctx:                  context.Background(),
+		rollbackFetchSession: 0,
+	}
+	updated, cmd := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'R'}})
+	m = updated.(Model)
+	if m.rollbackFetchSession != 1 {
+		t.Errorf("rollbackFetchSession = %d, want 1 (bumped on R press)", m.rollbackFetchSession)
+	}
+	if cmd == nil {
+		t.Fatal("R with a Preparer + selection should fire a fetch cmd")
+	}
+	msg := cmd()
+	rm, ok := msg.(rollbackSnapshotMsg)
+	if !ok {
+		t.Fatalf("cmd should produce rollbackSnapshotMsg, got %T", msg)
+	}
+	if rm.session != 1 {
+		t.Errorf("fetch session = %d, want 1", rm.session)
+	}
+	if rm.snap != snap {
+		t.Error("fetch should return the mock snapshot")
+	}
+	if mc.readCalls != 1 {
+		t.Errorf("ReadSnapshot calls = %d, want 1", mc.readCalls)
+	}
+}
+
+func TestRollbackSnapshotMsg_NoSnapshotWarns(t *testing.T) {
+	m := Model{
+		screen:               screenSelectContainers,
+		services:             []string{"web"},
+		selected:             map[int]bool{0: true},
+		rollbackFetchSession: 3,
+	}
+	updated, _ := m.Update(rollbackSnapshotMsg{snap: nil, session: 3})
+	m = updated.(Model)
+	if m.confirming {
+		t.Error("a missing snapshot must not enter the confirm flow")
+	}
+	if !strings.Contains(m.warning, "No rollback snapshot") {
+		t.Errorf("warning = %q, want a no-snapshot message", m.warning)
+	}
+}
+
+func TestRollbackSnapshotMsg_ReadErrorWarns(t *testing.T) {
+	m := Model{
+		screen:               screenSelectContainers,
+		services:             []string{"web"},
+		selected:             map[int]bool{0: true},
+		rollbackFetchSession: 1,
+	}
+	updated, _ := m.Update(rollbackSnapshotMsg{err: errors.New("schema 2 unsupported"), session: 1})
+	m = updated.(Model)
+	if m.confirming {
+		t.Error("a read error must not enter the confirm flow")
+	}
+	if !strings.Contains(m.warning, "rollback unavailable") {
+		t.Errorf("warning = %q, want a read-error message", m.warning)
+	}
+}
+
+func TestRollbackSnapshotMsg_TargetedMissingWarns(t *testing.T) {
+	snap := &compose.Snapshot{Schema: 1, Services: map[string]compose.SnapshotEntry{"web": {}}}
+	m := Model{
+		screen:               screenSelectContainers,
+		services:             []string{"web", "db"},
+		selected:             map[int]bool{0: true, 1: true},
+		rollbackTargets:      []string{"web", "db"}, // captured at R-press
+		rollbackFetchSession: 2,
+	}
+	updated, _ := m.Update(rollbackSnapshotMsg{snap: snap, session: 2})
+	m = updated.(Model)
+	if m.confirming {
+		t.Error("a selected service missing from the snapshot must not confirm")
+	}
+	if !strings.Contains(m.warning, "db") {
+		t.Errorf("warning = %q, want it to name the missing service 'db'", m.warning)
+	}
+}
+
+// TestRollbackSnapshotMsg_ComposeRemovedWarns (C6): a selected service that is in
+// the snapshot but has since been REMOVED from the compose file must not proceed
+// to PrepareRollback — the generated override would otherwise resurrect it as an
+// image-only service. It is filtered out (refused with a naming warning),
+// mirroring the CLI filterLiveTargets.
+func TestRollbackSnapshotMsg_ComposeRemovedWarns(t *testing.T) {
+	// Snapshot still records both web + db, but the live compose file only has web.
+	snap := rollbackTestSnapshot()
+	m := Model{
+		screen:               screenSelectContainers,
+		services:             []string{"web", "db"},
+		selected:             map[int]bool{0: true, 1: true}, // both selected
+		rollbackTargets:      []string{"web", "db"},          // captured at R-press
+		rollbackFetchSession: 2,
+	}
+	updated, _ := m.Update(rollbackSnapshotMsg{snap: snap, live: []string{"web"}, session: 2})
+	m = updated.(Model)
+	if m.confirming {
+		t.Error("a target removed from the compose file must not enter the confirm flow")
+	}
+	if m.pendingOp == runner.Rollback {
+		t.Error("pendingOp must not be set to Rollback when a target is stale")
+	}
+	if m.rollbackSnapshot != nil {
+		t.Error("the snapshot must not be stored when a target is refused")
+	}
+	if !strings.Contains(m.warning, "db") {
+		t.Errorf("warning = %q, want it to name the removed service 'db'", m.warning)
+	}
+	if !strings.Contains(m.warning, "compose file") {
+		t.Errorf("warning = %q, want a 'no longer in the compose file' message", m.warning)
+	}
+}
+
+// TestFetchRollbackSnapshot_PopulatesLiveServices (C6): the async fetch reads the
+// snapshot AND the current compose service set (ListServices) in one goroutine so
+// the handler can intersect them. A non-empty snapshot triggers the live fetch.
+func TestFetchRollbackSnapshot_PopulatesLiveServices(t *testing.T) {
+	snap := rollbackTestSnapshot()
+	mc := &mockRollbackComposer{mockComposer: mockComposer{services: []string{"web", "db"}}, snap: snap}
+	m := Model{composer: mc, ctx: context.Background(), rollbackFetchSession: 1}
+	cmd := m.fetchRollbackSnapshot()
+	if cmd == nil {
+		t.Fatal("fetchRollbackSnapshot returned nil cmd")
+	}
+	rm, ok := cmd().(rollbackSnapshotMsg)
+	if !ok {
+		t.Fatalf("want rollbackSnapshotMsg, got different msg")
+	}
+	if rm.err != nil {
+		t.Fatalf("unexpected err: %v", rm.err)
+	}
+	if strings.Join(rm.live, ",") != "web,db" {
+		t.Errorf("live = %v, want [web db] from ListServices", rm.live)
+	}
+}
+
+// TestFetchRollbackSnapshot_ListServicesErrorFailsClosed (C6): a ListServices
+// failure during the fetch fails closed — it surfaces as the shared err (the
+// handler shows "rollback unavailable: ..."), never proceeding without the
+// live-compose intersection.
+func TestFetchRollbackSnapshot_ListServicesErrorFailsClosed(t *testing.T) {
+	snap := rollbackTestSnapshot()
+	mc := &mockRollbackComposer{
+		mockComposer: mockComposer{err: errors.New("compose config --services failed")},
+		snap:         snap,
+	}
+	m := Model{composer: mc, ctx: context.Background(), rollbackFetchSession: 1}
+	rm := m.fetchRollbackSnapshot()().(rollbackSnapshotMsg)
+	if rm.err == nil {
+		t.Fatal("want a ListServices error surfaced, got nil")
+	}
+	if !strings.Contains(rm.err.Error(), "current compose services") {
+		t.Errorf("err = %v, want it to mention listing compose services", rm.err)
+	}
+	if rm.live != nil {
+		t.Errorf("live = %v, want nil on ListServices failure", rm.live)
+	}
+}
+
+func TestRollbackSnapshotMsg_PresentEntersConfirm(t *testing.T) {
+	snap := rollbackTestSnapshot()
+	m := Model{
+		screen:               screenSelectContainers,
+		services:             []string{"web"},
+		selected:             map[int]bool{0: true},
+		rollbackTargets:      []string{"web"}, // captured at R-press
+		rollbackFetchSession: 1,
+	}
+	// live includes the selected target, so the live-compose intersection passes.
+	updated, _ := m.Update(rollbackSnapshotMsg{snap: snap, live: []string{"web", "db"}, session: 1})
+	m = updated.(Model)
+	if !m.confirming || m.pendingOp != runner.Rollback {
+		t.Fatalf("confirming=%v pendingOp=%v, want confirming with Rollback", m.confirming, m.pendingOp)
+	}
+	if m.rollbackSnapshot != snap {
+		t.Error("the fetched snapshot should be stored for prep")
+	}
+	// esc cancels the confirmation (existing confirming flow).
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyEsc})
+	m = updated.(Model)
+	if m.confirming {
+		t.Error("esc should cancel the rollback confirmation")
+	}
+}
+
+func TestRollbackSnapshotMsg_StaleSessionRejected(t *testing.T) {
+	snap := rollbackTestSnapshot()
+	m := Model{
+		screen:               screenSelectContainers,
+		services:             []string{"web"},
+		selected:             map[int]bool{0: true},
+		rollbackFetchSession: 5,
+	}
+	updated, _ := m.Update(rollbackSnapshotMsg{snap: snap, session: 4}) // stale
+	m = updated.(Model)
+	if m.confirming {
+		t.Error("a stale-session fetch must not enter the confirm flow")
+	}
+	if m.rollbackSnapshot != nil {
+		t.Error("a stale-session fetch must not store the snapshot")
+	}
+}
+
+func TestRollbackSnapshotMsg_WrongScreenRejected(t *testing.T) {
+	snap := rollbackTestSnapshot()
+	m := Model{screen: screenLogs, rollbackFetchSession: 1}
+	updated, _ := m.Update(rollbackSnapshotMsg{snap: snap, session: 1})
+	m = updated.(Model)
+	if m.confirming {
+		t.Error("a fetch delivered off the container screen must be dropped")
+	}
+}
+
+func TestRollbackConfirm_MultiSelectTargetSet(t *testing.T) {
+	snap := rollbackTestSnapshot()
+	mc := &mockRollbackComposer{mockComposer: mockComposer{services: []string{"db", "web"}}, snap: snap}
+	m := NewModel(mc, io.Discard, mockRollbackFactory(mc), nil, nil)
+	m.screen = screenSelectContainers
+	m.services = []string{"db", "web"}
+	m.composer = mc
+	m.selected = map[int]bool{0: true, 1: true}
+	m.rollbackSnapshot = snap
+	m.rollbackTargets = []string{"db", "web"} // captured at R-press; drives the pipeline target
+	m.pendingOp = runner.Rollback
+	m.confirming = true
+	m.ctx = context.Background()
+	m.width, m.height = 80, 24
+
+	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	m = updated.(Model)
+
+	if m.screen != screenProgress {
+		t.Fatalf("screen = %d, want screenProgress after confirm", m.screen)
+	}
+	if strings.Join(m.opContainers, ",") != "db,web" {
+		t.Errorf("opContainers = %v, want [db web] (multi-select target set)", m.opContainers)
+	}
+}
+
+// TestRollbackTargets_CapturedAtPressNotAfterFetch (C11): the target set is
+// captured at R-press. If the user changes/clears the multi-select during the
+// async snapshot fetch, the rollback must still target the CAPTURED set — never
+// the mutated (here: cleared) selection, which the runner would treat as "all
+// services". This is the TOCTOU guard for an unintended all-service rollback.
+func TestRollbackTargets_CapturedAtPressNotAfterFetch(t *testing.T) {
+	snap := rollbackTestSnapshot() // records web + db
+	mc := &mockRollbackComposer{mockComposer: mockComposer{services: []string{"web", "db"}}, snap: snap}
+	m := Model{
+		screen:   screenSelectContainers,
+		services: []string{"web", "db"},
+		composer: mc,
+		selected: map[int]bool{0: true}, // web only
+		ctx:      context.Background(),
+	}
+	// Press R: captures {web}, bumps the fetch session, fires the async fetch.
+	updated, cmd := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'R'}})
+	m = updated.(Model)
+	if got := strings.Join(m.rollbackTargets, ","); got != "web" {
+		t.Fatalf("rollbackTargets after R = %q, want web (captured at press)", got)
+	}
+	if cmd == nil {
+		t.Fatal("R with a Preparer + selection should fire a fetch cmd")
+	}
+	session := m.rollbackFetchSession
+
+	// Simulate the user CLEARING the selection while the fetch is in flight.
+	m.selected = map[int]bool{}
+
+	// The snapshot lands for the captured session.
+	updated, _ = m.Update(rollbackSnapshotMsg{snap: snap, live: []string{"web", "db"}, session: session})
+	m = updated.(Model)
+	if !m.confirming || m.pendingOp != runner.Rollback {
+		t.Fatalf("want confirming Rollback for the captured target; confirming=%v pendingOp=%v", m.confirming, m.pendingOp)
+	}
+	if got := strings.Join(m.rollbackTargets, ","); got != "web" {
+		t.Errorf("captured rollbackTargets mutated to %q; a selection change must not touch it (want web)", got)
+	}
+
+	// Confirm: the pipeline target must be the captured {web}, NOT the now-empty
+	// selection (empty would become an all-service rollback in the runner).
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	m = updated.(Model)
+	if m.screen != screenProgress {
+		t.Fatalf("screen = %d, want screenProgress after confirm", m.screen)
+	}
+	if got := strings.Join(m.opContainers, ","); got != "web" {
+		t.Errorf("opContainers = %q, want web (captured set) — never empty/all", got)
+	}
+}
+
+// TestRollbackSnapshotMsg_EmptyCapturedRefuses (C11): if the captured target set
+// is somehow empty when the snapshot lands, the handler must REFUSE (warn) rather
+// than fall through to the confirm flow — an empty set would become an
+// all-service rollback in PrepareRollback/runner.Run.
+func TestRollbackSnapshotMsg_EmptyCapturedRefuses(t *testing.T) {
+	snap := rollbackTestSnapshot()
+	m := Model{
+		screen:               screenSelectContainers,
+		services:             []string{"web", "db"},
+		selected:             map[int]bool{0: true, 1: true},
+		rollbackTargets:      nil, // captured set empty
+		rollbackFetchSession: 2,
+	}
+	updated, _ := m.Update(rollbackSnapshotMsg{snap: snap, live: []string{"web", "db"}, session: 2})
+	m = updated.(Model)
+	if m.confirming {
+		t.Error("an empty captured target set must not enter the confirm flow")
+	}
+	if m.pendingOp == runner.Rollback {
+		t.Error("pendingOp must not be Rollback with an empty captured set")
+	}
+	if m.rollbackSnapshot != nil {
+		t.Error("the snapshot must not be stored when the captured set is empty")
+	}
+	if m.warning != warnNoSelection {
+		t.Errorf("warning = %q, want %q", m.warning, warnNoSelection)
+	}
+}
+
+func TestPrepareRollbackCmd_SuccessCallsPrepareWithTargets(t *testing.T) {
+	cleanup := func() {}
+	mc := &mockRollbackComposer{prepCleanup: cleanup}
+	snap := rollbackTestSnapshot()
+	m := Model{composer: mc, rollbackSnapshot: snap, ctx: context.Background()}
+	events := make(chan runner.StepEvent, 20)
+
+	cmd := m.prepareRollbackCmd(context.Background(), []string{"db", "web"}, io.Discard, events)
+	msg := cmd()
+	// Drain the pipeline goroutine launched on success (channel close = done).
+	for range events { //nolint:revive // draining for synchronization
+	}
+
+	pm, ok := msg.(rollbackPreppedMsg)
+	if !ok {
+		t.Fatalf("cmd should produce rollbackPreppedMsg, got %T", msg)
+	}
+	if pm.err != nil {
+		t.Fatalf("unexpected prep error: %v", pm.err)
+	}
+	if pm.cleanup == nil {
+		t.Error("cleanup should be returned on prep success")
+	}
+	if mc.prepCalls != 1 {
+		t.Errorf("PrepareRollback calls = %d, want 1", mc.prepCalls)
+	}
+	if strings.Join(mc.prepSvcs, ",") != "db,web" {
+		t.Errorf("PrepareRollback services = %v, want [db web]", mc.prepSvcs)
+	}
+}
+
+func TestPrepareRollbackCmd_ErrorReturnsErr(t *testing.T) {
+	mc := &mockRollbackComposer{prepErr: errors.New("image unavailable")}
+	m := Model{composer: mc, rollbackSnapshot: rollbackTestSnapshot(), ctx: context.Background()}
+	events := make(chan runner.StepEvent, 20)
+
+	cmd := m.prepareRollbackCmd(context.Background(), []string{"web"}, io.Discard, events)
+	msg := cmd()
+
+	pm, ok := msg.(rollbackPreppedMsg)
+	if !ok {
+		t.Fatalf("cmd should produce rollbackPreppedMsg, got %T", msg)
+	}
+	if pm.err == nil || !strings.Contains(pm.err.Error(), "image unavailable") {
+		t.Errorf("prepped err = %v, want the prep failure", pm.err)
+	}
+	if pm.cleanup != nil {
+		t.Error("no cleanup on prep failure")
+	}
+	// The pipeline goroutine must NOT have been launched on failure — events is
+	// still open with no writer/closer.
+	select {
+	case _, ok := <-events:
+		if !ok {
+			t.Error("events channel must not be closed on prep failure")
+		} else {
+			t.Error("no pipeline event should be produced on prep failure")
+		}
+	default:
+	}
+}
+
+func TestRollbackPreppedMsg_ErrorFailsOp(t *testing.T) {
+	m := Model{screen: screenProgress}
+	updated, cmd := m.Update(rollbackPreppedMsg{err: errors.New("pull failed")})
+	m = updated.(Model)
+	if !m.failed {
+		t.Error("prep error should mark the op failed")
+	}
+	if !strings.Contains(m.rollbackErr, "pull failed") {
+		t.Errorf("rollbackErr = %q, want the prep error text", m.rollbackErr)
+	}
+	if m.rollbackCleanup != nil {
+		t.Error("no cleanup should be stored on prep failure")
+	}
+	if cmd != nil {
+		t.Error("no further cmd on prep failure")
+	}
+}
+
+func TestRollbackPreppedMsg_SuccessStoresCleanupAndConsumesEvents(t *testing.T) {
+	calls := 0
+	cleanup := func() { calls++ }
+	events := make(chan runner.StepEvent)
+	close(events) // so waitForEvent resolves to pipelineDoneMsg immediately
+	m := Model{screen: screenProgress, eventCh: events}
+
+	updated, cmd := m.Update(rollbackPreppedMsg{cleanup: cleanup})
+	m = updated.(Model)
+
+	if m.rollbackCleanup == nil {
+		t.Fatal("cleanup should be stored for later invocation")
+	}
+	if calls != 0 {
+		t.Error("cleanup must NOT run at store time (only on leaving progress)")
+	}
+	if cmd == nil {
+		t.Fatal("success should return waitForEvent to consume pipeline events")
+	}
+	if _, ok := cmd().(pipelineDoneMsg); !ok {
+		t.Error("returned cmd should read from eventCh (waitForEvent)")
+	}
+}
+
+func TestRollbackPreppedMsg_OffScreenInvokesCleanup(t *testing.T) {
+	calls := 0
+	m := Model{screen: screenSelectContainers} // not the progress screen
+	m.Update(rollbackPreppedMsg{cleanup: func() { calls++ }})
+	if calls != 1 {
+		t.Errorf("an off-screen prepped msg should invoke cleanup once (no leak), got %d", calls)
+	}
+}
+
+func TestEscFromProgress_InvokesRollbackCleanupOnce(t *testing.T) {
+	calls := 0
+	m := Model{
+		screen:          screenProgress,
+		done:            true,
+		pendingOp:       runner.Rollback,
+		composer:        &mockComposer{},
+		ctx:             context.Background(),
+		rollbackCleanup: func() { calls++ },
+	}
+	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyEsc})
+	m = updated.(Model)
+	if calls != 1 {
+		t.Fatalf("rollbackCleanup calls = %d, want 1 on leaving progress", calls)
+	}
+	if m.rollbackCleanup != nil {
+		t.Error("rollbackCleanup should be cleared after invocation")
+	}
+	if m.screen != screenSelectContainers {
+		t.Fatalf("screen = %d, want screenSelectContainers", m.screen)
+	}
+	// A second esc (now on the container screen) must not re-invoke cleanup.
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyEsc})
+	m = updated.(Model)
+	if calls != 1 {
+		t.Errorf("rollbackCleanup must run exactly once, got %d", calls)
+	}
+}
+
+func TestEscSkipDuringWait_DefersRollbackCleanup(t *testing.T) {
+	calls := 0
+	m := Model{
+		screen:          screenProgress,
+		waiting:         true,
+		done:            true,
+		pendingOp:       runner.Rollback,
+		composer:        &mockComposer{},
+		ctx:             context.Background(),
+		rollbackCleanup: func() { calls++ },
+		waitSession:     1,
+	}
+	m.waitState = runner.NewWaitState([]string{"web"})
+	m.waitDeadline = time.Now().Add(runner.DefaultWaitTimeout)
+
+	// First esc = skip the wait; stays on progress, cleanup must NOT run.
+	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyEsc})
+	m = updated.(Model)
+	if calls != 0 {
+		t.Error("esc-skip must not invoke the rollback cleanup (still on progress)")
+	}
+	if m.rollbackCleanup == nil {
+		t.Fatal("cleanup must survive an esc-skip until the screen is left")
+	}
+	// Second esc leaves the progress screen and invokes cleanup.
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyEsc})
+	m = updated.(Model)
+	if calls != 1 {
+		t.Errorf("cleanup should run once on leaving progress, got %d", calls)
+	}
+}
+
+// TestCtrlCOnProgress_LocalRunsRollbackCleanup (Q5): a hard exit (ctrl+c → quit)
+// during a local rollback wait must remove the override temp file — otherwise it
+// leaks because the esc-only cleanup path is skipped on quit.
+func TestCtrlCOnProgress_LocalRunsRollbackCleanup(t *testing.T) {
+	calls := 0
+	m := Model{
+		screen:          screenProgress,
+		waiting:         true,
+		done:            true,
+		pendingOp:       runner.Rollback,
+		composer:        &mockComposer{},
+		ctx:             context.Background(),
+		rollbackCleanup: func() { calls++ },
+		waitSession:     1,
+		// disconnectFunc nil → local session → ctrl+c quits immediately.
+	}
+	m.waitState = runner.NewWaitState([]string{"web"})
+	m.waitDeadline = time.Now().Add(runner.DefaultWaitTimeout)
+
+	updated, cmd := m.Update(tea.KeyMsg{Type: tea.KeyCtrlC})
+	m = updated.(Model)
+	if calls != 1 {
+		t.Fatalf("rollbackCleanup calls = %d, want 1 on hard-quit", calls)
+	}
+	if m.rollbackCleanup != nil {
+		t.Error("rollbackCleanup should be cleared after invocation")
+	}
+	if cmd == nil {
+		t.Fatal("expected a quit command")
+	}
+	if _, ok := cmd().(tea.QuitMsg); !ok {
+		t.Errorf("expected tea.QuitMsg, got %T", cmd())
+	}
+}
+
+// TestCtrlCOnProgress_RemoteRunsCleanupOnConfirm (Q5): on a remote session the
+// ctrl+c shows the disconnect prompt (no cleanup yet); the cleanup runs only when
+// the user confirms with "y", while the ControlMaster socket is still live.
+func TestCtrlCOnProgress_RemoteRunsCleanupOnConfirm(t *testing.T) {
+	calls := 0
+	m := Model{
+		screen:          screenProgress,
+		waiting:         true,
+		done:            true,
+		pendingOp:       runner.Rollback,
+		composer:        &mockComposer{},
+		ctx:             context.Background(),
+		rollbackCleanup: func() { calls++ },
+		waitSession:     1,
+		disconnectFunc:  func() error { return nil }, // remote session
+		serverName:      "prod",
+	}
+	m.waitState = runner.NewWaitState([]string{"web"})
+	m.waitDeadline = time.Now().Add(runner.DefaultWaitTimeout)
+
+	// ctrl+c → confirmation prompt, cleanup deferred.
+	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyCtrlC})
+	m = updated.(Model)
+	if !m.quitting {
+		t.Fatal("ctrl+c on a remote session should show the disconnect prompt")
+	}
+	if calls != 0 {
+		t.Error("cleanup must NOT run until the quit is confirmed")
+	}
+	// Confirm quit → cleanup runs before teardown.
+	updated, cmd := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'y'}})
+	m = updated.(Model)
+	if calls != 1 {
+		t.Fatalf("rollbackCleanup calls = %d, want 1 after confirming quit", calls)
+	}
+	if cmd == nil || func() bool { _, ok := cmd().(tea.QuitMsg); return !ok }() {
+		t.Error("confirming quit should return tea.QuitMsg")
+	}
+}
+
+// TestHumanizeAge (T2) pins the four relative-age ranges.
+func TestHumanizeAge(t *testing.T) {
+	cases := []struct {
+		d    time.Duration
+		want string
+	}{
+		{30 * time.Second, "moments ago"},
+		{5 * time.Minute, "5m ago"},
+		{3 * time.Hour, "3h ago"},
+		{50 * time.Hour, "2d ago"},
+	}
+	for _, c := range cases {
+		if got := humanizeAge(c.d); got != c.want {
+			t.Errorf("humanizeAge(%v) = %q, want %q", c.d, got, c.want)
+		}
+	}
+}
+
+// TestRollbackAgeSuffix_PicksNewest (T2): with two target entries of different
+// ages the suffix reflects the NEWEST recorded_at (the most representative
+// "last deploy"), not the oldest.
+func TestRollbackAgeSuffix_PicksNewest(t *testing.T) {
+	now := time.Now().UTC()
+	m := Model{
+		rollbackSnapshot: &compose.Snapshot{
+			Services: map[string]compose.SnapshotEntry{
+				"web": {RecordedAt: now.Add(-3 * time.Hour).Format(time.RFC3339)},
+				"db":  {RecordedAt: now.Add(-50 * time.Hour).Format(time.RFC3339)},
+			},
+		},
+	}
+	got := m.rollbackAgeSuffix([]string{"web", "db"})
+	if !strings.Contains(got, "to snapshot") {
+		t.Errorf("rollbackAgeSuffix = %q, want the 'to snapshot' prefix", got)
+	}
+	if !strings.Contains(got, "3h ago") {
+		t.Errorf("rollbackAgeSuffix = %q, want the NEWEST age (3h ago), not the oldest (2d)", got)
+	}
+}
+
+// TestRollbackAgeSuffix_NilSnapshotEmpty (T2): no snapshot → empty suffix so the
+// confirm prompt degrades to the plain service list.
+func TestRollbackAgeSuffix_NilSnapshotEmpty(t *testing.T) {
+	m := Model{}
+	if got := m.rollbackAgeSuffix([]string{"web"}); got != "" {
+		t.Errorf("rollbackAgeSuffix with nil snapshot = %q, want empty", got)
+	}
+	// A snapshot with no parseable ages also degrades to empty.
+	m.rollbackSnapshot = &compose.Snapshot{Services: map[string]compose.SnapshotEntry{"web": {RecordedAt: "not-a-time"}}}
+	if got := m.rollbackAgeSuffix([]string{"web"}); got != "" {
+		t.Errorf("rollbackAgeSuffix with unparseable age = %q, want empty", got)
+	}
+}
+
+func TestEscFromProgress_RollbackInvalidatesUpdateCache(t *testing.T) {
+	m := Model{
+		screen:      screenProgress,
+		done:        true,
+		pendingOp:   runner.Rollback,
+		composer:    &mockComposer{},
+		ctx:         context.Background(),
+		updateCache: map[string]updateEntry{"|": {results: map[string]bool{"web": true}}},
+	}
+	if _, ok := m.updateCache[m.updatesCacheKey()]; !ok {
+		t.Fatalf("precondition: cache should hold key %q", m.updatesCacheKey())
+	}
+	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyEsc})
+	m = updated.(Model)
+	if _, ok := m.updateCache["|"]; ok {
+		t.Error("a successful Rollback should invalidate the update-availability cache")
+	}
+}
+
+func TestViewSelectContainers_FooterIncludesRollback(t *testing.T) {
+	mc := &mockComposer{services: []string{"web"}}
+	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
+	m.screen = screenSelectContainers
+	m.services = []string{"web"}
+	m.width = 200
+	m.height = 24
+	v := m.View()
+	if !strings.Contains(v, "R rollback") {
+		t.Errorf("container-screen footer should contain 'R rollback', got:\n%s", v)
+	}
+}
+
+func TestViewProgress_RollbackConfirmShowsAge(t *testing.T) {
+	snap := rollbackTestSnapshot()
+	mc := &mockRollbackComposer{mockComposer: mockComposer{services: []string{"web"}}, snap: snap}
+	m := NewModel(mc, io.Discard, mockRollbackFactory(mc), nil, nil)
+	m.screen = screenSelectContainers
+	m.services = []string{"web"}
+	m.composer = mc
+	m.selected = map[int]bool{0: true}
+	m.rollbackSnapshot = snap
+	m.rollbackTargets = []string{"web"} // captured at R-press; drives the confirm prompt
+	m.pendingOp = runner.Rollback
+	m.confirming = true
+	m.width, m.height = 120, 24
+	v := m.View()
+	if !strings.Contains(v, "Rollback web") {
+		t.Errorf("confirm prompt should show the Rollback op + service, got:\n%s", v)
+	}
+	if !strings.Contains(v, "snapshot") {
+		t.Errorf("confirm prompt should mention the snapshot age, got:\n%s", v)
+	}
+}
+
+func TestViewProgress_RollbackPrepErrorRendered(t *testing.T) {
+	mc := &mockComposer{services: []string{"web"}}
+	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
+	m.screen = screenProgress
+	m.pendingOp = runner.Rollback
+	m.failed = true
+	m.rollbackErr = "web: image sha256:ab unavailable"
+	m.width, m.height = 120, 24
+	v := m.View()
+	if !strings.Contains(v, "rollback prep failed") {
+		t.Errorf("progress view should render the rollback prep error, got:\n%s", v)
+	}
 }

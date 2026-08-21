@@ -209,6 +209,14 @@ type Compose struct {
 	UID        string // "uid:gid" for CURRENT_UID env var
 	Standalone bool   // use standalone docker-compose binary instead of docker compose plugin
 
+	// ExtraComposeFiles, when non-nil, are spliced into every compose
+	// invocation as `-f <file>` pairs immediately after the compose binary
+	// (`docker compose` / `docker-compose`), before the subcommand. Because
+	// `-f` disables compose's file auto-discovery, the discovered main
+	// compose file MUST be first in this slice. Default nil = no `-f` flags,
+	// producing byte-identical argv to the pre-ExtraComposeFiles behavior.
+	ExtraComposeFiles []string
+
 	detected bool // true after Detect() or SetStandalone() has been called
 
 	// testing hooks; nil = use real exec
@@ -336,17 +344,35 @@ func withStderr(err error) error {
 }
 
 func (c *Compose) command(ctx context.Context, args ...string) *exec.Cmd {
+	fileArgs := composeFileArgs(c.ExtraComposeFiles)
 	var cmd *exec.Cmd
 	if c.Standalone {
-		cmd = exec.CommandContext(ctx, "docker-compose", args...)
+		cmd = exec.CommandContext(ctx, "docker-compose", append(fileArgs, args...)...)
 	} else {
-		cmd = exec.CommandContext(ctx, "docker", append([]string{"compose"}, args...)...)
+		full := append([]string{"compose"}, fileArgs...)
+		full = append(full, args...)
+		cmd = exec.CommandContext(ctx, "docker", full...)
 	}
 	cmd.Env = append(os.Environ(), "CURRENT_UID="+c.UID)
 	if c.ProjectDir != "" {
 		cmd.Dir = c.ProjectDir
 	}
 	return cmd
+}
+
+// composeFileArgs expands a list of compose files into `-f <file>` argv pairs.
+// It returns nil for an empty/nil slice so callers emit byte-identical argv to
+// the pre-ExtraComposeFiles behavior. Because `-f` disables compose's file
+// auto-discovery, the discovered main compose file MUST be first in files.
+func composeFileArgs(files []string) []string {
+	if len(files) == 0 {
+		return nil
+	}
+	out := make([]string, 0, len(files)*2)
+	for _, f := range files {
+		out = append(out, "-f", f)
+	}
+	return out
 }
 
 // psEntry matches the JSON schema of `docker compose ps --format json`.

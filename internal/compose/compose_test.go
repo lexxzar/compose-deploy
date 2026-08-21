@@ -934,6 +934,141 @@ func TestCommand_Plugin(t *testing.T) {
 	}
 }
 
+func TestCommand_ExtraComposeFiles_Plugin(t *testing.T) {
+	c := &Compose{
+		ProjectDir:        "/proj",
+		UID:               "1000:1000",
+		ExtraComposeFiles: []string{"/proj/docker-compose.yml", "/tmp/override.yml"},
+	}
+
+	cmd := c.command(context.Background(), "up", "--no-start", "web")
+
+	gotArgs := cmd.Args[1:]
+	// -f pairs land immediately after "compose", before the subcommand, in
+	// slice order (main file first).
+	wantArgs := []string{
+		"compose",
+		"-f", "/proj/docker-compose.yml",
+		"-f", "/tmp/override.yml",
+		"up", "--no-start", "web",
+	}
+	if len(gotArgs) != len(wantArgs) {
+		t.Fatalf("args = %v, want %v", gotArgs, wantArgs)
+	}
+	for i, want := range wantArgs {
+		if gotArgs[i] != want {
+			t.Errorf("arg[%d] = %q, want %q", i, gotArgs[i], want)
+		}
+	}
+}
+
+func TestCommand_ExtraComposeFiles_Standalone(t *testing.T) {
+	c := &Compose{
+		ProjectDir:        "/proj",
+		UID:               "1000:1000",
+		Standalone:        true,
+		ExtraComposeFiles: []string{"/proj/compose.yml", "/tmp/override.yml"},
+	}
+
+	cmd := c.command(context.Background(), "start", "web")
+
+	gotArgs := cmd.Args[1:]
+	// Standalone: no leading "compose" subcommand, -f pairs come first.
+	wantArgs := []string{
+		"-f", "/proj/compose.yml",
+		"-f", "/tmp/override.yml",
+		"start", "web",
+	}
+	if len(gotArgs) != len(wantArgs) {
+		t.Fatalf("args = %v, want %v", gotArgs, wantArgs)
+	}
+	for i, want := range wantArgs {
+		if gotArgs[i] != want {
+			t.Errorf("arg[%d] = %q, want %q", i, gotArgs[i], want)
+		}
+	}
+}
+
+// TestCommand_NilExtraComposeFiles_ByteIdentical is the regression pin for
+// acceptance criterion 6: a nil ExtraComposeFiles field must produce argv
+// byte-identical to the pre-feature behavior across every compose subcommand
+// used by the codebase, in both plugin and standalone modes.
+func TestCommand_NilExtraComposeFiles_ByteIdentical(t *testing.T) {
+	subcommands := [][]string{
+		{"stop", "nginx", "postgres"},
+		{"rm", "-f", "nginx"},
+		{"pull"},
+		{"up", "--no-start", "nginx"},
+		{"start", "nginx"},
+		{"config", "--services"},
+		{"ps", "-a", "--format", "json"},
+		{"logs", "--follow", "--tail", "50", "web"},
+		{"ls", "-a", "--format", "json"},
+		{"exec", "web", "/bin/sh"},
+	}
+
+	for _, standalone := range []bool{false, true} {
+		for _, args := range subcommands {
+			name := "plugin"
+			if standalone {
+				name = "standalone"
+			}
+			name += "/" + strings.Join(args, "_")
+			t.Run(name, func(t *testing.T) {
+				withFiles := &Compose{ProjectDir: "/proj", UID: "1000:1000", Standalone: standalone}
+				// Explicitly nil (default) — assert it matches the same
+				// struct without the field being touched at all.
+				gotNil := withFiles.command(context.Background(), args...).Args
+
+				// Reconstruct the expected argv exactly as the pre-feature
+				// code path produced it.
+				var wantArgs []string
+				if standalone {
+					wantArgs = append([]string{"docker-compose"}, args...)
+				} else {
+					wantArgs = append([]string{"docker", "compose"}, args...)
+				}
+
+				if len(gotNil) != len(wantArgs) {
+					t.Fatalf("argv length = %d, want %d\ngot:  %v\nwant: %v",
+						len(gotNil), len(wantArgs), gotNil, wantArgs)
+				}
+				for i := range wantArgs {
+					if gotNil[i] != wantArgs[i] {
+						t.Errorf("argv[%d] = %q, want %q", i, gotNil[i], wantArgs[i])
+					}
+				}
+			})
+		}
+	}
+}
+
+func TestComposeFileArgs(t *testing.T) {
+	tests := []struct {
+		name  string
+		files []string
+		want  []string
+	}{
+		{"nil", nil, nil},
+		{"empty", []string{}, nil},
+		{"single", []string{"a.yml"}, []string{"-f", "a.yml"}},
+		{"multi", []string{"a.yml", "b.yml"}, []string{"-f", "a.yml", "-f", "b.yml"}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := composeFileArgs(tt.files)
+			if len(got) != len(tt.want) {
+				t.Fatalf("got %v, want %v", got, tt.want)
+			}
+			for i := range tt.want {
+				if got[i] != tt.want[i] {
+					t.Errorf("arg[%d] = %q, want %q", i, got[i], tt.want[i])
+				}
+			}
+		})
+	}
+}
+
 // --- Tests using injection hooks ---
 
 func TestListServices_ViaHook(t *testing.T) {

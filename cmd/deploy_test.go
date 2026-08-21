@@ -3,12 +3,14 @@ package cmd
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"os"
 	"os/exec"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/lexxzar/compose-deploy/internal/compose"
 	"github.com/lexxzar/compose-deploy/internal/logging"
@@ -331,6 +333,10 @@ func newTestCompose(dir string, mock *opMockComposer) *compose.Compose {
 }
 
 func TestRunOperation_LocalDeploy(t *testing.T) {
+	// Deploy records a pre-deploy snapshot under $HOME/.cdeploy/state/ — isolate
+	// HOME so the capture (best-effort, empty here) never writes to the real home.
+	t.Setenv("HOME", t.TempDir())
+
 	oldNew := opNewLocal
 	oldLogger := opNewLogger
 	oldProj := projectDir
@@ -433,6 +439,10 @@ func TestRunOperation_LocalStop(t *testing.T) {
 }
 
 func TestRunOperation_FailedStep(t *testing.T) {
+	// Deploy snapshots before the pipeline; isolate HOME so the (best-effort)
+	// capture never writes to the real home even when the deploy later fails.
+	t.Setenv("HOME", t.TempDir())
+
 	oldNew := opNewLocal
 	oldLogger := opNewLogger
 	oldProj := projectDir
@@ -971,6 +981,478 @@ func TestRunOperation_IdentityWithoutSSH(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "--identity requires --ssh") {
 		t.Errorf("error = %q, want it to contain '--identity requires --ssh'", err.Error())
+	}
+}
+
+// --- Task 9: --wait flags, exit-code contract, snapshot hook, verdict table ---
+
+// TestWaitFlags_Registration verifies --wait and --wait-timeout are registered
+// on deploy and restart but NOT on stop (stop has no health phase).
+func TestWaitFlags_Registration(t *testing.T) {
+	root := NewRootCmd()
+
+	for _, name := range []string{"deploy", "restart"} {
+		t.Run(name+"_has_flags", func(t *testing.T) {
+			cmd, _, err := root.Find([]string{name})
+			if err != nil {
+				t.Fatalf("%s command not found: %v", name, err)
+			}
+			if cmd.Flags().Lookup("wait") == nil {
+				t.Errorf("--wait flag not found on %s command", name)
+			}
+			wt := cmd.Flags().Lookup("wait-timeout")
+			if wt == nil {
+				t.Fatalf("--wait-timeout flag not found on %s command", name)
+			}
+			if wt.DefValue != runner.DefaultWaitTimeout.String() {
+				t.Errorf("--wait-timeout default = %q, want %q", wt.DefValue, runner.DefaultWaitTimeout.String())
+			}
+		})
+	}
+
+	stop, _, err := root.Find([]string{"stop"})
+	if err != nil {
+		t.Fatalf("stop command not found: %v", err)
+	}
+	if stop.Flags().Lookup("wait") != nil {
+		t.Error("--wait flag should NOT be registered on stop command")
+	}
+	if stop.Flags().Lookup("wait-timeout") != nil {
+		t.Error("--wait-timeout flag should NOT be registered on stop command")
+	}
+}
+
+// TestWaitTimeout_Parse verifies --wait-timeout parses a duration into the bound
+// global.
+func TestWaitTimeout_Parse(t *testing.T) {
+	oldWait := waitEnabled
+	oldTimeout := waitTimeout
+	t.Cleanup(func() {
+		waitEnabled = oldWait
+		waitTimeout = oldTimeout
+	})
+
+	root := NewRootCmd()
+	deploy, _, err := root.Find([]string{"deploy"})
+	if err != nil {
+		t.Fatalf("deploy command not found: %v", err)
+	}
+	if err := deploy.ParseFlags([]string{"--wait", "--wait-timeout", "45s"}); err != nil {
+		t.Fatalf("parsing wait flags: %v", err)
+	}
+	if !waitEnabled {
+		t.Error("--wait did not set waitEnabled")
+	}
+	if waitTimeout != 45*time.Second {
+		t.Errorf("waitTimeout = %s, want 45s", waitTimeout)
+	}
+}
+
+// TestWaitError_ErrorsAs verifies the exit-2 mapping mechanism main.go relies on:
+// a *WaitError is detectable via errors.As, both as the direct error and when
+// wrapped, while a plain error is not.
+func TestWaitError_ErrorsAs(t *testing.T) {
+	report := runner.WaitReport{
+		Verdicts: map[string]runner.WaitVerdict{"web": runner.VerdictUnhealthy},
+		OK:       false,
+	}
+	we := &WaitError{Report: report}
+
+	var target *WaitError
+	if !errors.As(error(we), &target) {
+		t.Fatal("errors.As did not match a direct *WaitError")
+	}
+
+	wrapped := fmt.Errorf("deploy: %w", we)
+	target = nil
+	if !errors.As(wrapped, &target) {
+		t.Fatal("errors.As did not match a wrapped *WaitError")
+	}
+	if target.Report.Verdicts["web"] != runner.VerdictUnhealthy {
+		t.Errorf("recovered report verdict = %q, want unhealthy", target.Report.Verdicts["web"])
+	}
+
+	if errors.As(errors.New("plain"), &target) {
+		t.Error("errors.As matched a plain error as *WaitError")
+	}
+}
+
+// TestWaitError_Message covers both message forms: the operational-error form
+// (Err set, surfaced via Unwrap) and the failing-service list form.
+func TestWaitError_Message(t *testing.T) {
+	// Operational error form.
+	underlying := errors.New("context canceled")
+	we := &WaitError{Err: underlying}
+	if !strings.Contains(we.Error(), "context canceled") {
+		t.Errorf("error = %q, want it to mention the underlying error", we.Error())
+	}
+	if !errors.Is(we, underlying) {
+		t.Error("Unwrap did not expose the underlying error")
+	}
+
+	// Failing-service list form (no operational error).
+	we = &WaitError{Report: runner.WaitReport{
+		Verdicts: map[string]runner.WaitVerdict{
+			"web": runner.VerdictHealthy,
+			"db":  runner.VerdictUnhealthy,
+			"api": runner.VerdictTimedOut,
+		},
+	}}
+	msg := we.Error()
+	if !strings.Contains(msg, "db") || !strings.Contains(msg, "unhealthy") {
+		t.Errorf("error = %q, want it to name db/unhealthy", msg)
+	}
+	if !strings.Contains(msg, "api") || !strings.Contains(msg, "timed out") {
+		t.Errorf("error = %q, want it to name api/timed out", msg)
+	}
+	if strings.Contains(msg, "web") {
+		t.Errorf("error = %q, should not name the healthy service web", msg)
+	}
+}
+
+// mockSnapshotter drives the recordSnapshot seam without a real composer.
+type mockSnapshotter struct {
+	result     compose.SnapshotResult
+	snapErr    error
+	writeErr   error
+	written    *compose.Snapshot
+	writeCalls int
+}
+
+func (m *mockSnapshotter) SnapshotServices(_ context.Context, _ []string) (compose.SnapshotResult, error) {
+	return m.result, m.snapErr
+}
+
+func (m *mockSnapshotter) WriteSnapshot(_ context.Context, fresh *compose.Snapshot) error {
+	m.writeCalls++
+	m.written = fresh
+	return m.writeErr
+}
+
+// TestRecordSnapshot_HappyPath: a clean capture is written and produces no
+// warnings.
+func TestRecordSnapshot_HappyPath(t *testing.T) {
+	snap := &compose.Snapshot{Schema: 1, ProjectDir: "/opt/app"}
+	m := &mockSnapshotter{result: compose.SnapshotResult{Snapshot: snap}}
+
+	var buf bytes.Buffer
+	recordSnapshot(context.Background(), m, nil, &buf)
+
+	if m.writeCalls != 1 {
+		t.Errorf("WriteSnapshot calls = %d, want 1", m.writeCalls)
+	}
+	if m.written != snap {
+		t.Error("WriteSnapshot did not receive the captured snapshot")
+	}
+	if buf.Len() != 0 {
+		t.Errorf("unexpected warnings on happy path: %q", buf.String())
+	}
+}
+
+// TestRecordSnapshot_CaptureError: a capture failure warns and never writes.
+func TestRecordSnapshot_CaptureError(t *testing.T) {
+	m := &mockSnapshotter{snapErr: errors.New("compose config unavailable")}
+
+	var buf bytes.Buffer
+	recordSnapshot(context.Background(), m, nil, &buf)
+
+	if m.writeCalls != 0 {
+		t.Errorf("WriteSnapshot calls = %d, want 0 after capture error", m.writeCalls)
+	}
+	if !strings.Contains(buf.String(), "skipped") || !strings.Contains(buf.String(), "compose config unavailable") {
+		t.Errorf("warning = %q, want it to mention skipped + the capture error", buf.String())
+	}
+}
+
+// TestRecordSnapshot_WarnAndProceed: per-service warnings are surfaced and a
+// write failure warns without panicking (deploy proceeds).
+func TestRecordSnapshot_WarnAndProceed(t *testing.T) {
+	m := &mockSnapshotter{
+		result: compose.SnapshotResult{
+			Snapshot: &compose.Snapshot{Schema: 1},
+			Warnings: []string{"db: not running, skipped"},
+		},
+		writeErr: errors.New("disk full"),
+	}
+
+	var buf bytes.Buffer
+	recordSnapshot(context.Background(), m, nil, &buf)
+
+	if m.writeCalls != 1 {
+		t.Errorf("WriteSnapshot calls = %d, want 1", m.writeCalls)
+	}
+	out := buf.String()
+	if !strings.Contains(out, "db: not running, skipped") {
+		t.Errorf("output = %q, want the per-service warning surfaced", out)
+	}
+	if !strings.Contains(out, "failed to write rollback snapshot") || !strings.Contains(out, "disk full") {
+		t.Errorf("output = %q, want the write-failure warning", out)
+	}
+}
+
+// TestFormatWaitReport verifies the verdict table renders each service with its
+// verdict label, sorted by name (golden-ish: substrings + ordering, color-free).
+func TestFormatWaitReport(t *testing.T) {
+	report := runner.WaitReport{
+		Verdicts: map[string]runner.WaitVerdict{
+			"web": runner.VerdictHealthy,
+			"db":  runner.VerdictUnhealthy,
+			"api": runner.VerdictRunningNoHC,
+		},
+	}
+	out := formatWaitReport(report)
+
+	for _, want := range []string{"web", "db", "api", "healthy", "unhealthy", "running (no healthcheck)"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("formatWaitReport output missing %q:\n%s", want, out)
+		}
+	}
+	// Sorted by service name: api < db < web.
+	iAPI := strings.Index(out, "api")
+	iDB := strings.Index(out, "db")
+	iWeb := strings.Index(out, "web")
+	if !(iAPI < iDB && iDB < iWeb) {
+		t.Errorf("services not sorted by name (api=%d db=%d web=%d):\n%s", iAPI, iDB, iWeb, out)
+	}
+}
+
+// newWaitTestCompose extends newTestCompose's hooks to also script the
+// ContainerStatus poll (`compose ps -a --format json`) the --wait phase drives,
+// plus best-effort empty snapshot data (`config`/`ps`). psJSON is returned for the
+// `ps -a` status query.
+func newWaitTestCompose(dir string, mock *opMockComposer, psJSON string) *compose.Compose {
+	c := compose.New(dir)
+	c.SetTestHooks(
+		func(cmd *exec.Cmd) error {
+			args := strings.Join(cmd.Args, " ")
+			switch {
+			case strings.Contains(args, "stop"):
+				return mock.Stop(context.Background(), nil, cmd.Stdout)
+			case strings.Contains(args, "rm"):
+				return mock.Remove(context.Background(), nil, cmd.Stdout)
+			case strings.Contains(args, "pull"):
+				return mock.Pull(context.Background(), nil, cmd.Stdout)
+			case strings.Contains(args, "up"):
+				return mock.Create(context.Background(), nil, cmd.Stdout)
+			case strings.Contains(args, "start"):
+				return mock.Start(context.Background(), nil, cmd.Stdout)
+			}
+			return nil
+		},
+		func(cmd *exec.Cmd) ([]byte, error) {
+			args := strings.Join(cmd.Args, " ")
+			switch {
+			case strings.Contains(args, "version"):
+				return []byte("Docker Compose version v2.24.0\n"), nil
+			case strings.Contains(args, "ps") && strings.Contains(args, "-a"):
+				return []byte(psJSON), nil // ContainerStatus for the wait
+			case strings.Contains(args, "config"):
+				return []byte(`{"services":{}}`), nil // snapshot: no services
+			case strings.Contains(args, "ps"):
+				return []byte("[]"), nil // snapshot: nothing running
+			}
+			return nil, nil
+		},
+	)
+	return c
+}
+
+// runWaitOperation wires the --wait globals and a scripted compose, runs the
+// operation, and returns its error plus everything written to stderr.
+func runWaitOperation(t *testing.T, op runner.Operation, containers []string, psJSON string, timeout time.Duration) (error, string) {
+	t.Helper()
+	t.Setenv("HOME", t.TempDir())
+
+	oldNew, oldLogger, oldProj, oldServer, oldLogDir := opNewLocal, opNewLogger, projectDir, serverName, logDir
+	oldWait, oldTimeout := waitEnabled, waitTimeout
+	t.Cleanup(func() {
+		opNewLocal, opNewLogger, projectDir, serverName, logDir = oldNew, oldLogger, oldProj, oldServer, oldLogDir
+		waitEnabled, waitTimeout = oldWait, oldTimeout
+	})
+
+	mock := &opMockComposer{}
+	opNewLocal = func(dir string) *compose.Compose { return newWaitTestCompose(dir, mock, psJSON) }
+	opNewLogger = func(dir string) (*logging.Logger, error) { return logging.NewLogger(t.TempDir()) }
+	projectDir, serverName, logDir = "", "", t.TempDir()
+	waitEnabled, waitTimeout = true, timeout
+
+	oldStderr := os.Stderr
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	os.Stderr = w
+	runErr := runOperation(context.Background(), op, false, containers)
+	w.Close()
+	os.Stderr = oldStderr
+	var buf strings.Builder
+	if _, cerr := io.Copy(&buf, r); cerr != nil {
+		t.Fatal(cerr)
+	}
+	return runErr, buf.String()
+}
+
+// TestRunOperation_WaitHealthy (T1/AC1): a --wait deploy whose services report
+// healthy exits with no error (also exercises the timeout<=0 default fallback).
+func TestRunOperation_WaitHealthy(t *testing.T) {
+	ps := `[{"Service":"web","State":"running","Health":"healthy","Status":"Up 5 minutes (healthy)"}]`
+	err, stderr := runWaitOperation(t, runner.Deploy, []string{"web"}, ps, 0) // 0 → default fallback
+	if err != nil {
+		t.Fatalf("healthy --wait deploy should succeed, got: %v", err)
+	}
+	if !strings.Contains(stderr, "All services healthy") {
+		t.Errorf("stderr missing the success line:\n%s", stderr)
+	}
+}
+
+// TestRunOperation_WaitUnhealthyDeploy (T1/AC1): a --wait deploy whose service is
+// unhealthy returns a *WaitError (exit 2) and prints the rollback hint.
+func TestRunOperation_WaitUnhealthyDeploy(t *testing.T) {
+	ps := `[{"Service":"web","State":"running","Health":"unhealthy","Status":"Up 5 minutes (unhealthy)"}]`
+	err, stderr := runWaitOperation(t, runner.Deploy, []string{"web"}, ps, 30*time.Second)
+	var we *WaitError
+	if !errors.As(err, &we) {
+		t.Fatalf("unhealthy --wait deploy should return *WaitError, got: %v", err)
+	}
+	if !strings.Contains(stderr, "run 'cdeploy rollback'") {
+		t.Errorf("deploy wait-failure must print the rollback hint:\n%s", stderr)
+	}
+}
+
+// TestRunOperation_WaitUnhealthyRestart (T1): a --wait restart failure also
+// returns a *WaitError but must NOT print the deploy-only rollback hint.
+func TestRunOperation_WaitUnhealthyRestart(t *testing.T) {
+	ps := `[{"Service":"web","State":"running","Health":"unhealthy","Status":"Up 5 minutes (unhealthy)"}]`
+	err, stderr := runWaitOperation(t, runner.Restart, []string{"web"}, ps, 30*time.Second)
+	var we *WaitError
+	if !errors.As(err, &we) {
+		t.Fatalf("unhealthy --wait restart should return *WaitError, got: %v", err)
+	}
+	if strings.Contains(stderr, "run 'cdeploy rollback'") {
+		t.Errorf("restart wait-failure must NOT print the deploy-only rollback hint:\n%s", stderr)
+	}
+}
+
+// TestWaitForHealth_CtxCancelNotWaitError (Q4): an operator interrupt (canceled
+// context) must NOT be wrapped in *WaitError — that would map to exit 2 and
+// misreport a deliberate Ctrl-C as "deployed but unhealthy".
+func TestWaitForHealth_CtxCancelNotWaitError(t *testing.T) {
+	oldWait, oldTimeout := waitEnabled, waitTimeout
+	t.Cleanup(func() { waitEnabled, waitTimeout = oldWait, oldTimeout })
+	waitTimeout = 30 * time.Second
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel() // pre-cancel: WaitHealthy returns context.Canceled on its first check
+
+	oldStderr := os.Stderr
+	r, w, _ := os.Pipe()
+	os.Stderr = w
+	err := waitForHealth(ctx, &opMockComposer{}, runner.Deploy, []string{"web"})
+	w.Close()
+	os.Stderr = oldStderr
+	var sb strings.Builder
+	_, _ = io.Copy(&sb, r)
+
+	if err == nil {
+		t.Fatal("expected an error on canceled context")
+	}
+	var we *WaitError
+	if errors.As(err, &we) {
+		t.Errorf("ctx-cancel must not be a *WaitError (would exit 2), got %v", err)
+	}
+	if !errors.Is(err, context.Canceled) {
+		t.Errorf("error should unwrap to context.Canceled, got %v", err)
+	}
+	if strings.Contains(sb.String(), "run 'cdeploy rollback'") {
+		t.Errorf("interrupt must not print the rollback hint:\n%s", sb.String())
+	}
+}
+
+// TestRunOperationWithPrep_PipelineTargets (C1): a prep hook that resolves a
+// target set narrows the PIPELINE (runner.Run) to exactly those services, not
+// just the wait phase. For `rollback -a` (containers == nil) the pipeline must
+// Stop/Create the resolved snapshot services, never every compose service with
+// its current unpinned image. A nil prep (deploy/restart) is unchanged.
+func TestRunOperationWithPrep_PipelineTargets(t *testing.T) {
+	tests := []struct {
+		name       string
+		op         runner.Operation
+		all        bool
+		containers []string
+		prep       func(context.Context, runner.Composer) (func(), []string, error)
+		wantIn     []string
+		wantNotIn  []string
+	}{
+		{
+			name: "rollback -a uses the resolved snapshot targets (not all)",
+			op:   runner.Rollback, all: true, containers: nil,
+			prep: func(_ context.Context, _ runner.Composer) (func(), []string, error) {
+				return nil, []string{"db", "web"}, nil
+			},
+			wantIn: []string{"db", "web"},
+		},
+		{
+			name: "rollback named passes the explicit service through unchanged",
+			op:   runner.Rollback, all: false, containers: []string{"web"},
+			prep:      func(_ context.Context, _ runner.Composer) (func(), []string, error) { return nil, []string{"web"}, nil },
+			wantIn:    []string{"web"},
+			wantNotIn: []string{"db"},
+		},
+		{
+			name: "restart with nil prep keeps operating on the explicit containers",
+			op:   runner.Restart, all: false, containers: []string{"api"},
+			prep:   nil,
+			wantIn: []string{"api"},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Setenv("HOME", t.TempDir())
+			oldNew, oldLogger, oldProj, oldServer, oldLogDir := opNewLocal, opNewLogger, projectDir, serverName, logDir
+			t.Cleanup(func() {
+				opNewLocal, opNewLogger, projectDir, serverName, logDir = oldNew, oldLogger, oldProj, oldServer, oldLogDir
+			})
+
+			var stopArgs string
+			opNewLocal = func(dir string) *compose.Compose {
+				c := compose.New(dir)
+				c.SetTestHooks(
+					func(cmd *exec.Cmd) error {
+						a := strings.Join(cmd.Args, " ")
+						if strings.Contains(a, "stop") {
+							stopArgs = a
+						}
+						return nil
+					},
+					func(cmd *exec.Cmd) ([]byte, error) {
+						if strings.Contains(strings.Join(cmd.Args, " "), "version") {
+							return []byte("Docker Compose version v2.24.0\n"), nil
+						}
+						return nil, nil
+					},
+				)
+				return c
+			}
+			opNewLogger = func(dir string) (*logging.Logger, error) { return logging.NewLogger(t.TempDir()) }
+			projectDir, serverName, logDir = "", "", t.TempDir()
+
+			if err := runOperationWithPrep(context.Background(), tt.op, tt.all, tt.containers, tt.prep); err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if stopArgs == "" {
+				t.Fatal("stop step never ran")
+			}
+			for _, w := range tt.wantIn {
+				if !strings.Contains(stopArgs, " "+w) {
+					t.Errorf("stop argv = %q, want it to include service %q", stopArgs, w)
+				}
+			}
+			for _, w := range tt.wantNotIn {
+				if strings.Contains(stopArgs, " "+w) {
+					t.Errorf("stop argv = %q, should NOT include %q", stopArgs, w)
+				}
+			}
+		})
 	}
 }
 

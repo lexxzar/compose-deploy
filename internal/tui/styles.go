@@ -39,6 +39,24 @@ var (
 	stepWaiting = lipgloss.NewStyle().
 			Foreground(lipgloss.Color("8"))
 
+	// Health-wait verdict styles (progress screen wait sub-state). Green pass,
+	// red fail, yellow pending — mirroring the CLI verdict table's palette.
+	waitPassStyle = lipgloss.NewStyle().
+			Foreground(lipgloss.Color("2"))
+
+	waitFailStyle = lipgloss.NewStyle().
+			Foreground(lipgloss.Color("1")).
+			Bold(true)
+
+	waitPendingStyle = lipgloss.NewStyle().
+				Foreground(lipgloss.Color("3"))
+
+	// waitHintStyle paints the "press R on the services screen to roll back"
+	// hint shown after a failed deploy wait.
+	waitHintStyle = lipgloss.NewStyle().
+			Foreground(lipgloss.Color("3")).
+			Bold(true)
+
 	statusRunningDot = lipgloss.NewStyle().
 				Foreground(lipgloss.Color("2"))
 

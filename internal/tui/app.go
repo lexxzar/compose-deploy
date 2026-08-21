@@ -15,6 +15,7 @@ import (
 	"github.com/charmbracelet/bubbles/textinput"
 	"github.com/charmbracelet/bubbles/viewport"
 	tea "github.com/charmbracelet/bubbletea"
+	"github.com/charmbracelet/lipgloss"
 	"github.com/charmbracelet/x/ansi"
 	"github.com/lexxzar/compose-deploy/internal/compose"
 	"github.com/lexxzar/compose-deploy/internal/config"
@@ -47,6 +48,12 @@ const updatesCacheTTL = 10 * time.Minute
 // session resets and U keypress just like success entries.
 const updatesErrorTTL = 30 * time.Second
 
+// containerHelpLine2 is the action-key legend on the container screen's help
+// footer. Shared by viewSelectContainers (rendering) and svcVisibleCount
+// (footer-height math) so the two can never drift on width — a divergence would
+// miscount visible rows and let the list overflow the terminal.
+const containerHelpLine2 = "  r restart  •  d deploy  •  s stop  •  R rollback  •  l logs  •  c config  •  x exec  •  U updates"
+
 // ConfigProvider provides access to docker-compose configuration files.
 // Defined in the tui package (not runner) because it returns *exec.Cmd and
 // is TUI-only. Both Compose and RemoteCompose implement it.
@@ -62,6 +69,31 @@ type ConfigProvider interface {
 // and is TUI/CLI-only — not a pipeline operation. Both Compose and RemoteCompose implement it.
 type ExecProvider interface {
 	ExecCommand(ctx context.Context, service string, command []string) (*exec.Cmd, error)
+}
+
+// Snapshotter records the currently-running image digests before a deploy so
+// that `cdeploy rollback` can later restore them. Defined in the tui package
+// (like ConfigProvider/ExecProvider) and type-asserted on the concrete composer
+// — a composer that does not implement it (e.g. a test mock) simply skips
+// snapshotting, so it is a best-effort capability rather than part of the
+// runner.Composer contract. Both *compose.Compose and *compose.RemoteCompose
+// satisfy it; the method set mirrors the cmd package's `snapshotter` seam.
+type Snapshotter interface {
+	SnapshotServices(ctx context.Context, services []string) (compose.SnapshotResult, error)
+	WriteSnapshot(ctx context.Context, fresh *compose.Snapshot) error
+}
+
+// RollbackPreparer exposes the concrete-composer capability the `R` key needs:
+// reading the host-side deploy snapshot and preparing a digest-pinned rollback
+// (pull missing blobs, generate the override, set ExtraComposeFiles). Type-
+// asserted on m.composer like Snapshotter / ConfigProvider / ExecProvider — a
+// composer that does not implement it (e.g. a test mock) makes the `R` key a
+// no-op, so it is a best-effort capability rather than part of the
+// runner.Composer contract. Both *compose.Compose and *compose.RemoteCompose
+// satisfy it; the method set mirrors the cmd package's rollbackPreparer seam.
+type RollbackPreparer interface {
+	ReadSnapshot(ctx context.Context) (*compose.Snapshot, error)
+	PrepareRollback(ctx context.Context, entries map[string]compose.SnapshotEntry, services []string, w io.Writer) (func(), error)
 }
 
 // ComposerFactory creates a runner.Composer for the given project directory.
@@ -243,14 +275,48 @@ type Model struct {
 	quitting bool
 
 	// Screen 2: progress
-	steps       []stepState
-	logContent  string
-	logViewport viewport.Model
-	spinner     spinner.Model
-	done        bool
-	failed      bool
-	eventCh     <-chan runner.StepEvent
-	cancel      context.CancelFunc
+	steps        []stepState
+	logContent   string
+	logViewport  viewport.Model
+	spinner      spinner.Model
+	done         bool
+	failed       bool
+	eventCh      <-chan runner.StepEvent
+	cancel       context.CancelFunc
+	opContainers []string // the operation's resolved target services; seeds the wait target set
+
+	// Screen 2: progress — health-wait sub-state. After a Deploy/Restart/Rollback
+	// pipeline completes (m.done), the progress screen enters a waiting sub-state
+	// that polls ContainerStatus and drives runner.EvaluateWait until every
+	// targeted service resolves (or the timeout elapses). StopOnly never waits.
+	// All fields are reset via clearWaitState() at every departure site and on
+	// esc-skip (which also bumps waitSession to invalidate in-flight polls/ticks).
+	waiting          bool             // actively polling for health (esc = skip)
+	waitState        runner.WaitState // per-service verdict accumulator; non-empty Services ⇒ verdicts are rendered
+	waitSession      uint64           // gates waitTickMsg/waitStatusMsg against a stale poll after esc-skip / departure
+	waitDeadline     time.Time        // wall-clock deadline; drives the countdown and the elapsed input to EvaluateWait
+	waitTickOverride func() tea.Cmd   // test seam: replaces tea.Tick in waitTick(); production never sets this
+
+	// Rollback (`R` key) support. rollbackSnapshot holds the host-side snapshot
+	// fetched by `R` so the confirm prompt can show its age and PrepareRollback
+	// can pin the digests. rollbackTargets is the selected service set CAPTURED
+	// at `R`-press time — the async snapshot fetch means the live multi-select
+	// may change or clear before rollbackSnapshotMsg lands, so the captured set
+	// (never the live selection) drives validation, the confirm prompt, prep, and
+	// the pipeline; an empty target set must NEVER reach the runner (empty == all
+	// services). rollbackFetchSession gates the async rollbackSnapshotMsg (bumped
+	// on `R` press and at the same context-change sites as the other sessions),
+	// which also protects the captured rollbackTargets from a stale fetch.
+	// rollbackCleanup is PrepareRollback's cleanup (override-file removal +
+	// ExtraComposeFiles reset), invoked when LEAVING screenProgress — NEVER
+	// goroutine-deferred (see the rollback cleanup timing race rule). rollbackErr
+	// surfaces a prep failure on the progress screen. rollbackSnapshot and
+	// rollbackTargets are cleared together at every documented departure site.
+	rollbackSnapshot     *compose.Snapshot
+	rollbackTargets      []string
+	rollbackFetchSession uint64
+	rollbackCleanup      func()
+	rollbackErr          string
 
 	// Screen: logs
 	logsService  string             // service being viewed
@@ -404,6 +470,48 @@ type updatesMsg struct {
 type refreshTickMsg struct{}
 
 type pipelineDoneMsg struct{}
+
+// waitTickMsg fires after runner.DefaultWaitPoll to schedule the next health
+// poll. session is captured at scheduling time and compared against
+// m.waitSession in the handler so a tick left over from a skipped/departed wait
+// is dropped. Singleton reschedule discipline like refreshTickMsg, but the loop
+// stops once the wait resolves (not an unconditional forever-loop).
+type waitTickMsg struct{ session uint64 }
+
+// waitStatusMsg carries one ContainerStatus poll result into the wait reducer.
+// session mirrors waitTickMsg so a poll from a skipped/departed wait is dropped.
+type waitStatusMsg struct {
+	status  map[string]runner.ServiceStatus
+	err     error
+	session uint64
+}
+
+// rollbackSnapshotMsg carries the result of the async ReadSnapshot fired by the
+// `R` key. session is captured at fetch time and compared against
+// m.rollbackFetchSession so a fetch that outlived its container-screen visit
+// (the user navigated away, or pressed `R` again) is dropped. live is the CURRENT
+// compose service set (from ListServices), fetched alongside the snapshot so the
+// handler can drop a selected target that has since been removed from the compose
+// file — mirroring the CLI's filterLiveTargets so a stale snapshot entry can't
+// resurrect a removed service as an image-only override. It is populated only when
+// err == nil and the snapshot is non-empty.
+type rollbackSnapshotMsg struct {
+	snap    *compose.Snapshot
+	live    []string
+	err     error
+	session uint64
+}
+
+// rollbackPreppedMsg carries the outcome of PrepareRollback (run before the
+// Rollback pipeline). On success cleanup is the deferred override-file / -f
+// reset — stored on the Model and invoked when LEAVING screenProgress, never
+// goroutine-deferred (see the rollback cleanup timing race rule). On failure err
+// is set and the op is marked failed before any pipeline step runs.
+type rollbackPreppedMsg struct {
+	cleanup func()
+	err     error
+}
+
 type logChunkMsg struct {
 	data    []byte
 	session uint64
@@ -896,7 +1004,15 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.serverColor = ""
 			m.updatesErr = ""
 			m.updateInFlight = false
+			// Clear rollback state too: a container-screen R fetch cannot have
+			// been in flight during a connect attempt, but keep the departure-site
+			// cleanup discipline uniform (mirrors clearSearch/clearWaitState).
+			m.rollbackSnapshot = nil
+			m.rollbackTargets = nil
+			m.rollbackCleanup = nil
+			m.rollbackFetchSession++
 			m.clearSearch()
+			m.clearWaitState()
 			return m, nil
 		}
 		m.serverErr = nil
@@ -1043,6 +1159,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.statsSession++
 		m.statusSession++
 		m.updatesSession++
+		m.rollbackFetchSession++
 		m.statsRequested = true
 		m.refreshInFlight = true
 		// Reset updateInFlight before calling maybeRefreshUpdatesCmd: the
@@ -1057,10 +1174,172 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, tea.Batch(cmds...)
 
 	case pipelineDoneMsg:
-		if !m.failed {
-			m.done = true
+		if m.failed {
+			return m, nil
 		}
+		m.done = true
+		// StopOnly has no health phase; a failed pipeline never reaches here.
+		// Deploy/Restart/Rollback enter the waiting sub-state and start the
+		// health-poll loop with the first poll firing immediately (containers
+		// were just (re)started).
+		if m.pendingOp == runner.StopOnly {
+			return m, nil
+		}
+		targets := m.opContainers
+		if len(targets) == 0 {
+			targets = m.services
+		}
+		if len(targets) == 0 {
+			return m, nil // nothing to wait on
+		}
+		m.waiting = true
+		m.waitSession++
+		m.waitState = runner.NewWaitState(targets)
+		m.waitDeadline = time.Now().Add(runner.DefaultWaitTimeout)
+		return m, m.pollWaitStatus()
+
+	case waitTickMsg:
+		// Stale ticks (skipped wait, departed screen, or a superseded session)
+		// are dead — drop without rescheduling. A live tick fires the next poll.
+		if m.screen != screenProgress || !m.waiting || msg.session != m.waitSession {
+			return m, nil
+		}
+		return m, m.pollWaitStatus()
+
+	case waitStatusMsg:
+		if m.screen != screenProgress || !m.waiting || msg.session != m.waitSession {
+			return m, nil
+		}
+		elapsed := m.waitElapsed()
+		if msg.err != nil {
+			// Transient poll failure: carry the reducer state forward and keep
+			// polling. Feeding a nil/zero status map into EvaluateWait would
+			// corrupt per-service verdicts (a running service would read as
+			// not-running), so instead we sweep pending → timed out directly
+			// once the deadline passes — guaranteeing termination even if
+			// ContainerStatus keeps failing.
+			if elapsed >= runner.DefaultWaitTimeout {
+				m.sweepWaitTimeout()
+				m.waiting = false
+				return m, nil
+			}
+			return m, m.waitTick()
+		}
+		var done bool
+		m.waitState, done = runner.EvaluateWait(m.waitState, msg.status, runner.WaitOptions{}, elapsed)
+		if done {
+			// Wait resolved: stop polling but KEEP waitState so the verdict
+			// lines (and the rollback hint on a failed deploy) stay rendered.
+			m.waiting = false
+			return m, nil
+		}
+		return m, m.waitTick()
+
+	case rollbackSnapshotMsg:
+		// Drop a fetch that outlived its container-screen visit (a context change
+		// bumped the session) or one that raced ahead of an in-progress
+		// confirmation / search (don't clobber an active prompt).
+		if m.screen != screenSelectContainers || msg.session != m.rollbackFetchSession {
+			return m, nil
+		}
+		if m.confirming || m.searching {
+			return m, nil
+		}
+		if msg.err != nil {
+			m.warning = fmt.Sprintf("rollback unavailable: %v", msg.err)
+			m.fixSvcOffset()
+			return m, nil
+		}
+		if msg.snap == nil || len(msg.snap.Services) == 0 {
+			m.warning = "No rollback snapshot found — deploy first to record one"
+			m.fixSvcOffset()
+			return m, nil
+		}
+		// Use the target set captured at R-press time — NOT the live selection.
+		// The user may have changed or cleared the multi-select during the async
+		// fetch; re-deriving from the current selection would let an empty set
+		// become an unintended all-service rollback (empty == all in the runner).
+		// The session check above already rejected a stale fetch, so a matching
+		// fetch always carries the capture from this R press.
+		targets := m.rollbackTargets
+		if len(targets) == 0 {
+			// Defensive: a matching-session fetch always carries a non-empty
+			// capture (guarded at R-press). Refuse rather than fall through to
+			// an all-service rollback.
+			m.warning = warnNoSelection
+			m.fixSvcOffset()
+			return m, nil
+		}
+		// Every selected service must have a snapshot entry — mirror the CLI
+		// refusal, naming exactly what is missing.
+		var missing []string
+		for _, svc := range targets {
+			if _, ok := msg.snap.Services[svc]; !ok {
+				missing = append(missing, svc)
+			}
+		}
+		if len(missing) > 0 {
+			slices.Sort(missing)
+			m.warning = fmt.Sprintf("no rollback snapshot for: %s", strings.Join(missing, ", "))
+			m.fixSvcOffset()
+			return m, nil
+		}
+		// Every selected service must ALSO still exist in the current compose file.
+		// Rollback pins images only against the live compose file, so a snapshot
+		// entry for a since-removed service must not resurrect it as a minimal
+		// image-only override (mirrors the CLI filterLiveTargets named-target
+		// refusal — the TUI selection is explicit, so a stale target refuses rather
+		// than silently proceeding with a subset). msg.live is the fresh
+		// ListServices result captured alongside the snapshot.
+		liveSet := make(map[string]bool, len(msg.live))
+		for _, svc := range msg.live {
+			liveSet[svc] = true
+		}
+		var removed []string
+		for _, svc := range targets {
+			if !liveSet[svc] {
+				removed = append(removed, svc)
+			}
+		}
+		if len(removed) > 0 {
+			slices.Sort(removed)
+			m.warning = fmt.Sprintf("no longer in the compose file: %s", strings.Join(removed, ", "))
+			m.fixSvcOffset()
+			return m, nil
+		}
+		// Snapshot present for all targets — enter the existing confirm flow with
+		// the Rollback op. enterProgress (on confirm) reads m.rollbackSnapshot for
+		// the prep.
+		m.rollbackSnapshot = msg.snap
+		m.pendingOp = runner.Rollback
+		m.confirming = true
+		m.fixSvcOffset()
 		return m, nil
+
+	case rollbackPreppedMsg:
+		// Prep runs only for a Rollback launched from screenProgress. If the user
+		// left the screen before it returned, invoke any cleanup so the override
+		// file / ExtraComposeFiles don't leak, then drop.
+		if m.screen != screenProgress {
+			if msg.cleanup != nil {
+				msg.cleanup()
+			}
+			return m, nil
+		}
+		if msg.err != nil {
+			// Prep failed before the pipeline ran: mark the op failed and surface
+			// the error on the progress screen. No cleanup to store — prep aborts
+			// before mutating ExtraComposeFiles on error.
+			m.failed = true
+			m.rollbackErr = msg.err.Error()
+			return m, nil
+		}
+		// Prep succeeded: the pipeline goroutine is already running (launched
+		// inside prepareRollbackCmd). Store the cleanup for invocation on leaving
+		// the progress screen (NEVER goroutine-deferred — see the race rule) and
+		// start consuming pipeline events.
+		m.rollbackCleanup = msg.cleanup
+		return m, m.waitForEvent()
 
 	case spinner.TickMsg:
 		if m.screen == screenProgress && !m.done && !m.failed {
@@ -1080,9 +1359,25 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 func (m Model) tryQuit() (tea.Model, tea.Cmd) {
 	if m.disconnectFunc != nil {
 		m.quitting = true
-		return m, nil
+		return m, nil // defer cleanup until the confirm ("y") actually quits
 	}
+	// Local session quitting for real: run any pending rollback-prep cleanup
+	// (override temp-file removal + ExtraComposeFiles reset) on the main
+	// goroutine so a hard exit during a rollback wait doesn't leak the file
+	// (the remote /tmp override in particular has no reaper). No-op when no
+	// rollback is in flight. Runs synchronously in Update — never
+	// goroutine-deferred (the documented rollback cleanup-timing race rule).
+	m.runRollbackCleanup()
 	return m, tea.Quit
+}
+
+// runRollbackCleanup invokes and clears the stored rollback-prep cleanup if set.
+// Idempotent (nils the field) so a later leave-progress path can't double-invoke.
+func (m *Model) runRollbackCleanup() {
+	if m.rollbackCleanup != nil {
+		m.rollbackCleanup()
+		m.rollbackCleanup = nil
+	}
 }
 
 func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
@@ -1093,6 +1388,12 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	if m.quitting {
 		switch key {
 		case "y":
+			// Confirmed quit on a remote session: run any pending rollback-prep
+			// cleanup (remote /tmp override rm -f) before tearing down — the
+			// ControlMaster socket is still live here, and Run()'s disconnectFunc
+			// (which closes it) only fires after the tea loop exits. Main
+			// goroutine, never goroutine-deferred (rollback cleanup race rule).
+			m.runRollbackCleanup()
 			return m, tea.Quit
 		case "n", "esc":
 			m.quitting = false
@@ -1182,12 +1483,17 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 				m.projDir = ""
 				m.projName = ""
 				m.updatesErr = ""
+				m.rollbackSnapshot = nil
+				m.rollbackTargets = nil
+				m.rollbackCleanup = nil
 				m.clearSearch()
+				m.clearWaitState()
 				if m.localComposer != nil {
 					m.composer = m.localComposer
 					m.statsSession++
 					m.statusSession++
 					m.updatesSession++
+					m.rollbackFetchSession++
 					m.statsRequested = true
 					m.refreshInFlight = true
 					// Reset updateInFlight before calling
@@ -1254,6 +1560,7 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 				m.statusSession++
 				m.updatesSession++
 				m.projectsSession++
+				m.rollbackFetchSession++
 				m.refreshInFlight = false
 				m.updateInFlight = false
 				m.updatesErr = ""
@@ -1264,6 +1571,7 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 				m.projErr = nil
 				m.showPicker = false
 				m.clearSearch()
+				m.clearWaitState()
 				if disconnectFn != nil {
 					return m, func() tea.Msg {
 						_ = disconnectFn()
@@ -1291,6 +1599,7 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.statsSession++
 			m.statusSession++
 			m.updatesSession++
+			m.rollbackFetchSession++
 			m.statsRequested = true
 			m.refreshInFlight = true
 			// Reset updateInFlight before calling maybeRefreshUpdatesCmd: the
@@ -1316,6 +1625,13 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 					return m.enterExec()
 				}
 				containers := m.selectedContainers()
+				if m.pendingOp == runner.Rollback {
+					// Rollback uses the set captured at R-press, not the live
+					// selection (which the async fetch let drift). This keeps the
+					// pipeline/prep target identical to what was validated and shown
+					// in the confirm prompt.
+					containers = m.rollbackTargets
+				}
 				return m.enterProgress(containers)
 			case "esc":
 				m.confirming = false
@@ -1391,6 +1707,9 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 				m.statsSession++
 				m.statusSession++
 				m.updatesSession++
+				m.rollbackFetchSession++
+				m.rollbackSnapshot = nil
+				m.rollbackTargets = nil
 				m.refreshInFlight = false
 				m.updateInFlight = false
 				m.updatesErr = ""
@@ -1409,6 +1728,7 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 				// we reach here, but call clearSearch() unconditionally so the
 				// ephemeral-on-departure invariant holds regardless of entry path.
 				m.clearSearch()
+				m.clearWaitState()
 				if m.projects == nil {
 					return m, m.loadProjects()
 				}
@@ -1457,6 +1777,36 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 				m.warning = warnNoSelection
 			}
 			m.fixSvcOffset()
+		case "R":
+			// Roll the selected services back to the last-deployed digests. Needs
+			// the concrete-composer RollbackPreparer capability (ReadSnapshot +
+			// PrepareRollback); a mock/composer without it makes R a no-op (mirrors
+			// the c/x type-assert guards). Guards mirror the action keys: an empty
+			// list is ignored (like l/x), an empty selection warns (like r/d/s).
+			// A fresh async ReadSnapshot decides warning vs confirmation.
+			if _, ok := m.composer.(RollbackPreparer); !ok {
+				return m, nil
+			}
+			if len(m.services) == 0 {
+				return m, nil
+			}
+			if m.selectedCount() == 0 {
+				m.warning = warnNoSelection
+				m.fixSvcOffset()
+				return m, nil
+			}
+			// Capture the selected target set NOW, at press time. The snapshot
+			// fetch below is async, so the live multi-select can change or clear
+			// before rollbackSnapshotMsg lands; carrying the captured set through
+			// the whole flow (validation → confirm → prep → pipeline) prevents a
+			// since-cleared selection from becoming an all-service rollback
+			// (empty == all in the runner). Non-empty here (selectedCount guard).
+			m.rollbackTargets = m.selectedContainers()
+			// Bump the fetch session first (invalidating any prior in-flight R
+			// fetch) and capture it inside the Cmd for staleness rejection; the
+			// same session also guards the captured rollbackTargets.
+			m.rollbackFetchSession++
+			return m, m.fetchRollbackSnapshot()
 		case "n":
 			// Cycle to the next match (committed search only; no-op otherwise).
 			m.cycleMatch(true)
@@ -1681,6 +2031,7 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.statsSession++
 			m.statusSession++
 			m.updatesSession++
+			m.rollbackFetchSession++
 			m.statsRequested = true
 			m.refreshInFlight = true
 			// Reset updateInFlight before calling maybeRefreshUpdatesCmd: the
@@ -2029,6 +2380,15 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 				return m.tryQuit()
 			}
 		case "esc":
+			if m.waiting {
+				// Skip the health wait: stop polling and drop the (partial)
+				// verdicts, but leave the operation "done". clearWaitState bumps
+				// waitSession so any in-flight poll/tick is discarded. The user
+				// stays on the progress screen in the plain done state; a second
+				// esc falls through to the back-nav cleanup below.
+				m.clearWaitState()
+				return m, nil
+			}
 			if m.done || m.failed {
 				// Invalidate the update-availability cache for the current
 				// project/server on a SUCCESSFUL operation that may have
@@ -2046,7 +2406,7 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 				// BEFORE the m.done/m.failed reset below — otherwise
 				// reading m.done after clearing it would always evaluate
 				// false and the invalidation would never fire.
-				if m.done && (m.pendingOp == runner.Deploy || m.pendingOp == runner.Restart) {
+				if m.done && (m.pendingOp == runner.Deploy || m.pendingOp == runner.Restart || m.pendingOp == runner.Rollback) {
 					if m.updateCache != nil {
 						delete(m.updateCache, m.updatesCacheKey())
 					}
@@ -2059,9 +2419,25 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 				m.eventCh = nil
 				m.cancel = nil
 				m.logContent = ""
+				m.rollbackErr = ""
+				m.rollbackSnapshot = nil
+				m.rollbackTargets = nil
+				// Invoke the rollback prep cleanup (override-file removal +
+				// ExtraComposeFiles reset) NOW, on the main goroutine, AFTER the
+				// wait phase — never goroutine-deferred (see the rollback cleanup
+				// timing race rule: a concurrent reset would race the wait poll's
+				// ContainerStatus read of ExtraComposeFiles). No-op for non-
+				// rollback ops (cleanup is nil).
+				m.runRollbackCleanup()
+				// Clear any resolved-but-not-skipped wait verdicts as we leave
+				// the progress screen (esc-skip already cleared them on the
+				// prior press; this covers a natural resolution followed by a
+				// single esc). Bumps waitSession to invalidate stragglers.
+				m.clearWaitState()
 				m.statsSession++
 				m.statusSession++
 				m.updatesSession++
+				m.rollbackFetchSession++
 				m.statsRequested = true
 				m.refreshInFlight = true
 				// Reset updateInFlight before calling maybeRefreshUpdatesCmd:
@@ -2111,6 +2487,7 @@ func (m Model) handleStepEvent(event runner.StepEvent) (tea.Model, tea.Cmd) {
 func (m *Model) enterProgress(containers []string) (tea.Model, tea.Cmd) {
 	op := m.pendingOp
 	m.screen = screenProgress
+	m.rollbackErr = ""
 	// Leaving screenSelectContainers for an operation: search is ephemeral.
 	m.clearSearch()
 
@@ -2141,9 +2518,164 @@ func (m *Model) enterProgress(containers []string) (tea.Model, tea.Cmd) {
 		logW = io.Discard
 	}
 
-	go runner.Run(ctx, m.composer, op, containers, logW, events)
+	// Remember the target set so pipelineDoneMsg can seed the health-wait
+	// reducer without re-deriving it (Rollback in particular does not use the
+	// container-screen selection).
+	m.opContainers = containers
+
+	if op == runner.Rollback {
+		// Rollback prep (pull missing blobs, generate the override, set
+		// ExtraComposeFiles) MUST run before runner.Run. It runs off the UI
+		// thread as prepareRollbackCmd, which launches the pipeline goroutine
+		// ITSELF only after a successful prep. Do NOT return waitForEvent here:
+		// nothing writes to `events` until prep succeeds, so consuming events
+		// starts on the rollbackPreppedMsg success path instead.
+		return *m, tea.Batch(m.spinner.Tick, m.prepareRollbackCmd(ctx, containers, logW, events))
+	}
+
+	// For a Deploy, snapshot the currently-running image digests FIRST — inside
+	// the same goroutine, before runner.Run touches anything (pre-Stop ordering)
+	// — so `cdeploy rollback` / the TUI `R` key can restore them. Best-effort:
+	// warnings go to the op log writer and never block the pipeline. Composers
+	// without the capability (test mocks) skip it entirely. Values are captured
+	// into locals so the goroutine never races the returning *Model.
+	composer := m.composer
+	go func() {
+		if op == runner.Deploy {
+			if s, ok := composer.(Snapshotter); ok {
+				recordDeploySnapshot(ctx, s, containers, logW)
+			}
+		}
+		runner.Run(ctx, composer, op, containers, logW, events)
+	}()
 
 	return *m, tea.Batch(m.spinner.Tick, m.waitForEvent())
+}
+
+// fetchRollbackSnapshot returns a Cmd that reads the host-side deploy snapshot
+// and delivers it as a rollbackSnapshotMsg tagged with the current fetch
+// session. The read hits the disk (local) or SSH (remote), so it runs off the UI
+// thread. The `R` handler asserts RollbackPreparer before calling; the nil guard
+// here keeps the helper total for any future caller.
+func (m Model) fetchRollbackSnapshot() tea.Cmd {
+	p, ok := m.composer.(RollbackPreparer)
+	if !ok {
+		return nil
+	}
+	composer := m.composer
+	ctx := m.ctx
+	session := m.rollbackFetchSession
+	return func() tea.Msg {
+		snap, err := p.ReadSnapshot(ctx)
+		if err != nil {
+			return rollbackSnapshotMsg{err: err, session: session}
+		}
+		// No snapshot to restore — the handler shows the warning; skip the
+		// live-service fetch (nothing to intersect), matching the CLI ordering
+		// which refuses on a missing snapshot before calling ListServices.
+		if snap == nil || len(snap.Services) == 0 {
+			return rollbackSnapshotMsg{snap: snap, session: session}
+		}
+		// Fetch the CURRENT compose service set so the handler can drop any
+		// selected target that has since been removed from the compose file
+		// (mirrors the CLI filterLiveTargets — a stale snapshot entry must not
+		// resurrect a removed service as an image-only override). Runs in the same
+		// off-UI goroutine as ReadSnapshot; a ListServices failure fails closed via
+		// the shared err path (the handler shows "rollback unavailable: ...").
+		live, err := composer.ListServices(ctx)
+		if err != nil {
+			return rollbackSnapshotMsg{err: fmt.Errorf("listing current compose services: %w", err), session: session}
+		}
+		return rollbackSnapshotMsg{snap: snap, live: live, session: session}
+	}
+}
+
+// prepareRollbackCmd runs the rollback prep off the UI thread: it asserts the
+// RollbackPreparer capability, calls PrepareRollback with the fetched snapshot
+// entries (which sets ExtraComposeFiles), and — ONLY on success — launches the
+// Rollback pipeline goroutine. Reading ExtraComposeFiles in runner.Run is
+// race-free: the `go` statement happens-after PrepareRollback's write. The
+// returned rollbackPreppedMsg carries the cleanup (stored on the Model, invoked
+// on leaving screenProgress) or the prep error (op marked failed). ctx is the
+// cancelable pipeline context so an esc-cancel aborts an in-flight pull.
+func (m Model) prepareRollbackCmd(ctx context.Context, containers []string, logW io.Writer, events chan runner.StepEvent) tea.Cmd {
+	composer := m.composer
+	snap := m.rollbackSnapshot
+	return func() tea.Msg {
+		p, ok := composer.(RollbackPreparer)
+		if !ok {
+			return rollbackPreppedMsg{err: fmt.Errorf("rollback is not supported for this connection")}
+		}
+		var entries map[string]compose.SnapshotEntry
+		if snap != nil {
+			entries = snap.Services
+		}
+		cleanup, err := p.PrepareRollback(ctx, entries, containers, logW)
+		if err != nil {
+			return rollbackPreppedMsg{err: err}
+		}
+		go runner.Run(ctx, composer, runner.Rollback, containers, logW, events)
+		return rollbackPreppedMsg{cleanup: cleanup}
+	}
+}
+
+// rollbackAgeSuffix formats a compact " to snapshot (3h ago)" hint for the
+// rollback confirm prompt using the NEWEST recorded_at among the target services
+// (merge keeps per-service ages, so the newest is the most representative "last
+// deploy"). Returns "" when no snapshot/age is available so the prompt degrades
+// to the plain service list.
+func (m Model) rollbackAgeSuffix(targets []string) string {
+	if m.rollbackSnapshot == nil {
+		return ""
+	}
+	var newest time.Time
+	for _, svc := range targets {
+		entry, ok := m.rollbackSnapshot.Services[svc]
+		if !ok {
+			continue
+		}
+		if t, err := time.Parse(time.RFC3339, entry.RecordedAt); err == nil && t.After(newest) {
+			newest = t
+		}
+	}
+	if newest.IsZero() {
+		return ""
+	}
+	return " to snapshot (" + humanizeAge(time.Since(newest)) + ")"
+}
+
+// humanizeAge renders a duration as a compact relative age (e.g. "3h ago",
+// "2d ago", "moments ago") for the rollback confirm prompt.
+func humanizeAge(d time.Duration) string {
+	switch {
+	case d < time.Minute:
+		return "moments ago"
+	case d < time.Hour:
+		return fmt.Sprintf("%dm ago", int(d.Minutes()))
+	case d < 24*time.Hour:
+		return fmt.Sprintf("%dh ago", int(d.Hours()))
+	default:
+		return fmt.Sprintf("%dd ago", int(d.Hours()/24))
+	}
+}
+
+// recordDeploySnapshot captures the currently-running image digests for the
+// targeted services and merge-writes them to the host state file. Strictly
+// best-effort (mirrors cmd.recordSnapshot): a capture error, per-service
+// warnings, and a write failure are all surfaced to the op log writer without
+// ever aborting — a snapshot problem must never block the deploy that follows.
+func recordDeploySnapshot(ctx context.Context, s Snapshotter, services []string, warn io.Writer) {
+	res, err := s.SnapshotServices(ctx, services)
+	if err != nil {
+		fmt.Fprintf(warn, "Warning: rollback snapshot skipped: %v\n", err)
+		return
+	}
+	for _, msg := range res.Warnings {
+		fmt.Fprintf(warn, "Warning: rollback snapshot: %s\n", msg)
+	}
+	if err := s.WriteSnapshot(ctx, res.Snapshot); err != nil {
+		fmt.Fprintf(warn, "Warning: failed to write rollback snapshot: %v (deploy continues)\n", err)
+	}
 }
 
 // waitForEvent returns a Cmd that waits for the next StepEvent.
@@ -2155,6 +2687,106 @@ func (m Model) waitForEvent() tea.Cmd {
 			return pipelineDoneMsg{}
 		}
 		return stepEventMsg(event)
+	}
+}
+
+// pollWaitStatus returns a Cmd that fetches one ContainerStatus snapshot and
+// delivers it as a waitStatusMsg tagged with the current wait session. It has no
+// delay of its own — the poll cadence comes from waitTick between polls.
+//
+// Each poll is bounded by a context derived from m.waitDeadline (the same wall
+// clock the countdown uses), NOT the raw m.ctx: a HUNG Docker daemon or a stalled
+// SSH status call would otherwise never return a waitStatusMsg, so the reducer's
+// timeout sweep would never run and the progress screen would wait indefinitely.
+// With the deadline bound, a hung poll returns a deadline error at ~m.waitDeadline
+// and the waitStatusMsg error path (elapsed >= timeout → sweepWaitTimeout) resolves
+// the wait as timed out. This mirrors the CLI driver's wait-scoped context (C5/C7).
+func (m Model) pollWaitStatus() tea.Cmd {
+	ctx := m.ctx
+	deadline := m.waitDeadline
+	c := m.composer
+	session := m.waitSession
+	return func() tea.Msg {
+		pollCtx, cancel := context.WithDeadline(ctx, deadline)
+		defer cancel()
+		status, err := c.ContainerStatus(pollCtx)
+		return waitStatusMsg{status: status, err: err, session: session}
+	}
+}
+
+// waitTick returns a Cmd that fires a waitTickMsg after runner.DefaultWaitPoll,
+// spacing successive health polls. The session is captured so a tick outliving
+// its wait (esc-skip / departure bumped waitSession) is dropped by the handler.
+// Tests install waitTickOverride to avoid leaving a real timer goroutine behind.
+func (m Model) waitTick() tea.Cmd {
+	if m.waitTickOverride != nil {
+		return m.waitTickOverride()
+	}
+	session := m.waitSession
+	return tea.Tick(runner.DefaultWaitPoll, func(time.Time) tea.Msg {
+		return waitTickMsg{session: session}
+	})
+}
+
+// clearWaitState resets the health-wait sub-state and bumps waitSession so any
+// in-flight poll/tick is invalidated. Called at every departure site and on
+// esc-skip. Idempotent — safe to call when no wait is active (it just re-bumps
+// the session over already-zero fields).
+func (m *Model) clearWaitState() {
+	m.waiting = false
+	m.waitState = runner.WaitState{}
+	m.waitDeadline = time.Time{}
+	m.opContainers = nil
+	m.waitSession++
+}
+
+// waitElapsed returns the time since the wait began, derived from the deadline
+// and the fixed default timeout the TUI always uses (no --wait-timeout in the
+// TUI). Fed to EvaluateWait, which owns the grace and timeout rules.
+func (m Model) waitElapsed() time.Duration {
+	return runner.DefaultWaitTimeout - time.Until(m.waitDeadline)
+}
+
+// waitResolved reports whether a wait ran to completion (verdicts present but no
+// longer actively polling). Distinct from esc-skip, which clears waitState.
+func (m Model) waitResolved() bool {
+	return !m.waiting && len(m.waitState.Services) > 0
+}
+
+// waitFailed reports whether any targeted service holds a non-passing verdict.
+// At resolution no verdict is still pending (the timeout sweep converts pending
+// → timed out), so this is an accurate pass/fail signal once waitResolved().
+func (m Model) waitFailed() bool {
+	for _, svc := range m.waitState.Services {
+		if !m.waitState.Verdicts[svc].OK() {
+			return true
+		}
+	}
+	return false
+}
+
+// sweepWaitTimeout marks every still-pending service as timed out. Used on the
+// poll-error path once the deadline passes, so a persistent ContainerStatus
+// failure resolves the wait instead of hanging (EvaluateWait can't run without
+// a trustworthy status map).
+func (m *Model) sweepWaitTimeout() {
+	for _, svc := range m.waitState.Services {
+		if !m.waitState.Verdicts[svc].Terminal() {
+			m.waitState.Verdicts[svc] = runner.VerdictTimedOut
+		}
+	}
+}
+
+// waitVerdictStyle picks the lipgloss style for a verdict: green pass, yellow
+// pending, red fail.
+func waitVerdictStyle(v runner.WaitVerdict) lipgloss.Style {
+	switch {
+	case v.OK():
+		return waitPassStyle
+	case v == runner.VerdictPending:
+		return waitPendingStyle
+	default:
+		return waitFailStyle
 	}
 }
 
@@ -3206,7 +3838,7 @@ func (m Model) svcVisibleCount() int {
 			back = "q back"
 		}
 		line1 := fmt.Sprintf("  space toggle  •  a all  •  / search  •  %s", back)
-		line2 := "  r restart  •  d deploy  •  s stop  •  l logs  •  c config  •  x exec  •  U updates"
+		line2 := containerHelpLine2
 		if m.searching {
 			line2 = "  enter jump  •  esc cancel"
 		} else if m.searchQuery != "" {
@@ -3822,13 +4454,23 @@ func (m Model) viewSelectContainers() string {
 	// helpStyle MarginTop blank + confirm text) matches the non-confirming
 	// footer exactly.
 	if m.confirming {
-		if m.pendingExec {
+		switch {
+		case m.pendingExec:
 			service := m.services[m.svcCursor]
 			b.WriteString(helpStyle.Render(fmt.Sprintf(
 				"  Exec into %s?  enter confirm  •  esc cancel",
 				service,
 			)))
-		} else {
+		case m.pendingOp == runner.Rollback:
+			// Show the captured target set (what will actually roll back), not the
+			// live selection which the async fetch may have let drift.
+			containers := m.rollbackTargets
+			b.WriteString(helpStyle.Render(fmt.Sprintf(
+				"  Rollback %s%s?  enter confirm  •  esc cancel",
+				strings.Join(containers, ", "),
+				m.rollbackAgeSuffix(containers),
+			)))
+		default:
 			containers := m.selectedContainers()
 			b.WriteString(helpStyle.Render(fmt.Sprintf(
 				"  %s %s?  enter confirm  •  esc cancel",
@@ -3859,7 +4501,7 @@ func (m Model) viewSelectContainers() string {
 		back = "q back"
 	}
 	line1 := fmt.Sprintf("  space toggle  •  a all  •  / search  •  %s", back)
-	line2 := "  r restart  •  d deploy  •  s stop  •  l logs  •  c config  •  x exec  •  U updates"
+	line2 := containerHelpLine2
 	if m.searching {
 		line2 = "  enter jump  •  esc cancel"
 	} else if m.searchQuery != "" {
@@ -4171,9 +4813,61 @@ func (m Model) viewProgress() string {
 		b.WriteString(fmt.Sprintf("  %s %s\n", icon, label))
 	}
 
-	if m.done || m.failed {
+	// Rollback prep failure: shown when PrepareRollback aborted before any
+	// pipeline step ran (so no step carries the ✗). The op is marked failed, so
+	// the footer already reads "q back".
+	if m.rollbackErr != "" {
+		b.WriteString("\n")
+		b.WriteString(stepFailed.Render("  ✗ rollback prep failed: " + m.rollbackErr))
+		b.WriteString("\n")
+	}
+
+	// Health-wait sub-state: live per-service verdicts (while polling) or the
+	// final verdicts (after natural resolution). esc-skip clears waitState, so
+	// this block is silent once a wait has been skipped.
+	if m.waiting || m.waitResolved() {
+		b.WriteString("\n")
+		if m.waiting {
+			remaining := time.Until(m.waitDeadline).Round(time.Second)
+			if remaining < 0 {
+				remaining = 0
+			}
+			b.WriteString(waitPendingStyle.Render(fmt.Sprintf("  Waiting for health (%s remaining)", remaining)))
+		} else {
+			b.WriteString(descStyle.Render("  Health check:"))
+		}
+		b.WriteString("\n")
+
+		width := 0
+		for _, svc := range m.waitState.Services {
+			if len(svc) > width {
+				width = len(svc)
+			}
+		}
+		for _, svc := range m.waitState.Services {
+			v := m.waitState.Verdicts[svc]
+			label := string(v)
+			if v == runner.VerdictPending {
+				label = "pending"
+			}
+			style := waitVerdictStyle(v)
+			b.WriteString(fmt.Sprintf("  %s %-*s  %s\n", style.Render(v.Icon()), width, svc, style.Render(label)))
+		}
+
+		// Rollback hint on a failed deploy wait only (a restart/rollback failure
+		// has no earlier snapshot to fall back to).
+		if m.waitResolved() && m.waitFailed() && m.pendingOp == runner.Deploy {
+			b.WriteString(waitHintStyle.Render("  press R on the services screen to roll back"))
+			b.WriteString("\n")
+		}
+	}
+
+	switch {
+	case m.waiting:
+		b.WriteString(helpStyle.Render("\n  esc skip"))
+	case m.done || m.failed:
 		b.WriteString(helpStyle.Render("\n  q back"))
-	} else {
+	default:
 		b.WriteString(helpStyle.Render("\n  esc cancel"))
 	}
 
