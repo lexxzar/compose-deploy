@@ -502,12 +502,12 @@ while `CheckUpdates` was still a mandatory interface method.]**
 - Modify: `internal/compose/updates.go`
 - Modify: `internal/compose/updates_test.go`
 
-- [ ] extract the loop at `updates.go:373-423` into a package-level helper taking a compare function and explicit knobs for the daemon cascade and the registry cascade
-- [ ] extract `compareImageDigest` into a package-level form parameterised by a `dockerRunner`, and parameterise the error classification with it — the two runners emit different error shapes **[R2]**
-- [ ] reduce `Compose.CheckUpdates` to a delegation
-- [ ] verify every existing test in `updates_test.go` passes **unchanged** — this is the AC7 proof
-- [ ] write tests for the extracted helper (daemon cascade, registry cascade, partial success)
-- [ ] run tests - must pass before task 11
+- [x] extract the loop at `updates.go:373-423` into a package-level helper taking a compare function and explicit knobs for the daemon cascade and the registry cascade
+- [x] extract `compareImageDigest` into a package-level form parameterised by a `dockerRunner`, and parameterise the error classification with it — the two runners emit different error shapes **[R2]**
+- [x] reduce `Compose.CheckUpdates` to a delegation
+- [x] verify every existing test in `updates_test.go` passes **unchanged** — this is the AC7 proof
+- [x] write tests for the extracted helper (daemon cascade, registry cascade, partial success)
+- [x] run tests - must pass before task 11
 
 ### Task 11: Extract the remote `CheckUpdates` loop
 

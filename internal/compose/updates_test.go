@@ -2,6 +2,7 @@ package compose
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -880,5 +881,219 @@ func TestParseImagetoolsDigest_RealFixture(t *testing.T) {
 	want := "sha256:0e760fdfbc48ba8041e7c6db999bb40bfca508b4be580ac75d32c4e29d202ce1"
 	if got != want {
 		t.Errorf("parseImagetoolsDigest(fixture) = %q, want %q", got, want)
+	}
+}
+
+// scanOutcome is one canned imageComparer answer.
+type scanOutcome struct {
+	updated bool
+	ok      bool
+	err     error
+}
+
+// scanFunc builds an imageComparer from a per-image table. A missing entry is
+// a programming error in the test, not a silent absent verdict.
+func scanFunc(t *testing.T, table map[string]scanOutcome) imageComparer {
+	t.Helper()
+	return func(_ context.Context, image string) (bool, bool, error) {
+		e, found := table[image]
+		if !found {
+			t.Fatalf("comparer called with unexpected image %q", image)
+		}
+		return e.updated, e.ok, e.err
+	}
+}
+
+func TestScanImageUpdates_PartialSuccess(t *testing.T) {
+	wanted := map[string]string{
+		"web":   "nginx:latest",
+		"db":    "postgres:16",
+		"cache": "redis:7",
+		"queue": "rabbitmq:3",
+	}
+	compare := scanFunc(t, map[string]scanOutcome{
+		"nginx:latest": {updated: true, ok: true},
+		"postgres:16":  {ok: true},
+		// A network-shaped failure and a daemon-shaped one, both absorbed
+		// as absent because at least one service got a verdict.
+		"redis:7":    {err: fmt.Errorf("dial tcp: connection refused")},
+		"rabbitmq:3": {err: fmt.Errorf("%w: cannot connect to the docker daemon", errLocalImageInspect)},
+	})
+	got, err := scanImageUpdates(context.Background(), wanted, compare, updateCascades{registry: true, daemon: true})
+	if err != nil {
+		t.Fatalf("scanImageUpdates: %v", err)
+	}
+	want := map[string]bool{"web": true, "db": false}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("results = %#v, want %#v", got, want)
+	}
+}
+
+func TestScanImageUpdates_OkFalseStaysAbsent(t *testing.T) {
+	wanted := map[string]string{"web": "nginx:latest"}
+	compare := scanFunc(t, map[string]scanOutcome{"nginx:latest": {updated: true}})
+	got, err := scanImageUpdates(context.Background(), wanted, compare, updateCascades{registry: true, daemon: true})
+	if err != nil {
+		t.Fatalf("scanImageUpdates: %v", err)
+	}
+	if len(got) != 0 {
+		t.Fatalf("results = %#v, want empty (ok=false is not a verdict)", got)
+	}
+}
+
+func TestScanImageUpdates_DaemonCascade(t *testing.T) {
+	wanted := map[string]string{"web": "nginx:latest", "db": "postgres:16"}
+	compare := scanFunc(t, map[string]scanOutcome{
+		"nginx:latest": {err: fmt.Errorf("%w: cannot connect to the docker daemon", errLocalImageInspect)},
+		"postgres:16":  {err: fmt.Errorf("%w: is the docker daemon running?", errLocalImageInspect)},
+	})
+
+	_, err := scanImageUpdates(context.Background(), wanted, compare, updateCascades{registry: true, daemon: true})
+	if err == nil || !strings.Contains(err.Error(), "local docker unavailable") {
+		t.Fatalf("err = %v, want local docker unavailable", err)
+	}
+
+	// The remote path leaves the daemon knob off, and the zero value must
+	// keep it that way: the same failures become plain absent verdicts.
+	got, err := scanImageUpdates(context.Background(), wanted, compare, updateCascades{registry: true})
+	if err != nil {
+		t.Fatalf("daemon cascade fired with the knob off: %v", err)
+	}
+	if len(got) != 0 {
+		t.Fatalf("results = %#v, want empty", got)
+	}
+}
+
+func TestScanImageUpdates_DaemonCascadeNeedsEveryFailureDaemonShaped(t *testing.T) {
+	wanted := map[string]string{"web": "nginx:latest", "db": "postgres:16"}
+	compare := scanFunc(t, map[string]scanOutcome{
+		"nginx:latest": {err: fmt.Errorf("%w: cannot connect to the docker daemon", errLocalImageInspect)},
+		// A benign per-image failure — the fresh-deploy case.
+		"postgres:16": {err: fmt.Errorf("%w: No such image: postgres:16", errLocalImageInspect)},
+	})
+	got, err := scanImageUpdates(context.Background(), wanted, compare, updateCascades{registry: true, daemon: true})
+	if err != nil {
+		t.Fatalf("cascade fired on a mixed failure set: %v", err)
+	}
+	if len(got) != 0 {
+		t.Fatalf("results = %#v, want empty", got)
+	}
+}
+
+func TestScanImageUpdates_RegistryCascade(t *testing.T) {
+	wanted := map[string]string{"web": "nginx:latest", "db": "postgres:16"}
+	compare := scanFunc(t, map[string]scanOutcome{
+		"nginx:latest": {err: fmt.Errorf("dial tcp 1.2.3.4:443: connect: connection refused")},
+		"postgres:16":  {err: fmt.Errorf("lookup registry-1.docker.io: no such host")},
+	})
+
+	_, err := scanImageUpdates(context.Background(), wanted, compare, updateCascades{registry: true, daemon: true})
+	if err == nil || !strings.Contains(err.Error(), "registry unreachable") {
+		t.Fatalf("err = %v, want registry unreachable", err)
+	}
+
+	got, err := scanImageUpdates(context.Background(), wanted, compare, updateCascades{})
+	if err != nil {
+		t.Fatalf("registry cascade fired with the knob off: %v", err)
+	}
+	if len(got) != 0 {
+		t.Fatalf("results = %#v, want empty", got)
+	}
+}
+
+func TestScanImageUpdates_NoCascadeWhenAnyVerdict(t *testing.T) {
+	wanted := map[string]string{"web": "nginx:latest", "db": "postgres:16"}
+	compare := scanFunc(t, map[string]scanOutcome{
+		"nginx:latest": {updated: true, ok: true},
+		"postgres:16":  {err: fmt.Errorf("dial tcp: connection refused")},
+	})
+	got, err := scanImageUpdates(context.Background(), wanted, compare, updateCascades{registry: true, daemon: true})
+	if err != nil {
+		t.Fatalf("cascade fired while a verdict existed: %v", err)
+	}
+	if !reflect.DeepEqual(got, map[string]bool{"web": true}) {
+		t.Fatalf("results = %#v, want {web:true}", got)
+	}
+}
+
+func TestScanImageUpdates_EmptySetNeverCascades(t *testing.T) {
+	got, err := scanImageUpdates(context.Background(), nil, scanFunc(t, nil), updateCascades{registry: true, daemon: true})
+	if err != nil {
+		t.Fatalf("scanImageUpdates: %v", err)
+	}
+	if len(got) != 0 {
+		t.Fatalf("results = %#v, want empty", got)
+	}
+}
+
+func TestCompareImageDigestVia_LocalErrWrapKnob(t *testing.T) {
+	boom := errors.New("cannot connect to the docker daemon")
+	f := &fakeDockerRunner{runErr: boom}
+
+	_, _, err := compareImageDigestVia(context.Background(), f, "nginx:latest", wrapLocalImageInspectErr)
+	if !errors.Is(err, errLocalImageInspect) {
+		t.Fatalf("err = %v, want errLocalImageInspect", err)
+	}
+	if !errors.Is(err, boom) {
+		t.Fatalf("err = %v, want the cause preserved", err)
+	}
+
+	// The remote binding passes nil: the error reaches the loop unwrapped,
+	// so it feeds the registry counters instead of the daemon ones.
+	_, _, err = compareImageDigestVia(context.Background(), f, "nginx:latest", nil)
+	if errors.Is(err, errLocalImageInspect) {
+		t.Fatalf("err = %v, want no sentinel with a nil wrapper", err)
+	}
+	if !errors.Is(err, boom) {
+		t.Fatalf("err = %v, want the raw cause", err)
+	}
+}
+
+func TestCompareImageDigestVia_VerdictThroughSeam(t *testing.T) {
+	f := &fakeDockerRunner{runFunc: func(args []string) ([]byte, error) {
+		switch {
+		case args[0] == "image":
+			return []byte("nginx@sha256:local\n"), nil
+		case args[0] == "buildx":
+			return []byte("Name:      docker.io/library/nginx:latest\nDigest:    sha256:0000000000000000000000000000000000000000000000000000000000000001\n"), nil
+		}
+		return nil, fmt.Errorf("unexpected argv: %v", args)
+	}}
+	updated, ok, err := compareImageDigestVia(context.Background(), f, "nginx:latest", wrapLocalImageInspectErr)
+	if err != nil || !ok || !updated {
+		t.Fatalf("compareImageDigestVia = (%v, %v, %v), want (true, true, nil)", updated, ok, err)
+	}
+	if len(f.runCalls) != 2 {
+		t.Fatalf("run calls = %d (%v), want 2 — imagetools must satisfy the fetch", len(f.runCalls), f.runCalls)
+	}
+}
+
+func TestFetchRemoteDigestVia_FallsBackToManifest(t *testing.T) {
+	f := &fakeDockerRunner{runFunc: func(args []string) ([]byte, error) {
+		if args[0] == "buildx" {
+			return nil, errors.New("unknown command: docker buildx")
+		}
+		return []byte(`{"Descriptor":{"digest":"sha256:fallback"}}`), nil
+	}}
+	dg, ok, err := fetchRemoteDigestVia(context.Background(), f, "nginx:latest")
+	if err != nil || !ok || dg != "sha256:fallback" {
+		t.Fatalf("fetchRemoteDigestVia = (%q, %v, %v), want the manifest fallback digest", dg, ok, err)
+	}
+	if len(f.runCalls) != 2 {
+		t.Fatalf("run calls = %d (%v), want 2", len(f.runCalls), f.runCalls)
+	}
+}
+
+func TestFetchRemoteDigestVia_TransportErrorSkipsFallback(t *testing.T) {
+	f := &fakeDockerRunner{runErr: fmt.Errorf("%w: ssh: connect to host db1 port 22: no route", errSSHTransport)}
+	_, ok, err := fetchRemoteDigestVia(context.Background(), f, "nginx:latest")
+	if ok {
+		t.Fatal("ok = true, want false on a transport failure")
+	}
+	if !errors.Is(err, errSSHTransport) {
+		t.Fatalf("err = %v, want errSSHTransport preserved for the batch abort", err)
+	}
+	if len(f.runCalls) != 1 {
+		t.Fatalf("run calls = %d (%v), want 1 — a dead hop must not be retried", len(f.runCalls), f.runCalls)
 	}
 }
