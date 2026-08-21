@@ -346,17 +346,17 @@ ten methods exist. `CheckUpdates` is a `(nil, nil)` stub here so the type is usa
 - Modify: `internal/compose/hostcontainers.go`
 - Modify: `internal/compose/hostcontainers_test.go`
 
-- [ ] declare `dockerRunner` with `run` / `stream` / `tty`, plus `ErrReadOnly` and `HostContainers`
-- [ ] add the unexported `localDockerRunner` (over `*Compose`) and `remoteDockerRunner` (over `*RemoteCompose`) adapters, reusing `runDockerCmd`, `runDockerCmdStream`, `runRemoteDockerCmd`, `runRemoteDockerCmdStream` and `sshArgs`
-- [ ] add exported `NewLocalHostContainers` and `NewRemoteHostContainers` constructors
-- [ ] implement `Stop`, `Remove`, `Pull`, `Create`, `Start` as `return ErrReadOnly`
-- [ ] add `CheckUpdates` as a `(nil, nil)` stub with a TODO naming task 12
-- [ ] implement `ListServices` — unmanaged container names, sorted
-- [ ] implement `ContainerStatus` using the task 1 helpers plus existing `parseCreatedAt`, `formatUptime`, `parsePortsString`
-- [ ] write tests for `ListServices` and `ContainerStatus` via an injected fake `dockerRunner`
-- [ ] write tests asserting all five write methods return `ErrReadOnly`
-- [ ] write a test asserting the remote runner splices `SSHExtraArgs` immediately before the host argument
-- [ ] run tests - must pass before task 3
+- [x] declare `dockerRunner` with `run` / `stream` / `tty`, plus `ErrReadOnly` and `HostContainers`
+- [x] add the unexported `localDockerRunner` (over `*Compose`) and `remoteDockerRunner` (over `*RemoteCompose`) adapters, reusing `runDockerCmd`, `runDockerCmdStream`, `runRemoteDockerCmd`, `runRemoteDockerCmdStream` and `sshArgs`
+- [x] add exported `NewLocalHostContainers` and `NewRemoteHostContainers` constructors
+- [x] implement `Stop`, `Remove`, `Pull`, `Create`, `Start` as `return ErrReadOnly`
+- [x] add `CheckUpdates` as a `(nil, nil)` stub with a TODO naming task 12
+- [x] implement `ListServices` — unmanaged container names, sorted
+- [x] implement `ContainerStatus` using the task 1 helpers plus existing `parseCreatedAt`, `formatUptime`, `parsePortsString`
+- [x] write tests for `ListServices` and `ContainerStatus` via an injected fake `dockerRunner`
+- [x] write tests asserting all five write methods return `ErrReadOnly`
+- [x] write a test asserting the remote runner splices `SSHExtraArgs` immediately before the host argument
+- [x] run tests - must pass before task 3
 
 ### Task 3: Implement `ContainerStats` through the seam
 

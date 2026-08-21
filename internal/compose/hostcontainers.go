@@ -1,10 +1,17 @@
 package compose
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
+	"os/exec"
 	"regexp"
+	"sort"
 	"strings"
+
+	"github.com/lexxzar/compose-deploy/internal/runner"
 )
 
 // hostPsEntry matches `docker ps --format '{{json .}}'` — NOT psEntry, which matches
@@ -108,4 +115,183 @@ func hostContainerName(names string) string {
 		names = names[:i]
 	}
 	return strings.TrimSpace(names)
+}
+
+// ErrReadOnly is returned by the five runner.Composer write methods on
+// HostContainers. A container with no compose project has no compose file, so
+// stop/rm/pull/create/start cannot be expressed as a compose verb. The TUI
+// gates every key that would reach these methods, so the sentinel is a
+// backstop rather than a user-facing path.
+var ErrReadOnly = errors.New("read-only: container is not managed by docker compose")
+
+// dockerRunner is the ONLY local/remote variation point of HostContainers.
+// It needs three methods rather than one *exec.Cmd builder because the three
+// call shapes are mutually exclusive: run CAPTURES output and classifies the
+// error, stream writes to an io.Writer and must NOT allocate a TTY, and tty
+// must (the remote form splices -t, matching RemoteCompose.ExecCommand).
+type dockerRunner interface {
+	run(ctx context.Context, args ...string) ([]byte, error)
+	stream(ctx context.Context, w io.Writer, args ...string) error
+	tty(ctx context.Context, args ...string) (*exec.Cmd, error)
+}
+
+// HostContainers is a read-only runner.Composer over the containers on a docker
+// host that carry no com.docker.compose.project label. Local and remote differ
+// only in the dockerRunner seam, so the remote form inherits runRemoteDockerCmd's
+// SSH transport classification and stderr capture for free.
+type HostContainers struct {
+	docker dockerRunner
+}
+
+// localDockerRunner adapts *Compose. run and stream reuse the existing
+// top-level docker primitives (which already bypass command(), since
+// `docker ps` is not a compose subcommand); tty builds the argv directly,
+// mirroring Compose.ExecCommand's "return the cmd, let the caller run it".
+type localDockerRunner struct{ c *Compose }
+
+func (l localDockerRunner) run(ctx context.Context, args ...string) ([]byte, error) {
+	return l.c.runDockerCmd(ctx, args)
+}
+
+func (l localDockerRunner) stream(ctx context.Context, w io.Writer, args ...string) error {
+	return l.c.runDockerCmdStream(ctx, args, w)
+}
+
+func (l localDockerRunner) tty(ctx context.Context, args ...string) (*exec.Cmd, error) {
+	return exec.CommandContext(ctx, "docker", args...), nil
+}
+
+// remoteDockerRunner adapts *RemoteCompose. Every form goes through sshArgs()
+// so SSHExtraArgs land immediately before the host argument.
+type remoteDockerRunner struct{ r *RemoteCompose }
+
+func (rd remoteDockerRunner) run(ctx context.Context, args ...string) ([]byte, error) {
+	return rd.r.runRemoteDockerCmd(ctx, args)
+}
+
+func (rd remoteDockerRunner) stream(ctx context.Context, w io.Writer, args ...string) error {
+	return rd.r.runRemoteDockerCmdStream(ctx, args, w)
+}
+
+func (rd remoteDockerRunner) tty(ctx context.Context, args ...string) (*exec.Cmd, error) {
+	escaped := make([]string, 0, len(args)+1)
+	escaped = append(escaped, "docker")
+	for _, a := range args {
+		escaped = append(escaped, shellEscape(a))
+	}
+	sshArgv := rd.r.sshArgs(
+		[]string{"-t", "-S", rd.r.SocketPath, "-o", "ControlMaster=no"},
+		strings.Join(escaped, " "),
+	)
+	return exec.CommandContext(ctx, "ssh", sshArgv...), nil
+}
+
+// NewLocalHostContainers returns a HostContainers reading the local docker host.
+func NewLocalHostContainers(c *Compose) *HostContainers {
+	return &HostContainers{docker: localDockerRunner{c: c}}
+}
+
+// NewRemoteHostContainers returns a HostContainers reading the remote docker
+// host over the existing ControlMaster socket.
+func NewRemoteHostContainers(r *RemoteCompose) *HostContainers {
+	return &HostContainers{docker: remoteDockerRunner{r: r}}
+}
+
+func (h *HostContainers) Stop(ctx context.Context, containers []string, w io.Writer) error {
+	return ErrReadOnly
+}
+
+func (h *HostContainers) Remove(ctx context.Context, containers []string, w io.Writer) error {
+	return ErrReadOnly
+}
+
+func (h *HostContainers) Pull(ctx context.Context, containers []string, w io.Writer) error {
+	return ErrReadOnly
+}
+
+func (h *HostContainers) Create(ctx context.Context, containers []string, w io.Writer) error {
+	return ErrReadOnly
+}
+
+func (h *HostContainers) Start(ctx context.Context, containers []string, w io.Writer) error {
+	return ErrReadOnly
+}
+
+// CheckUpdates is a stub: it returns no verdicts, which the tri-state contract
+// reads as "unknown" for every container, so the ⇧ column stays blank.
+// TODO(task 12): source the name-to-image map from the Image field already
+// returned by docker ps and reuse the extracted digest-compare loop.
+func (h *HostContainers) CheckUpdates(ctx context.Context, services []string) (map[string]bool, error) {
+	return nil, nil
+}
+
+// hostPsArgs is the discovery argv. The `{{json .}}` template form is used
+// rather than the bare `json` keyword, which only exists on Docker CLI >= 23.0;
+// this repo deliberately supports legacy hosts via Detect(), and the template
+// produces identical output on every CLI version.
+var hostPsArgs = []string{"ps", "-a", "--format", "{{json .}}"}
+
+// unmanagedEntries lists the host containers that carry no compose project
+// label. Entries whose first name is empty are dropped — an unnamed row could
+// not be addressed by any of the read methods.
+func (h *HostContainers) unmanagedEntries(ctx context.Context) ([]hostPsEntry, error) {
+	out, err := h.docker.run(ctx, hostPsArgs...)
+	if err != nil {
+		return nil, fmt.Errorf("listing host containers: %w", err)
+	}
+	entries, err := parseHostContainers(out)
+	if err != nil {
+		return nil, err
+	}
+	unmanaged := make([]hostPsEntry, 0, len(entries))
+	for _, e := range entries {
+		if isComposeManaged(e.Labels) || hostContainerName(e.Names) == "" {
+			continue
+		}
+		unmanaged = append(unmanaged, e)
+	}
+	return unmanaged, nil
+}
+
+// ListServices returns the names of the unmanaged containers, sorted.
+func (h *HostContainers) ListServices(ctx context.Context) ([]string, error) {
+	entries, err := h.unmanagedEntries(ctx)
+	if err != nil {
+		return nil, err
+	}
+	names := make([]string, 0, len(entries))
+	for _, e := range entries {
+		names = append(names, hostContainerName(e.Names))
+	}
+	sort.Strings(names)
+	return names, nil
+}
+
+// ContainerStatus maps each unmanaged container name to its status. There is no
+// replica aggregation here — a host container is its own row — so the fields map
+// one-to-one from the ps entry.
+func (h *HostContainers) ContainerStatus(ctx context.Context) (map[string]runner.ServiceStatus, error) {
+	entries, err := h.unmanagedEntries(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if len(entries) == 0 {
+		return nil, nil
+	}
+	status := make(map[string]runner.ServiceStatus, len(entries))
+	for _, e := range entries {
+		st := runner.ServiceStatus{
+			Running: e.State == "running",
+			Health:  parseHealthFromStatus(e.Status),
+			Uptime:  formatUptime(e.Status),
+		}
+		if t, ok := parseCreatedAt(e.CreatedAt); ok {
+			st.Created = t.Format("2006-01-02 15:04")
+		}
+		if e.Ports != "" {
+			st.Ports = dedupAndSortPorts(parsePortsString(e.Ports))
+		}
+		status[hostContainerName(e.Names)] = st
+	}
+	return status, nil
 }
