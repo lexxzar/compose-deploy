@@ -48,20 +48,6 @@ const updatesCacheTTL = 10 * time.Minute
 // session resets and U keypress just like success entries.
 const updatesErrorTTL = 30 * time.Second
 
-// containerHelpLines builds the container screen's two-line help footer.
-// Shared by viewSelectContainers (rendering) and svcVisibleCount (footer-height
-// math) so the two can never drift on width — a divergence would miscount
-// visible rows and let the list overflow the terminal.
-//
-// line1 carries everything that must ALWAYS stay visible. Both call sites
-// replace line2 wholesale while a search is open or committed, so `back` and
-// `? keys` would vanish in exactly the state where the overlay matters most.
-// The full key reference lives in the `?` overlay (help.go).
-func containerHelpLines(back string) (line1, line2 string) {
-	return fmt.Sprintf("  space toggle  •  %s  •  ? keys", back),
-		"  d deploy  •  r restart  •  l logs"
-}
-
 // ConfigProvider provides access to docker-compose configuration files.
 // Defined in the tui package (not runner) because it returns *exec.Cmd and
 // is TUI-only. Both Compose and RemoteCompose implement it.
@@ -1000,6 +986,13 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		})
 
 	case connectResultMsg:
+		// Close the overlay on both branches. Neither is reachable with it open
+		// today (the connect runs through tea.ExecProcess, which suspends key
+		// input, and the overlay swallows the enter that starts a connect), but
+		// the success branch reassigns m.screen and an overlay left open across
+		// that would silently swap its key table. Departure-site cleanup here is
+		// uniform with quitting / clearSearch / clearWaitState below.
+		m.helpOpen = false
 		if msg.err != nil {
 			m.serverErr = msg.err
 			m.composerFactory = m.localFactory
@@ -1007,10 +1000,6 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.projectsSession++
 			m.disconnectFunc = nil
 			m.quitting = false
-			// This is one of only two non-key-driven m.screen assignments. An
-			// overlay open here would silently switch its key table to the new
-			// screen, so close it alongside the quit prompt.
-			m.helpOpen = false
 			// Clear ALL transient state from the failed connect attempt: name,
 			// host, color, and update-detection flags. Without these, a
 			// subsequent connect attempt to a different server would inherit
@@ -1330,6 +1319,12 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.rollbackSnapshot = msg.snap
 		m.pendingOp = runner.Rollback
 		m.confirming = true
+		// This is the one confirmation armed by a message rather than a key, so
+		// the `?` open gate cannot have seen it. Close the overlay here instead:
+		// otherwise a user who presses R and then ? before the fetch lands gets
+		// the overlay drawn over a live rollback prompt, and the single esc that
+		// closes it would leave the prompt armed underneath.
+		m.helpOpen = false
 		m.fixSvcOffset()
 		return m, nil
 
@@ -1397,6 +1392,41 @@ func (m *Model) runRollbackCleanup() {
 	}
 }
 
+// confirmPromptArmed reports whether a destructive confirmation prompt is
+// drawn on the CURRENT screen, so the `?` intercept can refuse to cover it.
+//
+// The scoping is load-bearing, not tidiness: `confirming` is armed on the
+// container screen and enterProgress does not clear it (only the esc back-nav
+// out of screenProgress does), so an unscoped `!m.confirming` gate would keep
+// the overlay shut for the entire life of the progress screen.
+func (m Model) confirmPromptArmed() bool {
+	switch m.screen {
+	case screenSelectContainers:
+		return m.confirming
+	case screenSettingsList:
+		return m.settingsDelete
+	}
+	return false
+}
+
+// typingInInput reports whether an open text input is capturing raw runes on
+// the current screen. Two callers share it: the `?` intercept skips those
+// screens so `?` — a regex metacharacter the log filter accepts in RE2 mode —
+// lands in the input, and the q->esc rewrite skips them so server names like
+// "qa-prod" stay typeable. A new screen that opens a text input needs one
+// case here and nothing else.
+func (m Model) typingInInput() bool {
+	switch m.screen {
+	case screenSelectContainers:
+		return m.searching
+	case screenLogs:
+		return m.logFiltering || m.logSearching
+	case screenSettingsForm:
+		return m.settingsField < 4 // 0-3 are textinputs; 4 is the color picker
+	}
+	return false
+}
+
 func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	key := msg.String()
 
@@ -1441,36 +1471,35 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	// Open the overlay. Skipped while a text input is capturing runes (`?` is
 	// a regex metacharacter) and while a destructive confirmation is armed —
 	// the overlay would hide the prompt, and the single esc that closes the
-	// overlay would leave it armed underneath.
-	if key == "?" && !m.typingInInput() && !m.confirming && !m.settingsDelete {
+	// overlay would leave it armed underneath (confirmPromptArmed is
+	// screen-scoped for a reason — see its doc).
+	if key == "?" && !m.typingInInput() && !m.confirmPromptArmed() {
 		m.helpOpen = true
 		return m, nil
 	}
 
 	// q acts as a back key inside the app. It quits only when there is
 	// no parent screen to navigate to (server-select, or the project /
-	// containers screens when standalone). On the settings form, q falls
-	// through to the focused textinput so server names like "qa-prod" are
-	// typeable — except when the color picker (field 4) is focused, where
-	// q acts as back. screenProgress while running is also excluded so q
-	// cannot cancel an in-flight operation.
-	if key == "q" {
+	// containers screens when standalone). The typingInInput() guard skips
+	// the whole rewrite while a text input is open — the container search
+	// bar, the log filter/search bars, and the settings-form text fields —
+	// so q reaches the input as a literal character (server names like
+	// "qa-prod"). screenProgress while running is also excluded so q cannot
+	// cancel an in-flight operation.
+	if key == "q" && !m.typingInInput() {
 		switch m.screen {
 		case screenSelectServer:
 			return m, tea.Quit
 		case screenSelectProject:
-			if len(m.servers) == 0 && m.config == nil {
+			if !m.canGoBack() {
 				return m, tea.Quit
 			}
 			key = "esc"
 		case screenSelectContainers:
-			if m.searching {
-				// Search bar is capturing text — q is a literal character
-				// that must reach the searchInput (mirrors the settings-form
-				// field-4 textinput exception above). Leave key untouched.
-				break
-			}
-			if !m.showPicker && !m.confirming {
+			// The extra !m.confirming term has no canGoBack analogue: an armed
+			// prompt takes q as "cancel" (the esc handler clears it) even on the
+			// standalone screen, where q would otherwise quit.
+			if !m.canGoBack() && !m.confirming {
 				return m, tea.Quit
 			}
 			key = "esc"
@@ -1479,20 +1508,6 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 				return m, nil
 			}
 			key = "esc"
-		case screenLogs:
-			if m.logFiltering || m.logSearching {
-				// A filter or search bar is capturing text — q is a literal
-				// character that must reach the open input (mirrors the
-				// container-search and settings-form field-4 exceptions above).
-				// Leave key untouched so it falls through to the typing intercept.
-				break
-			}
-			key = "esc"
-		case screenSettingsForm:
-			if m.settingsField == 4 {
-				key = "esc"
-			}
-			// else fall through — textinput consumes it
 		default:
 			key = "esc"
 		}
@@ -3845,7 +3860,8 @@ func (m Model) hasStatusColumns() bool {
 // svcVisibleCount returns the number of services that fit in the terminal.
 // Header: breadcrumb + titleStyle MarginBottom blank + gap/indicator = 3 lines,
 // plus 1 more when column captions are shown.
-// Footer varies by state: confirming = 3; normal = 3 (one-line help) or 4 (two-line help).
+// Footer: 3 lines with a one-line help text, 4 when it wraps to two — the same
+// count in every search state and while confirming (containerFooter decides it).
 // Warning adds 1 extra line; an active stats/updates soft-warning adds 1 more.
 // When m.height is 0 (no WindowSizeMsg received), returns len(m.services) for backward compat.
 func (m Model) svcVisibleCount() int {
@@ -3870,33 +3886,26 @@ func (m Model) svcVisibleCount() int {
 	// merged bar+margin line, and the help text). Counting the bar separately
 	// over-reserved one row versus the pre-search baseline and left a blank line
 	// of slack at the bottom of the terminal. The list height stays constant
-	// across search-idle / searching / committed / confirming because the merged
-	// bar+margin line is present in every state (blank while confirming, with the
-	// confirm prompt taking the footer-text slot).
+	// across search-idle / searching / committed / confirming for two reasons:
+	// the merged bar+margin line is present in every state (blank while
+	// confirming, with the confirm prompt taking the footer-text slot), and the
+	// footer-text slot itself is always containerFooterLines() — which is
+	// derived from the idle footer alone and padded out in the other states.
 	var footerLines int
 	if m.confirming {
-		footerLines = 3
+		// gap-or-indicator (1) + helpStyle MarginTop space-line (1) + the confirm
+		// prompt, padded by the renderer to the same line count the help footer
+		// would occupy at this width. Reading that count from
+		// containerFooterLines() keeps the confirm state the same height as the
+		// idle one: hard-coding 3 here shows one row MORE than idle at every
+		// width where the footer wraps.
+		footerLines = 2 + m.containerFooterLines()
 	} else {
-		// Compute whether help fits on one line (same logic as viewSelectContainers)
-		back := "q quit"
-		if m.showPicker {
-			back = "q back"
-		}
-		line1, line2 := containerHelpLines(back)
-		if m.searching {
-			line2 = "  enter jump  •  esc cancel"
-		} else if m.searchQuery != "" {
-			line2 = "  n/N cycle  •  esc clear"
-		}
-		oneLine := line1 + "  •  " + line2[2:]
-		// ansi.StringWidth, not len: each • is 3 bytes but one display cell, so
-		// len() over-counts by 2 per separator and splits a footer that fits.
-		if m.width >= ansi.StringWidth(oneLine)+2 {
-			footerLines = 3
-		} else {
-			// two-line help adds one more = 4.
-			footerLines = 4
-		}
+		// gap-or-indicator (1) + helpStyle MarginTop space-line (1) + the help
+		// text itself (1 when it fits on one line, 2 when it wraps). The count
+		// comes from containerFooterLines(), which containerFooter() also pads
+		// every state out to, so the reservation always matches what is drawn.
+		footerLines = 2 + m.containerFooterLines()
 		if m.warning != "" {
 			footerLines++ // warning line
 		}
@@ -4228,6 +4237,83 @@ func healthIndicator(health string) string {
 	}
 }
 
+// canGoBack reports whether esc — and the q that rewrites to it — has a parent
+// screen to navigate to. It is false on the root screens a standalone run can
+// land on, where q QUITS and esc does nothing. The container footer's back
+// label and the `?` overlay's LEAVE group both read this one predicate, so
+// they cannot contradict each other on the same screen.
+func (m Model) canGoBack() bool {
+	switch m.screen {
+	case screenSelectServer:
+		return false
+	case screenSelectProject:
+		return len(m.servers) > 0 || m.config != nil
+	case screenSelectContainers:
+		return m.showPicker
+	}
+	return true
+}
+
+// containerHelpLines returns the IDLE container footer, the pair every other
+// footer state is measured against.
+func (m Model) containerHelpLines() (line1, line2 string) {
+	back := "q quit"
+	if m.canGoBack() {
+		back = "q back"
+	}
+	return fmt.Sprintf("  space toggle  •  %s  •  ? keys", back),
+		"  d deploy  •  r restart  •  l logs"
+}
+
+// containerFooterLines reports how many physical lines the container footer
+// occupies. It is decided from the IDLE footer alone, before any search-state
+// substitution, and containerFooter pads the other states out to it:
+// svcVisibleCount reserves rows from this count, so a footer that shrank while
+// the search bar was open would grow the service list by one row and re-flow it
+// under the cursor. Idle is the widest of the three variants.
+//
+// line2[2:] strips its leading indent so the two halves join with a single
+// separator. ansi.StringWidth, not len: each • is 3 bytes but one display cell,
+// so len() over-counts by 2 per separator and splits a footer that fits.
+func (m Model) containerFooterLines() int {
+	line1, line2 := m.containerHelpLines()
+	if m.width >= ansi.StringWidth(line1+"  •  "+line2[2:])+2 {
+		return 1
+	}
+	return 2
+}
+
+// containerFooter renders the container screen's help footer: six tokens —
+// `space toggle`, the back key and `? keys` on line1, `d deploy`, `r restart`
+// and `l logs` on line2. Every other binding on the screen lives only in the
+// `?` overlay (help.go).
+//
+// line1 carries what must stay visible while line2 is replaced: a COMMITTED
+// search swaps line2 wholesale, and q and `?` still work in that state. While
+// the search input is OPEN neither key works, so the whole footer becomes the
+// two that do.
+func (m Model) containerFooter() string {
+	line1, line2 := m.containerHelpLines()
+	switch {
+	case m.searching:
+		// The typing intercept binds only enter, esc and ctrl+c; every other
+		// key, `space`, q and `?` included, lands in the query as a literal rune.
+		line1, line2 = "  enter jump  •  esc cancel", ""
+	case m.searchQuery != "":
+		line2 = "  n/N cycle  •  esc clear"
+	}
+
+	if m.containerFooterLines() == 1 {
+		if line2 == "" {
+			return helpStyle.Render(line1)
+		}
+		return helpStyle.Render(line1 + "  •  " + line2[2:])
+	}
+	// A trailing newline pads the searching footer (line2 == "") out to the two
+	// reserved rows; lipgloss renders the empty half as a full-width blank line.
+	return helpStyle.Render(line1 + "\n" + line2)
+}
+
 func (m Model) viewSelectContainers() string {
 	var b strings.Builder
 	b.WriteString(titleStyle.Render(fmt.Sprintf(
@@ -4488,10 +4574,12 @@ func (m Model) viewSelectContainers() string {
 
 	// Reserved search-bar line — ALWAYS rendered (in both the confirming and
 	// non-confirming branches) so the list height never jumps between
-	// search-idle / searching / committed / confirming. While confirming the
-	// bar is suppressed (blank) because the confirm prompt takes precedence and
-	// is shown in the footer-text slot below; otherwise the bar shows the search
-	// input (typing), the compact committed summary, or a blank placeholder.
+	// search-idle / searching / committed / confirming. The footer text below is
+	// held to a state-independent line count for the same reason (see
+	// containerFooter). While confirming, the bar is suppressed (blank) because
+	// the confirm prompt takes precedence and is shown in the footer-text slot
+	// below; otherwise the bar shows the search input (typing), the compact
+	// committed summary, or a blank placeholder.
 	if m.confirming {
 		b.WriteString(gap + "  ")
 	} else {
@@ -4499,34 +4587,32 @@ func (m Model) viewSelectContainers() string {
 	}
 
 	// Confirming: the confirm prompt takes the footer-text slot (no help keys).
-	// The reserved bar line above is blank so the total line count (gap + bar +
-	// helpStyle MarginTop blank + confirm text) matches the non-confirming
-	// footer exactly.
+	// The reserved bar line above is blank, and the prompt below is padded to the
+	// help footer's line count, so the total (gap + bar + helpStyle MarginTop
+	// blank + prompt) matches the non-confirming footer exactly at every width.
 	if m.confirming {
+		var prompt string
 		switch {
 		case m.pendingExec:
-			service := m.services[m.svcCursor]
-			b.WriteString(helpStyle.Render(fmt.Sprintf(
-				"  Exec into %s?  enter confirm  •  esc cancel",
-				service,
-			)))
+			prompt = fmt.Sprintf("  Exec into %s?  enter confirm  •  esc cancel",
+				m.services[m.svcCursor])
 		case m.pendingOp == runner.Rollback:
 			// Show the captured target set (what will actually roll back), not the
 			// live selection which the async fetch may have let drift.
 			containers := m.rollbackTargets
-			b.WriteString(helpStyle.Render(fmt.Sprintf(
-				"  Rollback %s%s?  enter confirm  •  esc cancel",
-				strings.Join(containers, ", "),
-				m.rollbackAgeSuffix(containers),
-			)))
+			prompt = fmt.Sprintf("  Rollback %s%s?  enter confirm  •  esc cancel",
+				strings.Join(containers, ", "), m.rollbackAgeSuffix(containers))
 		default:
-			containers := m.selectedContainers()
-			b.WriteString(helpStyle.Render(fmt.Sprintf(
-				"  %s %s?  enter confirm  •  esc cancel",
-				m.pendingOp.String(),
-				strings.Join(containers, ", "),
-			)))
+			prompt = fmt.Sprintf("  %s %s?  enter confirm  •  esc cancel",
+				m.pendingOp.String(), strings.Join(m.selectedContainers(), ", "))
 		}
+		// Pad the prompt to however many lines the help footer occupies at this
+		// width (containerFooterLines is the single source for that count), so
+		// the list does not gain a row the moment the prompt appears.
+		if m.containerFooterLines() == 2 {
+			prompt += "\n"
+		}
+		b.WriteString(helpStyle.Render(prompt))
 		return b.String()
 	}
 
@@ -4545,25 +4631,9 @@ func (m Model) viewSelectContainers() string {
 		b.WriteString("\n  " + warningStyle.Render(fmt.Sprintf("updates: %s", m.updatesErr)))
 	}
 
-	back := "q quit"
-	if m.showPicker {
-		back = "q back"
-	}
-	line1, line2 := containerHelpLines(back)
-	if m.searching {
-		line2 = "  enter jump  •  esc cancel"
-	} else if m.searchQuery != "" {
-		line2 = "  n/N cycle  •  esc clear"
-	}
-	oneLine := line1 + "  •  " + line2[2:]
 	// helpStyle's MarginTop supplies the single blank line between the reserved
-	// bar (or warning) line and the help text. ansi.StringWidth, not len — see
-	// the matching guard in svcVisibleCount.
-	if m.width >= ansi.StringWidth(oneLine)+2 {
-		b.WriteString(helpStyle.Render(oneLine))
-	} else {
-		b.WriteString(helpStyle.Render(line1 + "\n" + line2))
-	}
+	// bar (or warning) line and the help text.
+	b.WriteString(m.containerFooter())
 	return b.String()
 }
 
