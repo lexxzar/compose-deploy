@@ -15327,6 +15327,40 @@ func TestInspectDataMsg_RawModeShowsVerbatimBytes(t *testing.T) {
 	}
 }
 
+// TestInspectDataMsg_RawModeFiltersControlBytes pins the raw buffer's own
+// sanitiser pass. docker's JSON escapes ONLY the C0 block — Go's encoding/json
+// emits DEL and the C1 code points as RAW bytes — so an ENV value or a probe
+// output set by a third-party image can still carry U+009B (CSI) or U+009D
+// (OSC, an OSC 52 clipboard write) onto the operator's terminal one keypress
+// away. inspectRaw itself stays verbatim: it is what ParseInspect reads.
+func TestInspectDataMsg_RawModeFiltersControlBytes(t *testing.T) {
+	payload := "[{\"Name\": \"/proj-web-1\", \"Config\": {\"Image\": \"nginx:1.27\", " +
+		"\"Env\": [\"MOTD=hi\u007fthere\u009d52;c;cGF5bG9hZA==ok\", \"CSI=a\u009b31mb\", \"ESC=x\\u001b[31my\"]}}]"
+
+	m := Model{screen: screenInspect, inspectSession: 1, inspectShowRaw: true}
+	m.inspectViewport = viewport.New(400, 20)
+
+	result, _ := m.Update(inspectDataMsg{data: []byte(payload), session: 1})
+	model := result.(Model)
+
+	if string(model.inspectRaw) != payload {
+		t.Error("inspectRaw must stay verbatim — it is the parser's input")
+	}
+	shown := model.inspectViewport.View()
+	for _, banned := range []string{"\u007f", "\u009b", "\u009d"} {
+		if strings.Contains(shown, banned) {
+			t.Errorf("raw mode must not write %q to the terminal:\n%q", banned, shown)
+		}
+	}
+	// Everything JSON already escaped stays byte-identical, the escaped ESC
+	// included: it is six printable characters, not an escape sequence.
+	for _, want := range []string{"nginx:1.27", "MOTD=hi", "there", "52;c;cGF5bG9hZA==ok", "CSI=a", "31mb", `ESC=x\u001b[31my`} {
+		if !strings.Contains(shown, want) {
+			t.Errorf("raw mode must keep the readable text %q:\n%s", want, shown)
+		}
+	}
+}
+
 func TestInspectDataMsg_StaleSessionDiscarded(t *testing.T) {
 	m := Model{screen: screenInspect, inspectSession: 5}
 	m.inspectViewport = viewport.New(100, 10)
@@ -16202,22 +16236,70 @@ func TestViewInspect_ParseErrorShowsTheRawBytes(t *testing.T) {
 // multi-line error pushes the title off the top, because bubbletea keeps only
 // the last m.height lines.
 func TestViewInspect_ErrorIsOneClampedLine(t *testing.T) {
-	m := Model{screen: screenInspect, inspectService: "web", width: 60, height: 24}
-	m.inspectViewport = viewport.New(56, 18)
-	m.inspectErr = fmt.Errorf("listing containers for inspect: %s",
-		"ssh: connect to host prod port 22\nbanner line two\nbanner line three that is really quite long indeed")
+	// The sweep runs 40-120, not one sample: at width 60 the footer happens to
+	// fit, so a single sample cannot see a chrome line that overflows a narrow
+	// pane. 40 is the narrowest width this repo supports and sweeps elsewhere
+	// (TestContainerFooterReservation runs 40-180).
+	for width := 40; width <= 120; width++ {
+		m := Model{screen: screenInspect, inspectService: "web", width: width, height: 24}
+		m.inspectViewport = viewport.New(width-4, 18)
+		m.inspectErr = fmt.Errorf("listing containers for inspect: %s",
+			"ssh: connect to host prod port 22\nbanner line two\nbanner line three that is really quite long indeed")
 
-	for _, line := range strings.Split(m.viewInspect(), "\n") {
-		if w := ansi.StringWidth(line); w > m.width {
-			t.Errorf("line is %d cells wide, want <= %d: %q", w, m.width, line)
+		for _, line := range strings.Split(m.viewInspect(), "\n") {
+			if w := ansi.StringWidth(line); w > m.width {
+				t.Errorf("width %d: line is %d cells wide, want <= %d: %q", width, w, m.width, line)
+			}
+		}
+		lines := strings.Split(ansi.Strip(m.viewInspect()), "\n")
+		errIdx := -1
+		for i, line := range lines {
+			if strings.Contains(line, "Error: listing") {
+				errIdx = i
+			}
+		}
+		if errIdx == -1 {
+			t.Errorf("width %d: the error must keep its head, which names what failed:\n%s", width, strings.Join(lines, "\n"))
+			continue
+		}
+		for i, line := range lines {
+			if i != errIdx && strings.Contains(line, "banner line") {
+				t.Errorf("width %d: the error must occupy one line, line %d also carries it: %q", width, i, line)
+			}
 		}
 	}
-	view := ansi.Strip(m.viewInspect())
-	if !strings.Contains(view, "Error: listing containers for inspect") {
-		t.Errorf("the error must keep its head, which names what failed:\n%s", view)
-	}
-	if strings.Contains(view, "banner line two") {
-		t.Error("the error must be collapsed and clamped to one line")
+}
+
+// TestViewInspect_FooterNeverExceedsWidth pins the other half of the same
+// budget. viewInspect fits the whole render into exactly m.height (title 3 +
+// viewport m.height-6 + one optional error line + footer 2), so a chrome line
+// wider than the pane wraps in the terminal, adds a physical row bubbletea does
+// not know about, and costs the title — the renderer keeps only the LAST
+// m.height lines. The footer measures 42 cells, so it overflows every width
+// below 42 in both modes; clampToWidth is what holds it, the way
+// containerFooter already does.
+func TestViewInspect_FooterNeverExceedsWidth(t *testing.T) {
+	for _, raw := range []bool{false, true} {
+		for width := 40; width <= 120; width++ {
+			m := Model{screen: screenInspect, inspectService: "web", width: width, height: 24, inspectShowRaw: raw}
+			m.inspectViewport = viewport.New(width-4, 18)
+			m.inspectRaw = []byte(inspectFixtureJSON)
+			m.rebuildInspectSummary()
+			m.setInspectContent()
+
+			lines := strings.Split(m.viewInspect(), "\n")
+			for _, line := range lines {
+				if w := ansi.StringWidth(line); w > width {
+					t.Errorf("raw=%v width %d: line is %d cells wide, want <= %d: %q", raw, width, w, width, line)
+				}
+			}
+			if len(lines) > m.height {
+				t.Errorf("raw=%v width %d: render is %d lines, want <= %d", raw, width, len(lines), m.height)
+			}
+			if !strings.Contains(ansi.Strip(lines[0]), "inspect") {
+				t.Errorf("raw=%v width %d: the first line must still be the title, got %q", raw, width, lines[0])
+			}
+		}
 	}
 }
 

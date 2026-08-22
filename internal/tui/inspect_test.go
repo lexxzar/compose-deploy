@@ -916,9 +916,11 @@ func TestExpandTabs(t *testing.T) {
 	}
 }
 
-// TestBuildInspectSummary_StripsTerminalEscapes pins the sanitiser. Raw mode is
-// safe because docker's JSON escapes a control byte into printable text, but the
-// summary decodes them back, and an ENV value, a health probe's output, an image
+// TestBuildInspectSummary_StripsTerminalEscapes pins the summary sanitiser.
+// docker's JSON escapes a C0 control byte into printable text, and raw mode
+// filters the DEL and C1 bytes it leaves behind (TestSanitizeInspectRaw), but
+// the summary decodes those escapes back into real bytes, and an ENV value, a
+// health probe's output, an image
 // ref or a mount path is attacker-influenceable: a third-party image can carry
 // an OSC 52 clipboard write, a title set or a report sequence straight onto the
 // operator's terminal. ansi.StringWidth counts an escape sequence as zero cells,
@@ -965,6 +967,41 @@ func TestBuildInspectSummary_StripsTerminalEscapes(t *testing.T) {
 		if !strings.Contains(out, want) {
 			t.Errorf("summary must keep the readable text %q:\n%s", want, out)
 		}
+	}
+}
+
+// TestSanitizeInspectRaw pins the raw path's filter. It is a FILTER, not a
+// rewrite: docker's JSON escapes only the C0 block, so DEL and the C1 escape
+// introducers arrive raw and have to go, while everything JSON already escaped
+// - the escaped ESC included - stays byte-identical. Newlines are the one
+// control kept, because they are the raw view's line structure.
+func TestSanitizeInspectRaw(t *testing.T) {
+	tests := []struct {
+		name string
+		in   string
+		want string
+	}{
+		{"newlines survive", "{\n  \"A\": 1\n}", "{\n  \"A\": 1\n}"},
+		{"del dropped", "A=b\x7fc", "A=bc"},
+		{"c1 csi dropped", "A=b\u009b31mc", "A=b31mc"},
+		{"c1 osc dropped", "A=b\u009d52;c;cGF5bG9hZA==c", "A=b52;c;cGF5bG9hZA==c"},
+		{"c1 block edges dropped", "a\u0080b\u009fc", "abc"},
+		{"raw esc and bel dropped", "A=\x1b[31mb\x07c", "A=[31mbc"},
+		{"lone cr dropped", "A=b\rc", "A=bc"},
+		{"escaped esc kept as text", `"Env": ["A=x\u001b[31my"]`, `"Env": ["A=x\u001b[31my"]`},
+		// A raw tab cannot reach here from docker (JSON escapes it), and it
+		// measures 0 cells while the terminal advances a stop, so it goes with
+		// the rest of C0 rather than being expanded on a path that never wraps.
+		{"tab dropped", "A=b\tc", "A=bc"},
+		{"wide runes untouched", "路径=/данные/データ", "路径=/данные/データ"},
+		{"u+00a0 is above the c1 block", "A=b\u00a0c", "A=b\u00a0c"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := sanitizeInspectRaw([]byte(tt.in)); got != tt.want {
+				t.Errorf("sanitizeInspectRaw(%q) = %q, want %q", tt.in, got, tt.want)
+			}
+		})
 	}
 }
 

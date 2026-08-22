@@ -3199,7 +3199,10 @@ func (m *Model) clearInspect() {
 // disagree about which buffer is on screen.
 func (m *Model) setInspectContent() {
 	if m.inspectShowRaw {
-		m.inspectViewport.SetContent(string(m.inspectRaw))
+		// The raw bytes are filtered, not rewritten: docker's JSON escapes only
+		// the C0 block, so DEL and the C1 escape introducers still arrive raw.
+		// See sanitizeInspectRaw.
+		m.inspectViewport.SetContent(sanitizeInspectRaw(m.inspectRaw))
 	} else {
 		m.inspectViewport.SetContent(m.inspectSummary)
 	}
@@ -5340,7 +5343,11 @@ func (m Model) viewInspect() string {
 		help += "r raw JSON"
 	}
 	help += "  •  up/down scroll  •  q back"
-	b.WriteString(helpStyle.Render(help))
+	// Clamped for the same reason as the error line above, and the same way
+	// containerFooter does it: the footer is 42 cells, so below 42 columns both
+	// its line and the helpStyle margin line wrap, add two physical rows the
+	// renderer does not know about, and push the title off the top.
+	b.WriteString(helpStyle.Render(clampToWidth(help, m.width)))
 	return b.String()
 }
 

@@ -645,3 +645,14 @@ focus rule, real, and deliberately not fixed on this branch):
   then `i` re-polls. `screenConfig` behaves the same way. Now stated in the
   README and in CLAUDE.md rather than left to be discovered; a refresh key is the
   follow-up.
+
+**Residual recorded during the round-3 review pass** (out of scope under the
+focus rule):
+- `viewConfig` and `viewLogs` render their footers UNCLAMPED, the same defect
+  `viewInspect` was fixed for in this pass — `viewConfig`'s footer measures 53
+  cells, so below 53 columns it wraps, adds a physical row the bubbletea
+  renderer does not account for, and scrolls the title off the top; neither
+  screen clamps its title either. Both were flagged by both review agents as a
+  shared house defect rather than something the inspect screen introduced. The
+  fix is one `clampToWidth` per footer plus a width sweep in each screen's view
+  test, and it belongs in its own commit against those screens.

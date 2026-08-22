@@ -67,25 +67,58 @@ func expandTabs(s string) string {
 	return out.String()
 }
 
+// unsafeTerminalRune reports whether a rune must never reach the terminal: the
+// C0 controls, DEL, and the 8-bit C1 block a terminal reads as escape
+// introducers (U+009B is CSI, U+009D is OSC). Both inspect buffers filter
+// through it, so the summary and raw mode cannot disagree about what is safe.
+func unsafeTerminalRune(r rune) bool {
+	return r < 0x20 || r == 0x7f || (r >= 0x80 && r <= 0x9f)
+}
+
 // sanitizeInspectLine makes one decoded line safe to write to a terminal.
-// Raw mode needs no equivalent: docker's JSON escapes a control byte into a
-// six-character backslash-u-0-0-1-b sequence, so it renders as text. The
-// summary decodes them back into real bytes, and an ENV value or a probe is
-// attacker-influenceable — a third-party image can carry an OSC 52 clipboard
-// write or a report/paste sequence, and ansi.StringWidth counts an escape
-// sequence as zero cells so both the wrap and the viewport pass it straight
-// through. ansi.Strip removes the escape sequences; the rune filter removes
-// what it leaves behind (BEL, CR, DEL, and the 8-bit C1 controls a terminal
-// reads as escape introducers). Tabs and newlines are dropped too: kv and
+// docker's JSON escapes a control byte into a six-character
+// backslash-u-0-0-1-b sequence, but ONLY the C0 block: Go's encoding/json
+// emits DEL and the C1 code points as raw bytes, so raw mode needs its own
+// pass too (see sanitizeInspectRaw). The summary decodes even the escaped C0
+// back into real bytes, and an ENV value or a probe is attacker-influenceable
+// — a third-party image can carry an OSC 52 clipboard write or a report/paste
+// sequence, and ansi.StringWidth counts an escape sequence as zero cells so
+// both the wrap and the viewport pass it straight through. ansi.Strip removes
+// the escape sequences; the rune filter removes what it leaves behind (BEL,
+// CR, DEL, and the C1 controls). Tabs and newlines are dropped too: kv and
 // block split on the newline and expandTabs has already run, so a survivor
 // here is by definition not something to write out.
 func sanitizeInspectLine(line string) string {
 	return strings.Map(func(r rune) rune {
-		if r < 0x20 || r == 0x7f || (r >= 0x80 && r <= 0x9f) {
+		if unsafeTerminalRune(r) {
 			return -1
 		}
 		return r
 	}, ansi.Strip(line))
+}
+
+// sanitizeInspectRaw makes the raw docker inspect payload safe to write to a
+// terminal. Go's encoding/json — which produces this payload on both the
+// daemon and the CLI side — escapes only the C0 block, so an ENV value, a
+// probe output or an image ref can still carry a raw DEL or a C1 escape
+// introducer (U+009B, U+009D) straight through `i` then `r`. Newlines are the
+// one control kept: they are the raw view's line structure.
+//
+// ansi.Strip is deliberately NOT run here. The ESC bytes arrive already
+// escaped as the six printable characters backslash-u-0-0-1-b, so there is no
+// escape sequence left to strip, and stripping would corrupt a payload that is
+// safe as it stands — the raw view stays byte-identical to `docker inspect`
+// for everything JSON already escapes.
+func sanitizeInspectRaw(raw []byte) string {
+	return strings.Map(func(r rune) rune {
+		if r == '\n' {
+			return r
+		}
+		if unsafeTerminalRune(r) {
+			return -1
+		}
+		return r
+	}, string(raw))
 }
 
 // wrapCells breaks one line into chunks of at most width display CELLS.
