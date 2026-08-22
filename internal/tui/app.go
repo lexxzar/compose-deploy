@@ -5305,17 +5305,38 @@ func (m Model) viewConfig() string {
 
 func (m Model) viewInspect() string {
 	var b strings.Builder
-	b.WriteString(titleStyle.Render(fmt.Sprintf("%s > inspect > %s", m.breadcrumb(), m.inspectService)))
+	// Clamped like the error line and the footer below, so all three chrome
+	// lines this view owns obey one width rule. It is the deterministic-output
+	// half of that rule, not a height fix: measured against the pinned
+	// bubbletea v1.3.10, standardRenderer.flush truncates every line at r.width
+	// with ansi.Truncate before writing it, so an over-WIDE line cannot add a
+	// physical row — only extra NEWLINES can, which is what the error collapse
+	// below is for. Clamping here keeps the cut in View, where the width sweeps
+	// can see it, and holds titleStyle's MarginBottom line too: lipgloss pads
+	// that blank row out to the CONTENT width, so an unclamped 200-cell
+	// breadcrumb widens two rows, not one.
+	b.WriteString(titleStyle.Render(clampToWidth(fmt.Sprintf("%s > inspect > %s", m.breadcrumb(), m.inspectService), m.width)))
 	b.WriteString("\n\n")
 
 	if m.inspectErr != nil {
 		// The chrome is budgeted for exactly ONE extra line, but the compose
 		// layer feeds raw stderr in here (an SSH banner, a multi-line docker
-		// failure), so the message is collapsed to one line and clamped to the
-		// pane — the same never-wrap discipline searchBarLine and logBarLine
-		// follow. Without it the renderer keeps only the last m.height lines
-		// and the title scrolls off.
-		oneLine := strings.Join(strings.Fields(m.inspectErr.Error()), " ")
+		// failure), so the message is collapsed to one line. THAT part is
+		// load-bearing for the height budget: the renderer splits View() on
+		// "\n" and keeps only the last m.height lines, so a second physical
+		// line really would cost the title.
+		//
+		// The collapse is not a sanitiser, though. strings.Fields drops only
+		// what unicode.IsSpace covers, so ESC, BEL, DEL and the C1 introducers
+		// survive it, and both stepFailed.Render and clampToWidth are
+		// ANSI-aware and pass them straight through. withStderr embeds the
+		// remote's stderr verbatim, so an SSH banner or a docker failure
+		// naming a hostile image ref reaches the terminal — the same
+		// attacker-influenceable path the summary already guards. Reuse
+		// sanitizeInspectLine so the error slot and the pane cannot disagree
+		// about what is safe; it runs AFTER the collapse so a newline reads as
+		// a word break instead of gluing two words together.
+		oneLine := sanitizeInspectLine(strings.Join(strings.Fields(m.inspectErr.Error()), " "))
 		b.WriteString(stepFailed.Render(clampToWidth("  Error: "+oneLine, m.width)))
 		b.WriteString("\n")
 	}
@@ -5344,10 +5365,12 @@ func (m Model) viewInspect() string {
 		help += "  •  "
 	}
 	help += "up/down scroll  •  q back"
-	// Clamped for the same reason as the error line above, and the same way
+	// Clamped for the same reason as the title above, and the same way
 	// containerFooter does it: the footer is 42 cells, so below 42 columns both
-	// its line and the helpStyle margin line wrap, add two physical rows the
-	// renderer does not know about, and push the title off the top.
+	// it and the helpStyle margin line overrun the pane. See the title comment
+	// for what the renderer does with an over-wide line — it truncates, so the
+	// clamp is about keeping the cut deterministic and visible to the width
+	// sweeps, not about buying back a row.
 	b.WriteString(helpStyle.Render(clampToWidth(help, m.width)))
 	return b.String()
 }

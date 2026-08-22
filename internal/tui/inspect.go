@@ -338,15 +338,24 @@ func formatInspectMount(m compose.InspectMount) string {
 // RUNNING container holds, which is the whole point: a compose file edited after
 // an `r` restart still shows the new value while the container holds the old one.
 func inspectEnvSection(b *inspectBuilder, doc compose.InspectDoc) {
-	if len(doc.Config.Env) == 0 {
-		return
-	}
-	b.section("ENV")
-
+	// The blanks are dropped BEFORE the header is written, for the same reason
+	// inspectHealthSection builds its rows into a scratch builder first: a
+	// section with nothing to say is omitted, and an Env slice of nothing but
+	// blank entries has nothing to say. A len(doc.Config.Env) != 0 gate reads
+	// as if it answered that, and does not.
+	entries := make([]string, 0, len(doc.Config.Env))
 	for _, e := range doc.Config.Env {
 		if strings.TrimSpace(e) == "" {
 			continue
 		}
+		entries = append(entries, e)
+	}
+	if len(entries) == 0 {
+		return
+	}
+	b.section("ENV")
+
+	for _, e := range entries {
 		b.block(inspectListIndent, e)
 	}
 }

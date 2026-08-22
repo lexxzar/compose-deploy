@@ -835,6 +835,12 @@ func TestBuildInspectSummary_EnvPresence(t *testing.T) {
 			want:  true,
 			lines: []string{"  BARE"},
 		},
+		// The header used to be written before the blanks were filtered, so a
+		// non-empty slice with nothing renderable in it produced an ENV header
+		// over no entries — the one case where "a section with nothing to say
+		// is omitted" was not honoured.
+		{name: "one blank entry", env: []string{""}, want: false},
+		{name: "only blank entries", env: []string{"", "   ", "\t", "\n"}, want: false},
 	}
 
 	for _, tt := range tests {

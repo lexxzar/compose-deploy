@@ -16270,14 +16270,96 @@ func TestViewInspect_ErrorIsOneClampedLine(t *testing.T) {
 	}
 }
 
+// TestViewInspect_ErrorLineIsSanitised pins the OTHER thing the error slot has
+// to do to its input. The compose layer builds this string with withStderr,
+// which embeds the remote's stderr verbatim, so a docker failure echoing a
+// hostile image ref or an SSH banner lands here — and strings.Fields, the only
+// pass the slot used to run, drops nothing but unicode whitespace: ESC, BEL,
+// DEL and the 8-bit C1 introducers all survive it, and stepFailed.Render plus
+// clampToWidth are both ANSI-aware and hand them straight to the terminal.
+// sanitizeInspectLine is the same pass every decoded summary line goes through,
+// so the two cannot disagree about what is safe.
+func TestViewInspect_ErrorLineIsSanitised(t *testing.T) {
+	hostile := "listing containers for inspect: \x1b]52;c;cGF5bG9hZA==\x07banner " +
+		"\x1b[31mred\x1b[0m \x9b31mCSI \x9d52;OSC\x07 tail\x7fDEL"
+
+	m := Model{screen: screenInspect, inspectService: "web", width: 300, height: 24}
+	m.inspectViewport = viewport.New(296, 18)
+	m.inspectErr = errors.New(hostile)
+
+	out := m.viewInspect()
+	for _, banned := range []string{"\x1b", "\x07", "\x7f", "\u009b", "\u009d"} {
+		if strings.Contains(out, banned) {
+			t.Errorf("viewInspect must not write %q to the terminal:\n%q", banned, out)
+		}
+	}
+	// The whole sequence goes, not just its introducer: a bare rune filter
+	// would leave the OSC 52 clipboard payload and the SGR parameters behind as
+	// readable text, which is how ansi.Strip earns its place in the pass.
+	for _, banned := range []string{"52;c;", "cGF5bG9hZA==", "31m"} {
+		if strings.Contains(out, banned) {
+			t.Errorf("viewInspect must strip the whole escape sequence, %q survived:\n%q", banned, out)
+		}
+	}
+	// What is left must still read as the error, and still be one line.
+	if !strings.Contains(out, "Error: listing containers for inspect: banner red") {
+		t.Errorf("the readable head must survive the pass:\n%s", out)
+	}
+	if got := strings.Count(out, "Error:"); got != 1 {
+		t.Errorf("the error must occupy one line, found %d:\n%q", got, out)
+	}
+}
+
+// TestViewInspect_TitleNeverExceedsWidth pins the last of the three chrome
+// lines this view owns. The title interpolates the breadcrumb — a server name,
+// a project name — and the service name, none of them bounded, so at a narrow
+// pane it is the one line that could still overrun. Measured against the pinned
+// bubbletea v1.3.10: standardRenderer.flush truncates each line at r.width, so
+// the overrun costs no row on its own; the clamp is what keeps the cut
+// deterministic in View and holds titleStyle's MarginBottom line too, which
+// lipgloss pads out to the CONTENT width.
+func TestViewInspect_TitleNeverExceedsWidth(t *testing.T) {
+	for _, withErr := range []bool{false, true} {
+		for width := 40; width <= 120; width++ {
+			m := Model{screen: screenInspect, width: width, height: 24}
+			m.serverName = strings.Repeat("prod-", 12) + "server"
+			m.serverColor = "red"
+			m.projName = strings.Repeat("project-", 6)
+			m.inspectService = strings.Repeat("service-", 6)
+			m.inspectViewport = viewport.New(width-4, 18)
+			m.inspectRaw = []byte(inspectFixtureJSON)
+			m.rebuildInspectSummary()
+			m.setInspectContent()
+			if withErr {
+				m.inspectErr = fmt.Errorf("listing containers for inspect: ssh: connect to host prod port 22")
+			}
+
+			lines := strings.Split(m.viewInspect(), "\n")
+			for _, line := range lines {
+				if w := ansi.StringWidth(line); w > width {
+					t.Errorf("err=%v width %d: line is %d cells wide, want <= %d: %q", withErr, width, w, width, line)
+				}
+			}
+			if len(lines) > m.height {
+				t.Errorf("err=%v width %d: render is %d lines, want <= %d", withErr, width, len(lines), m.height)
+			}
+			// Truncation keeps the head, so the breadcrumb still says where the
+			// user is even when the tail is cut.
+			if !strings.HasPrefix(ansi.Strip(lines[0]), "cdeploy") {
+				t.Errorf("err=%v width %d: the first line must still be the title, got %q", withErr, width, lines[0])
+			}
+		}
+	}
+}
+
 // TestViewInspect_FooterNeverExceedsWidth pins the other half of the same
 // budget. viewInspect fits the whole render into exactly m.height (title 3 +
-// viewport m.height-6 + one optional error line + footer 2), so a chrome line
-// wider than the pane wraps in the terminal, adds a physical row bubbletea does
-// not know about, and costs the title — the renderer keeps only the LAST
-// m.height lines. The footer measures 42 cells, so it overflows every width
-// below 42 in both modes; clampToWidth is what holds it, the way
-// containerFooter already does.
+// viewport m.height-6 + one optional error line + footer 2). The footer
+// measures 42 cells, so it overruns every width below 42 in both modes;
+// clampToWidth is what holds it, the way containerFooter already does. See
+// TestViewInspect_TitleNeverExceedsWidth for what the renderer does with an
+// over-wide line — it truncates, so what the sweep protects is the pane's own
+// width contract, not a row.
 func TestViewInspect_FooterNeverExceedsWidth(t *testing.T) {
 	for _, raw := range []bool{false, true} {
 		for width := 40; width <= 120; width++ {

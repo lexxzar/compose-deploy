@@ -653,12 +653,31 @@ focus rule, real, and deliberately not fixed on this branch):
 focus rule):
 - `viewConfig` and `viewLogs` render their footers UNCLAMPED, the same defect
   `viewInspect` was fixed for in this pass — `viewConfig`'s footer measures 53
-  cells, so below 53 columns it wraps, adds a physical row the bubbletea
-  renderer does not account for, and scrolls the title off the top; neither
-  screen clamps its title either. Both were flagged by both review agents as a
-  shared house defect rather than something the inspect screen introduced. The
-  fix is one `clampToWidth` per footer plus a width sweep in each screen's view
-  test, and it belongs in its own commit against those screens.
+  cells, so below 53 columns it overruns the pane; neither screen clamps its
+  TITLE either, which round 6 fixed on `viewInspect` and left as-is here under
+  the focus rule. Both were flagged by both review agents as a shared house
+  defect rather than something the inspect screen introduced. The fix is one
+  `clampToWidth` per footer AND per title, plus a width sweep in each screen's
+  view test, and it belongs in its own commit against those screens.
+  ➕ **Mechanism corrected in round 6, measured against the pinned bubbletea
+  v1.3.10 rather than assumed** (two review agents in that round asserted
+  opposite mechanisms): `standardRenderer.flush()` runs
+  `ansi.Truncate(line, r.width, "")` on every line before writing it, and
+  `r.width` comes from the SAME `WindowSizeMsg` that sets `m.width`, so the two
+  are always in lockstep and an over-WIDE line is right-clipped, never wrapped
+  — it cannot add a physical row. What costs a row is extra NEWLINES (the
+  renderer splits `View()` on `"\n"` and keeps only the last `r.height`
+  elements), which is why `viewInspect`'s `strings.Fields` collapse of a
+  multi-line stderr IS load-bearing while the width clamps are about keeping
+  the cut deterministic in `View()`, visible to the width sweeps, and uniform
+  across a screen's chrome. Empirically: a 60-cell line in a 20x6 pane emitted
+  exactly 20 cells once the size message had landed; the pre-size frame
+  (`r.width == 0`) emitted all 60 untruncated, but `m.width` is 0 in that same
+  frame and `clampToWidth` no-ops there, so a clamp buys nothing for it. The
+  older wrap-based rationale survives in the round-3/round-4 notes above and
+  in the `searchBarLine`/`logBarLine`/`containerFooter` comments elsewhere in
+  the repo; treat this note as the correction. The `viewInspect` comments were
+  corrected in place.
 
 **Residuals recorded during the round-4 review pass** (out of scope under the
 focus rule):
