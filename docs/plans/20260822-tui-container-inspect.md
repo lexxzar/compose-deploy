@@ -562,16 +562,19 @@ stays green.
 
 ### Task 11: Verify acceptance criteria
 
-- [ ] AC1 — an unhealthy container's last probe `Output` is visible and **soft-wrapped, not truncated** (the wedge)
-- [ ] AC2 — a stopped container renders STATE with its exit code and omits HEALTH
-- [ ] AC3 — a scaled service inspects the replica the Uptime column shows, **including on a running+restarting mix**
-- [ ] AC4 — a service with no container yields a named error, not a panic or a blank viewport
-- [ ] AC5 — `i` works on the read-only unmanaged screen, where `c` does not exist
-- [ ] AC6 — `r` toggles to raw JSON and back; `esc` and `q` both return with the fields cleared
-- [ ] AC7 — the `?` overlay names `i` on both container variants and lists the inspect screen's own keys
-- [ ] AC8 — `ctrl+c` on a remote session shows the disconnect prompt from `screenInspect`
-- [ ] run the full suite: `go test ./... -count=1`
-- [ ] build: `go build -o cdeploy .` and run `go vet ./...`
+Every AC below is pinned by a named automated test that exists and passes. No AC is
+marked done by inspection.
+
+- [x] AC1 — an unhealthy container's last probe `Output` is visible and **soft-wrapped, not truncated** (the wedge) — pinned by `TestBuildInspectSummary_UnhealthyProbeOutput` (the probe string reaches the summary verbatim, with the HEALTH rows around it), `TestBuildInspectSummary_ProbeOutputWrapsNotTruncates` (at widths 30/40/60 the probe no longer fits one line yet every rune survives) and `TestBuildInspectSummary_MultiLineProbeOutput`
+- [x] AC2 — a stopped container renders STATE with its exit code and omits HEALTH — pinned by `TestBuildInspectSummary_StoppedFixture` (asserts `status exited` + `exit code 3` and that `HEALTH` is absent) and by the absent-case row of `TestBuildInspectSummary_HealthSectionPresence`
+- [x] AC3 — a scaled service inspects the replica the Uptime column shows, **including on a running+restarting mix** — pinned by `TestPickInspectContainer_MatchesUptimeColumn`, which drives the SAME entries through `pickInspectContainer` and `parseContainerStatus` and fails if the two disagree; plus the picker table in `TestPickInspectContainer` and the end-to-end `TestComposeInspect_PicksTheUptimeReplica` (asserts the inspect argv carries the running replica's ID)
+- [x] AC4 — a service with no container yields a named error, not a panic or a blank viewport — pinned at the composer layer by `TestComposeInspect_NoContainerFound`, `TestRemoteInspect_NoContainerFound` and `TestHostContainers_Inspect_NoMatch` (all assert the `no container found for %q` text), and at the TUI layer by `TestInspectDataMsg_FetchError` plus `TestViewInspect_ShowsFetchError`. ➕ Added `TestInspectKey_MissingContainerSurfacesNamedError`, which drives the whole path (`i` → fetch cmd → `inspectDataMsg` → `viewInspect()`) and asserts the rendered screen names the service and does not read as loading — no test covered that end to end before
+- [x] AC5 — `i` works on the read-only unmanaged screen, where `c` does not exist — pinned by `TestInspectKey_EntersOnReadOnlyComposer`, which asserts `m.readOnly()` as a precondition and then that `i` still reaches `screenInspect` with a fetch command; the `c` half is already pinned by `TestReadOnly_GatesWriteKeys`
+- [x] AC6 — `r` toggles to raw JSON and back; `esc` and `q` both return with the fields cleared — pinned by `TestInspectScreen_RToggleRoundTrips` (summary → raw → summary, footer label follows, raw bytes undisturbed), `TestInspectScreen_EscClearsAndReturns` (every `inspect*` field cleared, viewport reset, no status refresh), `TestInspectScreen_EscClearsErrorSlot` and `TestInspectScreen_QTakesTheSamePath`
+- [x] AC7 — the `?` overlay names `i` on both container variants and lists the inspect screen's own keys — pinned by `TestHelpGroups_NamesEveryBoundKey` (writable `bound[screenSelectContainers]` contains `i`, and `bound[screenInspect]` is the screen's own 8-key set, both directions) and `TestHelpGroups_ReadOnlyNamesEveryBoundKey` (read-only `bound` contains `i`); `TestHelpOverlay_OpensFromEveryScreen` covers the inspect screen's overlay content (`summary / raw JSON`)
+- [x] AC8 — `ctrl+c` on a remote session shows the disconnect prompt from `screenInspect` — pinned by the `inspect` row of `TestCtrlCConfirmation_AllRemoteScreens`
+- [x] run the full suite: `go test ./... -count=1` — all 7 packages pass
+- [x] build: `go build -o cdeploy .` and run `go vet ./...` — both clean
 
 ### Task 12: [Final] Update documentation
 

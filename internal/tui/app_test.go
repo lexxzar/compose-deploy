@@ -15844,3 +15844,30 @@ func TestInspectScreen_RTogglePutsTheReaderAtTheTop(t *testing.T) {
 		t.Errorf("YOffset = %d, want 0 after the mode toggle", got.inspectViewport.YOffset)
 	}
 }
+
+// TestInspectKey_MissingContainerSurfacesNamedError drives AC4 end to end: the
+// composer's `no container found` error must travel from the key press through
+// the fetch and the message handler into the rendered screen, so the user reads
+// the name of the service that has no container rather than a blank viewport.
+func TestInspectKey_MissingContainerSurfacesNamedError(t *testing.T) {
+	mc := &mockInspectComposer{inspectErr: fmt.Errorf("no container found for %q", "web")}
+	mc.services = []string{"web"}
+	m := inspectTestModel(t, mc, mc.services)
+
+	result, cmd := m.Update(keyMsgFor("i"))
+	m = result.(Model)
+	if cmd == nil {
+		t.Fatal("i should return the fetch command")
+	}
+
+	result, _ = m.Update(cmd())
+	m = result.(Model)
+
+	view := m.viewInspect()
+	if !strings.Contains(view, `no container found for "web"`) {
+		t.Errorf("the named error should reach the screen:\n%s", view)
+	}
+	if strings.Contains(view, "Loading") {
+		t.Error("a failed fetch must not leave the screen reading as loading")
+	}
+}
