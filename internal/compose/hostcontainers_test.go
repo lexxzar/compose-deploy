@@ -37,21 +37,6 @@ func TestParseHostContainers_NDJSON(t *testing.T) {
 	}
 }
 
-func TestParseHostContainers_ArrayForm(t *testing.T) {
-	data := []byte(`[{"ID":"aaa111222333","Names":"web","State":"running"},{"ID":"bbb444555666","Names":"db","State":"exited"}]`)
-
-	got, err := parseHostContainers(data)
-	if err != nil {
-		t.Fatalf("parseHostContainers() error = %v", err)
-	}
-	if len(got) != 2 {
-		t.Fatalf("len = %d, want 2", len(got))
-	}
-	if got[0].Names != "web" || got[1].Names != "db" {
-		t.Errorf("names = %q, %q", got[0].Names, got[1].Names)
-	}
-}
-
 func TestParseHostContainers_Empty(t *testing.T) {
 	tests := []struct {
 		name string
@@ -59,7 +44,6 @@ func TestParseHostContainers_Empty(t *testing.T) {
 	}{
 		{"empty", ""},
 		{"whitespace", "   \n  "},
-		{"empty array", "[]"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -461,8 +445,8 @@ func TestHostContainers_WriteMethodsAreReadOnly(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			if err := tt.fn(); !errors.Is(err, ErrReadOnly) {
-				t.Errorf("%s() error = %v, want ErrReadOnly", tt.name, err)
+			if err := tt.fn(); !errors.Is(err, errReadOnly) {
+				t.Errorf("%s() error = %v, want errReadOnly", tt.name, err)
 			}
 		})
 	}
@@ -633,11 +617,11 @@ func TestHostContainers_CheckUpdates_RegistryCascade(t *testing.T) {
 	}
 }
 
-// TestHostContainers_CheckUpdates_NoDaemonCascade pins design decision: the
-// daemon knob is off on this path. A daemon-shaped local failure is absorbed
-// as absent rather than surfacing "local docker unavailable" — a dead local
-// daemon fails the docker ps discovery call first, so the cascade would only
-// ever mislabel a remote host's failure.
+// TestHostContainers_CheckUpdates_NoDaemonCascade pins the design decision:
+// the daemon cascade cannot fire on this path. A daemon-shaped local failure
+// is absorbed as absent rather than surfacing "local docker unavailable" — a
+// dead local daemon fails the docker ps discovery call first, so the cascade
+// would only ever mislabel a remote host's failure.
 func TestHostContainers_CheckUpdates_NoDaemonCascade(t *testing.T) {
 	daemonDown := errors.New("Cannot connect to the Docker daemon at unix:///var/run/docker.sock")
 	f := hostUpdatesRunner(hostPsUpdates, map[string]hostDigests{
@@ -655,7 +639,7 @@ func TestHostContainers_CheckUpdates_NoDaemonCascade(t *testing.T) {
 	}
 }
 
-// TestHostContainers_CheckUpdates_TransportAbort pins the remote knob: a dead
+// TestHostContainers_CheckUpdates_TransportAbort pins the remote abort: a dead
 // SSH hop fails every remaining image the same way, so the scan returns on the
 // first errSSHTransport rather than burning the rest of the round-trips.
 func TestHostContainers_CheckUpdates_TransportAbort(t *testing.T) {
@@ -1519,10 +1503,10 @@ func TestHostContainers_CheckUpdates_MemoizesRepeatedImages(t *testing.T) {
 }
 
 // TestCompareImageDigest_SentinelBinding pins each composer's local-error
-// wrapper INDEPENDENTLY of the cascade knob. The daemon cascade needs both the
-// knob and the sentinel, so a test that only drives CheckUpdates passes when
-// either one alone is flipped; asserting the wrapper directly makes the second
-// variable mutation-sensitive on its own.
+// wrapper directly. The daemon cascade dispatches on the errLocalImageInspect
+// sentinel alone, so which composer applies it IS the design decision — a test
+// that only drives CheckUpdates cannot tell a missing wrapper from a failure
+// the cascade classifier rejected.
 func TestCompareImageDigest_SentinelBinding(t *testing.T) {
 	daemonDown := errors.New("Cannot connect to the Docker daemon at unix:///var/run/docker.sock")
 

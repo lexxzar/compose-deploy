@@ -919,7 +919,7 @@ func TestScanImageUpdates_PartialSuccess(t *testing.T) {
 		"redis:7":    {err: fmt.Errorf("dial tcp: connection refused")},
 		"rabbitmq:3": {err: fmt.Errorf("%w: cannot connect to the docker daemon", errLocalImageInspect)},
 	})
-	got, err := scanImageUpdates(context.Background(), wanted, compare, updateCascades{registry: true, daemon: true})
+	got, err := scanImageUpdates(context.Background(), wanted, compare)
 	if err != nil {
 		t.Fatalf("scanImageUpdates: %v", err)
 	}
@@ -932,7 +932,7 @@ func TestScanImageUpdates_PartialSuccess(t *testing.T) {
 func TestScanImageUpdates_OkFalseStaysAbsent(t *testing.T) {
 	wanted := map[string]string{"web": "nginx:latest"}
 	compare := scanFunc(t, map[string]scanOutcome{"nginx:latest": {updated: true}})
-	got, err := scanImageUpdates(context.Background(), wanted, compare, updateCascades{registry: true, daemon: true})
+	got, err := scanImageUpdates(context.Background(), wanted, compare)
 	if err != nil {
 		t.Fatalf("scanImageUpdates: %v", err)
 	}
@@ -948,16 +948,22 @@ func TestScanImageUpdates_DaemonCascade(t *testing.T) {
 		"postgres:16":  {err: fmt.Errorf("%w: is the docker daemon running?", errLocalImageInspect)},
 	})
 
-	_, err := scanImageUpdates(context.Background(), wanted, compare, updateCascades{registry: true, daemon: true})
+	_, err := scanImageUpdates(context.Background(), wanted, compare)
 	if err == nil || !strings.Contains(err.Error(), "local docker unavailable") {
 		t.Fatalf("err = %v, want local docker unavailable", err)
 	}
 
-	// The remote path leaves the daemon knob off, and the zero value must
-	// keep it that way: the same failures become plain absent verdicts.
-	got, err := scanImageUpdates(context.Background(), wanted, compare, updateCascades{registry: true})
+	// The errLocalImageInspect sentinel is the ONLY thing that routes a
+	// failure to the daemon counters. The remote and host comparers pass a nil
+	// wrapper, so the same daemon-shaped stderr from the far side of an SSH hop
+	// must stay an absent verdict rather than naming the wrong machine.
+	unwrapped := scanFunc(t, map[string]scanOutcome{
+		"nginx:latest": {err: errors.New("cannot connect to the docker daemon")},
+		"postgres:16":  {err: errors.New("is the docker daemon running?")},
+	})
+	got, err := scanImageUpdates(context.Background(), wanted, unwrapped)
 	if err != nil {
-		t.Fatalf("daemon cascade fired with the knob off: %v", err)
+		t.Fatalf("daemon cascade fired without the sentinel: %v", err)
 	}
 	if len(got) != 0 {
 		t.Fatalf("results = %#v, want empty", got)
@@ -971,7 +977,7 @@ func TestScanImageUpdates_DaemonCascadeNeedsEveryFailureDaemonShaped(t *testing.
 		// A benign per-image failure — the fresh-deploy case.
 		"postgres:16": {err: fmt.Errorf("%w: No such image: postgres:16", errLocalImageInspect)},
 	})
-	got, err := scanImageUpdates(context.Background(), wanted, compare, updateCascades{registry: true, daemon: true})
+	got, err := scanImageUpdates(context.Background(), wanted, compare)
 	if err != nil {
 		t.Fatalf("cascade fired on a mixed failure set: %v", err)
 	}
@@ -987,14 +993,21 @@ func TestScanImageUpdates_RegistryCascade(t *testing.T) {
 		"postgres:16":  {err: fmt.Errorf("lookup registry-1.docker.io: no such host")},
 	})
 
-	_, err := scanImageUpdates(context.Background(), wanted, compare, updateCascades{registry: true, daemon: true})
+	_, err := scanImageUpdates(context.Background(), wanted, compare)
 	if err == nil || !strings.Contains(err.Error(), "registry unreachable") {
 		t.Fatalf("err = %v, want registry unreachable", err)
 	}
 
-	got, err := scanImageUpdates(context.Background(), wanted, compare, updateCascades{})
+	// The cascade needs EVERY remote-side failure to look like a network
+	// fault. A per-image docker failure (auth, manifest unknown) stays an
+	// absent verdict instead.
+	perImage := scanFunc(t, map[string]scanOutcome{
+		"nginx:latest": {err: errors.New("exit status 1: manifest unknown")},
+		"postgres:16":  {err: errors.New("exit status 1: unauthorized")},
+	})
+	got, err := scanImageUpdates(context.Background(), wanted, perImage)
 	if err != nil {
-		t.Fatalf("registry cascade fired with the knob off: %v", err)
+		t.Fatalf("registry cascade fired on per-image failures: %v", err)
 	}
 	if len(got) != 0 {
 		t.Fatalf("results = %#v, want empty", got)
@@ -1007,7 +1020,7 @@ func TestScanImageUpdates_NoCascadeWhenAnyVerdict(t *testing.T) {
 		"nginx:latest": {updated: true, ok: true},
 		"postgres:16":  {err: fmt.Errorf("dial tcp: connection refused")},
 	})
-	got, err := scanImageUpdates(context.Background(), wanted, compare, updateCascades{registry: true, daemon: true})
+	got, err := scanImageUpdates(context.Background(), wanted, compare)
 	if err != nil {
 		t.Fatalf("cascade fired while a verdict existed: %v", err)
 	}
@@ -1017,7 +1030,7 @@ func TestScanImageUpdates_NoCascadeWhenAnyVerdict(t *testing.T) {
 }
 
 func TestScanImageUpdates_EmptySetNeverCascades(t *testing.T) {
-	got, err := scanImageUpdates(context.Background(), nil, scanFunc(t, nil), updateCascades{registry: true, daemon: true})
+	got, err := scanImageUpdates(context.Background(), nil, scanFunc(t, nil))
 	if err != nil {
 		t.Fatalf("scanImageUpdates: %v", err)
 	}

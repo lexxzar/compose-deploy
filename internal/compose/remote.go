@@ -638,19 +638,21 @@ func (r *RemoteCompose) ListProjects(ctx context.Context) ([]Project, error) {
 // the SSH counterpart and behaves identically with respect to tri-state
 // semantics, soft per-image failure, and absent-as-unknown.
 //
-// The scan itself is the shared scanImageUpdates loop; only the knobs and the
-// comparer differ from the local path:
+// The scan itself is the shared scanImageUpdates loop; only the comparer
+// differs from the local path, and the comparer is what selects the cascades:
 //
-//   - registry: on. A Docker Hub outage seen from the remote host must surface
-//     as "registry unreachable" rather than a silent blank glyph column,
-//     because sshTransportStderrPatterns is deliberately SSH-only and will not
-//     catch it.
-//   - daemon: OFF, and it must stay off. The docker CLI runs on the far side of
-//     the SSH hop, so a failed image inspect is indistinguishable from any
-//     other per-image docker error and there is no local daemon to diagnose.
-//   - transportAbort: on. A dead SSH hop fails every remaining image the same
-//     way, so the loop returns on the first errSSHTransport instead of burning
-//     the rest of the round-trips.
+//   - registry: applies. A Docker Hub outage seen from the remote host must
+//     surface as "registry unreachable" rather than a silent blank glyph
+//     column, because sshTransportStderrPatterns is deliberately SSH-only and
+//     will not catch it.
+//   - daemon: cannot fire, and must not. compareImageDigest below passes a nil
+//     localErrWrap, so no failure carries errLocalImageInspect. The docker CLI
+//     runs on the far side of the SSH hop, so a failed image inspect is
+//     indistinguishable from any other per-image docker error and there is no
+//     local daemon to diagnose.
+//   - transport abort: applies. A dead SSH hop fails every remaining image the
+//     same way, so the loop returns on the first errSSHTransport instead of
+//     burning the rest of the round-trips.
 //
 // The per-image inspect calls reach the remote host through the
 // remoteDockerRunner seam, which builds the SSH argv DIRECTLY — `docker image
@@ -664,8 +666,7 @@ func (r *RemoteCompose) CheckUpdates(ctx context.Context, services []string) (ma
 	if err != nil {
 		return nil, err
 	}
-	return scanImageUpdates(ctx, filterServices(images, services), r.compareImageDigest,
-		updateCascades{registry: true, transportAbort: true})
+	return scanImageUpdates(ctx, filterServices(images, services), r.compareImageDigest)
 }
 
 // fetchServiceImages runs `docker compose config --format json` on the

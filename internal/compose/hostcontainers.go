@@ -33,23 +33,17 @@ type hostPsEntry struct {
 const composeProjectLabel = "com.docker.compose.project="
 
 // parseHostContainers parses the output of `docker ps -a --format '{{json .}}'`.
-// Tolerant of both NDJSON (the template form emits one object per line) and the
-// JSON-array form, matching the parseContainerStatus and parseStatsOutput convention.
+// NDJSON only, unlike the sibling parseContainerStatus/parseStatsOutput: those
+// read a --format json flag whose shape changed across Docker versions, while
+// a per-container Go template emits one object per line by construction on
+// every version, so there is no array form to tolerate.
 func parseHostContainers(data []byte) ([]hostPsEntry, error) {
 	s := strings.TrimSpace(string(data))
-	if s == "" || s == "[]" {
+	if s == "" {
 		return nil, nil
 	}
 
 	var entries []hostPsEntry
-
-	if strings.HasPrefix(s, "[") {
-		if err := json.Unmarshal([]byte(s), &entries); err != nil {
-			return nil, fmt.Errorf("parsing host containers: %w", err)
-		}
-		return entries, nil
-	}
-
 	for _, line := range strings.Split(s, "\n") {
 		line = strings.TrimSpace(line)
 		if line == "" {
@@ -109,12 +103,12 @@ func hostContainerName(names string) string {
 	return strings.TrimSpace(names)
 }
 
-// ErrReadOnly is returned by the five runner.Composer write methods on
+// errReadOnly is returned by the five runner.Composer write methods on
 // HostContainers. A container with no compose project has no compose file, so
 // stop/rm/pull/create/start cannot be expressed as a compose verb. The TUI
 // gates every key that would reach these methods, so the sentinel is a
 // backstop rather than a user-facing path.
-var ErrReadOnly = errors.New("read-only: container is not managed by docker compose")
+var errReadOnly = errors.New("read-only: container is not managed by docker compose")
 
 // dockerRunner is the ONLY local/remote variation point of HostContainers.
 // It needs three methods rather than one *exec.Cmd builder because the three
@@ -138,7 +132,7 @@ type HostContainers struct {
 }
 
 // HostContainers implements every runner.Composer method: the five reads are
-// real, the five writes refuse with ErrReadOnly. It also satisfies
+// real, the five writes refuse with errReadOnly. It also satisfies
 // tui.ExecProvider (asserted in internal/tui/app_test.go, since compose cannot
 // import tui) but deliberately NOT tui.ConfigProvider or tui.RollbackPreparer —
 // a container with no compose file has no config to show and no snapshot to
@@ -206,23 +200,23 @@ func NewRemoteHostContainers(r *RemoteCompose) *HostContainers {
 func (h *HostContainers) ReadOnlyComposer() bool { return true }
 
 func (h *HostContainers) Stop(ctx context.Context, containers []string, w io.Writer) error {
-	return ErrReadOnly
+	return errReadOnly
 }
 
 func (h *HostContainers) Remove(ctx context.Context, containers []string, w io.Writer) error {
-	return ErrReadOnly
+	return errReadOnly
 }
 
 func (h *HostContainers) Pull(ctx context.Context, containers []string, w io.Writer) error {
-	return ErrReadOnly
+	return errReadOnly
 }
 
 func (h *HostContainers) Create(ctx context.Context, containers []string, w io.Writer) error {
-	return ErrReadOnly
+	return errReadOnly
 }
 
 func (h *HostContainers) Start(ctx context.Context, containers []string, w io.Writer) error {
-	return ErrReadOnly
+	return errReadOnly
 }
 
 // CheckUpdates reports per-container "image update available" verdicts. See
@@ -234,17 +228,15 @@ func (h *HostContainers) Start(ctx context.Context, containers []string, w io.Wr
 // returns, so there is no second discovery call and no `docker compose config`
 // (an unmanaged container has no compose file to read).
 //
-// Cascade knobs, all three deliberate:
-//
-//   - registry: on. A registry outage must surface as "registry unreachable"
-//     rather than a silently blank glyph column, on both paths.
-//   - daemon: OFF, and the nil localErrWrap below is what keeps it that way.
-//     The cascade could never fire here anyway: a dead local daemon fails the
-//     `docker ps` discovery call above first, so the error returns from
-//     unmanagedEntries long before any image inspect runs. On the remote path
-//     there is no local daemon to diagnose, matching RemoteCompose.
-//   - transportAbort: on. Necessary for the remote runner, and inert for the
-//     local one, which never emits errSSHTransport.
+// Which systemic-failure cascade can fire is decided by the error shape the
+// comparer emits, not by a flag. The registry cascade applies: an outage must
+// surface as "registry unreachable" rather than a silently blank glyph column.
+// The daemon cascade cannot, because compareImageDigest below passes a nil
+// localErrWrap and so never emits errLocalImageInspect — right on both
+// runners: locally a dead daemon fails the `docker ps` discovery call above
+// long before any image inspect runs, and remotely there is no local daemon to
+// diagnose. The transport abort applies on the remote runner and is inert on
+// the local one, which never emits errSSHTransport.
 //
 // An untagged image is absorbed as absent rather than an error: `docker ps`
 // reports an image ID for it, which either yields no RepoDigests (so the
@@ -255,8 +247,7 @@ func (h *HostContainers) CheckUpdates(ctx context.Context, services []string) (m
 	if err != nil {
 		return nil, err
 	}
-	return scanImageUpdates(ctx, filterServices(hostImageMap(entries), services), h.compareImageDigest,
-		updateCascades{registry: true, transportAbort: true})
+	return scanImageUpdates(ctx, filterServices(hostImageMap(entries), services), h.compareImageDigest)
 }
 
 // bareImageIDRe matches the image-ID form `docker ps` reports for a container
