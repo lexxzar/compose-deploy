@@ -458,15 +458,17 @@ Plus, outside the tables:
 - Modify: `internal/tui/help.go`
 - Modify: `internal/tui/help_test.go`
 
-- [ ] **read "No test forces the screen tax" first** — nothing below goes red if skipped
-- [ ] declare the `Inspector` interface beside `ConfigProvider` / `ExecProvider`
-- [ ] tax 1: append `screenInspect` to the `screen` iota after `screenSettingsForm`
-- [ ] tax 2-3: add it to `allScreens` and change `TestAllScreens_Complete`'s bound to `int(screenInspect) + 1`
-- [ ] tax 4-5: add `"inspect"` to `screenName()` and `case screenInspect` to `helpGroupsFor()` — MOVE (`↑ ↓`, `pgup pgdown`), VIEW (`r`, `actions: true`), LEAVE 3rd of 3
-- [ ] tax 6: add the `screenInspect` row to the `bound` map with the exact key set from Technical Details
-- [ ] add the seven `inspect*` Model fields, `inspectDataMsg`, its session-gated handler, and `fetchInspect(session uint64) tea.Cmd`
-- [ ] write tests: a current-session message populates the fields, a stale session is discarded, an off-screen message is discarded
-- [ ] run `go test ./internal/tui/` — must pass before task 8
+- [x] **read "No test forces the screen tax" first** — nothing below goes red if skipped
+- [x] declare the `Inspector` interface beside `ConfigProvider` / `ExecProvider`
+- [x] tax 1: append `screenInspect` to the `screen` iota after `screenSettingsForm`
+- [x] tax 2-3: add it to `allScreens` and change `TestAllScreens_Complete`'s bound to `int(screenInspect) + 1` — the `allScreens` doc comment was reworded from "a 9th screen" to "a new screen", which the fixed bound now makes true
+- [x] tax 4-5: add `"inspect"` to `screenName()` and `case screenInspect` to `helpGroupsFor()` — MOVE (`↑ ↓`, `pgup pgdown`), VIEW (`r`, `actions: true`), LEAVE 3rd of 3
+- [x] tax 6: add the `screenInspect` row to the `bound` map with the exact key set from Technical Details
+- [x] add the seven `inspect*` Model fields, `inspectDataMsg`, its session-gated handler, and `fetchInspect(session uint64) tea.Cmd`
+- [x] write tests: a current-session message populates the fields, a stale session is discarded, an off-screen message is discarded
+- [x] run `go test ./internal/tui/` — must pass before task 8
+- ➕ [x] two helpers landed with the handler, for Tasks 8-9 to reuse: `rebuildInspectSummary()` (parse + render at the viewport's current width; a parse failure sets `inspectErr`, empties the summary and **keeps** `inspectRaw` so `r` stays a working escape hatch) and `setInspectContent()` (the single `SetContent` chokepoint, so the fetch handler, the `r` toggle and the resize branch cannot disagree about which buffer is on screen)
+- ➕ [x] `mockInspectComposer` added to `app_test.go` for the `fetchInspect` tests — Task 8's mock-composer checkbox can reuse it rather than adding a second one
 
 ### Task 8: Add enterInspect and the `i` key on the container screen
 

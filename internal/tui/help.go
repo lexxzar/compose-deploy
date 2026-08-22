@@ -323,6 +323,21 @@ func helpGroupsFor(s screen, hc helpContext) []helpGroup {
 				{"ctrl+c", "quit"},
 			}},
 		}
+
+	case screenInspect:
+		return []helpGroup{
+			{title: "MOVE", entries: []helpEntry{
+				{"↑ ↓", "scroll"},
+				{"pgup pgdown", "page"},
+			}},
+			{title: "VIEW", actions: true, entries: []helpEntry{
+				{"r", "summary / raw JSON"},
+			}},
+			{title: "LEAVE", entries: []helpEntry{
+				{"q esc", "back"},
+				{"ctrl+c", "quit"},
+			}},
+		}
 	}
 	return nil
 }
@@ -346,6 +361,8 @@ func screenName(s screen) string {
 		return "settings"
 	case screenSettingsForm:
 		return "settings form"
+	case screenInspect:
+		return "inspect"
 	}
 	return ""
 }

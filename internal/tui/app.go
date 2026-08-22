@@ -65,6 +65,17 @@ type ExecProvider interface {
 	ExecCommand(ctx context.Context, service string, command []string) (*exec.Cmd, error)
 }
 
+// Inspector returns the raw `docker inspect` JSON for one service's container.
+// Declared in the tui package beside ConfigProvider/ExecProvider and
+// type-asserted on the concrete composer — a composer that does not implement
+// it (a test mock) makes the `i` key a silent no-op. All three composers
+// satisfy it, including the read-only *compose.HostContainers: inspect is
+// read-only by nature, so unlike every other recent container key it is NOT
+// gated on m.readOnly().
+type Inspector interface {
+	Inspect(ctx context.Context, service string) ([]byte, error)
+}
+
 // Snapshotter records the currently-running image digests before a deploy so
 // that `cdeploy rollback` can later restore them. Defined in the tui package
 // (like ConfigProvider/ExecProvider) and type-asserted on the concrete composer
@@ -207,6 +218,7 @@ const (
 	screenConfig
 	screenSettingsList
 	screenSettingsForm
+	screenInspect
 )
 
 // Model is the Bubble Tea model for the cdeploy TUI.
@@ -374,6 +386,15 @@ type Model struct {
 	configValid    *bool          // nil = not checked, true = valid, false = invalid
 	configValidMsg string         // validation error message
 	configSession  uint64         // monotonic counter for stale message rejection
+
+	// Screen: inspect
+	inspectService  string         // service whose container is being inspected
+	inspectRaw      []byte         // raw `docker inspect` JSON, verbatim (raw mode)
+	inspectSummary  string         // rendered curated summary (cached; rebuilt on resize)
+	inspectShowRaw  bool           // false = summary (default), true = raw JSON
+	inspectViewport viewport.Model // viewport for whichever mode is active
+	inspectErr      error          // fetch or parse failure
+	inspectSession  uint64         // monotonic counter for stale message rejection
 
 	// Screen: settings list
 	settingsCursor int  // cursor in settings list
@@ -551,6 +572,11 @@ type configEditDoneMsg struct {
 	session uint64
 }
 type configValidateMsg struct {
+	err     error
+	session uint64
+}
+type inspectDataMsg struct {
+	data    []byte
 	err     error
 	session uint64
 }
@@ -1184,6 +1210,19 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.configValid = &v
 			m.configValidMsg = ""
 		}
+		return m, nil
+
+	case inspectDataMsg:
+		if m.screen != screenInspect || msg.session != m.inspectSession {
+			return m, nil
+		}
+		if msg.err != nil {
+			m.inspectErr = msg.err
+			return m, nil
+		}
+		m.inspectRaw = msg.data
+		m.rebuildInspectSummary()
+		m.setInspectContent()
 		return m, nil
 
 	case execDoneMsg:
@@ -2999,6 +3038,52 @@ func (m Model) fetchConfigResolved() tea.Cmd {
 	return func() tea.Msg {
 		data, err := cp.ConfigResolved(ctx)
 		return configResolvedMsg{data: data, err: err, session: session}
+	}
+}
+
+// rebuildInspectSummary re-parses the cached raw bytes and re-renders the
+// curated summary at the viewport's current width. A parse failure is surfaced
+// in the error slot and leaves the summary empty — the raw bytes are still
+// intact, so the `r` toggle remains a working escape hatch.
+func (m *Model) rebuildInspectSummary() {
+	if len(m.inspectRaw) == 0 {
+		m.inspectSummary = ""
+		return
+	}
+	doc, err := compose.ParseInspect(m.inspectRaw)
+	if err != nil {
+		m.inspectErr = err
+		m.inspectSummary = ""
+		return
+	}
+	m.inspectErr = nil
+	m.inspectSummary = buildInspectSummary(doc, m.inspectViewport.Width)
+}
+
+// setInspectContent is the single SetContent chokepoint for the inspect
+// viewport, so the mode toggle, the fetch handler and the resize branch cannot
+// disagree about which buffer is on screen.
+func (m *Model) setInspectContent() {
+	if m.inspectShowRaw {
+		m.inspectViewport.SetContent(string(m.inspectRaw))
+		return
+	}
+	m.inspectViewport.SetContent(m.inspectSummary)
+}
+
+// fetchInspect runs `docker inspect` for the service being inspected. The
+// session is passed in rather than read off the Model so the value captured is
+// the one live at the call site, matching refreshUpdates.
+func (m Model) fetchInspect(session uint64) tea.Cmd {
+	ins, ok := m.composer.(Inspector)
+	if !ok {
+		return nil
+	}
+	ctx := m.ctx
+	service := m.inspectService
+	return func() tea.Msg {
+		data, err := ins.Inspect(ctx, service)
+		return inspectDataMsg{data: data, err: err, session: session}
 	}
 }
 

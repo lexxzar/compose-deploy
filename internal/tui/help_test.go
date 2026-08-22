@@ -14,7 +14,7 @@ import (
 
 // allScreens is every screen constant, pinned complete by
 // TestAllScreens_Complete below: the constants are a contiguous iota run, so a
-// 9th screen that is not listed here fails that test instead of silently
+// new screen that is not listed here fails that test instead of silently
 // skipping every screen-table test in this file.
 var allScreens = []screen{
 	screenSelectServer,
@@ -25,6 +25,7 @@ var allScreens = []screen{
 	screenConfig,
 	screenSettingsList,
 	screenSettingsForm,
+	screenInspect,
 }
 
 // allProgressPhases is every progressPhase constant, pinned complete by
@@ -47,10 +48,13 @@ func TestAllProgressPhases_Complete(t *testing.T) {
 }
 
 // TestAllScreens_Complete closes the loop the other screen-table tests depend
-// on. screen is a contiguous iota run (screenSelectServer..screenSettingsForm),
-// so the count is the whole check.
+// on. screen is a contiguous iota run (screenSelectServer..screenInspect), so
+// the count is the whole check. The bound anchors to the LAST constant, so
+// appending a new screen without listing it here goes red — see the residual
+// recorded in CLAUDE.md: it used to anchor to screenSettingsForm, which made
+// the promise above false.
 func TestAllScreens_Complete(t *testing.T) {
-	if want := int(screenSettingsForm) + 1; len(allScreens) != want {
+	if want := int(screenInspect) + 1; len(allScreens) != want {
 		t.Fatalf("allScreens has %d entries, want %d — add the new screen here and to helpGroupsFor()",
 			len(allScreens), want)
 	}
@@ -140,6 +144,7 @@ func TestHelpGroups_NamesEveryBoundKey(t *testing.T) {
 		screenConfig:       {"q", "ctrl+c", "esc", "r", "e", "up", "down", "pgup", "pgdown"},
 		screenSettingsList: {"q", "ctrl+c", "esc", "up", "k", "down", "j", "a", "enter", "e", "d", "y", "n"},
 		screenSettingsForm: {"q", "ctrl+c", "esc", "tab", "shift+tab", "up", "down", "left", "right", "enter"},
+		screenInspect:      {"q", "ctrl+c", "esc", "r", "up", "down", "pgup", "pgdown"},
 	}
 
 	for _, s := range allScreens {

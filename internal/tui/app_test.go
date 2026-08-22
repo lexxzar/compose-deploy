@@ -15230,3 +15230,186 @@ func TestReadOnly_UpdateKeyStillFetches(t *testing.T) {
 		t.Error("U did not mark updateInFlight")
 	}
 }
+
+// mockInspectComposer implements both runner.Composer and Inspector, so the
+// `i` key's type assertion succeeds. Follows the
+// TestReadOnly_GatesWriteKeys_WithCapableComposer precedent: a mock that lacks
+// the capability would let a test pass on the assertion rather than on the
+// behaviour under test.
+type mockInspectComposer struct {
+	mockComposer
+	inspectRaw     []byte
+	inspectErr     error
+	inspectCalls   int
+	inspectService string
+}
+
+func (m *mockInspectComposer) Inspect(ctx context.Context, service string) ([]byte, error) {
+	m.inspectCalls++
+	m.inspectService = service
+	return m.inspectRaw, m.inspectErr
+}
+
+// inspectFixtureJSON is a minimal but structurally real `docker inspect`
+// payload: the single-element array, the leading-slash name and a healthcheck,
+// so the handler exercises the parse and the renderer, not just the plumbing.
+const inspectFixtureJSON = `[{
+  "Name": "/proj-web-1",
+  "Image": "sha256:0123456789abcdef",
+  "RestartCount": 2,
+  "State": {
+    "Status": "running",
+    "Running": true,
+    "StartedAt": "2026-08-22T03:00:00.000000000Z",
+    "Health": {"Status": "healthy", "FailingStreak": 0,
+      "Log": [{"Start": "2026-08-22T03:09:35.0Z", "End": "2026-08-22T03:09:38.0Z", "ExitCode": 0, "Output": "ok\n"}]}
+  },
+  "Config": {"Image": "nginx:1.27", "Env": ["TZ=UTC"],
+    "Healthcheck": {"Test": ["CMD-SHELL", "curl -fsS http://localhost/"], "Interval": 3000000000, "Timeout": 2000000000, "Retries": 2}},
+  "HostConfig": {"RestartPolicy": {"Name": "unless-stopped"}},
+  "Mounts": [{"Type": "volume", "Name": "data", "Source": "/var/lib/docker/volumes/data/_data", "Destination": "/data", "RW": true}]
+}]`
+
+func TestInspectDataMsg_CurrentSessionPopulates(t *testing.T) {
+	m := Model{screen: screenInspect, inspectSession: 5, inspectService: "web"}
+	m.inspectViewport = viewport.New(100, 10)
+
+	result, _ := m.Update(inspectDataMsg{data: []byte(inspectFixtureJSON), session: 5})
+	model := result.(Model)
+
+	if model.inspectErr != nil {
+		t.Fatalf("inspectErr = %v, want nil", model.inspectErr)
+	}
+	if string(model.inspectRaw) != inspectFixtureJSON {
+		t.Error("inspectRaw should hold the bytes verbatim")
+	}
+	if model.inspectSummary == "" {
+		t.Fatal("inspectSummary should be rendered")
+	}
+	for _, want := range []string{"STATE", "running", "HEALTH", "healthy", "IMAGE", "nginx:1.27"} {
+		if !strings.Contains(model.inspectSummary, want) {
+			t.Errorf("summary missing %q:\n%s", want, model.inspectSummary)
+		}
+	}
+	if got := model.inspectViewport.View(); !strings.Contains(got, "STATE") {
+		t.Errorf("viewport should show the summary, got:\n%s", got)
+	}
+}
+
+func TestInspectDataMsg_RawModeShowsVerbatimBytes(t *testing.T) {
+	m := Model{screen: screenInspect, inspectSession: 1, inspectShowRaw: true}
+	m.inspectViewport = viewport.New(200, 10)
+
+	result, _ := m.Update(inspectDataMsg{data: []byte(inspectFixtureJSON), session: 1})
+	model := result.(Model)
+
+	if got := model.inspectViewport.View(); !strings.Contains(got, `"Name": "/proj-web-1"`) {
+		t.Errorf("raw mode should render the inspect bytes, got:\n%s", got)
+	}
+}
+
+func TestInspectDataMsg_StaleSessionDiscarded(t *testing.T) {
+	m := Model{screen: screenInspect, inspectSession: 5}
+	m.inspectViewport = viewport.New(100, 10)
+
+	result, _ := m.Update(inspectDataMsg{data: []byte(inspectFixtureJSON), session: 3})
+	model := result.(Model)
+
+	if model.inspectRaw != nil || model.inspectSummary != "" {
+		t.Error("stale inspectDataMsg should be discarded")
+	}
+}
+
+func TestInspectDataMsg_OffScreenDiscarded(t *testing.T) {
+	m := Model{screen: screenSelectContainers, inspectSession: 5}
+	m.inspectViewport = viewport.New(100, 10)
+
+	result, _ := m.Update(inspectDataMsg{data: []byte(inspectFixtureJSON), session: 5})
+	model := result.(Model)
+
+	if model.inspectRaw != nil || model.inspectSummary != "" {
+		t.Error("inspectDataMsg should be discarded when not on the inspect screen")
+	}
+}
+
+func TestInspectDataMsg_FetchError(t *testing.T) {
+	m := Model{screen: screenInspect, inspectSession: 2}
+	m.inspectViewport = viewport.New(100, 10)
+
+	result, _ := m.Update(inspectDataMsg{err: fmt.Errorf("no container found for \"web\""), session: 2})
+	model := result.(Model)
+
+	if model.inspectErr == nil {
+		t.Fatal("inspectErr should be set on a fetch failure")
+	}
+	if !strings.Contains(model.inspectErr.Error(), "no container found") {
+		t.Errorf("inspectErr = %q", model.inspectErr.Error())
+	}
+	if model.inspectRaw != nil {
+		t.Error("a failed fetch must not populate inspectRaw")
+	}
+}
+
+// TestInspectDataMsg_ParseErrorKeepsRaw pins the escape hatch: a payload the
+// narrow parser cannot read still reaches raw mode, so the user is never left
+// with a blank screen and no way to see what docker actually returned.
+func TestInspectDataMsg_ParseErrorKeepsRaw(t *testing.T) {
+	m := Model{screen: screenInspect, inspectSession: 1}
+	m.inspectViewport = viewport.New(100, 10)
+
+	result, _ := m.Update(inspectDataMsg{data: []byte("[]"), session: 1})
+	model := result.(Model)
+
+	if model.inspectErr == nil {
+		t.Fatal("a parse failure should surface in inspectErr")
+	}
+	if string(model.inspectRaw) != "[]" {
+		t.Errorf("inspectRaw = %q, want the bytes kept for raw mode", string(model.inspectRaw))
+	}
+	if model.inspectSummary != "" {
+		t.Error("summary should be empty when the parse failed")
+	}
+}
+
+func TestFetchInspect_SendsSessionAndService(t *testing.T) {
+	mc := &mockInspectComposer{inspectRaw: []byte(inspectFixtureJSON)}
+	m := Model{composer: mc, ctx: context.Background(), inspectService: "web"}
+
+	cmd := m.fetchInspect(7)
+	if cmd == nil {
+		t.Fatal("fetchInspect returned nil for an Inspector composer")
+	}
+	msg, ok := cmd().(inspectDataMsg)
+	if !ok {
+		t.Fatalf("fetchInspect produced %T, want inspectDataMsg", cmd())
+	}
+	if msg.session != 7 {
+		t.Errorf("session = %d, want 7", msg.session)
+	}
+	if string(msg.data) != inspectFixtureJSON {
+		t.Error("fetchInspect should carry the composer's bytes verbatim")
+	}
+	if mc.inspectService != "web" {
+		t.Errorf("Inspect called with %q, want \"web\"", mc.inspectService)
+	}
+}
+
+func TestFetchInspect_NilForNonInspector(t *testing.T) {
+	m := Model{composer: &mockComposer{}, ctx: context.Background(), inspectService: "web"}
+	if cmd := m.fetchInspect(1); cmd != nil {
+		t.Error("fetchInspect should return nil when the composer is not an Inspector")
+	}
+}
+
+func TestFetchInspect_PropagatesError(t *testing.T) {
+	mc := &mockInspectComposer{inspectErr: fmt.Errorf("boom")}
+	m := Model{composer: mc, ctx: context.Background(), inspectService: "web"}
+
+	msg, ok := m.fetchInspect(1)().(inspectDataMsg)
+	if !ok {
+		t.Fatal("want inspectDataMsg")
+	}
+	if msg.err == nil || !strings.Contains(msg.err.Error(), "boom") {
+		t.Errorf("err = %v, want boom", msg.err)
+	}
+}
