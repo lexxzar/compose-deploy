@@ -443,12 +443,12 @@ Plus, outside the tables:
 - Modify: `internal/tui/inspect_test.go`
 - Modify: `internal/tui/styles.go` (only if reuse fails)
 
-- [ ] add IMAGE (configured ref, resolved digest, command, entrypoint)
-- [ ] add MOUNTS (type, `source → destination`, rw) and ENV (`KEY=VALUE`, verbatim — see Design decisions)
-- [ ] **check `groupHeaderStyle` (`styles.go:75`) and `helpGroupTitleStyle` (:130) for reuse before adding a new section style**
-- [ ] write tests for each section: present, absent, and empty-collection cases
-- [ ] re-run the width test with all five sections
-- [ ] run `go test ./internal/tui/` — must pass before task 7
+- [x] add IMAGE (configured ref, resolved digest, command, entrypoint)
+- [x] add MOUNTS (type, `source → destination`, rw) and ENV (`KEY=VALUE`, verbatim — see Design decisions)
+- [x] **check `groupHeaderStyle` (`styles.go:75`) and `helpGroupTitleStyle` (:130) for reuse before adding a new section style** — `helpGroupTitleStyle` was already reused by `inspectBuilder.section()` in Task 5, so no new style was added
+- [x] write tests for each section: present, absent, and empty-collection cases
+- [x] re-run the width test with all five sections — the synthetic "long values" doc in `TestBuildInspectSummary_NeverExceedsWidth` gained a long image ref, command, entrypoint, mount and env entry
+- [x] run `go test ./internal/tui/` — must pass before task 7
 
 ### Task 7: Add the screen constant, tax items 1-5, Model fields and fetch command
 

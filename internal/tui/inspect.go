@@ -28,6 +28,11 @@ const (
 	// inspectBlockIndent is the left pad of a free-form block (a health probe's
 	// output), one level deeper than a value row's label.
 	inspectBlockIndent = 4
+
+	// inspectListIndent is the left pad of a plain list entry (an ENV line),
+	// level with the label of a value row rather than one step deeper — the
+	// entry is the whole row, not the value half of one.
+	inspectListIndent = 2
 )
 
 // inspectBuilder accumulates the summary line by line. Every push goes through
@@ -117,6 +122,9 @@ func buildInspectSummary(doc compose.InspectDoc, width int) string {
 	b := &inspectBuilder{width: width}
 	inspectStateSection(b, doc)
 	inspectHealthSection(b, doc)
+	inspectImageSection(b, doc)
+	inspectMountsSection(b, doc)
+	inspectEnvSection(b, doc)
 	return b.String()
 }
 
@@ -181,6 +189,84 @@ func inspectHealthSection(b *inspectBuilder, doc compose.InspectDoc) {
 	b.kv("last probe", formatProbeHeader(probe))
 	if out := strings.TrimRight(probe.Output, "\n"); out != "" {
 		b.block(inspectBlockIndent, out)
+	}
+}
+
+// inspectImageSection renders what the container actually runs: the ref the
+// compose file asked for, the digest docker resolved it to, and the command
+// pair. The digest is the row that answers "did my deploy take?" — a stale
+// container keeps the old digest under an unchanged tag.
+func inspectImageSection(b *inspectBuilder, doc compose.InspectDoc) {
+	cmd := strings.Join(doc.Config.Cmd, " ")
+	entrypoint := strings.Join(doc.Config.Entrypoint, " ")
+	if doc.Config.Image == "" && doc.Image == "" && cmd == "" && entrypoint == "" {
+		return
+	}
+	b.section("IMAGE")
+
+	if doc.Config.Image != "" {
+		b.kv("image", doc.Config.Image)
+	}
+	if doc.Image != "" {
+		b.kv("digest", doc.Image)
+	}
+	if cmd != "" {
+		b.kv("command", cmd)
+	}
+	if entrypoint != "" {
+		b.kv("entrypoint", entrypoint)
+	}
+}
+
+func inspectMountsSection(b *inspectBuilder, doc compose.InspectDoc) {
+	if len(doc.Mounts) == 0 {
+		return
+	}
+	b.section("MOUNTS")
+
+	for _, m := range doc.Mounts {
+		label := m.Type
+		if label == "" {
+			label = "mount"
+		}
+		b.kv(label, formatInspectMount(m))
+	}
+}
+
+// formatInspectMount renders one mount as "source → destination  rw". The arrow
+// is U+2192, the same one FormatPort uses, so the two columns read alike.
+func formatInspectMount(m compose.InspectMount) string {
+	source := m.Source
+	if source == "" {
+		// An anonymous volume has no bind source; its generated name is all
+		// there is to identify it by.
+		source = m.Name
+	}
+	if source == "" {
+		source = "(unnamed)"
+	}
+	access := "ro"
+	if m.RW {
+		access = "rw"
+	}
+	return source + " → " + m.Destination + "  " + access
+}
+
+// inspectEnvSection renders the container's environment verbatim, secrets
+// included — see the no-masking decision in the README. These are the values the
+// RUNNING container holds, which is the whole point: a compose file edited after
+// an `r` restart still shows the new value while the container holds the old one.
+func inspectEnvSection(b *inspectBuilder, doc compose.InspectDoc) {
+	if len(doc.Config.Env) == 0 {
+		return
+	}
+	b.section("ENV")
+
+	for _, e := range doc.Config.Env {
+		if strings.TrimSpace(e) == "" {
+			continue
+		}
+		b.block(inspectListIndent, e)
 	}
 }
 

@@ -159,6 +159,13 @@ func TestBuildInspectSummary_NeverExceedsWidth(t *testing.T) {
 				},
 			},
 			Config: compose.InspectConfig{
+				Image:      "registry.example.com/team/" + strings.Repeat("very-long-image-name-", 4) + "service:2026.08.22-rc1",
+				Cmd:        []string{"/app/server", "--config", strings.Repeat("/deep/path/segment", 6) + "/config.yaml"},
+				Entrypoint: []string{"/usr/local/bin/" + strings.Repeat("entrypoint-", 6) + "wrapper.sh"},
+				Env: []string{
+					"DATABASE_URL=postgres://appuser:hunter2@" + strings.Repeat("sub.", 12) + "example.com:5432/appdb",
+					"SHORT=1",
+				},
 				Healthcheck: &compose.InspectHealthcheck{
 					Test:     []string{"CMD-SHELL", strings.Repeat("curl -fsS http://localhost/healthz && ", 8) + "true"},
 					Interval: 5 * time.Second,
@@ -166,6 +173,12 @@ func TestBuildInspectSummary_NeverExceedsWidth(t *testing.T) {
 					Retries:  3,
 				},
 			},
+			Mounts: []compose.InspectMount{{
+				Type:        "bind",
+				Source:      strings.Repeat("/a-rather-long-directory-name", 5),
+				Destination: strings.Repeat("/another-long-directory-name", 4),
+				RW:          true,
+			}},
 		},
 	}
 
@@ -193,6 +206,11 @@ func TestBuildInspectSummary_StateAlwaysRenders(t *testing.T) {
 	}
 	if strings.Contains(out, "started") {
 		t.Errorf("empty doc has no start time and must not render the row:\n%s", out)
+	}
+	for _, section := range []string{"IMAGE", "MOUNTS", "ENV"} {
+		if strings.Contains(out, section) {
+			t.Errorf("empty doc must not render %s:\n%s", section, out)
+		}
 	}
 }
 
@@ -384,4 +402,284 @@ func TestFormatRestartPolicy(t *testing.T) {
 			}
 		})
 	}
+}
+
+// inspectRow builds the "label<pad>value" text a kv row renders to, so a test
+// pins the alignment without hard-coding a run of spaces it has to recount every
+// time a label changes length.
+func inspectRow(label, value string) string {
+	pad := max(inspectValueCol-len("  "+label), 1)
+	return label + strings.Repeat(" ", pad) + value
+}
+
+func TestBuildInspectSummary_ImageSection(t *testing.T) {
+	doc := loadInspectFixture(t, "docker_inspect_healthy.json")
+	out := buildInspectSummary(doc, 200)
+
+	for _, want := range []string{
+		"IMAGE",
+		inspectRow("image", "nginx:latest"),
+		inspectRow("digest", "sha256:d090ef0c3fa38df49d89dfcca52ce77f71d88a8db6bd8388d78817cad20a0c1f"),
+		inspectRow("command", "nginx -g daemon off;"),
+		inspectRow("entrypoint", "/docker-entrypoint.sh"),
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("summary missing %q:\n%s", want, out)
+		}
+	}
+}
+
+// TestBuildInspectSummary_ImageSectionShellCommand pins that a shell-form command
+// reaches the summary as one row, quotes and redirections intact — that string is
+// the reason the stopped fixture exited 3.
+func TestBuildInspectSummary_ImageSectionShellCommand(t *testing.T) {
+	doc := loadInspectFixture(t, "docker_inspect_stopped.json")
+	out := buildInspectSummary(doc, 200)
+
+	const cmd = `echo 'migration failed: relation "users" does not exist' >&2; exit 3`
+	if !strings.Contains(out, inspectRow("command", cmd)) {
+		t.Errorf("summary missing the shell command %q:\n%s", cmd, out)
+	}
+	if !strings.Contains(out, inspectRow("entrypoint", "/bin/sh -c")) {
+		t.Errorf("summary missing the entrypoint:\n%s", out)
+	}
+}
+
+func TestBuildInspectSummary_ImageSectionPresence(t *testing.T) {
+	tests := []struct {
+		name    string
+		doc     compose.InspectDoc
+		want    bool
+		wantRow string
+		skipRow string
+	}{
+		{name: "nothing to say", want: false},
+		{
+			name:    "digest only",
+			doc:     compose.InspectDoc{Image: "sha256:abc"},
+			want:    true,
+			wantRow: inspectRow("digest", "sha256:abc"),
+			skipRow: "image  ",
+		},
+		{
+			name:    "configured ref only",
+			doc:     compose.InspectDoc{Config: compose.InspectConfig{Image: "redis:7"}},
+			want:    true,
+			wantRow: inspectRow("image", "redis:7"),
+			skipRow: "digest",
+		},
+		{
+			name:    "command only",
+			doc:     compose.InspectDoc{Config: compose.InspectConfig{Cmd: []string{"sleep", "infinity"}}},
+			want:    true,
+			wantRow: inspectRow("command", "sleep infinity"),
+			skipRow: "entrypoint",
+		},
+		{
+			name:    "empty command slice is not a command",
+			doc:     compose.InspectDoc{Image: "sha256:abc", Config: compose.InspectConfig{Cmd: []string{}}},
+			want:    true,
+			wantRow: inspectRow("digest", "sha256:abc"),
+			skipRow: "command",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			out := buildInspectSummary(tt.doc, 80)
+			if got := strings.Contains(out, "IMAGE"); got != tt.want {
+				t.Fatalf("IMAGE present = %v, want %v:\n%s", got, tt.want, out)
+			}
+			if tt.wantRow != "" && !strings.Contains(out, tt.wantRow) {
+				t.Errorf("summary missing %q:\n%s", tt.wantRow, out)
+			}
+			if tt.skipRow != "" && strings.Contains(out, tt.skipRow) {
+				t.Errorf("summary must not contain %q:\n%s", tt.skipRow, out)
+			}
+		})
+	}
+}
+
+func TestBuildInspectSummary_MountsSection(t *testing.T) {
+	doc := loadInspectFixture(t, "docker_inspect_healthy.json")
+	if len(doc.Mounts) != 2 {
+		t.Fatalf("fixture mounts = %d, want 2", len(doc.Mounts))
+	}
+	out := buildInspectSummary(doc, 200)
+
+	if !strings.Contains(out, "MOUNTS") {
+		t.Fatalf("summary missing MOUNTS:\n%s", out)
+	}
+	for _, m := range doc.Mounts {
+		want := inspectRow(m.Type, formatInspectMount(m))
+		if !strings.Contains(out, want) {
+			t.Errorf("summary missing mount row %q:\n%s", want, out)
+		}
+	}
+	if !strings.Contains(out, "/usr/share/nginx/html  ro") {
+		t.Errorf("read-only bind mount lost its access flag:\n%s", out)
+	}
+	if !strings.Contains(out, "/var/cache/nginx  rw") {
+		t.Errorf("read-write volume lost its access flag:\n%s", out)
+	}
+}
+
+// TestBuildInspectSummary_MountsWrapNotTruncate pins that a long bind source
+// survives a narrow pane — the destination is the half that falls off the edge
+// without a wrap, and it is the half that identifies the mount.
+func TestBuildInspectSummary_MountsWrapNotTruncate(t *testing.T) {
+	doc := loadInspectFixture(t, "docker_inspect_healthy.json")
+	for _, width := range []int{40, 60, 80} {
+		out := buildInspectSummary(doc, width)
+		for _, m := range doc.Mounts {
+			if !strings.Contains(squeeze(out), squeeze(formatInspectMount(m))) {
+				t.Errorf("width %d: mount %q truncated:\n%s", width, m.Destination, out)
+			}
+		}
+	}
+}
+
+func TestBuildInspectSummary_MountsAbsent(t *testing.T) {
+	doc := loadInspectFixture(t, "docker_inspect_unhealthy.json")
+	if len(doc.Mounts) != 0 {
+		t.Fatalf("fixture mounts = %d, want 0", len(doc.Mounts))
+	}
+	if out := buildInspectSummary(doc, 120); strings.Contains(out, "MOUNTS") {
+		t.Errorf("container with no mounts must not render MOUNTS:\n%s", out)
+	}
+}
+
+func TestFormatInspectMount(t *testing.T) {
+	tests := []struct {
+		name string
+		in   compose.InspectMount
+		want string
+	}{
+		{
+			name: "read-only bind",
+			in:   compose.InspectMount{Type: "bind", Source: "/srv/site", Destination: "/usr/share/nginx/html"},
+			want: "/srv/site → /usr/share/nginx/html  ro",
+		},
+		{
+			name: "read-write volume",
+			in:   compose.InspectMount{Type: "volume", Name: "appdata", Source: "/var/lib/docker/volumes/appdata/_data", Destination: "/data", RW: true},
+			want: "/var/lib/docker/volumes/appdata/_data → /data  rw",
+		},
+		{
+			name: "anonymous volume falls back to its name",
+			in:   compose.InspectMount{Type: "volume", Name: "a1b2c3", Destination: "/cache", RW: true},
+			want: "a1b2c3 → /cache  rw",
+		},
+		{
+			name: "no source and no name",
+			in:   compose.InspectMount{Type: "tmpfs", Destination: "/tmp", RW: true},
+			want: "(unnamed) → /tmp  rw",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := formatInspectMount(tt.in); got != tt.want {
+				t.Errorf("formatInspectMount(%+v) = %q, want %q", tt.in, got, tt.want)
+			}
+		})
+	}
+}
+
+// TestBuildInspectSummary_EnvVerbatim pins the no-masking decision: the values
+// the running container holds are rendered exactly as docker reports them,
+// secrets included. Masking here without masking raw mode would protect nothing.
+func TestBuildInspectSummary_EnvVerbatim(t *testing.T) {
+	doc := loadInspectFixture(t, "docker_inspect_healthy.json")
+	out := buildInspectSummary(doc, 200)
+
+	if !strings.Contains(out, "ENV") {
+		t.Fatalf("summary missing ENV:\n%s", out)
+	}
+	for _, want := range []string{
+		"  POSTGRES_PASSWORD=s3cr3t-pw",
+		"  DATABASE_URL=postgres://appuser:hunter2@db:5432/appdb",
+		"  APP_ENV=production",
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("summary missing env entry %q:\n%s", want, out)
+		}
+	}
+	if got, want := strings.Count(out, "PATH=/usr/local/sbin"), 1; got != want {
+		t.Errorf("PATH entries = %d, want %d:\n%s", got, want, out)
+	}
+}
+
+func TestBuildInspectSummary_EnvPresence(t *testing.T) {
+	tests := []struct {
+		name  string
+		env   []string
+		want  bool
+		lines []string
+	}{
+		{name: "nil", want: false},
+		{name: "empty slice", env: []string{}, want: false},
+		{name: "one entry", env: []string{"A=1"}, want: true, lines: []string{"  A=1"}},
+		{
+			name:  "blank entries are dropped",
+			env:   []string{"A=1", "", "   ", "B=2"},
+			want:  true,
+			lines: []string{"  A=1", "  B=2"},
+		},
+		{
+			name:  "a value with no equals is still shown",
+			env:   []string{"BARE"},
+			want:  true,
+			lines: []string{"  BARE"},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			doc := compose.InspectDoc{Config: compose.InspectConfig{Env: tt.env}}
+			out := buildInspectSummary(doc, 80)
+			if got := strings.Contains(out, "ENV"); got != tt.want {
+				t.Fatalf("ENV present = %v, want %v:\n%s", got, tt.want, out)
+			}
+			for _, line := range tt.lines {
+				if !strings.Contains(out, line) {
+					t.Errorf("summary missing %q:\n%s", line, out)
+				}
+			}
+			if got := envBlockLines(out); tt.want && got != len(tt.lines) {
+				t.Errorf("ENV block has %d lines, want %d:\n%s", got, len(tt.lines), out)
+			}
+		})
+	}
+}
+
+// TestBuildInspectSummary_SectionOrder pins the five sections into the documented
+// reading order: what the container is doing, then why it is unhealthy, then what
+// it runs, then what it has attached.
+func TestBuildInspectSummary_SectionOrder(t *testing.T) {
+	doc := loadInspectFixture(t, "docker_inspect_healthy.json")
+	out := buildInspectSummary(doc, 200)
+
+	prev := -1
+	for _, section := range []string{"STATE", "HEALTH", "IMAGE", "MOUNTS", "ENV"} {
+		at := strings.Index(out, section)
+		if at < 0 {
+			t.Fatalf("summary missing %s:\n%s", section, out)
+		}
+		if at <= prev {
+			t.Errorf("%s at %d is not after the previous section at %d:\n%s", section, at, prev, out)
+		}
+		prev = at
+	}
+}
+
+// envBlockLines counts the entries rendered under the ENV header. ENV is the
+// last section, so everything after its title belongs to it.
+func envBlockLines(summary string) int {
+	lines := strings.Split(summary, "\n")
+	for i, line := range lines {
+		if strings.Contains(line, "ENV") {
+			return len(lines) - i - 1
+		}
+	}
+	return 0
 }
