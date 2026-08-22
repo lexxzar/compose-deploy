@@ -819,6 +819,13 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			} else if entry.results != nil {
 				m.hydrateUpdates(entry.results)
 			}
+		} else if !m.autoUpdatesAllowed() {
+			// The failure entry the warning described has expired and no
+			// automatic refetch will replace it here (U is the only trigger),
+			// so the warning is no longer current — drop it instead of leaving
+			// it on screen for the life of the read-only view. Cleared before
+			// fixSvcOffset below, which re-clamps the row the warning freed.
+			m.updatesErr = ""
 		}
 		m.fixSvcOffset()
 		// Self-heal: if no fresh cache entry exists (TTL expired or never
@@ -1834,7 +1841,13 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			// Multi-select exists only to feed d/r/s/R. On a read-only composer
 			// those are gated, so toggling would arm nothing — and the row
 			// checkbox is not rendered either (see viewSelectContainers).
+			//
+			// Every gated key below re-clamps before returning: the dispatch
+			// clears m.warning above, which frees the warning footer line and
+			// grows svcVisibleCount() by one, so a scrolled list would keep a
+			// too-large svcOffset and render a blank row at the bottom.
 			if m.readOnly() {
+				m.fixSvcOffset()
 				return m, nil
 			}
 			if len(m.services) > 0 {
@@ -1842,6 +1855,7 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			}
 		case "a":
 			if m.readOnly() {
+				m.fixSvcOffset()
 				return m, nil
 			}
 			allSel := m.allSelected()
@@ -1850,6 +1864,7 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			}
 		case "r":
 			if m.readOnly() {
+				m.fixSvcOffset()
 				return m, nil
 			}
 			if m.selectedCount() > 0 {
@@ -1861,6 +1876,7 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.fixSvcOffset()
 		case "d":
 			if m.readOnly() {
+				m.fixSvcOffset()
 				return m, nil
 			}
 			if m.selectedCount() > 0 {
@@ -1872,6 +1888,7 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.fixSvcOffset()
 		case "s":
 			if m.readOnly() {
+				m.fixSvcOffset()
 				return m, nil
 			}
 			if m.selectedCount() > 0 {
@@ -1893,6 +1910,7 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			// inert key that a help table still names is the failure mode this
 			// gate pairs with, so the gate and the table move together.
 			if m.readOnly() {
+				m.fixSvcOffset()
 				return m, nil
 			}
 			if _, ok := m.composer.(RollbackPreparer); !ok {
@@ -1957,6 +1975,7 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			// ConfigProvider, so c already no-ops, but the gate keeps the key's
 			// absence from the read-only help table honest.
 			if m.readOnly() {
+				m.fixSvcOffset()
 				return m, nil
 			}
 			if _, ok := m.composer.(ConfigProvider); ok {
@@ -3718,6 +3737,10 @@ func (m *Model) maybeRefreshUpdatesCmd() tea.Cmd {
 		return nil
 	}
 	if !m.autoUpdatesAllowed() {
+		// Same reasoning as the statusMsg branch: the cached failure has
+		// expired and U is the only thing that can refresh it, so the stale
+		// warning must not survive into the new visit.
+		m.updatesErr = ""
 		return nil
 	}
 	m.updateInFlight = true

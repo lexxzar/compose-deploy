@@ -28,8 +28,19 @@ on others breaks the uniform-row contract that the footer and the `?` overlay de
 - **AC2** — The row is absent when the host has no such containers.
 - **AC3a** — The screen shows name, status dot, health icon, Created, Uptime, Ports, CPU and
   Mem, in the same columns as a compose project.
-- **AC3b** — The screen shows the `⇧` update glyph. **[R2: split from AC3 — this is the only
-  criterion that depends on tasks 10-12, the one droppable block.]**
+- **AC3b** — The screen shows the `⇧` update glyph **after the user presses `U`**, and only
+  then. **[R2: split from AC3 — this is the only criterion that depends on tasks 10-12, the one
+  droppable block.]** **[R3, during implementation: the criterion was unconditional and shipped
+  as an opt-in. All three automatic entry points — `maybeRefreshUpdatesCmd()`, the `statusMsg`
+  self-heal and `Init()`'s picker-skipped fast path — consult `autoUpdatesAllowed()`
+  (= `!m.readOnly()`) and skip the fetch. A compose project bounds the check to one service
+  list the user manages; the unmanaged list comes from `docker ps -a`, so it grows with every
+  container left on the host and each distinct image costs a registry manifest request. An
+  automatic fan-out on screen entry, repeated by every 5s status tick, can exhaust the
+  anonymous Docker Hub manifest quota and break a real `docker pull` from the same host. The
+  CLI is opt-in for the same reason (`list --updates`), and the `?` overlay names
+  `U check updates`. The glyphs therefore blank once the 10-minute cache entry expires; the
+  user presses `U` again.]**
 - **AC4** — These keys work: `l` logs, `x` exec, `enter` (confirm the exec prompt), `/` `n` `N`
   search, `U` force update check, `esc`/`q` back, `?` overlay, arrows.
 - **AC5** — These keys are inert AND absent from both the footer and the `?` overlay:
@@ -207,9 +218,16 @@ project picker
    a direct collision. Two failures follow: a fresh entry from the fast-track context
    suppresses the unmanaged `CheckUpdates` for the full 10-minute TTL, and `hydrateUpdates`
    writes the other context's verdicts onto any colliding service name (the phantom guard only
-   drops *unknown* names, not colliding ones). Fix with an explicit `projUnmanaged bool` on
-   Model folded into the key. Its cleanup rule is crisp: it is set or cleared at exactly the
-   four sites that already assign `m.projDir` — `app.go:1543`, `:1628`, `:1657`, `:1777`.
+   drops *unknown* names, not colliding ones). Fix with an `"unmanaged|"` prefix on the key,
+   derived from `m.readOnly()`. **[R3, during implementation: the plan asked for a parallel
+   `projUnmanaged bool` on Model, set or cleared at the four `m.projDir` assignment sites. That
+   field was deleted during review and the prefix now comes from the composer. The composer IS
+   the context the cache describes, it is live at all three `updatesCacheKey()` call sites, and
+   it is assigned or nil'd at exactly the sites such a field would have to be cleared at — so
+   deriving it keeps four entries out of the back-navigation cleanup discipline CLAUDE.md calls
+   the repo's most fragile invariant, where one forgotten site silently mis-keys the cache.
+   Pinned end-to-end by `TestUpdatesCacheKey_FollowsComposerAcrossNavigation`, which drives
+   unmanaged-pick → `esc` → `esc` → local fast-track.]**
 
 8. **`c` and `R` gate themselves for free — but still get explicit gates.** `HostContainers`
    does not implement `ConfigProvider` or `RollbackPreparer`, so those keys already no-op. An
@@ -298,11 +316,13 @@ var ErrReadOnly = errors.New("read-only: container is not managed by docker comp
 ### Processing flow
 
 1. Picker load calls `CountUnmanaged`. A non-zero count appends the synthetic `Project` with
-   `Unmanaged: true` and `Status: "N containers"`. The append happens **after** `ListProjects`
+   `Unmanaged: true` and `Desc: "N containers"`. **[R3: the plan reused `Status` for the count;
+   the shipped code adds a `Desc` field — see task 5.]** The append happens **after** `ListProjects`
    returns, deliberately bypassing `sortProjects` — that sorts case-insensitively by name
    (`compose.go:113,118`) and `(` sorts before every letter, so a sorted `(unmanaged)` would
    land first instead of last.
-2. `enter` builds `HostContainers` through the widened factory and sets `m.projUnmanaged`.
+2. `enter` builds `HostContainers` through the widened factory. The update-cache key follows
+   the composer — no Model field is set. **[R3, see design decision 7.]**
 3. `screenSelectContainers` runs its normal fetch batch — `loadServices`, `refreshStats`,
    `maybeRefreshUpdatesCmd`. No new message types, no new session counters.
 4. `m.readOnly()` gates keys, selection widgets, footer and `?` overlay.
@@ -395,8 +415,12 @@ ten methods exist. `CheckUpdates` is a `(nil, nil)` stub here so the type is usa
 
 **[R2: `internal/tui/app.go` added — `viewSelectProject` renders `shortenPath(proj.ConfigDir)`
 in the description column (`app.go:4213`), which is blank for this row. The count is carried in
-`Project.Status`, which is already free-text (`"running(3)"`), so no new field is needed.
-The append is extracted to a package-level helper because `cmd/root.go` has no test seam.]**
+a new `Project.Desc` field. The append is extracted to a package-level helper because
+`cmd/root.go` has no test seam.]** **[R3, during implementation: the plan reused `Project.Status`
+for the count. `Status` means the `docker compose ls` lifecycle string and the picker never
+renders it, so overloading it would leave the field with two meanings and the rendered one
+bolted on. `Desc` is a description-column override: empty on a compose project, the count on the
+unmanaged row.]**
 
 **Files:**
 - Modify: `internal/compose/compose.go`
@@ -406,11 +430,11 @@ The append is extracted to a package-level helper because `cmd/root.go` has no t
 - Modify: `internal/tui/app_test.go`
 - Modify: `cmd/root.go`
 
-- [x] add `Unmanaged bool` to `compose.Project`, documenting that `ConfigDir` is empty and `Status` holds the count when it is set
+- [x] add `Unmanaged bool` and `Desc string` to `compose.Project`, documenting that `ConfigDir` is empty and `Desc` holds the count when `Unmanaged` is set
 - [x] add `CountUnmanaged(ctx) (int, error)` on `HostContainers`
 - [x] add `WithUnmanagedRow(ctx, hc *HostContainers, projects []Project) []Project` — appends after `ListProjects` (bypassing `sortProjects`, per Processing flow step 1) and swallows a count error as zero
 - [x] call the helper from both `ProjectLoader` literals in `cmd/root.go` as a one-line call
-- [x] branch `viewSelectProject`'s description column on `proj.Unmanaged` to render `proj.Status` instead of `shortenPath(proj.ConfigDir)`
+- [x] branch `viewSelectProject`'s description column on `proj.Desc` to render it instead of `shortenPath(proj.ConfigDir)`
 - [x] write tests for `CountUnmanaged` (some unmanaged, none, all managed)
 - [x] write tests for `WithUnmanagedRow` (appended when non-zero, absent when zero, absent on error, always last)
 - [x] write a render test asserting the row shows `(unmanaged)` and `N containers`
@@ -442,7 +466,7 @@ The append is extracted to a package-level helper because `cmd/root.go` has no t
 - [x] implement that method on `HostContainers`
 - [x] add `Model.readOnly() bool` type-asserting `m.composer`, nil-safe for `Model{}` test literals
 - [x] early-return from the `d`, `r`, `s`, `R`, `c`, `space` and `a` cases when `m.readOnly()`
-- [x] add `projUnmanaged bool` to Model, fold it into `updatesCacheKey()`, and set or clear it at exactly the four `m.projDir` assignment sites — `app.go:1543`, `:1628`, `:1657`, `:1777` **[R2, design decision 7]**
+- [x] prefix `updatesCacheKey()` with `"unmanaged|"` when `m.readOnly()`, so the key follows the composer and no Model field needs clearing at the four `m.projDir` assignment sites **[R2, design decision 7; R3: shipped as a composer-derived prefix, not the planned `projUnmanaged bool`]**
 - [x] write tests asserting each gated key produces no state change and no `pendingOp`
 - [x] write tests asserting `l`, `x`, `enter`-after-`x`, `/`, `U` still work on a read-only composer
 - [x] write a test asserting `m.readOnly()` is false for a normal composer and for a zero-value Model
@@ -551,7 +575,7 @@ while `CheckUpdates` was still a mandatory interface method.]**
 ### Task 14: [Final] Update documentation
 
 - [x] update `README.md` with the unmanaged-container view and its read-only limits
-- [x] add a CLAUDE.md architecture paragraph covering `HostContainers`, the three-method `dockerRunner` seam, the widened `ComposerFactory`, the `projUnmanaged` cache-key component, and the read-only footer/overlay/checkbox contract (split into three `**Unmanaged containers — …**` paragraphs, matching the `Update detection — …` convention; also refreshed the `Key abstraction`, `Update detection — systemic-failure cascades`, `Package Coupling` and `Testing Approach` paragraphs that the feature made stale)
+- [x] add a CLAUDE.md architecture paragraph covering `HostContainers`, the three-method `dockerRunner` seam, the widened `ComposerFactory`, the composer-derived `"unmanaged|"` cache-key prefix, the `U`-only update opt-in, and the read-only footer/overlay/checkbox contract (split into three `**Unmanaged containers — …**` paragraphs, matching the `Update detection — …` convention; also refreshed the `Key abstraction`, `Update detection — systemic-failure cascades`, `Package Coupling` and `Testing Approach` paragraphs that the feature made stale)
 - [x] update the `Adding New Operations` checklist in CLAUDE.md to mention the read-only help variant (new step 4: gate the key on `m.readOnly()` and keep it out of `readOnlyContainerGroups()`)
 - [x] update `skills/cdeploy/SKILL.md` — no change needed: the skill drives the non-interactive CLI only and tells agents never to launch the TUI, and this view is TUI-only (`cdeploy list` still covers compose projects only). `go test ./skills/ -count=1` passes unchanged
 - [x] move this plan to `docs/plans/completed/` (deferred to orchestrator - runs after review phases)

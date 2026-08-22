@@ -14564,6 +14564,43 @@ func TestReadOnly_GatesWriteKeys_WithCapableComposer(t *testing.T) {
 	}
 }
 
+// TestReadOnly_GatedKeyReclampsOffset pins the reserved-bar side of the gates.
+// The container dispatch clears m.warning before the switch, which frees the
+// warning footer line and grows svcVisibleCount() by one. Every other case in
+// the switch re-clamps; a gated key that returns early without fixSvcOffset
+// leaves a too-large svcOffset and renders a blank row under the last service.
+func TestReadOnly_GatedKeyReclampsOffset(t *testing.T) {
+	for _, key := range []string{"d", "r", "s", "R", "c", " ", "a"} {
+		t.Run(key, func(t *testing.T) {
+			mc := readOnlyTestComposer()
+			mc.services = nil
+			for i := 0; i < 30; i++ {
+				mc.services = append(mc.services, fmt.Sprintf("svc-%02d", i))
+			}
+			m := newReadOnlyModel(t, mc)
+			m.height = 24
+			// The x-on-stopped warning is the state this reproduces from.
+			m.warning = "Container is not running"
+			m.svcCursor = len(m.services) - 1
+			m.fixSvcOffset()
+			if m.svcOffset == 0 {
+				t.Fatal("precondition: the list must scroll at this height")
+			}
+
+			updated, _ := m.Update(keyMsgFor(key))
+			got := updated.(Model)
+
+			if got.warning != "" {
+				t.Fatalf("precondition: the dispatch must clear the warning, got %q", got.warning)
+			}
+			want := len(got.services) - got.svcVisibleCount()
+			if got.svcOffset != want {
+				t.Errorf("svcOffset = %d, want %d; the gated key left a blank row at the bottom", got.svcOffset, want)
+			}
+		})
+	}
+}
+
 // TestReadOnly_KeepsReadKeys is the other half of AC4/AC5: the read keys must
 // still work on a read-only composer. Without this, gating by composer type
 // could over-reach and silently disable the whole screen.
@@ -15064,6 +15101,61 @@ func TestReadOnly_NoAutomaticUpdateFetch(t *testing.T) {
 		})
 		if wcmd == nil {
 			t.Error("control: the writable status self-heal must still fetch on a cache miss")
+		}
+	})
+}
+
+// TestReadOnly_StaleUpdateWarningClears is the other side of the U-only opt-in.
+// A failed U caches a failure entry whose warning both self-heal paths restore
+// while it is fresh; once it expires, no automatic refetch will ever replace it
+// here, so the warning it explained is no longer current and must go — without
+// this, one failed U would keep its warning for the life of the screen.
+func TestReadOnly_StaleUpdateWarningClears(t *testing.T) {
+	const errText = "registry unreachable"
+
+	staleModel := func(t *testing.T, age time.Duration) Model {
+		t.Helper()
+		m := newReadOnlyModel(t, readOnlyTestComposer())
+		m.updatesErr = errText
+		m.updateCache = map[string]updateEntry{
+			m.updatesCacheKey(): {
+				fetchedAt: time.Now().Add(-age),
+				err:       true,
+				errMsg:    errText,
+			},
+		}
+		return m
+	}
+
+	tick := func(m Model) Model {
+		updated, _ := m.Update(statusMsg{
+			status:  map[string]runner.ServiceStatus{"watchtower": {Running: true}},
+			session: m.statusSession,
+		})
+		return updated.(Model)
+	}
+
+	t.Run("status tick drops an expired failure", func(t *testing.T) {
+		got := tick(staleModel(t, updatesErrorTTL+time.Second))
+		if got.updatesErr != "" {
+			t.Errorf("updatesErr = %q; an expired failure must not survive on a read-only screen", got.updatesErr)
+		}
+	})
+
+	t.Run("status tick keeps a fresh failure", func(t *testing.T) {
+		got := tick(staleModel(t, time.Second))
+		if got.updatesErr != errText {
+			t.Errorf("updatesErr = %q, want %q; a fresh failure is still the ground truth", got.updatesErr, errText)
+		}
+	})
+
+	t.Run("screen entry drops an expired failure", func(t *testing.T) {
+		m := staleModel(t, updatesErrorTTL+time.Second)
+		if cmd := m.maybeRefreshUpdatesCmd(); cmd != nil {
+			t.Error("read-only entry fired an automatic CheckUpdates; U must be the only trigger")
+		}
+		if m.updatesErr != "" {
+			t.Errorf("updatesErr = %q, want cleared", m.updatesErr)
 		}
 	})
 }
