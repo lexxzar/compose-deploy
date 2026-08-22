@@ -56,14 +56,15 @@ cdeploy
 
 After you select a remote server, the server name is shown in the breadcrumb on subsequent screens. If that server has a `color` set in `~/.cdeploy/servers.yml`, the breadcrumb renders it as a colored badge; if `color` is omitted, the breadcrumb stays plain text.
 
-The TUI has six main screens, plus an inline settings editor reachable from screen 1:
+The TUI has seven main screens, plus an inline settings editor reachable from screen 1:
 
 1. **Server select** — choose a remote server or "Local" (only shown when servers are configured); press `s` to open the settings editor for managing servers
 2. **Project select** — pick a Docker Compose project (auto-skipped if the current directory has a compose file). When the host also runs containers that no compose project owns, an extra `(unmanaged)` row appears at the end of the list with the container count — see [Unmanaged containers](#unmanaged-containers-read-only)
-3. **Service select** — pick services (`space` toggles one, `a` toggles all) and choose an action (`r` restart, `d` deploy, `s` stop, `R` rollback, `l` logs, `c` config, `x` exec, `U` re-check updates); press `/` to search-and-jump to a service by name substring and `n`/`N` to cycle through matches (search moves the cursor and highlights matches without filtering the list or touching your selection); also shows CPU% and Mem (used/limit) columns for running services, refreshed on screen entry and after every operation. Services whose registry image is newer than the local copy get a yellow `⇧` marker next to the service name; the indicator is cached for 10 minutes and `U` forces a refresh. `R` reads the host-side deploy snapshot and, when one exists, asks to confirm a digest-pinned rollback of the selected services (the prompt shows how long ago the snapshot was recorded). The footer shows only the most-used keys; press `?` for the full key list for the current screen. On the `(unmanaged)` row this screen is read-only — see [Unmanaged containers](#unmanaged-containers-read-only).
+3. **Service select** — pick services (`space` toggles one, `a` toggles all) and choose an action (`r` restart, `d` deploy, `s` stop, `R` rollback, `l` logs, `i` inspect, `c` config, `x` exec, `U` re-check updates); press `/` to search-and-jump to a service by name substring and `n`/`N` to cycle through matches (search moves the cursor and highlights matches without filtering the list or touching your selection); also shows CPU% and Mem (used/limit) columns for running services, refreshed on screen entry and after every operation. Services whose registry image is newer than the local copy get a yellow `⇧` marker next to the service name; the indicator is cached for 10 minutes and `U` forces a refresh. `R` reads the host-side deploy snapshot and, when one exists, asks to confirm a digest-pinned rollback of the selected services (the prompt shows how long ago the snapshot was recorded). The footer shows only the most-used keys; press `?` for the full key list for the current screen. On the `(unmanaged)` row this screen is read-only — see [Unmanaged containers](#unmanaged-containers-read-only).
 4. **Progress** — watch step-by-step execution with status indicators. After a deploy, restart, or rollback the screen enters a **health-wait** sub-state: it polls each targeted service and shows a live per-service verdict (`♥` healthy, `●` running with no healthcheck, `✗` failed, `~` pending) with a countdown to the timeout. Press `esc` to skip the wait (the operation stays "done"). A failed deploy wait shows the hint `press R on the services screen to roll back`.
 5. **Logs** — live-stream logs for the selected service. `w` toggles soft-wrap, `p` toggles JSON pretty-print, and scrolling up pauses the auto-follow (`G` jumps back to the live tail). Press `f` to open a live **filter** (a grep that hides non-matching lines while the stream keeps buffering underneath; a leading `!` excludes matching lines) and `/` to open a **search** that highlights and jumps within the (possibly filtered) view (`n`/`N` cycle through matches). Both use case-insensitive substring matching by default; `ctrl+r` toggles Go regular-expression (RE2) mode. `esc` peels back one layer at a time — closing an open search or filter input, then clearing a committed search, then a committed filter, and finally leaving the screen.
 6. **Config** — inspect or edit the compose file, toggle between raw and resolved config, and see validation status
+7. **Inspect** — read-only view of what the container under the cursor actually holds: state, health (including the last healthcheck probe output), image digest, mounts and environment, with `r` toggling to the raw `docker inspect` JSON — see [Container Inspect Screen](#container-inspect-screen)
 
 #### Navigation
 
@@ -100,11 +101,13 @@ Select it to get the usual service screen over those containers: status dot, hea
 
 | Key | On the unmanaged screen |
 |-----|-------------------------|
-| `l` `x` `U` | Work as usual — logs, exec, force an update check |
+| `l` `i` `x` `U` | Work as usual — logs, inspect, exec, force an update check |
 | `/` `n` `N` `esc` `q` `?` arrows | Work as usual — search, navigate, back, key list |
 | `d` `r` `s` `R` `c` `space` `a` | Inert and unadvertised — deploy, restart, stop, rollback, config, and multi-select need a compose project |
 
 **Update checks are opt-in here.** The `⇧` glyph does not appear on its own on this screen — press `U`. A compose project bounds the check to its own service list, but the unmanaged list comes from `docker ps -a`, so every distinct image on the host would cost a registry manifest request on every visit; that can exhaust an anonymous registry rate limit and break a later `docker pull` from the same host. `cdeploy list --updates` is opt-in for the same reason.
+
+`i` matters most here: a hand-started container has no compose file, so [inspect](#container-inspect-screen) is the only way to see its environment, mounts, image digest and healthcheck output.
 
 To start, stop, or replace an unmanaged container, use the docker CLI on the host. `cdeploy list` covers compose projects only — unmanaged containers are a TUI view.
 
@@ -423,6 +426,26 @@ From the service screen, press `c` to open the compose config viewer/editor. Thi
 - `r` toggles between the raw compose file and resolved/interpolated `docker compose config` output
 - `e` opens the compose file in your editor. Local mode uses `$EDITOR`, then `$VISUAL`, then `vi`; values like `code --wait` are supported. Remote mode runs `${EDITOR:-vi}` over SSH on the target host.
 - After the editor exits, cdeploy reloads the raw file, switches back to raw view, and validates it with `docker compose config --quiet`. Validation errors are shown inline in the TUI.
+
+## Container Inspect Screen
+
+From the service screen, press `i` to inspect the container under the cursor. Where `c` shows what the compose file *declares*, inspect shows what the running container actually *holds* — the two disagree whenever a compose file is edited and the service is restarted (`r`) instead of deployed (`d`).
+
+The screen opens on a curated summary with five sections:
+
+- **STATE** — status, exit code (stopped containers only), OOM kill, start time, restart policy and restart count
+- **HEALTH** — health status, failing streak, the healthcheck definition, and **the last probe's output**, soft-wrapped rather than truncated. This is the answer to "why is this `✗` unhealthy?" and it appears nowhere else in cdeploy. The section is omitted for a container with no healthcheck.
+- **IMAGE** — the configured image reference, the digest docker resolved it to, and the command and entrypoint
+- **MOUNTS** — type, `source → destination`, and the read-write flag
+- **ENV** — the container's environment, one `KEY=VALUE` per line
+
+Keys: `r` toggles between the summary and the raw `docker inspect` JSON (byte-identical to what the docker CLI prints), the arrows and `pgup`/`pgdown` scroll, and `esc` or `q` returns to the service screen. Both modes are read-only — inspect changes no container state.
+
+> **Environment values are shown verbatim, secrets included.** `docker inspect` prints `POSTGRES_PASSWORD`, `DATABASE_URL=postgres://user:pass@host/db` and API tokens in cleartext, and cdeploy masks nothing in either mode. This matches lazydocker, k9s and Docker Desktop. The consequence is real: pressing `i` while you share a screen or record a terminal exposes those values to everyone watching. The output is held in memory only — it is not written to `~/.cdeploy/logs/`.
+
+For a scaled service, cdeploy inspects the same replica the Uptime column shows — the longest-running one, and always a running replica over a restarting one. A service with no container reports `no container found for "<service>"` instead of a blank screen.
+
+Inspect also works on the read-only [unmanaged containers](#unmanaged-containers-read-only) screen, where `c` does not exist. It is a TUI-only view; there is no `cdeploy inspect` subcommand.
 
 ## AI agent integration
 
