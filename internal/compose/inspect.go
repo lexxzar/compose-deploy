@@ -1,6 +1,11 @@
 package compose
 
-import "time"
+import (
+	"encoding/json"
+	"fmt"
+	"strings"
+	"time"
+)
 
 // pickInspectContainer selects which replica of a compose service to inspect.
 //
@@ -71,4 +76,35 @@ func pickHostInspectContainer(entries []hostPsEntry, name string) (string, bool)
 		}
 	}
 	return "", false
+}
+
+// parsePsEntries parses `docker compose ps --format json` into the raw entry
+// slice the inspect pickers consume. Docker Compose v2.21+ emits a JSON array;
+// older versions emit NDJSON, so both shapes are accepted — the same tolerance
+// parseContainerStatus and parsePsIDToService apply to the very same output.
+func parsePsEntries(data []byte) ([]psEntry, error) {
+	s := strings.TrimSpace(string(data))
+	if s == "" || s == "[]" {
+		return nil, nil
+	}
+
+	var entries []psEntry
+	if strings.HasPrefix(s, "[") {
+		if err := json.Unmarshal([]byte(s), &entries); err != nil {
+			return nil, fmt.Errorf("parsing ps for inspect: %w", err)
+		}
+		return entries, nil
+	}
+	for _, line := range strings.Split(s, "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		var e psEntry
+		if err := json.Unmarshal([]byte(line), &e); err != nil {
+			return nil, fmt.Errorf("parsing ps for inspect: %w", err)
+		}
+		entries = append(entries, e)
+	}
+	return entries, nil
 }

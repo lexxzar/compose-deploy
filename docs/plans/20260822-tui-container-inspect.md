@@ -388,13 +388,13 @@ Plus, outside the tables:
 - Modify: `internal/compose/remote.go`
 - Modify: `internal/compose/inspect_test.go`
 
-- [ ] add `Compose.Inspect(ctx, service)`: `docker compose ps -a --format json` through `command()`, parse to `[]psEntry`, `pickInspectContainer`, then `runDockerCmd(ctx, []string{"inspect", id})` — **bypassing `command()`**, because `docker inspect` is a top-level docker command
-- [ ] add `RemoteCompose.Inspect(ctx, service)`: same shape through `remoteCommand()` for ps and `runRemoteDockerCmd` for inspect, so `SSHExtraArgs` splices before the host arg for free
-- [ ] return a clear `no container found for %q` error when the picker misses
-- [ ] **test-seam note:** both the ps call and the inspect call route through the single `outputCmd` hook (`RemoteCompose` also has `outputErrCmd`, which takes precedence) — the test double must **dispatch on argv** to serve two different responses
-- [ ] write tests asserting exact argv for both (the inspect argv must NOT contain `compose`), remote shell-escaping of the container ID, and the `SSHExtraArgs`-before-host splice
-- [ ] write error-path tests: ps failure propagates, no-match produces the named error
-- [ ] run `go test ./internal/compose/` — must pass before task 3
+- [x] add `Compose.Inspect(ctx, service)`: `docker compose ps -a --format json` through `command()`, parse to `[]psEntry`, `pickInspectContainer`, then `runDockerCmd(ctx, []string{"inspect", id})` — **bypassing `command()`**, because `docker inspect` is a top-level docker command
+- [x] add `RemoteCompose.Inspect(ctx, service)`: same shape through `remoteCommand()` for ps and `runRemoteDockerCmd` for inspect, so `SSHExtraArgs` splices before the host arg for free
+- [x] return a clear `no container found for %q` error when the picker misses
+- [x] **test-seam note:** both the ps call and the inspect call route through the single `outputCmd` hook (`RemoteCompose` also has `outputErrCmd`, which takes precedence) — the test double must **dispatch on argv** to serve two different responses
+- [x] write tests asserting exact argv for both (the inspect argv must NOT contain `compose`), remote shell-escaping of the container ID, and the `SSHExtraArgs`-before-host splice
+- [x] write error-path tests: ps failure propagates, no-match produces the named error
+- [x] run `go test ./internal/compose/` — must pass before task 3
 
 ### Task 3: Add HostContainers.Inspect through the dockerRunner seam
 
