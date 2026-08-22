@@ -16142,8 +16142,10 @@ func TestInspectDataMsg_EmptyOutputIsAnError(t *testing.T) {
 
 // TestInspectScreen_ResizeKeepsTheChosenModeAfterAParseFailure pins where the
 // forced raw switch lives. rebuildInspectSummary runs on the fetch AND on every
-// resize; forcing the mode inside it would flip the user back to raw the next
-// time the terminal changed size, undoing their `r`.
+// resize; forcing the mode inside it would flip the reader back to raw the next
+// time the terminal changed size. The mode is cleared on the model directly
+// rather than through `r`, because the toggle is inert while the summary is
+// empty — this pins the resize branch, not how the mode got there.
 func TestInspectScreen_ResizeKeepsTheChosenModeAfterAParseFailure(t *testing.T) {
 	m := Model{screen: screenInspect, inspectSession: 1, inspectService: "web", width: 100, height: 24}
 	m.inspectViewport = viewport.New(96, 18)
@@ -16153,15 +16155,10 @@ func TestInspectScreen_ResizeKeepsTheChosenModeAfterAParseFailure(t *testing.T) 
 		t.Fatal("precondition: the fetch should switch to raw on a parse failure")
 	}
 
-	result, _ = m.Update(keyMsgFor("r"))
-	m = result.(Model)
-	if m.inspectShowRaw {
-		t.Fatal("precondition: r should leave raw mode")
-	}
-
+	m.inspectShowRaw = false
 	result, _ = m.Update(tea.WindowSizeMsg{Width: 80, Height: 30})
 	if resized := result.(Model); resized.inspectShowRaw {
-		t.Error("a resize must not undo the user's r after a parse failure")
+		t.Error("a resize must not force raw mode; only the fetch handler does")
 	}
 }
 
@@ -16200,8 +16197,6 @@ func TestViewInspect_ShowsFetchError(t *testing.T) {
 	}
 }
 
-// TestViewInspect_ParseErrorKeepsViewportOnScreen is the other half of the
-// escape hatch: the error line shows, and the viewport stays so r still works.
 // TestViewInspect_ParseErrorShowsTheRawBytes pins the escape hatch end to end:
 // when the narrow parser refuses the payload the raw bytes are the only content
 // that exists, so the screen switches to them rather than leaving an error line
@@ -16225,8 +16220,16 @@ func TestViewInspect_ParseErrorShowsTheRawBytes(t *testing.T) {
 	if !strings.Contains(view, "[]") {
 		t.Errorf("the pane must show the payload the parser choked on:\n%s", view)
 	}
-	if !strings.Contains(view, "r summary") {
-		t.Error("the footer must offer the way back to the summary")
+	// The summary the toggle would switch to is empty, so the footer must not
+	// name r — the same no-op rule TestViewInspect_FooterDropsRWithoutBuffers
+	// pins for a failed fetch, applied to the target buffer rather than to the
+	// raw one.
+	if strings.Contains(view, "r summary") {
+		t.Errorf("an empty summary must not be advertised:\n%s", view)
+	}
+	result, _ = m.Update(keyMsgFor("r"))
+	if again := result.(Model); !again.inspectShowRaw {
+		t.Error("r must be inert while the summary is empty; it left raw mode")
 	}
 }
 

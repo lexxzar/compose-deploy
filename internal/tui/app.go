@@ -2404,10 +2404,13 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		case "r":
 			// Two-way toggle over two buffers already in hand — no refetch,
 			// unlike screenConfig's r, whose resolved half is lazily fetched.
-			// A failed FETCH leaves neither buffer, so the toggle would only
-			// flip the footer's own label over an empty pane; viewInspect drops
-			// the token in that state and the key has to agree with it.
-			if len(m.inspectRaw) == 0 {
+			// The gate reads the TARGET buffer, not just the raw one: a failed
+			// FETCH leaves neither buffer and a failed PARSE leaves the raw
+			// bytes but no summary, so in both states the toggle would only
+			// flip the footer's own label over an empty pane. viewInspect drops
+			// the token from the same predicate, so the key and the footer
+			// cannot disagree.
+			if !m.inspectToggleAvailable() {
 				return m, nil
 			}
 			m.inspectShowRaw = !m.inspectShowRaw
@@ -3209,6 +3212,17 @@ func (m *Model) setInspectContent() {
 	// recovers it except an undocumented left. The raw path resets for the
 	// same reason on a resize that widens the pane past the longest line.
 	m.inspectViewport.SetXOffset(0)
+}
+
+// inspectToggleAvailable reports whether the buffer `r` would switch TO holds
+// anything. A failed FETCH leaves neither buffer; a failed PARSE leaves the raw
+// bytes but no summary. Both the key handler and viewInspect's footer read this
+// one predicate, so the screen can never advertise a toggle it then refuses.
+func (m Model) inspectToggleAvailable() bool {
+	if m.inspectShowRaw {
+		return m.inspectSummary != ""
+	}
+	return len(m.inspectRaw) > 0
 }
 
 // fetchInspect runs `docker inspect` for the service being inspected. The
@@ -5352,11 +5366,12 @@ func (m Model) viewInspect() string {
 
 	// Footer names only what the screen binds. pgup/pgdown and the esc alias
 	// live in the ? overlay, matching viewConfig's shorter legend. The r token
-	// is dropped when a failed fetch left no bytes: with neither buffer in hand
-	// the toggle can only relabel itself over an empty pane, and this repo does
-	// not advertise a no-op.
+	// is dropped whenever the buffer it would switch TO is empty — a failed
+	// fetch leaves neither, a failed parse leaves no summary — because the
+	// toggle could then only relabel itself over an empty pane, and this repo
+	// does not advertise a no-op.
 	help := "  "
-	if len(m.inspectRaw) > 0 {
+	if m.inspectToggleAvailable() {
 		if m.inspectShowRaw {
 			help += "r summary"
 		} else {

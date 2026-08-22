@@ -338,7 +338,7 @@ Nothing here is forced by a failing test; see "No test forces the screen tax".
 | 2 | `allScreens` gains the constant — **unblocks the six iterating tests** | `help_test.go:19` |
 | 3 | `TestAllScreens_Complete` bound → `int(screenInspect) + 1` | `help_test.go:53` |
 | 4 | `screenName()` returns `"inspect"` | `help.go:331` |
-| 5 | `helpGroupsFor()` gains `case screenInspect` — MOVE / VIEW / LEAVE | `help.go:187` |
+| 5 | `helpGroupsFor()` gains `case screenInspect` — MOVE (`↑ ↓`, `← →`, `pgup pgdown`) / VIEW / LEAVE | `help.go:187` |
 | 6 | `bound` map gains a `screenInspect` row (see exact set below) | `help_test.go:128` |
 | 7 | `inspectGroup()` gains `{"i", "inspect"}` — one shared append, position matters | `help.go:144` |
 | 8 | `TestCtrlCConfirmation_AllRemoteScreens` gains a row | `app_test.go:8043` |
@@ -353,7 +353,7 @@ Exact `bound` row for item 6 — the dispatch must bind precisely this set, incl
 `ctrl+c` → `tryQuit()`, or the reverse direction of the drift pin fires:
 
 ```go
-screenInspect: {"q", "ctrl+c", "esc", "r", "up", "down", "pgup", "pgdown"},
+screenInspect: {"q", "ctrl+c", "esc", "r", "up", "down", "left", "right", "pgup", "pgdown"},
 ```
 
 Plus, outside the tables:
@@ -465,7 +465,7 @@ Plus, outside the tables:
 - [x] declare the `Inspector` interface beside `ConfigProvider` / `ExecProvider`
 - [x] tax 1: append `screenInspect` to the `screen` iota after `screenSettingsForm`
 - [x] tax 2-3: add it to `allScreens` and change `TestAllScreens_Complete`'s bound to `int(screenInspect) + 1` — the `allScreens` doc comment was reworded from "a 9th screen" to "a new screen", which the fixed bound now makes true
-- [x] tax 4-5: add `"inspect"` to `screenName()` and `case screenInspect` to `helpGroupsFor()` — MOVE (`↑ ↓`, `pgup pgdown`), VIEW (`r`, `actions: true`), LEAVE 3rd of 3
+- [x] tax 4-5: add `"inspect"` to `screenName()` and `case screenInspect` to `helpGroupsFor()` — MOVE (`↑ ↓`, `← →`, `pgup pgdown`), VIEW (`r`, `actions: true`), LEAVE 3rd of 3
 - [x] tax 6: add the `screenInspect` row to the `bound` map with the exact key set from Technical Details
 - [x] add the seven `inspect*` Model fields, `inspectDataMsg`, its session-gated handler, and `fetchInspect() tea.Cmd` (the plan prescribed a `session uint64` parameter; the round-4 review pass dropped it — the seven sibling fetch commands all read the session off the Model, and the one call site passed `m.inspectSession` anyway)
 - [x] write tests: a current-session message populates the fields, a stale session is discarded, an off-screen message is discarded
@@ -481,7 +481,7 @@ Plus, outside the tables:
 
 - [x] add `enterInspect()` modelled on `enterConfig()`: bump `inspectSession`, reset the fields, size the viewport at `m.height - 6` (through `inspectViewportSize()` since the round-4 pass, so the `WindowSizeMsg` branch cannot drift from it), set `m.screen`, call `m.clearSearch()` (departure site #10), return the fetch command
 - [x] add `case "i"` to the container dispatch: early-return when `len(m.services) == 0`, then type-assert `m.composer.(Inspector)` and no-op if absent — **no `m.readOnly()` gate**
-- [x] **document in a comment** that the `i` no-op paths do not call `fixSvcOffset()`, matching the existing `l` / `x` guards rather than the read-only gates — an inherited hole, adopted knowingly
+- [x] **record** that the `i` no-op paths do not call `fixSvcOffset()`, matching the existing `l` / `x` guards rather than the read-only gates — an inherited hole, adopted knowingly. The plan originally asked for a code comment; an earlier review round moved it OUT of the code under the repo's "avoid comments, rationale goes in the plan" rule, so the knowledge lives in the round-4 residual list below instead
 - [x] add a mock composer implementing `Inspector`, following the `TestReadOnly_GatesWriteKeys_WithCapableComposer` precedent — Task 7's `mockInspectComposer` covers the writable case; `readOnlyInspectComposer` (new) covers the read-only one, which is the case the not-gated-on-`readOnly` asymmetry actually rests on
 - [x] write tests: `i` enters on a writable composer, `i` enters on a read-only composer, `i` no-ops on an empty list, `i` no-ops when the composer is not an `Inspector`
 - [x] write a test asserting a committed container search is cleared by `enterInspect()`
@@ -502,7 +502,8 @@ Plus, outside the tables:
 - [x] run `go test ./internal/tui/` — must pass before task 10
 - ➕ [x] `clearInspect()` extracted as the single departure-cleanup helper (the `esc` handler calls it), so a future departure site cannot reset a partial field set. It deliberately does **not** bump `inspectSession` — `enterInspect()` bumps on the way in, which is what invalidates an in-flight fetch, and the handler's screen check discards one that lands after departure. Same discipline as `configSession`.
 - ➕ [x] the `r` toggle calls `inspectViewport.GotoTop()` after the chokepoint: `SetContent` preserves `YOffset`, so a toggle from a scrolled summary into the much longer raw JSON would land the reader mid-document. Pinned by `TestInspectScreen_RTogglePutsTheReaderAtTheTop`.
-- ➕ [x] `viewInspect()` keeps the viewport on screen **beside** the error line when `inspectRaw` is non-empty (the parse-failure case), so `r` stays a working escape hatch; it reads as "Loading..." only when there are neither bytes nor an error. Pinned by `TestViewInspect_ParseErrorKeepsViewportOnScreen`.
+- ➕ [x] `viewInspect()` keeps the viewport on screen **beside** the error line when `inspectRaw` is non-empty (the parse-failure case), so the bytes the parser choked on are still readable; it reads as "Loading..." only when there are neither bytes nor an error. Pinned by `TestViewInspect_ParseErrorShowsTheRawBytes`.
+- ➕ [x] the `r` gate and the footer token both read one predicate, `inspectToggleAvailable()`, which tests the buffer the toggle would switch **TO**. A failed FETCH leaves neither buffer; a failed PARSE leaves the raw bytes but no summary. The first version tested `len(inspectRaw) == 0` only, so after a parse failure the footer still named `r summary` and pressing it landed the reader on an empty pane under the error line — the no-op this repo does not advertise. Pinned by `TestViewInspect_FooterDropsRWithoutBuffers`, `TestInspectScreen_RIsInertWithoutBuffers` and the two added assertions in `TestViewInspect_ParseErrorShowsTheRawBytes`.
 - ⚠️ pre-existing, untouched: `gofmt -l .` reports `cmd/list_test.go`. Not caused by this task and out of scope per the focus rule.
 
 ### Task 10: Pay the remaining screen tax — container key and the four silent tables
@@ -703,3 +704,18 @@ focus rule):
   and the inspect resize branch were collapsed into `inspectViewportSize()` in
   this pass; the config pair is the same three-line shape and can follow in the
   same commit as the unclamped-footer residual above.
+
+**Residual recorded during the final review pass** (out of scope under the
+focus rule):
+- `esc` from `screenInspect` does not call `fixSvcOffset()` on the way back to
+  `screenSelectContainers`, so a terminal resize performed WHILE on the inspect
+  screen can leave a stale `svcOffset` and a blank trailing row under the last
+  service. `esc` from `screenConfig` behaves identically — both clear their
+  screen's fields and assign `m.screen` with no re-clamp. This is a shared
+  pre-existing pattern, not something the inspect screen introduced, so it was
+  deliberately NOT fixed on one screen alone: diverging the two in a cleanup
+  pass would leave the next reader unable to tell which one is the convention.
+  The fix is one `fixSvcOffset()` call in each of the two `esc` handlers plus a
+  resize-then-`esc` test per screen, and it belongs in the same commit as the
+  `case "i"` / `l` / `x` guard residual above — all four are the same missing
+  re-clamp.
