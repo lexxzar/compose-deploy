@@ -817,8 +817,10 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// periodic statusMsg — the overwrite above wipes UpdateAvailable
 		// and the cache lookup misses, so nothing replaces them. Mirror
 		// maybeRefreshUpdatesCmd's in-flight guard discipline so we never
-		// stack a second fetch.
-		if !fresh && !m.updateInFlight && m.composer != nil {
+		// stack a second fetch, and its autoUpdatesAllowed gate — otherwise
+		// the read-only screen would fire the unbounded host-wide registry
+		// fan-out on every 5-second status tick instead of never.
+		if !fresh && !m.updateInFlight && m.composer != nil && m.autoUpdatesAllowed() {
 			m.updateInFlight = true
 			return m, m.refreshUpdates()
 		}
@@ -3704,8 +3706,30 @@ func (m *Model) maybeRefreshUpdatesCmd() tea.Cmd {
 		}
 		return nil
 	}
+	if !m.autoUpdatesAllowed() {
+		return nil
+	}
 	m.updateInFlight = true
 	return m.refreshUpdates()
+}
+
+// autoUpdatesAllowed reports whether the update check may fire on its own.
+// It is false on a read-only composer, where U is the only trigger.
+//
+// A compose project bounds the check to one service list the user is actively
+// managing. The unmanaged view has no such bound: it is derived from
+// `docker ps -a`, so every leftover container on the host contributes a
+// distinct image, and every image costs one local inspect plus one REGISTRY
+// manifest request, run sequentially. Firing that on screen entry would spend
+// dozens of round-trips per visit and can exhaust the anonymous Docker Hub
+// manifest quota, which then breaks a real docker pull from the same host.
+//
+// The CLI reaches the same conclusion for the same reason — `list --updates`
+// is opt-in — so the read-only screen matches it: the glyph column stays blank
+// until the user asks for it, and the `?` overlay already advertises
+// `U check updates`.
+func (m Model) autoUpdatesAllowed() bool {
+	return !m.readOnly()
 }
 
 // refreshTick returns a Cmd that fires a refreshTickMsg after
@@ -4356,7 +4380,15 @@ func (m Model) containerHelpLines() (line1, line2 string) {
 // substitution, and containerFooter pads the other states out to it:
 // svcVisibleCount reserves rows from this count, so a footer that shrank while
 // the search bar was open would grow the service list by one row and re-flow it
-// under the cursor. Idle is the widest of the three variants.
+// under the cursor. The count is therefore state-INDEPENDENT by design; do not
+// make it read the substituted footer.
+//
+// On the write path idle is also the widest variant, so the one-line branch it
+// picks always holds the substitutions too. The READ-ONLY pair inverts that:
+// its line2 (`l logs • x exec`, 19 cells) is SHORTER than the committed-search
+// substitution (`n/N cycle • esc clear`, 25), so the one-line branch chosen at
+// widths 43-46 does not hold. containerFooter clamps its rendered string for
+// that band rather than widening the count here, which would re-flow the list.
 //
 // line2[2:] strips its leading indent so the two halves join with a single
 // separator. ansi.StringWidth, not len: each • is 3 bytes but one display cell,
@@ -4379,6 +4411,12 @@ func (m Model) containerFooterLines() int {
 // search swaps line2 wholesale, and q and `?` still work in that state. While
 // the search input is OPEN neither key works, so the whole footer becomes the
 // two that do.
+//
+// Every rendered line is clamped to m.width, the same never-wrap guarantee
+// searchBarLine and logBarLine give. containerFooterLines picks one line or two
+// from the IDLE pair alone (it must stay state-independent, or the list
+// re-flows), so a substitution WIDER than the idle line2 can overrun a width
+// the idle pair fit — the read-only pair does exactly that at widths 43-46.
 func (m Model) containerFooter() string {
 	line1, line2 := m.containerHelpLines()
 	switch {
@@ -4392,13 +4430,13 @@ func (m Model) containerFooter() string {
 
 	if m.containerFooterLines() == 1 {
 		if line2 == "" {
-			return helpStyle.Render(line1)
+			return helpStyle.Render(clampToWidth(line1, m.width))
 		}
-		return helpStyle.Render(line1 + "  •  " + line2[2:])
+		return helpStyle.Render(clampToWidth(line1+"  •  "+line2[2:], m.width))
 	}
 	// A trailing newline pads the searching footer (line2 == "") out to the two
 	// reserved rows; lipgloss renders the empty half as a full-width blank line.
-	return helpStyle.Render(line1 + "\n" + line2)
+	return helpStyle.Render(clampToWidth(line1, m.width) + "\n" + clampToWidth(line2, m.width))
 }
 
 func (m Model) viewSelectContainers() string {

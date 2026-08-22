@@ -14734,10 +14734,12 @@ func TestUpdatesCache_UnmanagedDoesNotReplayFastTrackVerdicts(t *testing.T) {
 		t.Errorf("UpdateAvailable = %v, want nil; the fast-track verdict leaked into the unmanaged view", *ua)
 	}
 
-	// The miss must also queue a fresh fetch (the statusMsg self-heal) rather
-	// than leaving the unmanaged view suppressed for the fast-track TTL.
-	if cmd == nil || !got.updateInFlight {
-		t.Error("a cache miss on the unmanaged key should queue a refreshUpdates")
+	// The miss must NOT queue a fetch: the unmanaged view is opt-in, so the
+	// self-heal stays gated and U is the only trigger (see
+	// TestReadOnly_NoAutomaticUpdateFetch). The isolation above therefore comes
+	// from the key alone, which the writable control below confirms.
+	if cmd != nil || got.updateInFlight {
+		t.Error("a cache miss on the unmanaged key must not queue an automatic refreshUpdates")
 	}
 
 	// Control: on a writable composer the SAME cache entry does replay —
@@ -14999,5 +15001,85 @@ func TestReadOnly_FetchErrorSurfacesInSvcErr(t *testing.T) {
 				t.Errorf("the error is not rendered on the container screen:\n%s", view)
 			}
 		})
+	}
+}
+
+// TestReadOnly_NoAutomaticUpdateFetch pins the opt-in contract for the
+// unmanaged view: nothing may fire CheckUpdates on its own there.
+//
+// The compose path bounds the check to one project's service list. The
+// unmanaged path is derived from `docker ps -a`, so the set grows with every
+// container ever left on the host and each distinct image costs a REGISTRY
+// manifest request. An automatic fan-out on screen entry — and again on every
+// 5-second status tick via the self-heal — can exhaust the anonymous Docker Hub
+// quota and break a real docker pull from the same host, so U is the only
+// trigger, matching the CLI's opt-in `list --updates`.
+//
+// Both automatic entry points are driven, each against a WRITABLE control: a
+// gate applied to only one of them leaves the other firing, and the self-heal
+// is the worse half (it repeats forever).
+func TestReadOnly_NoAutomaticUpdateFetch(t *testing.T) {
+	writable := func(t *testing.T) Model {
+		t.Helper()
+		mc := &mockComposer{services: []string{"web"}}
+		m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
+		m.screen = screenSelectContainers
+		m.updateInFlight = false
+		m.refreshInFlight = false
+		installFakeTick(&m)
+		return m
+	}
+
+	t.Run("screen entry", func(t *testing.T) {
+		ro := newReadOnlyModel(t, readOnlyTestComposer())
+		if cmd := ro.maybeRefreshUpdatesCmd(); cmd != nil {
+			t.Error("read-only entry fired an automatic CheckUpdates; U must be the only trigger")
+		}
+		if ro.updateInFlight {
+			t.Error("read-only entry set updateInFlight without fetching")
+		}
+		w := writable(t)
+		if cmd := w.maybeRefreshUpdatesCmd(); cmd == nil {
+			t.Error("control: a writable cache miss must still fetch")
+		}
+	})
+
+	t.Run("status-tick self-heal", func(t *testing.T) {
+		ro := newReadOnlyModel(t, readOnlyTestComposer())
+		result, cmd := ro.Update(statusMsg{
+			status:  map[string]runner.ServiceStatus{"watchtower": {Running: true}},
+			session: ro.statusSession,
+		})
+		if cmd != nil {
+			t.Error("the status self-heal fired an automatic CheckUpdates on the read-only screen")
+		}
+		if result.(Model).updateInFlight {
+			t.Error("the status self-heal set updateInFlight on the read-only screen")
+		}
+
+		w := writable(t)
+		_, wcmd := w.Update(statusMsg{
+			status:  map[string]runner.ServiceStatus{"web": {Running: true}},
+			session: w.statusSession,
+		})
+		if wcmd == nil {
+			t.Error("control: the writable status self-heal must still fetch on a cache miss")
+		}
+	})
+}
+
+// TestReadOnly_UpdateKeyStillFetches is the other half of the opt-in contract:
+// the automatic paths are gated, U is not. The `?` overlay advertises
+// `U check updates` on the read-only screen, so a gate that also caught the
+// keypress would leave the overlay promising a no-op.
+func TestReadOnly_UpdateKeyStillFetches(t *testing.T) {
+	m := newReadOnlyModel(t, readOnlyTestComposer())
+
+	result, cmd := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'U'}})
+	if cmd == nil {
+		t.Fatal("U must still force a CheckUpdates on the read-only screen")
+	}
+	if !result.(Model).updateInFlight {
+		t.Error("U did not mark updateInFlight")
 	}
 }

@@ -104,6 +104,8 @@ Select it to get the usual service screen over those containers: status dot, hea
 | `/` `n` `N` `esc` `q` `?` arrows | Work as usual — search, navigate, back, key list |
 | `d` `r` `s` `R` `c` `space` `a` | Inert and unadvertised — deploy, restart, stop, rollback, config, and multi-select need a compose project |
 
+**Update checks are opt-in here.** The `⇧` glyph does not appear on its own on this screen — press `U`. A compose project bounds the check to its own service list, but the unmanaged list comes from `docker ps -a`, so every distinct image on the host would cost a registry manifest request on every visit; that can exhaust an anonymous registry rate limit and break a later `docker pull` from the same host. `cdeploy list --updates` is opt-in for the same reason.
+
 To start, stop, or replace an unmanaged container, use the docker CLI on the host. `cdeploy list` covers compose projects only — unmanaged containers are a TUI view.
 
 ### CLI Mode
@@ -193,7 +195,7 @@ A yellow `⇧` glyph next to a service name in `cdeploy list` and the TUI servic
 
 Failures are non-fatal: `cdeploy: updates unavailable: <err>` (single-project) or `cdeploy: updates unavailable for "<project>": <err>` (multi-project) is written to stderr, the cell stays blank, exit code 0. JSON output adds `update_available: true|false` with `omitempty`; existing JSON consumers see the original wire shape when the flag is absent.
 
-In the TUI, the indicator is cached for 10 minutes per (project, server) context; the unmanaged view gets its own slot rather than sharing the local one. Press `U` on the service-select screen to bypass the cache and re-check immediately.
+In the TUI, the indicator is cached for 10 minutes per (project, server) context; the unmanaged view gets its own slot rather than sharing the local one. Press `U` on the service-select screen to bypass the cache and re-check immediately. On the unmanaged screen the check never runs on its own — `U` is the only trigger (see [Unmanaged containers](#unmanaged-containers-read-only)).
 
 **Multi-arch images:** for multi-arch images (commonly: `nginx`, `postgres`, `alpine`, `node`, `redis`), the check uses `docker buildx imagetools inspect` which returns the manifest-LIST digest — matching what `docker image inspect` records locally — so multi-arch images are reported correctly. The legacy `docker manifest inspect --verbose` fallback (used only when the buildx plugin is unavailable, i.e. very old Docker installs) returns per-platform descriptor digests that never match the local manifest-list digest and can produce false positives for multi-arch images; upgrading to Docker v23+ (which ships buildx by default) eliminates that case. Run `docker pull` manually to confirm a flagged update before deploying if you suspect a false positive.
 

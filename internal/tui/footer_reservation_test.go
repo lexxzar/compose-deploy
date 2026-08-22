@@ -176,6 +176,14 @@ func TestContainerFooterReservation(t *testing.T) {
 // The existing reservation sweep uses queries that MATCH a service; this one
 // drives a maximally long query so the bar clamps to exactly m.width, the
 // worst case for the merge.
+//
+// The readOnly dimension is swept for the same reason its neighbour above
+// sweeps it: containerFooterLines picks one line or two from the IDLE pair, and
+// on the write path the committed-search substitution is SHORTER than the idle
+// line2, so the one-line branch always held it. The read-only pair inverts
+// that — idle line2 is `l logs • x exec` (19 cells) and the substitution is
+// `n/N cycle • esc clear` (25) — which pushed 1-4 cells of CONTENT past the
+// width at 43-46 until containerFooter clamped its rendered string.
 func TestContainerView_ExcessLineWidthIsPaddingOnly(t *testing.T) {
 	const nServices = 30
 	svcs := make([]string, nServices)
@@ -215,29 +223,34 @@ func TestContainerView_ExcessLineWidthIsPaddingOnly(t *testing.T) {
 	// bare fmt.Sprintf and no clampToWidth, so it overflows below ~46 columns.
 	// That predates the search bar and the footer trim alike (same code on
 	// main) and is out of scope here.
-	for width := 40; width <= 180; width++ {
-		for _, st := range states {
-			m := Model{}
-			m.screen = screenSelectContainers
-			m.services = svcs
-			m.selected = map[int]bool{}
-			m.height = 24
-			m.width = width
-			m.showPicker = true
-			m.searchInput = textinput.New()
-			st.setup(&m)
+	for _, readOnly := range []bool{false, true} {
+		for width := 40; width <= 180; width++ {
+			for _, st := range states {
+				m := Model{}
+				m.screen = screenSelectContainers
+				m.services = svcs
+				m.selected = map[int]bool{}
+				m.height = 24
+				m.width = width
+				m.showPicker = true
+				m.searchInput = textinput.New()
+				if readOnly {
+					m.composer = &readOnlyMockComposer{}
+				}
+				st.setup(&m)
 
-			out := m.viewSelectContainers()
-			lines := strings.Split(out, "\n")
-			if len(lines) != m.height {
-				t.Fatalf("width=%d state=%s: %d physical lines, want %d",
-					width, st.name, len(lines), m.height)
-			}
-			for i, ln := range lines {
-				visible := strings.TrimRight(ansi.Strip(ln), " ")
-				if w := ansi.StringWidth(visible); w > width {
-					t.Errorf("width=%d state=%s: line %d carries %d cells of CONTENT past the width: %q",
-						width, st.name, i, w, visible)
+				out := m.viewSelectContainers()
+				lines := strings.Split(out, "\n")
+				if len(lines) != m.height {
+					t.Fatalf("readOnly=%v width=%d state=%s: %d physical lines, want %d",
+						readOnly, width, st.name, len(lines), m.height)
+				}
+				for i, ln := range lines {
+					visible := strings.TrimRight(ansi.Strip(ln), " ")
+					if w := ansi.StringWidth(visible); w > width {
+						t.Errorf("readOnly=%v width=%d state=%s: line %d carries %d cells of CONTENT past the width: %q",
+							readOnly, width, st.name, i, w, visible)
+					}
 				}
 			}
 		}
@@ -762,6 +775,52 @@ func TestSvcVisibleCount_GainsRowVersusOldFooter(t *testing.T) {
 			if got := m.svcVisibleCount(); got < old {
 				t.Errorf("width=%d state=%s: svcVisibleCount()=%d regressed below the old build's %d",
 					width, st.name, got, old)
+			}
+		}
+	}
+}
+
+// TestContainerFooter_NeverExceedsWidth pins the clamp directly, so a
+// regression names the cause instead of surfacing as one odd row in the view
+// sweep above.
+//
+// containerFooterLines must stay state-INDEPENDENT — it is decided from the
+// idle pair and svcVisibleCount reserves rows from it, so making it read the
+// substituted footer would grow the list by a row mid-search, the exact
+// re-flow the reserved-bar design prevents. The cost is that a substitution
+// WIDER than the idle line2 can overrun a width the idle pair fit. Only the
+// read-only pair does that today (idle line2 19 cells, committed 25), at
+// widths 43-46; containerFooter therefore clamps every rendered line, the same
+// never-wrap guarantee searchBarLine and logBarLine give.
+func TestContainerFooter_NeverExceedsWidth(t *testing.T) {
+	states := []struct {
+		name  string
+		setup func(m *Model)
+	}{
+		{"idle", func(m *Model) {}},
+		{"searching", func(m *Model) { m.searching = true }},
+		{"committed", func(m *Model) { m.searchQuery = "svc1" }},
+	}
+
+	for _, readOnly := range []bool{false, true} {
+		for width := 20; width <= 180; width++ {
+			for _, st := range states {
+				m := Model{}
+				m.screen = screenSelectContainers
+				m.width = width
+				m.showPicker = true
+				if readOnly {
+					m.composer = &readOnlyMockComposer{}
+				}
+				st.setup(&m)
+
+				for i, ln := range strings.Split(m.containerFooter(), "\n") {
+					visible := strings.TrimRight(ansi.Strip(ln), " ")
+					if w := ansi.StringWidth(visible); w > width {
+						t.Errorf("readOnly=%v width=%d state=%s: footer line %d is %d cells wide: %q",
+							readOnly, width, st.name, i, w, visible)
+					}
+				}
 			}
 		}
 	}
