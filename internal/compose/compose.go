@@ -749,13 +749,9 @@ func (c *Compose) Inspect(ctx context.Context, service string) ([]byte, error) {
 	if err != nil {
 		return nil, fmt.Errorf("listing containers for inspect: %w", withStderr(err))
 	}
-	entries, err := parsePsEntries(out)
+	id, err := resolveInspectID(out, service)
 	if err != nil {
 		return nil, err
-	}
-	id, ok := pickInspectContainer(entries, service)
-	if !ok {
-		return nil, fmt.Errorf("no container found for %q", service)
 	}
 	raw, err := c.runDockerCmd(ctx, []string{"inspect", id})
 	if err != nil {

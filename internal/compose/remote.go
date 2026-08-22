@@ -453,13 +453,9 @@ func (r *RemoteCompose) Inspect(ctx context.Context, service string) ([]byte, er
 	if err != nil {
 		return nil, fmt.Errorf("listing remote containers for inspect: %w", withStderr(err))
 	}
-	entries, err := parsePsEntries(out)
+	id, err := resolveInspectID(out, service)
 	if err != nil {
 		return nil, err
-	}
-	id, ok := pickInspectContainer(entries, service)
-	if !ok {
-		return nil, fmt.Errorf("no container found for %q", service)
 	}
 	raw, err := r.runRemoteDockerCmd(ctx, []string{"inspect", id})
 	if err != nil {

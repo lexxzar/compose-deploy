@@ -5,8 +5,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
-	"unicode/utf8"
 
+	"github.com/charmbracelet/x/ansi"
 	"github.com/lexxzar/compose-deploy/internal/compose"
 )
 
@@ -35,6 +35,22 @@ const (
 	inspectListIndent = 2
 )
 
+// wrapCells breaks one line into chunks of at most width display CELLS.
+// softWrapLine chunks by RUNE, which overruns the pane by up to 2x for a wide
+// grapheme (CJK, emoji) — and a probe output, an env value or a mount path can
+// carry either, so the never-exceed-width invariant this screen promises has to
+// be measured the same way it is rendered. Nothing is dropped: the chunks
+// concatenate back to the input.
+//
+// A single wide grapheme still occupies 2 cells, so a width of 1 is the one
+// case that cannot hold.
+func wrapCells(line string, width int) []string {
+	if width <= 0 || ansi.StringWidth(line) <= width {
+		return []string{line}
+	}
+	return strings.Split(ansi.Hardwrap(line, width, true), "\n")
+}
+
 // inspectBuilder accumulates the summary line by line. Every push goes through
 // a soft wrap at the target width, so the caller never has to think about the
 // never-exceed-width invariant.
@@ -60,15 +76,15 @@ func (b *inspectBuilder) section(title string) {
 // lines aligned under the value column; it is never truncated.
 func (b *inspectBuilder) kv(label, value string) {
 	head := "  " + label
-	if n := utf8.RuneCountInString(head); n < inspectValueCol {
+	if n := ansi.StringWidth(head); n < inspectValueCol {
 		head += strings.Repeat(" ", inspectValueCol-n)
 	} else {
 		head += " "
 	}
 
-	indent := utf8.RuneCountInString(head)
+	indent := ansi.StringWidth(head)
 	if b.width-indent < inspectMinValueWidth {
-		for _, chunk := range softWrapLine(strings.TrimRight(head, " "), b.width) {
+		for _, chunk := range wrapCells(strings.TrimRight(head, " "), b.width) {
 			b.push(chunk)
 		}
 		b.block(inspectBlockIndent, value)
@@ -78,7 +94,7 @@ func (b *inspectBuilder) kv(label, value string) {
 	pad := strings.Repeat(" ", indent)
 	first := true
 	for _, para := range strings.Split(value, "\n") {
-		for _, chunk := range softWrapLine(para, b.width-indent) {
+		for _, chunk := range wrapCells(para, b.width-indent) {
 			if first {
 				b.push(head + chunk)
 				first = false
@@ -97,10 +113,11 @@ func (b *inspectBuilder) block(indent int, text string) {
 	if indent >= b.width {
 		indent = 0
 	}
-	avail := max(b.width-indent, 1)
+	// The guard above leaves indent < b.width, so avail is at least 1.
+	avail := b.width - indent
 	pad := strings.Repeat(" ", indent)
 	for _, para := range strings.Split(strings.TrimRight(text, "\n"), "\n") {
-		for _, chunk := range softWrapLine(strings.TrimRight(para, " \t"), avail) {
+		for _, chunk := range wrapCells(strings.TrimRight(para, " \t"), avail) {
 			b.push(pad + chunk)
 		}
 	}
@@ -131,6 +148,12 @@ func buildInspectSummary(doc compose.InspectDoc, width int) string {
 func inspectStateSection(b *inspectBuilder, doc compose.InspectDoc) {
 	b.section("STATE")
 
+	// The breadcrumb names the SERVICE; on a scaled service this row is the
+	// only place the summary says which replica was picked.
+	if doc.Name != "" {
+		b.kv("container", doc.Name)
+	}
+
 	status := doc.State.Status
 	if status == "" {
 		status = "unknown"
@@ -141,6 +164,11 @@ func inspectStateSection(b *inspectBuilder, doc compose.InspectDoc) {
 	// one it is the answer the user came for.
 	if !doc.State.Running {
 		b.kv("exit code", strconv.Itoa(doc.State.ExitCode))
+	}
+	// docker's own reason the container failed — on a container that never
+	// started this is the whole answer, and the exit code alone is not.
+	if errText := strings.TrimSpace(doc.State.Error); errText != "" {
+		b.kv("error", errText)
 	}
 	if doc.State.OOMKilled {
 		b.kv("oom killed", "yes")
@@ -157,39 +185,50 @@ func inspectHealthSection(b *inspectBuilder, doc compose.InspectDoc) {
 	if !hasHealthcheck(hc, state) {
 		return
 	}
-	b.section("HEALTH")
 
+	// The rows are built into a scratch builder first: hasHealthcheck answers
+	// "is there a healthcheck", which a zero-valued &InspectHealthcheck{} with
+	// no runtime state satisfies while having nothing at all to say. A section
+	// with nothing to say is omitted, so the header is only written once at
+	// least one row exists.
+	rows := &inspectBuilder{width: b.width}
 	if state != nil {
 		status := state.Status
 		if status == "" {
 			status = "unknown"
 		}
-		b.kv("status", status)
-		b.kv("failing streak", strconv.Itoa(state.FailingStreak))
+		rows.kv("status", status)
+		rows.kv("failing streak", strconv.Itoa(state.FailingStreak))
 	}
 	if hc != nil {
 		if test := strings.Join(hc.Test, " "); test != "" {
-			b.kv("test", test)
+			rows.kv("test", test)
 		}
 		if hc.Interval > 0 {
-			b.kv("interval", hc.Interval.String())
+			rows.kv("interval", hc.Interval.String())
 		}
 		if hc.Timeout > 0 {
-			b.kv("timeout", hc.Timeout.String())
+			rows.kv("timeout", hc.Timeout.String())
+		}
+		if hc.StartPeriod > 0 {
+			rows.kv("start period", hc.StartPeriod.String())
 		}
 		if hc.Retries > 0 {
-			b.kv("retries", strconv.Itoa(hc.Retries))
+			rows.kv("retries", strconv.Itoa(hc.Retries))
+		}
+	}
+	if probe, ok := lastHealthProbe(state); ok {
+		rows.kv("last probe", formatProbeHeader(probe))
+		if out := strings.TrimRight(probe.Output, "\n"); out != "" {
+			rows.block(inspectBlockIndent, out)
 		}
 	}
 
-	probe, ok := lastHealthProbe(state)
-	if !ok {
+	if len(rows.lines) == 0 {
 		return
 	}
-	b.kv("last probe", formatProbeHeader(probe))
-	if out := strings.TrimRight(probe.Output, "\n"); out != "" {
-		b.block(inspectBlockIndent, out)
-	}
+	b.section("HEALTH")
+	b.lines = append(b.lines, rows.lines...)
 }
 
 // inspectImageSection renders what the container actually runs: the ref the

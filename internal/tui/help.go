@@ -337,6 +337,7 @@ func helpGroupsFor(s screen, hc helpContext) []helpGroup {
 		return []helpGroup{
 			{title: "MOVE", entries: []helpEntry{
 				{"↑ ↓", "scroll"},
+				{"← →", "scroll sideways"},
 				{"pgup pgdown", "page"},
 			}},
 			{title: "VIEW", actions: true, entries: []helpEntry{

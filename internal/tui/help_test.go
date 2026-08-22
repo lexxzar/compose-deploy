@@ -144,7 +144,10 @@ func TestHelpGroups_NamesEveryBoundKey(t *testing.T) {
 		screenConfig:       {"q", "ctrl+c", "esc", "r", "e", "up", "down", "pgup", "pgdown"},
 		screenSettingsList: {"q", "ctrl+c", "esc", "up", "k", "down", "j", "a", "enter", "e", "d", "y", "n"},
 		screenSettingsForm: {"q", "ctrl+c", "esc", "tab", "shift+tab", "up", "down", "left", "right", "enter"},
-		screenInspect:      {"q", "ctrl+c", "esc", "r", "up", "down", "pgup", "pgdown"},
+		screenInspect: {
+			"q", "ctrl+c", "esc", "r", "up", "down", "left", "right",
+			"pgup", "pgdown",
+		},
 	}
 
 	for _, s := range allScreens {
@@ -713,15 +716,20 @@ func TestViewHelp_InspectSurvivesTheFirstTruncation(t *testing.T) {
 		if !strings.Contains(view, "inspect") {
 			t.Errorf("width %d: i was the first key sacrificed; move it up inside inspectGroup:\n%s", w, view)
 		}
-		if strings.Contains(view, "check updates") {
-			t.Errorf("width %d: the truncation table moved — U was expected to go first at height 23:\n%s", w, view)
-		}
 	}
-	// And the full-fit height, so a future row added to any action group shows
-	// up here as the threshold moving rather than as a silent loss.
+	// The full-fit height, so a future row added to any action group shows up
+	// here as the threshold moving rather than as a silent loss — and i's
+	// POSITION, as an ordering against the key the budget sacrifices first.
+	// Asserting `check updates` is ABSENT at height 23 instead would pin the
+	// whole overlay's first sacrifice, so any future row in any action group
+	// would fail this test with a message about inspect.
 	m := Model{screen: screenSelectContainers, width: 50, height: 24, showPicker: true, helpOpen: true}
-	if view := ansi.Strip(m.View()); !strings.Contains(view, "check updates") {
-		t.Errorf("height 24 no longer fits every action row:\n%s", view)
+	view := ansi.Strip(m.View())
+	if !strings.Contains(view, "check updates") {
+		t.Fatalf("height 24 no longer fits every action row:\n%s", view)
+	}
+	if at, uAt := strings.Index(view, "inspect"), strings.Index(view, "check updates"); at > uAt {
+		t.Errorf("inspect renders below check updates, so it goes first under the budget:\n%s", view)
 	}
 }
 

@@ -136,12 +136,26 @@ func squeeze(s string) string {
 	return strings.ReplaceAll(strings.ReplaceAll(s, " ", ""), "\n", "")
 }
 
+// TestBuildInspectSummary_NeverExceedsWidth pins the wrap-not-truncate promise
+// in DISPLAY CELLS, which is the unit the pane is measured in. An ASCII-only
+// sweep cannot fail it: runes and cells agree there, so a rune-counting wrap
+// looks correct right up until a probe output, an env value or a mount path
+// carries CJK or an emoji and renders at 2x the pane width. The "wide runes"
+// doc is what makes the assertion load-bearing.
 func TestBuildInspectSummary_NeverExceedsWidth(t *testing.T) {
-	docs := map[string]compose.InspectDoc{
-		"healthy":   loadInspectFixture(t, "docker_inspect_healthy.json"),
-		"unhealthy": loadInspectFixture(t, "docker_inspect_unhealthy.json"),
-		"stopped":   loadInspectFixture(t, "docker_inspect_stopped.json"),
-		"long values": {
+	// minWidth is the narrowest pane a doc can be measured at. A single wide
+	// grapheme occupies 2 cells and cannot be split, so a doc carrying one
+	// cannot hold a 1-cell pane; ASCII docs are swept down to width 1, where
+	// the narrow-pane guards in kv and block actually fire.
+	type widthCase struct {
+		doc      compose.InspectDoc
+		minWidth int
+	}
+	docs := map[string]widthCase{
+		"healthy":   {doc: loadInspectFixture(t, "docker_inspect_healthy.json")},
+		"unhealthy": {doc: loadInspectFixture(t, "docker_inspect_unhealthy.json")},
+		"stopped":   {doc: loadInspectFixture(t, "docker_inspect_stopped.json")},
+		"long values": {doc: compose.InspectDoc{
 			Name:         "verbose",
 			RestartCount: 3,
 			State: compose.InspectState{
@@ -167,10 +181,11 @@ func TestBuildInspectSummary_NeverExceedsWidth(t *testing.T) {
 					"SHORT=1",
 				},
 				Healthcheck: &compose.InspectHealthcheck{
-					Test:     []string{"CMD-SHELL", strings.Repeat("curl -fsS http://localhost/healthz && ", 8) + "true"},
-					Interval: 5 * time.Second,
-					Timeout:  3 * time.Second,
-					Retries:  3,
+					Test:        []string{"CMD-SHELL", strings.Repeat("curl -fsS http://localhost/healthz && ", 8) + "true"},
+					Interval:    5 * time.Second,
+					Timeout:     3 * time.Second,
+					StartPeriod: 2 * time.Second,
+					Retries:     3,
 				},
 			},
 			Mounts: []compose.InspectMount{{
@@ -179,12 +194,49 @@ func TestBuildInspectSummary_NeverExceedsWidth(t *testing.T) {
 				Destination: strings.Repeat("/another-long-directory-name", 4),
 				RW:          true,
 			}},
-		},
+		}},
+		"wide runes": {minWidth: 2, doc: compose.InspectDoc{
+			Name:         "\u30a6\u30a7\u30d6\u30b5\u30fc\u30d0\u30fc",
+			RestartCount: 1,
+			State: compose.InspectState{
+				Status: "running",
+				Error:  "\u8d77\u52d5\u306b\u5931\u6557\u3057\u307e\u3057\u305f\uff1a\u5b9f\u884c\u30d5\u30a1\u30a4\u30eb\u304c\u898b\u3064\u304b\u308a\u307e\u305b\u3093",
+				Health: &compose.InspectHealth{
+					Status:        "unhealthy",
+					FailingStreak: 3,
+					Log: []compose.InspectHealthLog{{
+						ExitCode: 1,
+						Output:   strings.Repeat("\u30d8\u30eb\u30b9\u30c1\u30a7\u30c3\u30af\u306b\u5931\u6557\u3057\u307e\u3057\u305f \U0001f525 ", 6),
+					}},
+				},
+			},
+			Config: compose.InspectConfig{
+				Image: "registry.example.com/\u30c1\u30fc\u30e0/\u30a6\u30a7\u30d6\u30b5\u30fc\u30d0\u30fc:1.0",
+				Cmd:   []string{"/app/server", "--\u8a2d\u5b9a", "/etc/\u8a2d\u5b9a/\u30d5\u30a1\u30a4\u30eb.yaml"},
+				Env: []string{
+					"MESSAGE=\u3053\u3093\u306b\u3061\u306f\u4e16\u754c\u3001\u3053\u308c\u306f\u3068\u3066\u3082\u9577\u3044\u5024\u3067\u3059 \U0001f680\U0001f680\U0001f680",
+					"SHORT=1",
+				},
+				Healthcheck: &compose.InspectHealthcheck{
+					Test:     []string{"CMD-SHELL", "curl -fsS http://localhost/\u30d8\u30eb\u30b9 || exit 1"},
+					Interval: 5 * time.Second,
+				},
+			},
+			Mounts: []compose.InspectMount{{
+				Type:        "bind",
+				Source:      "/srv/\u30c7\u30fc\u30bf/\u30a6\u30a7\u30d6\u30b5\u30a4\u30c8",
+				Destination: "/usr/share/nginx/\u516c\u958b",
+				RW:          false,
+			}},
+		}},
 	}
 
-	for name, doc := range docs {
-		for _, width := range []int{20, 30, 40, 60, 80, 120} {
-			out := buildInspectSummary(doc, width)
+	for name, tc := range docs {
+		for _, width := range []int{1, 4, 10, 20, 30, 40, 60, 80, 120} {
+			if width < tc.minWidth {
+				continue
+			}
+			out := buildInspectSummary(tc.doc, width)
 			for i, line := range strings.Split(out, "\n") {
 				if w := ansi.StringWidth(line); w > width {
 					t.Errorf("%s at width %d: line %d is %d cells: %q", name, width, i, w, line)
@@ -214,15 +266,53 @@ func TestBuildInspectSummary_StateAlwaysRenders(t *testing.T) {
 	}
 }
 
+// TestBuildInspectSummary_StateNamesTheContainerAndItsError pins the two rows
+// that answer "which replica am I looking at" and "why did it not start". The
+// breadcrumb names the SERVICE, so on a scaled service the container row is the
+// only place the picked replica is named; State.Error is docker's own reason,
+// and on a container that never ran the exit code alone says nothing.
+func TestBuildInspectSummary_StateNamesTheContainerAndItsError(t *testing.T) {
+	doc := compose.InspectDoc{
+		Name: "shop-worker-2",
+		State: compose.InspectState{
+			Status:   "created",
+			ExitCode: 127,
+			Error:    `exec: "worker": executable file not found in $PATH`,
+		},
+	}
+	out := buildInspectSummary(doc, 100)
+	for _, want := range []string{
+		"container       shop-worker-2",
+		"status          created",
+		"exit code       127",
+		`error           exec: "worker": executable file not found in $PATH`,
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("summary missing %q:\n%s", want, out)
+		}
+	}
+}
+
+// TestBuildInspectSummary_StateOmitsEmptyRows is the other direction: a blank
+// name or a blank error must not render a labelled row with nothing after it.
+func TestBuildInspectSummary_StateOmitsEmptyRows(t *testing.T) {
+	doc := compose.InspectDoc{State: compose.InspectState{Status: "running", Running: true, Error: "   "}}
+	out := buildInspectSummary(doc, 80)
+	for _, skip := range []string{"container", "error"} {
+		if strings.Contains(out, skip) {
+			t.Errorf("summary must not render an empty %q row:\n%s", skip, out)
+		}
+	}
+}
+
 func TestBuildInspectSummary_OOMKilledAndRestartPolicy(t *testing.T) {
 	doc := compose.InspectDoc{
 		RestartCount: 7,
 		State: compose.InspectState{
-			Status:     "exited",
-			ExitCode:   137,
-			OOMKilled:  true,
-			StartedAt:  "2026-08-22T03:09:23Z",
-			FinishedAt: "2026-08-22T03:11:00Z",
+			Status:    "exited",
+			ExitCode:  137,
+			OOMKilled: true,
+			StartedAt: "2026-08-22T03:09:23Z",
 		},
 		HostConfig: compose.InspectHostConfig{
 			RestartPolicy: compose.InspectRestartPolicy{Name: "on-failure", MaximumRetryCount: 5},
@@ -274,6 +364,27 @@ func TestBuildInspectSummary_HealthSectionPresence(t *testing.T) {
 			wantSection: true,
 			wantRows:    []string{"status          starting", "failing streak  0"},
 			skipRows:    []string{"interval", "last probe"},
+		},
+		{
+			// hasHealthcheck answers "is there a healthcheck", which a
+			// zero-valued config satisfies while having nothing to say. A bare
+			// header with no rows under it contradicts the documented "a
+			// section with nothing to say is omitted".
+			name:        "zero-valued healthcheck has nothing to say",
+			hc:          &compose.InspectHealthcheck{},
+			wantSection: false,
+		},
+		{
+			name:        "runtime state with no status reads as unknown",
+			state:       &compose.InspectHealth{},
+			wantSection: true,
+			wantRows:    []string{"status          unknown", "failing streak  0"},
+		},
+		{
+			name:        "start period is rendered beside the other intervals",
+			hc:          &compose.InspectHealthcheck{Test: []string{"CMD", "true"}, StartPeriod: 30 * time.Second},
+			wantSection: true,
+			wantRows:    []string{"start period    30s"},
 		},
 		{
 			name:        "probe with no output renders only the header",
@@ -511,7 +622,13 @@ func TestBuildInspectSummary_MountsSection(t *testing.T) {
 		t.Fatalf("summary missing MOUNTS:\n%s", out)
 	}
 	for _, m := range doc.Mounts {
-		want := inspectRow(m.Type, formatInspectMount(m))
+		body := formatInspectMount(m)
+		// The needle comes from the function under test, so an empty return
+		// would make Contains trivially true.
+		if body == "" {
+			t.Fatalf("formatInspectMount(%+v) = \"\"; the assertion below would be vacuous", m)
+		}
+		want := inspectRow(m.Type, body)
 		if !strings.Contains(out, want) {
 			t.Errorf("summary missing mount row %q:\n%s", want, out)
 		}
@@ -528,14 +645,56 @@ func TestBuildInspectSummary_MountsSection(t *testing.T) {
 // survives a narrow pane — the destination is the half that falls off the edge
 // without a wrap, and it is the half that identifies the mount.
 func TestBuildInspectSummary_MountsWrapNotTruncate(t *testing.T) {
+	// LITERAL expectations, not formatInspectMount's own output: a needle
+	// produced by the function under test would make this test pass vacuously
+	// the moment that function returned "" (strings.Contains(x, "") is true).
+	want := []string{
+		"/srv/cdeployfixture/site → /usr/share/nginx/html  ro",
+		"/var/lib/docker/volumes/cdeployfixture_webdata/_data → /var/cache/nginx  rw",
+	}
 	doc := loadInspectFixture(t, "docker_inspect_healthy.json")
+	if len(doc.Mounts) != len(want) {
+		t.Fatalf("fixture mounts = %d, want %d", len(doc.Mounts), len(want))
+	}
 	for _, width := range []int{40, 60, 80} {
-		out := buildInspectSummary(doc, width)
-		for _, m := range doc.Mounts {
-			if !strings.Contains(squeeze(out), squeeze(formatInspectMount(m))) {
-				t.Errorf("width %d: mount %q truncated:\n%s", width, m.Destination, out)
+		out := squeeze(buildInspectSummary(doc, width))
+		for _, w := range want {
+			if !strings.Contains(out, squeeze(w)) {
+				t.Errorf("width %d: mount %q truncated:\n%s", width, w, buildInspectSummary(doc, width))
 			}
 		}
+	}
+}
+
+// TestBuildInspectSummary_MountLabelEdges pins the two mount-row labels that do
+// not come from docker's short type enum. A mount Type is free-form JSON, so it
+// is the one kv label that can outgrow the value column: the fallback keeps a
+// typeless row identifiable, and an over-long one must still leave a space
+// between the label and the value rather than running them together.
+func TestBuildInspectSummary_MountLabelEdges(t *testing.T) {
+	tests := []struct {
+		name string
+		in   compose.InspectMount
+		want string
+	}{
+		{
+			name: "no type falls back to mount",
+			in:   compose.InspectMount{Source: "/srv/data", Destination: "/data", RW: true},
+			want: "mount           /srv/data → /data  rw",
+		},
+		{
+			name: "a type wider than the value column still separates",
+			in:   compose.InspectMount{Type: "some-very-long-mount-type", Source: "/srv/data", Destination: "/data"},
+			want: "some-very-long-mount-type /srv/data → /data  ro",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			out := buildInspectSummary(compose.InspectDoc{Mounts: []compose.InspectMount{tt.in}}, 80)
+			if !strings.Contains(out, tt.want) {
+				t.Errorf("summary missing %q:\n%s", tt.want, out)
+			}
+		})
 	}
 }
 
@@ -672,14 +831,25 @@ func TestBuildInspectSummary_SectionOrder(t *testing.T) {
 	}
 }
 
-// envBlockLines counts the entries rendered under the ENV header. ENV is the
-// last section, so everything after its title belongs to it.
+// envBlockLines counts the entries rendered under the ENV header. It matches
+// the section header EXACTLY (after stripping the header's styling) and stops
+// at the blank line that separates sections, rather than assuming ENV is last
+// and that no other line contains the substring "ENV" — either assumption
+// would turn the exact-count assertions above into silent tautologies.
 func envBlockLines(summary string) int {
 	lines := strings.Split(summary, "\n")
 	for i, line := range lines {
-		if strings.Contains(line, "ENV") {
-			return len(lines) - i - 1
+		if strings.TrimSpace(ansi.Strip(line)) != "ENV" {
+			continue
 		}
+		n := 0
+		for _, entry := range lines[i+1:] {
+			if strings.TrimSpace(entry) == "" {
+				break
+			}
+			n++
+		}
+		return n
 	}
 	return 0
 }

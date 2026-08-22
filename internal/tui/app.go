@@ -723,7 +723,15 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.configViewport.Height = h
 		}
 		if m.screen == screenInspect {
-			m.inspectViewport.Width = msg.Width - 4
+			// The same floors enterInspect applies, so the two sizing sites
+			// cannot disagree: an unguarded width goes negative on a very
+			// narrow pane, and buildInspectSummary would then wrap to its
+			// 80-column fallback for a viewport that renders nothing.
+			w := msg.Width - 4
+			if w < 10 {
+				w = 40
+			}
+			m.inspectViewport.Width = w
 			// -6, the config sizing. NOT the logs -7, which reserves a row for
 			// the log bar the inspect screen does not have.
 			h := msg.Height - 6
@@ -3068,6 +3076,14 @@ func (m *Model) enterInspect() (tea.Model, tea.Cmd) {
 		w = 40
 	}
 	m.inspectViewport = viewport.New(w, vpHeight)
+	// Raw mode is the escape hatch, and real `docker inspect` output carries
+	// lines hundreds of columns wide (a LowerDir list, a JSON-escaped probe
+	// Output). The viewport hard-cuts at its width with no wrap, so without a
+	// horizontal step left/right are inert and everything past the edge is
+	// unreachable. 4 is the step enterLogs uses when wrap is off. The summary
+	// is wrapped to the width, so its longest line never exceeds the pane and
+	// SetXOffset clamps the offset to 0 there.
+	m.inspectViewport.SetHorizontalStep(4)
 
 	m.screen = screenInspect
 	// Leaving screenSelectContainers for the inspect screen: search is ephemeral.
@@ -3139,6 +3155,10 @@ func (m *Model) rebuildInspectSummary() {
 	if err != nil {
 		m.inspectErr = err
 		m.inspectSummary = ""
+		// The raw bytes are the only content that exists now, so switch to
+		// them rather than leaving an error line above an empty pane and
+		// making the user guess that `r` is the way to the payload.
+		m.inspectShowRaw = true
 		return
 	}
 	m.inspectErr = nil
@@ -5266,7 +5286,14 @@ func (m Model) viewInspect() string {
 	b.WriteString("\n\n")
 
 	if m.inspectErr != nil {
-		b.WriteString(stepFailed.Render(fmt.Sprintf("  Error: %v", m.inspectErr)))
+		// The chrome is budgeted for exactly ONE extra line, but the compose
+		// layer feeds raw stderr in here (an SSH banner, a multi-line docker
+		// failure), so the message is collapsed to one line and clamped to the
+		// pane — the same never-wrap discipline searchBarLine and logBarLine
+		// follow. Without it the renderer keeps only the last m.height lines
+		// and the title scrolls off.
+		oneLine := strings.Join(strings.Fields(m.inspectErr.Error()), " ")
+		b.WriteString(stepFailed.Render(clampToWidth("  Error: "+oneLine, m.width)))
 		b.WriteString("\n")
 	}
 	switch {

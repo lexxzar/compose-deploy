@@ -60,7 +60,7 @@
         "ExecIDs": null,
         "HostConfig": {
             "Binds": [
-                "/private/tmp/claude-501/-Users-zavulon-GolandProjects-compose-deploy/11dab8dd-84f6-477d-bc59-f5cd2ebc41ff/scratchpad/fixtures/site:/usr/share/nginx/html:ro",
+                "/srv/cdeployfixture/site:/usr/share/nginx/html:ro",
                 "cdeployfixture_webdata:/var/cache/nginx:rw"
             ],
             "ContainerIDFile": "",
@@ -167,7 +167,7 @@
         "Mounts": [
             {
                 "Type": "bind",
-                "Source": "/private/tmp/claude-501/-Users-zavulon-GolandProjects-compose-deploy/11dab8dd-84f6-477d-bc59-f5cd2ebc41ff/scratchpad/fixtures/site",
+                "Source": "/srv/cdeployfixture/site",
                 "Destination": "/usr/share/nginx/html",
                 "Mode": "ro",
                 "RW": false,
@@ -238,8 +238,8 @@
                 "com.docker.compose.image": "sha256:d090ef0c3fa38df49d89dfcca52ce77f71d88a8db6bd8388d78817cad20a0c1f",
                 "com.docker.compose.oneoff": "False",
                 "com.docker.compose.project": "cdeployfixture",
-                "com.docker.compose.project.config_files": "/private/tmp/claude-501/-Users-zavulon-GolandProjects-compose-deploy/11dab8dd-84f6-477d-bc59-f5cd2ebc41ff/scratchpad/fixtures/compose.yml",
-                "com.docker.compose.project.working_dir": "/private/tmp/claude-501/-Users-zavulon-GolandProjects-compose-deploy/11dab8dd-84f6-477d-bc59-f5cd2ebc41ff/scratchpad/fixtures",
+                "com.docker.compose.project.config_files": "/srv/cdeployfixture/compose.yml",
+                "com.docker.compose.project.working_dir": "/srv/cdeployfixture",
                 "com.docker.compose.service": "healthyweb",
                 "com.docker.compose.version": "2.40.3",
                 "maintainer": "NGINX Docker Maintainers \u003cdocker-maint@nginx.com\u003e"

@@ -25,42 +25,54 @@ func pickInspectContainer(entries []psEntry, service string) (string, bool) {
 	}
 
 	var (
-		fallback           string
-		haveFallback       bool
-		chosen             string
+		fallback string
+		chosen   string
+		// longestFromRunning separates "no running replica seen yet" from "a
+		// running replica whose parsed duration is zero", which a zero
+		// longestUpDur alone cannot.
 		longestUpDur       time.Duration
 		longestFromRunning bool
-		haveUptime         bool
 	)
 
 	for _, entry := range entries {
 		if entry.Service != service || entry.ID == "" {
 			continue
 		}
-		if !haveFallback {
-			fallback, haveFallback = entry.ID, true
+		if fallback == "" {
+			fallback = entry.ID
 		}
 
 		uptime := formatUptime(entry.Status)
 		switch {
 		case entry.State == "running" && uptime != "":
-			dur := parseUptimeDuration(uptime)
-			if !longestFromRunning || dur > longestUpDur {
-				longestUpDur, longestFromRunning = dur, true
-				haveUptime, chosen = true, entry.ID
+			if dur := parseUptimeDuration(uptime); !longestFromRunning || dur > longestUpDur {
+				longestUpDur, longestFromRunning, chosen = dur, true, entry.ID
 			}
-		case uptime == "restarting" && !haveUptime:
-			haveUptime, chosen = true, entry.ID
+		case uptime == "restarting" && chosen == "":
+			chosen = entry.ID
 		}
 	}
 
-	if chosen != "" {
-		return chosen, true
+	if chosen == "" {
+		chosen = fallback
 	}
-	if haveFallback {
-		return fallback, true
+	return chosen, chosen != ""
+}
+
+// resolveInspectID turns one `docker compose ps` payload into the container ID
+// to inspect. Both Compose.Inspect and RemoteCompose.Inspect share this middle
+// half — only their transports differ — and the "no container found" text is a
+// user-visible contract pinned by tests on both sides, so it has one home.
+func resolveInspectID(psOut []byte, service string) (string, error) {
+	entries, err := parsePsEntries(psOut)
+	if err != nil {
+		return "", err
 	}
-	return "", false
+	id, ok := pickInspectContainer(entries, service)
+	if !ok {
+		return "", fmt.Errorf("no container found for %q", service)
+	}
+	return id, nil
 }
 
 // pickHostInspectContainer selects the unmanaged host container to inspect.
@@ -132,17 +144,18 @@ type InspectDoc struct {
 // omits the key entirely for an image with no healthcheck, and the HEALTH section
 // is dropped on exactly that distinction — a zero-valued struct could not carry it.
 type InspectState struct {
-	Status     string         `json:"Status"`
-	Running    bool           `json:"Running"`
-	Paused     bool           `json:"Paused"`
-	Restarting bool           `json:"Restarting"`
-	OOMKilled  bool           `json:"OOMKilled"`
-	Dead       bool           `json:"Dead"`
-	ExitCode   int            `json:"ExitCode"`
-	Error      string         `json:"Error"`
-	StartedAt  string         `json:"StartedAt"`
-	FinishedAt string         `json:"FinishedAt"`
-	Health     *InspectHealth `json:"Health"`
+	Status string `json:"Status"`
+	// Running gates the exit-code row: a running container's ExitCode is
+	// always 0 and says nothing.
+	Running   bool `json:"Running"`
+	OOMKilled bool `json:"OOMKilled"`
+	ExitCode  int  `json:"ExitCode"`
+	// Error is docker's own reason a container failed to start (a missing
+	// executable, an OOM detail). On a stopped container it is often the whole
+	// answer, so the STATE section renders it when non-empty.
+	Error     string         `json:"Error"`
+	StartedAt string         `json:"StartedAt"`
+	Health    *InspectHealth `json:"Health"`
 }
 
 // InspectHealth mirrors `.State.Health`.
@@ -155,7 +168,6 @@ type InspectHealth struct {
 // InspectHealthLog is one probe result in `.State.Health.Log`. Output is the
 // probe's combined stdout/stderr — the field the inspect screen exists for.
 type InspectHealthLog struct {
-	Start    string `json:"Start"`
 	End      string `json:"End"`
 	ExitCode int    `json:"ExitCode"`
 	Output   string `json:"Output"`
@@ -199,7 +211,6 @@ type InspectMount struct {
 	Name        string `json:"Name"`
 	Source      string `json:"Source"`
 	Destination string `json:"Destination"`
-	Mode        string `json:"Mode"`
 	RW          bool   `json:"RW"`
 }
 

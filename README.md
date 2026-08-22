@@ -415,6 +415,8 @@ If your services define Docker health checks, cdeploy displays their status alon
 
 For scaled services, the worst-case health is shown (unhealthy > starting > healthy). Services without a health check show only the running/stopped dot. The same icons appear in `cdeploy list` output.
 
+To see **why** a container is `✗` unhealthy, press `i` on the service screen: the [inspect screen](#container-inspect-screen) shows the last healthcheck probe's own output, which is the one place cdeploy surfaces it.
+
 ## Logging
 
 All docker compose output is logged to `~/.cdeploy/logs/`. Each log file is named `cdeploy_on_{hostname}_{timestamp}.log`, so you get a per-host, timestamped record of every operation. Override the directory with `--log-dir`.
@@ -433,15 +435,21 @@ From the service screen, press `i` to inspect the container under the cursor. Wh
 
 The screen opens on a curated summary with five sections:
 
-- **STATE** — status, exit code (stopped containers only), OOM kill, start time, restart policy and restart count
+- **STATE** — the container name, status, exit code (stopped containers only), docker's own start error, OOM kill, start time, restart policy and restart count. The container name matters on a scaled service: it names which replica you are looking at.
 - **HEALTH** — health status, failing streak, the healthcheck definition, and **the last probe's output**, soft-wrapped rather than truncated. This is the answer to "why is this `✗` unhealthy?" and it appears nowhere else in cdeploy. The section is omitted for a container with no healthcheck.
 - **IMAGE** — the configured image reference, the digest docker resolved it to, and the command and entrypoint
 - **MOUNTS** — type, `source → destination`, and the read-write flag
-- **ENV** — the container's environment, one `KEY=VALUE` per line
+- **ENV** — the container's environment, one `KEY=VALUE` per line, unmasked
 
-Keys: `r` toggles between the summary and the raw `docker inspect` JSON (byte-identical to what the docker CLI prints), the arrows and `pgup`/`pgdown` scroll, and `esc` or `q` returns to the service screen. Both modes are read-only — inspect changes no container state.
+The summary is curated, not complete — networks, labels, resource limits and published ports are not in it (ports have their own column on the service screen). Press `r` for the raw JSON, which carries everything `docker inspect` returns.
 
-> **Environment values are shown verbatim, secrets included.** `docker inspect` prints `POSTGRES_PASSWORD`, `DATABASE_URL=postgres://user:pass@host/db` and API tokens in cleartext, and cdeploy masks nothing in either mode. This matches lazydocker, k9s and Docker Desktop. The consequence is real: pressing `i` while you share a screen or record a terminal exposes those values to everyone watching. The output is held in memory only — it is not written to `~/.cdeploy/logs/`.
+Keys: `r` toggles between the summary and the raw `docker inspect` JSON (byte-identical to what the docker CLI prints), the arrows and `pgup`/`pgdown` scroll, `←`/`→` scroll sideways through the long lines raw mode does not wrap, and `esc` or `q` returns to the service screen. Both modes are read-only — inspect changes no container state.
+
+**The screen is a snapshot.** The data is read once, when you press `i`; it does not auto-refresh. To re-read a container whose health is still changing, press `esc` and `i` again.
+
+Inspect works on remote servers selected through the TUI, over the existing SSH connection. It costs two round-trips there — one `docker compose ps` to resolve the container ID, one `docker inspect` for the payload itself, which is typically 10-50KB.
+
+> **Environment values are shown as-is, secrets included.** `docker inspect` prints `POSTGRES_PASSWORD`, `DATABASE_URL=postgres://user:pass@host/db` and API tokens in cleartext, and cdeploy masks nothing in either mode (the summary drops trailing spaces from a line so the pane has no ragged padding; raw mode alters nothing at all). This matches lazydocker, k9s and Docker Desktop. The consequence is real: pressing `i` while you share a screen or record a terminal exposes those values to everyone watching. The output is held in memory only — it is not written to `~/.cdeploy/logs/`.
 
 For a scaled service, cdeploy inspects the same replica the Uptime column shows — the longest-running one, and always a running replica over a restarting one. A service with no container reports `no container found for "<service>"` instead of a blank screen.
 

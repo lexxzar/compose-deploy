@@ -604,5 +604,44 @@ marked done by inspection.
   standalone RESTART POLICY block) — raw mode answers each today
 - adding `i` to the read-only container footer (touches the reservation math)
 - a `cdeploy inspect` CLI subcommand
-- fixing the `TestAllScreens_Complete` bound so a 9th screen genuinely does fail it
+- fixing the `TestAllScreens_Complete` bound so a TENTH screen genuinely does fail
+  it. Task 7 moved the bound from `int(screenSettingsForm) + 1` to
+  `int(screenInspect) + 1`, so the hole has moved on by one rather than closed —
+  the bound still anchors to the last constant by hand. Recorded in CLAUDE.md's
+  `?` overlay paragraph and in the new `## Adding a New TUI Screen` recipe.
 - secret masking — if ever added it must cover **both** modes
+
+**Residuals recorded during the round-1 review pass** (out of scope under the
+focus rule, real, and deliberately not fixed on this branch):
+- `parsePsEntries` (`internal/compose/inspect.go`) is the **fourth** copy of the
+  array-or-NDJSON `psEntry` decode, against `parseContainerStatus`
+  (`compose.go`), `parsePsIDToService` (`stats.go`) and
+  `parseRunningContainerIDs` (`snapshot.go`). The new helper is the
+  general-purpose one, so the other three are now redundant rather than merely
+  similar; each collapses to `parsePsEntries` plus its own projection loop once
+  the helper takes an error-context string. Touches three widely-tested parsers,
+  so it wants its own commit. The `if outputCmd != nil { … } else { cmd.Output() }`
+  preamble both `Inspect` methods open with is the same shape of duplication at a
+  larger scale — 20 sites across `compose.go`/`remote.go`/`snapshot.go`, all
+  pre-existing.
+- the Uptime selection rule now exists twice — the `svcAgg` block in
+  `parseContainerStatus` (`compose.go`) and `pickInspectContainer`
+  (`inspect.go`) — guarded by a mirror comment on both sides plus
+  `TestPickInspectContainer_MatchesUptimeColumn`. A shared `uptimeWinner.offer`
+  would delete the comment pair and make the cross-check test redundant, but it
+  edits `parseContainerStatus`, which is out of this branch's blast radius.
+- `AGENTS.md` (the non-Claude sibling of CLAUDE.md) is many features behind: it
+  still reads "Six screens", omits `i`/`screenInspect`, describes the
+  pre-`q`-as-back-key dispatch, and has zero mentions of unmanaged containers,
+  the rollback pipeline, the wait engine, the `?` overlay, `ReadOnlyComposer` or
+  container search. Pre-existing systemic drift. It wants either a resync pass of
+  its own or a reduction to a pointer at CLAUDE.md, so it cannot keep diverging
+  silently.
+- `screenConfig` and `screenLogs` still size their viewports from an UNGUARDED
+  `msg.Width - 4` in the `WindowSizeMsg` branch while their `enter*` helpers
+  floor it. The inspect branch was brought into line with `enterInspect` in the
+  review pass; the other two were left as inherited.
+- the inspect view is a one-shot snapshot with no in-place refresh key — `esc`
+  then `i` re-polls. `screenConfig` behaves the same way. Now stated in the
+  README and in CLAUDE.md rather than left to be discovered; a refresh key is the
+  follow-up.

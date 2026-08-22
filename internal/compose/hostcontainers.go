@@ -133,10 +133,10 @@ type HostContainers struct {
 
 // HostContainers implements every runner.Composer method: the five reads are
 // real, the five writes refuse with errReadOnly. It also satisfies
-// tui.ExecProvider (asserted in internal/tui/app_test.go, since compose cannot
-// import tui) but deliberately NOT tui.ConfigProvider or tui.RollbackPreparer —
-// a container with no compose file has no config to show and no snapshot to
-// roll back to, so the c and R keys gate themselves.
+// tui.ExecProvider and tui.Inspector (both asserted in internal/tui/app_test.go,
+// since compose cannot import tui) but deliberately NOT tui.ConfigProvider or
+// tui.RollbackPreparer — a container with no compose file has no config to show
+// and no snapshot to roll back to, so the c and R keys gate themselves.
 var _ runner.Composer = (*HostContainers)(nil)
 
 // localDockerRunner adapts *Compose. run and stream reuse the existing
