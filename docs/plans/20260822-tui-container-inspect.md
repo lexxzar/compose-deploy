@@ -476,13 +476,14 @@ Plus, outside the tables:
 - Modify: `internal/tui/app.go`
 - Modify: `internal/tui/app_test.go`
 
-- [ ] add `enterInspect()` modelled on `enterConfig()`: bump `inspectSession`, reset the fields, size the viewport at `m.height - 6`, set `m.screen`, call `m.clearSearch()` (departure site #10), return the fetch command
-- [ ] add `case "i"` to the container dispatch: early-return when `len(m.services) == 0`, then type-assert `m.composer.(Inspector)` and no-op if absent — **no `m.readOnly()` gate**
-- [ ] **document in a comment** that the `i` no-op paths do not call `fixSvcOffset()`, matching the existing `l` / `x` guards rather than the read-only gates — an inherited hole, adopted knowingly
-- [ ] add a mock composer implementing `Inspector`, following the `TestReadOnly_GatesWriteKeys_WithCapableComposer` precedent
-- [ ] write tests: `i` enters on a writable composer, `i` enters on a read-only composer, `i` no-ops on an empty list, `i` no-ops when the composer is not an `Inspector`
-- [ ] write a test asserting a committed container search is cleared by `enterInspect()`
-- [ ] run `go test ./internal/tui/` — must pass before task 9
+- [x] add `enterInspect()` modelled on `enterConfig()`: bump `inspectSession`, reset the fields, size the viewport at `m.height - 6`, set `m.screen`, call `m.clearSearch()` (departure site #10), return the fetch command
+- [x] add `case "i"` to the container dispatch: early-return when `len(m.services) == 0`, then type-assert `m.composer.(Inspector)` and no-op if absent — **no `m.readOnly()` gate**
+- [x] **document in a comment** that the `i` no-op paths do not call `fixSvcOffset()`, matching the existing `l` / `x` guards rather than the read-only gates — an inherited hole, adopted knowingly
+- [x] add a mock composer implementing `Inspector`, following the `TestReadOnly_GatesWriteKeys_WithCapableComposer` precedent — Task 7's `mockInspectComposer` covers the writable case; `readOnlyInspectComposer` (new) covers the read-only one, which is the case the not-gated-on-`readOnly` asymmetry actually rests on
+- [x] write tests: `i` enters on a writable composer, `i` enters on a read-only composer, `i` no-ops on an empty list, `i` no-ops when the composer is not an `Inspector`
+- [x] write a test asserting a committed container search is cleared by `enterInspect()`
+- [x] run `go test ./internal/tui/` — must pass before task 9
+- ➕ [x] `inspectTestModel(t, composer, services)` test helper added, so the four dispatch tests build the container screen the same way regardless of which composer double they drive
 
 ### Task 9: Add viewInspect, the `r` toggle, esc cleanup and resize
 

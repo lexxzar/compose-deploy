@@ -15413,3 +15413,151 @@ func TestFetchInspect_PropagatesError(t *testing.T) {
 		t.Errorf("err = %v, want boom", msg.err)
 	}
 }
+
+// readOnlyInspectComposer is the read-only counterpart of mockInspectComposer:
+// the exact capability set of *compose.HostContainers plus Inspector. The `i`
+// key is the one container key that is NOT gated on m.readOnly(), so this
+// double is what proves the key reaches enterInspect on the unmanaged screen.
+type readOnlyInspectComposer struct {
+	readOnlyMockComposer
+	inspectRaw []byte
+}
+
+func (m *readOnlyInspectComposer) Inspect(ctx context.Context, service string) ([]byte, error) {
+	return m.inspectRaw, nil
+}
+
+func inspectTestModel(t *testing.T, c runner.Composer, services []string) Model {
+	t.Helper()
+	m := NewModel(c, io.Discard, func(compose.Project) runner.Composer { return c }, nil, nil)
+	m.screen = screenSelectContainers
+	m.services = append([]string(nil), services...)
+	m.svcStatus = map[string]runner.ServiceStatus{}
+	for _, s := range services {
+		m.svcStatus[s] = runner.ServiceStatus{Running: true}
+	}
+	m.width, m.height = 120, 24
+	m.updateInFlight = false
+	m.refreshInFlight = false
+	installFakeTick(&m)
+	return m
+}
+
+func TestInspectKey_EntersOnWritableComposer(t *testing.T) {
+	mc := &mockInspectComposer{inspectRaw: []byte(inspectFixtureJSON)}
+	mc.services = []string{"web", "db"}
+	m := inspectTestModel(t, mc, mc.services)
+	m.svcCursor = 1
+
+	result, cmd := m.Update(keyMsgFor("i"))
+	got := result.(Model)
+
+	if got.screen != screenInspect {
+		t.Fatalf("screen = %d, want screenInspect", got.screen)
+	}
+	if got.inspectService != "db" {
+		t.Errorf("inspectService = %q, want \"db\" (the cursor row)", got.inspectService)
+	}
+	if got.inspectSession == 0 {
+		t.Error("enterInspect must bump inspectSession")
+	}
+	if got.inspectShowRaw {
+		t.Error("the summary is the default mode")
+	}
+	if got.inspectViewport.Height != m.height-6 {
+		t.Errorf("viewport height = %d, want %d (the config sizing)", got.inspectViewport.Height, m.height-6)
+	}
+	if cmd == nil {
+		t.Fatal("enterInspect must return the fetch command")
+	}
+	if _, ok := cmd().(inspectDataMsg); !ok {
+		t.Error("the returned command must produce an inspectDataMsg")
+	}
+}
+
+// TestInspectKey_EntersOnReadOnlyComposer pins the deliberate asymmetry: every
+// other container key added recently is gated on m.readOnly(), and i is not.
+func TestInspectKey_EntersOnReadOnlyComposer(t *testing.T) {
+	mc := &readOnlyInspectComposer{
+		readOnlyMockComposer: *readOnlyTestComposer(),
+		inspectRaw:           []byte(inspectFixtureJSON),
+	}
+	m := inspectTestModel(t, mc, mc.services)
+
+	if !m.readOnly() {
+		t.Fatal("precondition: the double must be read-only")
+	}
+
+	result, cmd := m.Update(keyMsgFor("i"))
+	got := result.(Model)
+
+	if got.screen != screenInspect {
+		t.Fatalf("screen = %d, want screenInspect — i must not be gated on readOnly", got.screen)
+	}
+	if cmd == nil {
+		t.Fatal("enterInspect must return the fetch command on the read-only screen too")
+	}
+}
+
+func TestInspectKey_NoOpOnEmptyList(t *testing.T) {
+	mc := &mockInspectComposer{inspectRaw: []byte(inspectFixtureJSON)}
+	m := inspectTestModel(t, mc, nil)
+
+	result, cmd := m.Update(keyMsgFor("i"))
+	got := result.(Model)
+
+	if got.screen != screenSelectContainers {
+		t.Errorf("screen = %d, want screenSelectContainers", got.screen)
+	}
+	if cmd != nil {
+		t.Error("i on an empty list must not fetch")
+	}
+	if mc.inspectCalls != 0 {
+		t.Errorf("Inspect called %d times, want 0", mc.inspectCalls)
+	}
+}
+
+func TestInspectKey_NoOpWhenNotInspector(t *testing.T) {
+	mc := &mockComposer{services: []string{"web"}}
+	m := inspectTestModel(t, mc, mc.services)
+
+	if _, ok := m.composer.(Inspector); ok {
+		t.Fatal("precondition: the plain mock must not be an Inspector")
+	}
+
+	result, cmd := m.Update(keyMsgFor("i"))
+	got := result.(Model)
+
+	if got.screen != screenSelectContainers {
+		t.Errorf("screen = %d, want screenSelectContainers", got.screen)
+	}
+	if cmd != nil {
+		t.Error("i must not fetch when the composer is not an Inspector")
+	}
+	if got.warning != "" {
+		t.Errorf("warning = %q; a silent no-op must not advertise itself", got.warning)
+	}
+}
+
+// TestInspectKey_ClearsCommittedSearch pins departure site #10 of the
+// clearSearch checklist: leaving screenSelectContainers must never carry a
+// committed search (and its stale match indices) into a nested screen.
+func TestInspectKey_ClearsCommittedSearch(t *testing.T) {
+	mc := &mockInspectComposer{inspectRaw: []byte(inspectFixtureJSON)}
+	mc.services = []string{"web", "webhook", "db"}
+	m := inspectTestModel(t, mc, mc.services)
+	m.searchQuery = "web"
+	m.searchMatches = []int{0, 1}
+	m.svcCursor = 1
+
+	result, _ := m.Update(keyMsgFor("i"))
+	got := result.(Model)
+
+	if got.screen != screenInspect {
+		t.Fatalf("screen = %d, want screenInspect", got.screen)
+	}
+	if got.searchQuery != "" || got.searchMatches != nil || got.searching {
+		t.Errorf("committed search survived enterInspect: query=%q matches=%v searching=%v",
+			got.searchQuery, got.searchMatches, got.searching)
+	}
+}

@@ -2020,6 +2020,23 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			if _, ok := m.composer.(ConfigProvider); ok {
 				return m.enterConfig()
 			}
+		case "i":
+			// Deliberately NOT gated on m.readOnly(): inspect is read-only by
+			// nature and works identically on both container variants, so it is
+			// named in both help tables.
+			//
+			// Neither no-op path below calls fixSvcOffset(), matching the l/x
+			// guards rather than the read-only gates. The dispatch clears
+			// m.warning above the switch, so a freed warning line leaves
+			// svcOffset unclamped for one render — an inherited hole, adopted
+			// knowingly rather than fixed here for one key.
+			if len(m.services) == 0 {
+				return m, nil
+			}
+			if _, ok := m.composer.(Inspector); !ok {
+				return m, nil
+			}
+			return m.enterInspect()
 		case "x":
 			if _, ok := m.composer.(ExecProvider); !ok {
 				return m, nil
@@ -2988,6 +3005,34 @@ func (m *Model) enterConfig() (tea.Model, tea.Cmd) {
 	// Leaving screenSelectContainers for the config screen: search is ephemeral.
 	m.clearSearch()
 	return *m, m.fetchConfigFile()
+}
+
+// enterInspect opens the read-only inspect screen for the service under the
+// cursor. Modelled on enterConfig: bump the session, reset every inspect field,
+// size the viewport with the config sizing (m.height - 6, NOT the logs -7 which
+// reserves a row for the log bar), then return the fetch command.
+func (m *Model) enterInspect() (tea.Model, tea.Cmd) {
+	m.inspectSession++
+	m.inspectService = m.services[m.svcCursor]
+	m.inspectRaw = nil
+	m.inspectSummary = ""
+	m.inspectShowRaw = false
+	m.inspectErr = nil
+
+	vpHeight := m.height - 6
+	if vpHeight < 3 {
+		vpHeight = 3
+	}
+	w := m.width - 4
+	if w < 10 {
+		w = 40
+	}
+	m.inspectViewport = viewport.New(w, vpHeight)
+
+	m.screen = screenInspect
+	// Leaving screenSelectContainers for the inspect screen: search is ephemeral.
+	m.clearSearch()
+	return *m, m.fetchInspect(m.inspectSession)
 }
 
 func (m *Model) enterExec() (tea.Model, tea.Cmd) {
