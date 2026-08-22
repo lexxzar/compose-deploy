@@ -428,13 +428,13 @@ Plus, outside the tables:
 - Create: `internal/tui/inspect.go`
 - Create: `internal/tui/inspect_test.go`
 
-- [ ] create `internal/tui/inspect.go` with `buildInspectSummary(doc compose.InspectDoc, width int) string`
-- [ ] render STATE: status, exit code, `OOMKilled`, started at, restart policy, restart count — always rendered
-- [ ] render HEALTH: status, failing streak, healthcheck test/interval/timeout/retries, and the **last probe `Output`**; omit the whole section when the container has no healthcheck
-- [ ] soft-wrap the probe output via the existing `softWrapLine` in `internal/tui/format.go` — it must never truncate
-- [ ] write tests against all three fixtures: the unhealthy probe Output appears verbatim, HEALTH is absent without a healthcheck, STATE renders for a stopped container with its exit code
-- [ ] write a test asserting no rendered line exceeds the supplied width
-- [ ] run `go test ./internal/tui/` — must pass before task 6
+- [x] create `internal/tui/inspect.go` with `buildInspectSummary(doc compose.InspectDoc, width int) string`
+- [x] render STATE: status, exit code, `OOMKilled`, started at, restart policy, restart count — always rendered
+- [x] render HEALTH: status, failing streak, healthcheck test/interval/timeout/retries, and the **last probe `Output`**; omit the whole section when the container has no healthcheck
+- [x] soft-wrap the probe output via the existing `softWrapLine` in `internal/tui/format.go` — it must never truncate
+- [x] write tests against all three fixtures: the unhealthy probe Output appears verbatim, HEALTH is absent without a healthcheck, STATE renders for a stopped container with its exit code
+- [x] write a test asserting no rendered line exceeds the supplied width
+- [x] run `go test ./internal/tui/` — must pass before task 6
 
 ### Task 6: Render the IMAGE, MOUNTS and ENV sections
 
