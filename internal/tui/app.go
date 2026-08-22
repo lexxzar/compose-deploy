@@ -2,7 +2,6 @@ package tui
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -724,22 +723,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.configViewport.Height = h
 		}
 		if m.screen == screenInspect {
-			// The same floors enterInspect applies, so the two sizing sites
-			// cannot disagree: an unguarded width goes negative on a very
-			// narrow pane, and buildInspectSummary would then wrap to its
-			// 80-column fallback for a viewport that renders nothing.
-			w := msg.Width - 4
-			if w < 10 {
-				w = 40
-			}
-			m.inspectViewport.Width = w
-			// -6, the config sizing. NOT the logs -7, which reserves a row for
-			// the log bar the inspect screen does not have.
-			h := msg.Height - 6
-			if h < 3 {
-				h = 3
-			}
-			m.inspectViewport.Height = h
+			m.inspectViewport.Width, m.inspectViewport.Height = inspectViewportSize(msg.Width, msg.Height)
 			// The summary is wrapped to the viewport width, so it has to be
 			// rebuilt from the raw bytes — which survive, keeping raw mode
 			// byte-identical to `docker inspect` across a resize.
@@ -1249,7 +1233,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			// early-returns on empty bytes, so ParseInspect's own "empty
 			// output" error never fires and viewInspect would read
 			// "Loading..." for ever, with no error and no way to retry.
-			m.inspectErr = errors.New("docker inspect returned no output")
+			m.inspectErr = fmt.Errorf("docker inspect returned no output")
 			return m, nil
 		}
 		m.inspectRaw = msg.data
@@ -2064,12 +2048,6 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			// Deliberately NOT gated on m.readOnly(): inspect is read-only by
 			// nature and works identically on both container variants, so it is
 			// named in both help tables.
-			//
-			// Neither no-op path below calls fixSvcOffset(), matching the l/x
-			// guards rather than the read-only gates. The dispatch clears
-			// m.warning above the switch, so a freed warning line leaves
-			// svcOffset unclamped for one render — an inherited hole, adopted
-			// knowingly rather than fixed here for one key.
 			if len(m.services) == 0 {
 				return m, nil
 			}
@@ -2426,6 +2404,12 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		case "r":
 			// Two-way toggle over two buffers already in hand — no refetch,
 			// unlike screenConfig's r, whose resolved half is lazily fetched.
+			// A failed FETCH leaves neither buffer, so the toggle would only
+			// flip the footer's own label over an empty pane; viewInspect drops
+			// the token in that state and the key has to agree with it.
+			if len(m.inspectRaw) == 0 {
+				return m, nil
+			}
 			m.inspectShowRaw = !m.inspectShowRaw
 			m.setInspectContent()
 			m.inspectViewport.GotoTop()
@@ -3072,10 +3056,27 @@ func (m *Model) enterConfig() (tea.Model, tea.Cmd) {
 	return *m, m.fetchConfigFile()
 }
 
+// inspectViewportSize is the one home for the inspect pane's chrome budget, so
+// enterInspect and the WindowSizeMsg branch cannot drift apart. The height uses
+// the config sizing (-6), NOT the logs -7, which reserves a row for the log bar
+// the inspect screen does not have. Both floors are load-bearing: an unguarded
+// width goes negative on a very narrow pane, and buildInspectSummary would then
+// wrap to its 80-column fallback for a viewport that renders nothing.
+func inspectViewportSize(width, height int) (int, int) {
+	w := width - 4
+	if w < 10 {
+		w = 40
+	}
+	h := height - 6
+	if h < 3 {
+		h = 3
+	}
+	return w, h
+}
+
 // enterInspect opens the read-only inspect screen for the service under the
 // cursor. Modelled on enterConfig: bump the session, reset every inspect field,
-// size the viewport with the config sizing (m.height - 6, NOT the logs -7 which
-// reserves a row for the log bar), then return the fetch command.
+// size the viewport, then return the fetch command.
 func (m *Model) enterInspect() (tea.Model, tea.Cmd) {
 	m.inspectSession++
 	m.inspectService = m.services[m.svcCursor]
@@ -3084,14 +3085,7 @@ func (m *Model) enterInspect() (tea.Model, tea.Cmd) {
 	m.inspectShowRaw = false
 	m.inspectErr = nil
 
-	vpHeight := m.height - 6
-	if vpHeight < 3 {
-		vpHeight = 3
-	}
-	w := m.width - 4
-	if w < 10 {
-		w = 40
-	}
+	w, vpHeight := inspectViewportSize(m.width, m.height)
 	m.inspectViewport = viewport.New(w, vpHeight)
 	// Raw mode is the escape hatch, and real `docker inspect` output carries
 	// lines hundreds of columns wide (a LowerDir list, a JSON-escaped probe
@@ -3105,7 +3099,7 @@ func (m *Model) enterInspect() (tea.Model, tea.Cmd) {
 	m.screen = screenInspect
 	// Leaving screenSelectContainers for the inspect screen: search is ephemeral.
 	m.clearSearch()
-	return *m, m.fetchInspect(m.inspectSession)
+	return *m, m.fetchInspect()
 }
 
 func (m *Model) enterExec() (tea.Model, tea.Cmd) {
@@ -3218,15 +3212,16 @@ func (m *Model) setInspectContent() {
 }
 
 // fetchInspect runs `docker inspect` for the service being inspected. The
-// session is passed in rather than read off the Model so the value captured is
-// the one live at the call site, matching refreshUpdates.
-func (m Model) fetchInspect(session uint64) tea.Cmd {
+// returned inspectDataMsg carries the session live when the command was built,
+// so a response that lands after a departure is dropped by the handler.
+func (m Model) fetchInspect() tea.Cmd {
 	ins, ok := m.composer.(Inspector)
 	if !ok {
 		return nil
 	}
 	ctx := m.ctx
 	service := m.inspectService
+	session := m.inspectSession
 	return func() tea.Msg {
 		data, err := ins.Inspect(ctx, service)
 		return inspectDataMsg{data: data, err: err, session: session}
@@ -5335,14 +5330,20 @@ func (m Model) viewInspect() string {
 	}
 
 	// Footer names only what the screen binds. pgup/pgdown and the esc alias
-	// live in the ? overlay, matching viewConfig's shorter legend.
+	// live in the ? overlay, matching viewConfig's shorter legend. The r token
+	// is dropped when a failed fetch left no bytes: with neither buffer in hand
+	// the toggle can only relabel itself over an empty pane, and this repo does
+	// not advertise a no-op.
 	help := "  "
-	if m.inspectShowRaw {
-		help += "r summary"
-	} else {
-		help += "r raw JSON"
+	if len(m.inspectRaw) > 0 {
+		if m.inspectShowRaw {
+			help += "r summary"
+		} else {
+			help += "r raw JSON"
+		}
+		help += "  •  "
 	}
-	help += "  •  up/down scroll  •  q back"
+	help += "up/down scroll  •  q back"
 	// Clamped for the same reason as the error line above, and the same way
 	// containerFooter does it: the footer is 42 cells, so below 42 columns both
 	// its line and the helpStyle margin line wrap, add two physical rows the

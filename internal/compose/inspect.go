@@ -2,11 +2,18 @@ package compose
 
 import (
 	"encoding/json"
-	"errors"
 	"fmt"
 	"strings"
 	"time"
 )
+
+// errNoContainer is the one producer of the "no container found" text. Both
+// compose Inspect methods reach it through resolveInspectID and
+// HostContainers.Inspect calls it directly, so the wording two test suites pin
+// as a user-visible contract cannot be spelled two ways.
+func errNoContainer(name string) error {
+	return fmt.Errorf("no container found for %q", name)
+}
 
 // pickInspectContainer selects which replica of a compose service to inspect.
 //
@@ -61,8 +68,7 @@ func pickInspectContainer(entries []psEntry, service string) (string, bool) {
 
 // resolveInspectID turns one `docker compose ps` payload into the container ID
 // to inspect. Both Compose.Inspect and RemoteCompose.Inspect share this middle
-// half — only their transports differ — and the "no container found" text is a
-// user-visible contract pinned by tests on both sides, so it has one home.
+// half — only their transports differ.
 func resolveInspectID(psOut []byte, service string) (string, error) {
 	entries, err := parsePsEntries(psOut)
 	if err != nil {
@@ -70,7 +76,7 @@ func resolveInspectID(psOut []byte, service string) (string, error) {
 	}
 	id, ok := pickInspectContainer(entries, service)
 	if !ok {
-		return "", fmt.Errorf("no container found for %q", service)
+		return "", errNoContainer(service)
 	}
 	return id, nil
 }
@@ -223,7 +229,7 @@ type InspectMount struct {
 func ParseInspect(raw []byte) (InspectDoc, error) {
 	s := strings.TrimSpace(string(raw))
 	if s == "" {
-		return InspectDoc{}, errors.New("parsing docker inspect: empty output")
+		return InspectDoc{}, fmt.Errorf("parsing docker inspect: empty output")
 	}
 
 	var docs []InspectDoc
@@ -231,7 +237,7 @@ func ParseInspect(raw []byte) (InspectDoc, error) {
 		return InspectDoc{}, fmt.Errorf("parsing docker inspect: %w", err)
 	}
 	if len(docs) == 0 {
-		return InspectDoc{}, errors.New("parsing docker inspect: no container in output")
+		return InspectDoc{}, fmt.Errorf("parsing docker inspect: no container in output")
 	}
 
 	doc := docs[0]

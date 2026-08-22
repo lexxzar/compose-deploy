@@ -14378,9 +14378,10 @@ func TestHostContainers_CapabilityInterfaces(t *testing.T) {
 }
 
 // readOnlyMockComposer is a mockComposer that also satisfies ReadOnlyComposer
-// and ExecProvider — the exact capability set of *compose.HostContainers. The
-// real type is used for the interface pins above; this mock is used for key
-// dispatch so no test ever shells out to docker.
+// and ExecProvider — the read-only-plus-exec subset of *compose.HostContainers,
+// which also implements Inspector (readOnlyInspectComposer models that whole
+// set). The real type is used for the interface pins above; this mock is used
+// for key dispatch so no test ever shells out to docker.
 type readOnlyMockComposer struct {
 	mockComposer
 	execErr error
@@ -14397,13 +14398,12 @@ func (m *readOnlyMockComposer) ExecCommand(ctx context.Context, service string, 
 
 func newReadOnlyModel(t *testing.T, mc *readOnlyMockComposer) Model {
 	t.Helper()
-	// The factory must hand back the READ-ONLY composer: passing the embedded
-	// mockComposer would let any test that triggers m.composerFactory(...) swap
-	// in a writable one, and every read-only assertion after that would go
-	// quiet rather than fail.
-	m := NewModel(mc, io.Discard, func(compose.Project) runner.Composer { return mc }, nil, nil)
-	m.screen = screenSelectContainers
-	m.services = append([]string(nil), mc.services...)
+	// inspectTestModel supplies the shared container-screen setup, and it hands
+	// the composer to NewModel as the factory too — load-bearing here, because a
+	// factory returning the embedded writable mockComposer would let any test
+	// that triggers m.composerFactory(...) swap the read-only one out, and every
+	// read-only assertion after that would go quiet rather than fail.
+	m := inspectTestModel(t, mc, mc.services)
 	// Copy rather than alias mc.status: hydrateUpdates mutates m.svcStatus in
 	// place, and an alias would write verdicts back into the composer double
 	// that later subtests share.
@@ -14411,10 +14411,6 @@ func newReadOnlyModel(t *testing.T, mc *readOnlyMockComposer) Model {
 	for k, v := range mc.status {
 		m.svcStatus[k] = v
 	}
-	m.width, m.height = 120, 24
-	m.updateInFlight = false
-	m.refreshInFlight = false
-	installFakeTick(&m)
 	return m
 }
 
@@ -15426,9 +15422,9 @@ func TestInspectDataMsg_ParseErrorKeepsRaw(t *testing.T) {
 
 func TestFetchInspect_SendsSessionAndService(t *testing.T) {
 	mc := &mockInspectComposer{inspectRaw: []byte(inspectFixtureJSON)}
-	m := Model{composer: mc, ctx: context.Background(), inspectService: "web"}
+	m := Model{composer: mc, ctx: context.Background(), inspectService: "web", inspectSession: 7}
 
-	cmd := m.fetchInspect(7)
+	cmd := m.fetchInspect()
 	if cmd == nil {
 		t.Fatal("fetchInspect returned nil for an Inspector composer")
 	}
@@ -15449,7 +15445,7 @@ func TestFetchInspect_SendsSessionAndService(t *testing.T) {
 
 func TestFetchInspect_NilForNonInspector(t *testing.T) {
 	m := Model{composer: &mockComposer{}, ctx: context.Background(), inspectService: "web"}
-	if cmd := m.fetchInspect(1); cmd != nil {
+	if cmd := m.fetchInspect(); cmd != nil {
 		t.Error("fetchInspect should return nil when the composer is not an Inspector")
 	}
 }
@@ -15458,7 +15454,7 @@ func TestFetchInspect_PropagatesError(t *testing.T) {
 	mc := &mockInspectComposer{inspectErr: fmt.Errorf("boom")}
 	m := Model{composer: mc, ctx: context.Background(), inspectService: "web"}
 
-	msg, ok := m.fetchInspect(1)().(inspectDataMsg)
+	msg, ok := m.fetchInspect()().(inspectDataMsg)
 	if !ok {
 		t.Fatal("want inspectDataMsg")
 	}
@@ -15482,6 +15478,10 @@ func (m *readOnlyInspectComposer) Inspect(ctx context.Context, service string) (
 	return m.inspectRaw, nil
 }
 
+// inspectTestModel builds a container screen sitting on the given composer,
+// with every service running. The composer is also the composerFactory's return
+// value, so a test that trips a factory call keeps the same double.
+// newReadOnlyModel delegates here and then reseeds svcStatus from its mock.
 func inspectTestModel(t *testing.T, c runner.Composer, services []string) Model {
 	t.Helper()
 	m := NewModel(c, io.Discard, func(compose.Project) runner.Composer { return c }, nil, nil)
@@ -16300,6 +16300,95 @@ func TestViewInspect_FooterNeverExceedsWidth(t *testing.T) {
 				t.Errorf("raw=%v width %d: the first line must still be the title, got %q", raw, width, lines[0])
 			}
 		}
+	}
+}
+
+// TestViewInspect_FitsShortTerminal is the height half of the same budget the
+// width sweeps pin, and the sibling of TestViewHelp_FitsShortTerminal. The
+// render is title 3 + viewport + optional error 1 + footer 2, so a viewport
+// sized anywhere but inspectViewportSize's -6 spills past the pane and
+// bubbletea's renderer — which keeps only the LAST m.height lines — drops the
+// title with no key that brings it back.
+//
+// The sweep starts at 9: inspectViewportSize floors the viewport at 3 rows, so
+// below that the chrome alone (3 + 3 + 2 = 8, plus an error line) is taller than
+// the pane, the same floor the ? overlay bottoms out at.
+func TestViewInspect_FitsShortTerminal(t *testing.T) {
+	for _, withErr := range []bool{false, true} {
+		for _, width := range []int{40, 80, 120} {
+			for height := 9; height <= 30; height++ {
+				m := Model{screen: screenInspect, inspectSession: 1, inspectService: "web", width: width, height: height}
+				w, h := inspectViewportSize(width, height)
+				m.inspectViewport = viewport.New(w, h)
+				result, _ := m.Update(inspectDataMsg{data: []byte(inspectFixtureJSON), session: 1})
+				m = result.(Model)
+				if withErr {
+					m.inspectErr = fmt.Errorf("listing containers for inspect: ssh: connect to host prod port 22")
+				}
+
+				// The RAW view string, with no TrimSuffix: bubbletea splits on
+				// "\n" and a trailing newline is a whole extra element, so a
+				// trimming test would hide exactly the overflow this pins.
+				lines := strings.Split(m.viewInspect(), "\n")
+				if len(lines) > height {
+					t.Errorf("err=%v %dx%d: render is %d lines, want <= %d", withErr, width, height, len(lines), height)
+				}
+				if !strings.Contains(ansi.Strip(lines[0]), "inspect") {
+					t.Errorf("err=%v %dx%d: the first line must still be the title, got %q", withErr, width, height, lines[0])
+				}
+			}
+		}
+	}
+}
+
+// TestViewInspect_NoTrailingNewline pins the invariant the height budget rests
+// on, so a regression names the cause rather than the symptom. bubbletea hands
+// View() straight to the renderer, which splits on "\n" with no TrimSuffix and
+// keeps the last m.height elements — a trailing newline therefore renders the
+// screen one line too tall and costs the title. viewSelectContainers, viewLogs
+// and viewHelp end without one for the same reason.
+func TestViewInspect_NoTrailingNewline(t *testing.T) {
+	m := inspectScreenModel(t)
+	if strings.HasSuffix(m.viewInspect(), "\n") {
+		t.Error("viewInspect must not end in a newline")
+	}
+}
+
+// TestViewInspect_FooterDropsRWithoutBuffers pins the no-op rule on the one
+// state where the toggle has nothing to toggle: a FETCH failure leaves neither
+// buffer, so an advertised r could only relabel itself over an empty pane.
+func TestViewInspect_FooterDropsRWithoutBuffers(t *testing.T) {
+	m := Model{screen: screenInspect, inspectSession: 1, inspectService: "web", width: 100, height: 24}
+	m.inspectViewport = viewport.New(96, 18)
+	result, _ := m.Update(inspectDataMsg{err: fmt.Errorf("no container found for %q", "web"), session: 1})
+	m = result.(Model)
+
+	view := ansi.Strip(m.viewInspect())
+	for _, unwanted := range []string{"r raw JSON", "r summary"} {
+		if strings.Contains(view, unwanted) {
+			t.Errorf("a failed fetch must not advertise %q:\n%s", unwanted, view)
+		}
+	}
+	for _, want := range []string{"up/down scroll", "q back"} {
+		if !strings.Contains(view, want) {
+			t.Errorf("footer missing %q:\n%s", want, view)
+		}
+	}
+}
+
+// TestInspectScreen_RIsInertWithoutBuffers is the key half of the same rule:
+// the footer stops naming r, so r has to stop doing anything — otherwise the
+// mode flag drifts behind an unadvertised key and a later resize would render
+// the wrong buffer.
+func TestInspectScreen_RIsInertWithoutBuffers(t *testing.T) {
+	m := Model{screen: screenInspect, inspectSession: 1, inspectService: "web", width: 100, height: 24}
+	m.inspectViewport = viewport.New(96, 18)
+	result, _ := m.Update(inspectDataMsg{err: fmt.Errorf("boom"), session: 1})
+	m = result.(Model)
+
+	result, _ = m.Update(keyMsgFor("r"))
+	if got := result.(Model); got.inspectShowRaw {
+		t.Error("r must not flip the mode when a failed fetch left no bytes")
 	}
 }
 

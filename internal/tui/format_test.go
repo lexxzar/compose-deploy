@@ -3,6 +3,8 @@ package tui
 import (
 	"strings"
 	"testing"
+
+	"github.com/charmbracelet/x/ansi"
 )
 
 func TestFormatLogContent_Empty(t *testing.T) {
@@ -289,5 +291,89 @@ func TestTryPrettyJSON(t *testing.T) {
 	_, ok = tryPrettyJSON("   ")
 	if ok {
 		t.Error("should not detect whitespace as JSON")
+	}
+}
+
+// TestExpandTabs pins the tab-stop expansion the width invariant depends on.
+// ansi.StringWidth counts a tab as zero cells, so a value carrying one measures
+// narrow, wraps late and renders past the pane edge.
+func TestExpandTabs(t *testing.T) {
+	tests := []struct {
+		name string
+		in   string
+		want string
+	}{
+		{"no tab", "plain value", "plain value"},
+		{"leading tab", "\tx", "        x"},
+		{"one column in", "a\tb", "a       b"},
+		{"exactly at a stop", "12345678\tx", "12345678        x"},
+		{"one before a stop", "1234567\tx", "1234567 x"},
+		{"consecutive", "a\t\tb", "a               b"},
+		{"stack trace", "\tmain.run()\n", "        main.run()\n"},
+		{"wide runes count cells", "あ\tx", "あ      x"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := expandTabs(tc.in); got != tc.want {
+				t.Errorf("expandTabs(%q) = %q, want %q", tc.in, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestWrapCells pins the difference from softWrapLine that the inspect
+// summary's never-exceed-width invariant rests on: a wide grapheme is 2 cells,
+// so a rune-counting wrap hands back chunks that render twice the pane width.
+func TestWrapCells(t *testing.T) {
+	tests := []struct {
+		name  string
+		in    string
+		width int
+		want  []string
+	}{
+		{"fits", "abc", 10, []string{"abc"}},
+		{"zero width is unbounded", "abcdef", 0, []string{"abcdef"}},
+		{"ascii splits at the width", "abcdef", 3, []string{"abc", "def"}},
+		{"wide runes split by cell", "あいうえ", 4, []string{"あい", "うえ"}},
+		{"tabs are expanded first", "a\tb", 4, []string{"a   ", "    ", "b"}},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got := wrapCells(tc.in, tc.width)
+			if strings.Join(got, "") != expandTabs(tc.in) {
+				t.Errorf("wrapCells(%q, %d) = %q, chunks must concatenate back to the input", tc.in, tc.width, got)
+			}
+			if len(got) != len(tc.want) {
+				t.Fatalf("wrapCells(%q, %d) = %q, want %q", tc.in, tc.width, got, tc.want)
+			}
+			for i := range got {
+				if got[i] != tc.want[i] {
+					t.Errorf("wrapCells(%q, %d)[%d] = %q, want %q", tc.in, tc.width, i, got[i], tc.want[i])
+				}
+			}
+		})
+	}
+}
+
+// TestWrapCells_BeatsSoftWrapLineOnWideRunes is the regression the cell-aware
+// wrap exists for: softWrapLine counts runes, so it declares a CJK line fitted
+// at a width it renders at 2x.
+func TestWrapCells_BeatsSoftWrapLineOnWideRunes(t *testing.T) {
+	const line = "あいうえおかきくけこ"
+	const width = 6
+
+	for i, chunk := range wrapCells(line, width) {
+		if w := ansi.StringWidth(chunk); w > width {
+			t.Errorf("wrapCells chunk %d is %d cells, want <= %d: %q", i, w, width, chunk)
+		}
+	}
+	over := false
+	for _, chunk := range softWrapLine(line, width) {
+		if ansi.StringWidth(chunk) > width {
+			over = true
+		}
+	}
+	if !over {
+		t.Error("softWrapLine no longer overruns on wide runes; wrapCells has lost its reason to exist")
 	}
 }

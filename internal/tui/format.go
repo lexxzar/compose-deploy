@@ -4,7 +4,13 @@ import (
 	"encoding/json"
 	"strings"
 	"unicode/utf8"
+
+	"github.com/charmbracelet/x/ansi"
 )
+
+// tabStopWidth is the tab stop tabs are expanded to before a value is
+// measured. See expandTabs.
+const tabStopWidth = 8
 
 // formatLogContent applies pretty-print and/or soft-wrap transformations to raw log content.
 // Processing order: pretty-print first (expands JSON), then soft-wrap.
@@ -143,4 +149,51 @@ func softWrapLine(line string, width int) []string {
 	}
 	result = append(result, line)
 	return result
+}
+
+// expandTabs replaces every tab with spaces up to the next tab stop.
+// ansi.StringWidth counts a tab as ZERO cells while a terminal advances the
+// cursor to the next multiple of tabStopWidth, so a tab-bearing value (a Go
+// or Java stack trace in a health probe's output, any env value carrying one)
+// measures narrow, wraps late and renders wider than the pane — which pushes
+// viewInspect past m.height and scrolls the title off. The substituted spaces
+// ARE what the terminal draws, so after this the measurement and the render
+// agree.
+func expandTabs(s string) string {
+	if !strings.Contains(s, "\t") {
+		return s
+	}
+	parts := strings.Split(s, "\t")
+	var out strings.Builder
+	col := 0
+	for i, part := range parts {
+		out.WriteString(part)
+		col += ansi.StringWidth(part)
+		if i == len(parts)-1 {
+			break
+		}
+		pad := tabStopWidth - col%tabStopWidth
+		out.WriteString(strings.Repeat(" ", pad))
+		col += pad
+	}
+	return out.String()
+}
+
+// wrapCells breaks one line into chunks of at most width display CELLS. It is
+// the cell-aware sibling of softWrapLine, which chunks by RUNE and so overruns
+// the pane by up to 2x for a wide grapheme (CJK, emoji). The inspect summary
+// uses this one: a probe output, an env value or a mount path can carry either,
+// so its never-exceed-width invariant has to be measured the same way it is
+// rendered. Nothing is dropped: the chunks concatenate back to the input.
+//
+// A single wide grapheme still occupies 2 cells, so a width of 1 is the one
+// case that cannot hold.
+func wrapCells(line string, width int) []string {
+	// Before the measurement, never after it: a tab expanded post-wrap would
+	// widen a chunk the wrap already declared to fit.
+	line = expandTabs(line)
+	if width <= 0 || ansi.StringWidth(line) <= width {
+		return []string{line}
+	}
+	return strings.Split(ansi.Hardwrap(line, width, true), "\n")
 }

@@ -33,39 +33,7 @@ const (
 	// level with the label of a value row rather than one step deeper — the
 	// entry is the whole row, not the value half of one.
 	inspectListIndent = 2
-
-	// inspectTabWidth is the tab stop tabs are expanded to before a value is
-	// measured. See expandTabs.
-	inspectTabWidth = 8
 )
-
-// expandTabs replaces every tab with spaces up to the next tab stop.
-// ansi.StringWidth counts a tab as ZERO cells while a terminal advances the
-// cursor to the next multiple of inspectTabWidth, so a tab-bearing value (a Go
-// or Java stack trace in a health probe's output, any env value carrying one)
-// measures narrow, wraps late and renders wider than the pane — which pushes
-// viewInspect past m.height and scrolls the title off. The substituted spaces
-// ARE what the terminal draws, so after this the measurement and the render
-// agree.
-func expandTabs(s string) string {
-	if !strings.Contains(s, "\t") {
-		return s
-	}
-	parts := strings.Split(s, "\t")
-	var out strings.Builder
-	col := 0
-	for i, part := range parts {
-		out.WriteString(part)
-		col += ansi.StringWidth(part)
-		if i == len(parts)-1 {
-			break
-		}
-		pad := inspectTabWidth - col%inspectTabWidth
-		out.WriteString(strings.Repeat(" ", pad))
-		col += pad
-	}
-	return out.String()
-}
 
 // unsafeTerminalRune reports whether a rune must never reach the terminal: the
 // C0 controls, DEL, and the 8-bit C1 block a terminal reads as escape
@@ -119,25 +87,6 @@ func sanitizeInspectRaw(raw []byte) string {
 		}
 		return r
 	}, string(raw))
-}
-
-// wrapCells breaks one line into chunks of at most width display CELLS.
-// softWrapLine chunks by RUNE, which overruns the pane by up to 2x for a wide
-// grapheme (CJK, emoji) — and a probe output, an env value or a mount path can
-// carry either, so the never-exceed-width invariant this screen promises has to
-// be measured the same way it is rendered. Nothing is dropped: the chunks
-// concatenate back to the input.
-//
-// A single wide grapheme still occupies 2 cells, so a width of 1 is the one
-// case that cannot hold.
-func wrapCells(line string, width int) []string {
-	// Before the measurement, never after it: a tab expanded post-wrap would
-	// widen a chunk the wrap already declared to fit.
-	line = expandTabs(line)
-	if width <= 0 || ansi.StringWidth(line) <= width {
-		return []string{line}
-	}
-	return strings.Split(ansi.Hardwrap(line, width, true), "\n")
 }
 
 // inspectBuilder accumulates the summary line by line. Every push goes through

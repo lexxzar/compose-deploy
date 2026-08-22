@@ -298,7 +298,10 @@ data is omitted; STATE always renders):
 and multi-line (curl bodies, stack traces) and it is the feature's whole
 justification. `viewConfig` puts content in a viewport with no wrap and no
 `SetHorizontalStep`, so a truncating summary would cut the wedge at the terminal edge.
-Reuse `softWrapLine` from `internal/tui/format.go`.
+**Implementation deviation:** `softWrapLine` (`internal/tui/format.go`) chunks by
+RUNE, which overruns the pane by up to 2x on a wide grapheme, so Task 5 added the
+cell-aware `wrapCells` beside it instead of reusing it. See the round-4 residual on
+the log viewer, which still wraps by rune.
 
 ### Model fields, message and session
 
@@ -431,7 +434,7 @@ Plus, outside the tables:
 - [x] create `internal/tui/inspect.go` with `buildInspectSummary(doc compose.InspectDoc, width int) string`
 - [x] render STATE: status, exit code, `OOMKilled`, started at, restart policy, restart count — always rendered
 - [x] render HEALTH: status, failing streak, healthcheck test/interval/timeout/retries, and the **last probe `Output`**; omit the whole section when the container has no healthcheck
-- [x] soft-wrap the probe output via the existing `softWrapLine` in `internal/tui/format.go` — it must never truncate
+- [x] soft-wrap the probe output — it must never truncate. **Deviation from the plan text:** `softWrapLine` was NOT reused; it counts runes, so a CJK/emoji probe output renders at up to 2x the pane. Task 5 added the cell-aware `wrapCells` (plus `expandTabs`) beside it in `internal/tui/format.go` instead
 - [x] write tests against all three fixtures: the unhealthy probe Output appears verbatim, HEALTH is absent without a healthcheck, STATE renders for a stopped container with its exit code
 - [x] write a test asserting no rendered line exceeds the supplied width
 - [x] run `go test ./internal/tui/` — must pass before task 6
@@ -464,7 +467,7 @@ Plus, outside the tables:
 - [x] tax 2-3: add it to `allScreens` and change `TestAllScreens_Complete`'s bound to `int(screenInspect) + 1` — the `allScreens` doc comment was reworded from "a 9th screen" to "a new screen", which the fixed bound now makes true
 - [x] tax 4-5: add `"inspect"` to `screenName()` and `case screenInspect` to `helpGroupsFor()` — MOVE (`↑ ↓`, `pgup pgdown`), VIEW (`r`, `actions: true`), LEAVE 3rd of 3
 - [x] tax 6: add the `screenInspect` row to the `bound` map with the exact key set from Technical Details
-- [x] add the seven `inspect*` Model fields, `inspectDataMsg`, its session-gated handler, and `fetchInspect(session uint64) tea.Cmd`
+- [x] add the seven `inspect*` Model fields, `inspectDataMsg`, its session-gated handler, and `fetchInspect() tea.Cmd` (the plan prescribed a `session uint64` parameter; the round-4 review pass dropped it — the seven sibling fetch commands all read the session off the Model, and the one call site passed `m.inspectSession` anyway)
 - [x] write tests: a current-session message populates the fields, a stale session is discarded, an off-screen message is discarded
 - [x] run `go test ./internal/tui/` — must pass before task 8
 - ➕ [x] two helpers landed with the handler, for Tasks 8-9 to reuse: `rebuildInspectSummary()` (parse + render at the viewport's current width; a parse failure sets `inspectErr`, empties the summary and **keeps** `inspectRaw` so `r` stays a working escape hatch) and `setInspectContent()` (the single `SetContent` chokepoint, so the fetch handler, the `r` toggle and the resize branch cannot disagree about which buffer is on screen)
@@ -476,7 +479,7 @@ Plus, outside the tables:
 - Modify: `internal/tui/app.go`
 - Modify: `internal/tui/app_test.go`
 
-- [x] add `enterInspect()` modelled on `enterConfig()`: bump `inspectSession`, reset the fields, size the viewport at `m.height - 6`, set `m.screen`, call `m.clearSearch()` (departure site #10), return the fetch command
+- [x] add `enterInspect()` modelled on `enterConfig()`: bump `inspectSession`, reset the fields, size the viewport at `m.height - 6` (through `inspectViewportSize()` since the round-4 pass, so the `WindowSizeMsg` branch cannot drift from it), set `m.screen`, call `m.clearSearch()` (departure site #10), return the fetch command
 - [x] add `case "i"` to the container dispatch: early-return when `len(m.services) == 0`, then type-assert `m.composer.(Inspector)` and no-op if absent — **no `m.readOnly()` gate**
 - [x] **document in a comment** that the `i` no-op paths do not call `fixSvcOffset()`, matching the existing `l` / `x` guards rather than the read-only gates — an inherited hole, adopted knowingly
 - [x] add a mock composer implementing `Inspector`, following the `TestReadOnly_GatesWriteKeys_WithCapableComposer` precedent — Task 7's `mockInspectComposer` covers the writable case; `readOnlyInspectComposer` (new) covers the read-only one, which is the case the not-gated-on-`readOnly` asymmetry actually rests on
@@ -656,3 +659,28 @@ focus rule):
   shared house defect rather than something the inspect screen introduced. The
   fix is one `clampToWidth` per footer plus a width sweep in each screen's view
   test, and it belongs in its own commit against those screens.
+
+**Residuals recorded during the round-4 review pass** (out of scope under the
+focus rule):
+- the LOG VIEWER still wraps by RUNE. `softWrapLine` (`internal/tui/format.go`)
+  is what `w` soft-wrap runs every log line through, so a CJK or emoji log line
+  renders at up to 2x the pane width — exactly the overrun `wrapCells` was added
+  beside it to prevent for the inspect summary. `TestSoftWrapLine_UTF8` pins the
+  rune behaviour, which makes the divergence read as intentional; it is not.
+  Switching `softWrapLine` to cells touches `formatLogContent`,
+  `formatLogLines`, the `logsFormatted` fold and the physical-line indices
+  `logComputeMatches`/`highlightMatches` work in, so it wants its own commit
+  against the log viewer.
+- the container screen's `case "i"` no-op paths (`len(m.services) == 0`, a
+  composer that is not an `Inspector`) do not call `fixSvcOffset()`, matching the
+  `l`/`x` guards rather than the read-only gates. The dispatch clears `m.warning`
+  above the switch, so a freed warning line leaves `svcOffset` unclamped for one
+  render and a scrolled list can show a blank row under its last service. An
+  inherited hole shared with `l` and `x`; the fix is one call in each of the
+  three guards plus a sweep in `TestReadOnly_GatedKeyReclampsOffset`'s shape.
+- `viewInspect`'s footer clamp landed, but `viewConfig` and `viewLogs` still
+  size their own viewports from an unguarded `msg.Width - 4` in the
+  `WindowSizeMsg` branch while their `enter*` helpers floor it. `enterInspect`
+  and the inspect resize branch were collapsed into `inspectViewportSize()` in
+  this pass; the config pair is the same three-line shape and can follow in the
+  same commit as the unclamped-footer residual above.

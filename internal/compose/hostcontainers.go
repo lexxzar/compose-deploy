@@ -477,7 +477,7 @@ func (h *HostContainers) Inspect(ctx context.Context, name string) ([]byte, erro
 	}
 	id, ok := pickHostInspectContainer(entries, name)
 	if !ok {
-		return nil, fmt.Errorf("no container found for %q", name)
+		return nil, errNoContainer(name)
 	}
 	raw, err := h.docker.run(ctx, "inspect", id)
 	if err != nil {

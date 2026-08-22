@@ -231,36 +231,36 @@ func TestBuildInspectSummary_NeverExceedsWidth(t *testing.T) {
 			}},
 		}},
 		"wide runes": {minWidth: 2, doc: compose.InspectDoc{
-			Name:         "\u30a6\u30a7\u30d6\u30b5\u30fc\u30d0\u30fc",
+			Name:         "ウェブサーバー",
 			RestartCount: 1,
 			State: compose.InspectState{
 				Status: "running",
-				Error:  "\u8d77\u52d5\u306b\u5931\u6557\u3057\u307e\u3057\u305f\uff1a\u5b9f\u884c\u30d5\u30a1\u30a4\u30eb\u304c\u898b\u3064\u304b\u308a\u307e\u305b\u3093",
+				Error:  "起動に失敗しました：実行ファイルが見つかりません",
 				Health: &compose.InspectHealth{
 					Status:        "unhealthy",
 					FailingStreak: 3,
 					Log: []compose.InspectHealthLog{{
 						ExitCode: 1,
-						Output:   strings.Repeat("\u30d8\u30eb\u30b9\u30c1\u30a7\u30c3\u30af\u306b\u5931\u6557\u3057\u307e\u3057\u305f \U0001f525 ", 6),
+						Output:   strings.Repeat("ヘルスチェックに失敗しました 🔥 ", 6),
 					}},
 				},
 			},
 			Config: compose.InspectConfig{
-				Image: "registry.example.com/\u30c1\u30fc\u30e0/\u30a6\u30a7\u30d6\u30b5\u30fc\u30d0\u30fc:1.0",
-				Cmd:   []string{"/app/server", "--\u8a2d\u5b9a", "/etc/\u8a2d\u5b9a/\u30d5\u30a1\u30a4\u30eb.yaml"},
+				Image: "registry.example.com/チーム/ウェブサーバー:1.0",
+				Cmd:   []string{"/app/server", "--設定", "/etc/設定/ファイル.yaml"},
 				Env: []string{
-					"MESSAGE=\u3053\u3093\u306b\u3061\u306f\u4e16\u754c\u3001\u3053\u308c\u306f\u3068\u3066\u3082\u9577\u3044\u5024\u3067\u3059 \U0001f680\U0001f680\U0001f680",
+					"MESSAGE=こんにちは世界、これはとても長い値です 🚀🚀🚀",
 					"SHORT=1",
 				},
 				Healthcheck: &compose.InspectHealthcheck{
-					Test:     []string{"CMD-SHELL", "curl -fsS http://localhost/\u30d8\u30eb\u30b9 || exit 1"},
+					Test:     []string{"CMD-SHELL", "curl -fsS http://localhost/ヘルス || exit 1"},
 					Interval: 5 * time.Second,
 				},
 			},
 			Mounts: []compose.InspectMount{{
 				Type:        "bind",
-				Source:      "/srv/\u30c7\u30fc\u30bf/\u30a6\u30a7\u30d6\u30b5\u30a4\u30c8",
-				Destination: "/usr/share/nginx/\u516c\u958b",
+				Source:      "/srv/データ/ウェブサイト",
+				Destination: "/usr/share/nginx/公開",
 				RW:          false,
 			}},
 		}},
@@ -481,7 +481,11 @@ func TestBuildInspectSummary_MultiLineProbeOutput(t *testing.T) {
 		}
 	}
 	if strings.HasSuffix(out, "\n") {
-		t.Errorf("summary must not end in a newline: %q", out[max(len(out)-20, 0):])
+		tail := len(out) - 20
+		if tail < 0 {
+			tail = 0
+		}
+		t.Errorf("summary must not end in a newline: %q", out[tail:])
 	}
 }
 
@@ -554,7 +558,13 @@ func TestFormatRestartPolicy(t *testing.T) {
 // pins the alignment without hard-coding a run of spaces it has to recount every
 // time a label changes length.
 func inspectRow(label, value string) string {
-	pad := max(inspectValueCol-len("  "+label), 1)
+	// ansi.StringWidth, not len: kv measures its label column in display cells,
+	// and a non-ASCII label would otherwise make helper and production disagree
+	// silently rather than fail.
+	pad := inspectValueCol - ansi.StringWidth("  "+label)
+	if pad < 1 {
+		pad = 1
+	}
 	return label + strings.Repeat(" ", pad) + value
 }
 
@@ -887,33 +897,6 @@ func envBlockLines(summary string) int {
 		return n
 	}
 	return 0
-}
-
-// TestExpandTabs pins the tab-stop expansion the width invariant depends on.
-// ansi.StringWidth counts a tab as zero cells, so a value carrying one measures
-// narrow, wraps late and renders past the pane edge.
-func TestExpandTabs(t *testing.T) {
-	tests := []struct {
-		name string
-		in   string
-		want string
-	}{
-		{"no tab", "plain value", "plain value"},
-		{"leading tab", "\tx", "        x"},
-		{"one column in", "a\tb", "a       b"},
-		{"exactly at a stop", "12345678\tx", "12345678        x"},
-		{"one before a stop", "1234567\tx", "1234567 x"},
-		{"consecutive", "a\t\tb", "a               b"},
-		{"stack trace", "\tmain.run()\n", "        main.run()\n"},
-		{"wide runes count cells", "\u3042\tx", "\u3042      x"},
-	}
-	for _, tc := range tests {
-		t.Run(tc.name, func(t *testing.T) {
-			if got := expandTabs(tc.in); got != tc.want {
-				t.Errorf("expandTabs(%q) = %q, want %q", tc.in, got, tc.want)
-			}
-		})
-	}
 }
 
 // TestBuildInspectSummary_StripsTerminalEscapes pins the summary sanitiser.
