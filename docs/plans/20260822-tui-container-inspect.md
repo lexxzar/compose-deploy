@@ -374,12 +374,12 @@ Plus, outside the tables:
 - Create: `internal/compose/inspect.go`
 - Create: `internal/compose/inspect_test.go`
 
-- [ ] create `internal/compose/inspect.go` with `pickInspectContainer(entries []psEntry, service string) (string, bool)` **mirroring the `entry.State == "running"` gate at `compose.go:877-887` exactly** — any running replica beats a restarting one, longest duration wins among running
-- [ ] add `pickHostInspectContainer(entries []hostPsEntry, name string) (string, bool)` — first match on the existing `hostContainerName(e.Names)` helper, **no longest-running rule** (host container names are unique)
-- [ ] both return `("", false)` on no match — never a panic, never an arbitrary container
-- [ ] write table tests for `pickInspectContainer`: single match, scaled service picks longest-running, **running+restarting mix picks the running one**, all-restarting falls back, no match, empty slice
-- [ ] write table tests for `pickHostInspectContainer`: match, comma-joined `Names`, no match, empty slice
-- [ ] run `go test ./internal/compose/` — must pass before task 2
+- [x] create `internal/compose/inspect.go` with `pickInspectContainer(entries []psEntry, service string) (string, bool)` **mirroring the `entry.State == "running"` gate at `compose.go:877-887` exactly** — any running replica beats a restarting one, longest duration wins among running
+- [x] add `pickHostInspectContainer(entries []hostPsEntry, name string) (string, bool)` — first match on the existing `hostContainerName(e.Names)` helper, **no longest-running rule** (host container names are unique)
+- [x] both return `("", false)` on no match — never a panic, never an arbitrary container
+- [x] write table tests for `pickInspectContainer`: single match, scaled service picks longest-running, **running+restarting mix picks the running one**, all-restarting falls back, no match, empty slice
+- [x] write table tests for `pickHostInspectContainer`: match, comma-joined `Names`, no match, empty slice
+- [x] run `go test ./internal/compose/` — must pass before task 2
 
 ### Task 2: Add Compose.Inspect and RemoteCompose.Inspect
 
