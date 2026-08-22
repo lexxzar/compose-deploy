@@ -15561,3 +15561,282 @@ func TestInspectKey_ClearsCommittedSearch(t *testing.T) {
 			got.searchQuery, got.searchMatches, got.searching)
 	}
 }
+
+// inspectScreenModel builds a populated inspect screen the way enterInspect
+// leaves it: raw bytes in hand, summary rendered and the viewport filled.
+func inspectScreenModel(t *testing.T) Model {
+	t.Helper()
+	m := Model{screen: screenInspect, inspectSession: 1, inspectService: "web"}
+	m.width, m.height = 120, 24
+	m.inspectViewport = viewport.New(m.width-4, m.height-6)
+	result, _ := m.Update(inspectDataMsg{data: []byte(inspectFixtureJSON), session: 1})
+	got := result.(Model)
+	if got.inspectSummary == "" {
+		t.Fatal("precondition: the summary should be rendered")
+	}
+	return got
+}
+
+func TestInspectScreen_RToggleRoundTrips(t *testing.T) {
+	m := inspectScreenModel(t)
+
+	if m.inspectShowRaw {
+		t.Fatal("precondition: the summary is the default mode")
+	}
+	if got := m.inspectViewport.View(); !strings.Contains(got, "STATE") {
+		t.Fatalf("summary mode should show the summary, got:\n%s", got)
+	}
+
+	result, _ := m.Update(keyMsgFor("r"))
+	raw := result.(Model)
+	if !raw.inspectShowRaw {
+		t.Fatal("r should switch to raw mode")
+	}
+	if got := raw.inspectViewport.View(); !strings.Contains(got, `"Name": "/proj-web-1"`) {
+		t.Errorf("raw mode should show the verbatim bytes, got:\n%s", got)
+	}
+	if !strings.Contains(raw.viewInspect(), "r summary") {
+		t.Error("the footer should offer the way back to the summary")
+	}
+
+	result, _ = raw.Update(keyMsgFor("r"))
+	back := result.(Model)
+	if back.inspectShowRaw {
+		t.Fatal("a second r should switch back to the summary")
+	}
+	if got := back.inspectViewport.View(); !strings.Contains(got, "STATE") {
+		t.Errorf("summary should be restored, got:\n%s", got)
+	}
+	if string(back.inspectRaw) != inspectFixtureJSON {
+		t.Error("the round trip must not disturb the raw bytes")
+	}
+	if !strings.Contains(back.viewInspect(), "r raw JSON") {
+		t.Error("the footer should offer raw mode again")
+	}
+}
+
+// TestInspectScreen_RTogglesWithoutRefetch pins the difference from
+// screenConfig's r: both buffers are already in hand, so the toggle issues no
+// command.
+func TestInspectScreen_RTogglesWithoutRefetch(t *testing.T) {
+	m := inspectScreenModel(t)
+	if _, cmd := m.Update(keyMsgFor("r")); cmd != nil {
+		t.Error("the r toggle must not fetch — the raw bytes are already held")
+	}
+}
+
+func TestInspectScreen_EscClearsAndReturns(t *testing.T) {
+	m := inspectScreenModel(t)
+	m.inspectShowRaw = true
+
+	result, cmd := m.Update(tea.KeyMsg{Type: tea.KeyEsc})
+	got := result.(Model)
+
+	if got.screen != screenSelectContainers {
+		t.Fatalf("screen = %d, want screenSelectContainers", got.screen)
+	}
+	if got.inspectService != "" || got.inspectRaw != nil || got.inspectSummary != "" ||
+		got.inspectShowRaw || got.inspectErr != nil {
+		t.Errorf("esc left inspect state behind: service=%q raw=%d summary=%d showRaw=%v err=%v",
+			got.inspectService, len(got.inspectRaw), len(got.inspectSummary),
+			got.inspectShowRaw, got.inspectErr)
+	}
+	if got.inspectViewport.Height != 0 {
+		t.Error("esc should reset the viewport")
+	}
+	// Read-only screen: no status refresh on the way out, matching screenConfig
+	// rather than screenLogs/screenProgress.
+	if cmd != nil {
+		t.Error("esc from the inspect screen must not refresh status")
+	}
+}
+
+// TestInspectScreen_EscClearsErrorSlot covers the failed-fetch departure: the
+// error must not survive into the next visit.
+func TestInspectScreen_EscClearsErrorSlot(t *testing.T) {
+	m := Model{screen: screenInspect, inspectSession: 1, inspectService: "web"}
+	m.inspectViewport = viewport.New(100, 10)
+	result, _ := m.Update(inspectDataMsg{err: fmt.Errorf("boom"), session: 1})
+	m = result.(Model)
+	if m.inspectErr == nil {
+		t.Fatal("precondition: the error should be set")
+	}
+
+	result, _ = m.Update(tea.KeyMsg{Type: tea.KeyEsc})
+	got := result.(Model)
+	if got.inspectErr != nil {
+		t.Errorf("inspectErr = %v, want nil after esc", got.inspectErr)
+	}
+	if got.screen != screenSelectContainers {
+		t.Errorf("screen = %d, want screenSelectContainers", got.screen)
+	}
+}
+
+// TestInspectScreen_QTakesTheSamePath pins the q→esc rewrite: screenInspect
+// opens no text input, so it falls into the rewrite block's default case and
+// needs no typingInInput() entry of its own.
+func TestInspectScreen_QTakesTheSamePath(t *testing.T) {
+	m := inspectScreenModel(t)
+
+	result, _ := m.Update(keyMsgFor("q"))
+	got := result.(Model)
+
+	if got.screen != screenSelectContainers {
+		t.Fatalf("screen = %d, want screenSelectContainers — q must rewrite to esc", got.screen)
+	}
+	if got.inspectRaw != nil || got.inspectSummary != "" {
+		t.Error("q should clear the inspect state exactly like esc")
+	}
+}
+
+func TestInspectScreen_ResizeRebuildsAndKeepsRaw(t *testing.T) {
+	m := inspectScreenModel(t)
+	wide := m.inspectSummary
+
+	result, _ := m.Update(tea.WindowSizeMsg{Width: 44, Height: 30})
+	got := result.(Model)
+
+	if got.inspectViewport.Width != 40 {
+		t.Errorf("viewport width = %d, want 40 (msg.Width - 4)", got.inspectViewport.Width)
+	}
+	if got.inspectViewport.Height != 24 {
+		t.Errorf("viewport height = %d, want 24 (msg.Height - 6, the config sizing)", got.inspectViewport.Height)
+	}
+	if string(got.inspectRaw) != inspectFixtureJSON {
+		t.Error("a resize must preserve the raw bytes verbatim")
+	}
+	if got.inspectSummary == "" {
+		t.Fatal("the summary should be rebuilt at the new width")
+	}
+	if got.inspectSummary == wide {
+		t.Error("the summary should be re-wrapped, not reused at the old width")
+	}
+	for _, line := range strings.Split(got.inspectSummary, "\n") {
+		if ansi.StringWidth(line) > 40 {
+			t.Errorf("rebuilt line exceeds the new width: %q", line)
+		}
+	}
+}
+
+// TestInspectScreen_ResizeInRawModeKeepsBuffer pins the chokepoint: a resize
+// while raw mode is on must leave raw mode on and the viewport showing bytes.
+func TestInspectScreen_ResizeInRawModeKeepsBuffer(t *testing.T) {
+	m := inspectScreenModel(t)
+	result, _ := m.Update(keyMsgFor("r"))
+	m = result.(Model)
+
+	result, _ = m.Update(tea.WindowSizeMsg{Width: 200, Height: 40})
+	got := result.(Model)
+
+	if !got.inspectShowRaw {
+		t.Fatal("a resize must not change the mode")
+	}
+	if view := got.inspectViewport.View(); !strings.Contains(view, `"Name": "/proj-web-1"`) {
+		t.Errorf("raw mode should still show the bytes after a resize, got:\n%s", view)
+	}
+}
+
+// TestInspectScreen_ResizeOffScreenIsInert guards the branch condition: a
+// WindowSizeMsg that lands on another screen must not touch inspect state.
+func TestInspectScreen_ResizeOffScreenIsInert(t *testing.T) {
+	m := inspectScreenModel(t)
+	m.screen = screenSelectContainers
+
+	result, _ := m.Update(tea.WindowSizeMsg{Width: 44, Height: 30})
+	got := result.(Model)
+
+	if got.inspectViewport.Width != 116 {
+		t.Errorf("viewport width = %d, want the untouched 116", got.inspectViewport.Width)
+	}
+}
+
+func TestViewInspect_RendersBreadcrumbAndFooter(t *testing.T) {
+	m := inspectScreenModel(t)
+	m.serverName = "prod"
+	m.projName = "shop"
+
+	view := m.viewInspect()
+	for _, want := range []string{"cdeploy > prod > shop > inspect > web", "STATE", "r raw JSON", "q back"} {
+		if !strings.Contains(view, want) {
+			t.Errorf("view missing %q:\n%s", want, view)
+		}
+	}
+}
+
+func TestViewInspect_LoadingBeforeFetch(t *testing.T) {
+	m := Model{screen: screenInspect, inspectService: "web"}
+	m.inspectViewport = viewport.New(100, 10)
+
+	if view := m.viewInspect(); !strings.Contains(view, "Loading") {
+		t.Errorf("view should show a loading line before the fetch lands:\n%s", view)
+	}
+}
+
+func TestViewInspect_ShowsFetchError(t *testing.T) {
+	m := Model{screen: screenInspect, inspectService: "web", inspectErr: fmt.Errorf("no container found for \"web\"")}
+	m.inspectViewport = viewport.New(100, 10)
+
+	view := m.viewInspect()
+	if !strings.Contains(view, "no container found") {
+		t.Errorf("view should surface inspectErr:\n%s", view)
+	}
+	if strings.Contains(view, "Loading") {
+		t.Error("an errored fetch must not still read as loading")
+	}
+}
+
+// TestViewInspect_ParseErrorKeepsViewportOnScreen is the other half of the
+// escape hatch: the error line shows, and the viewport stays so r still works.
+func TestViewInspect_ParseErrorKeepsViewportOnScreen(t *testing.T) {
+	m := Model{screen: screenInspect, inspectSession: 1, inspectService: "web"}
+	m.inspectViewport = viewport.New(100, 10)
+	result, _ := m.Update(inspectDataMsg{data: []byte("[]"), session: 1})
+	m = result.(Model)
+
+	view := m.viewInspect()
+	if !strings.Contains(view, "Error:") {
+		t.Errorf("the parse failure should show in the error slot:\n%s", view)
+	}
+	if strings.Contains(view, "Loading") {
+		t.Error("bytes are in hand, so the screen must not read as loading")
+	}
+	if !strings.Contains(view, "r raw JSON") {
+		t.Error("the footer must still offer raw mode — it is the escape hatch")
+	}
+}
+
+func TestInspectScreen_ArrowsReachTheViewport(t *testing.T) {
+	m := inspectScreenModel(t)
+	m.inspectViewport.Height = 3
+	m.setInspectContent()
+	if m.inspectViewport.AtBottom() {
+		t.Fatal("precondition: the summary must overflow a 3-line viewport")
+	}
+
+	result, _ := m.Update(tea.KeyMsg{Type: tea.KeyDown})
+	got := result.(Model)
+	if got.inspectViewport.YOffset == 0 {
+		t.Error("down should scroll the inspect viewport")
+	}
+
+	result, _ = got.Update(tea.KeyMsg{Type: tea.KeyPgDown})
+	if result.(Model).inspectViewport.YOffset <= got.inspectViewport.YOffset {
+		t.Error("pgdown should page the inspect viewport")
+	}
+}
+
+// TestInspectScreen_RTogglePutsTheReaderAtTheTop pins the small courtesy the
+// chokepoint alone does not give: SetContent preserves YOffset, so a toggle
+// from a scrolled summary into the much longer raw JSON would otherwise land
+// the reader mid-document.
+func TestInspectScreen_RTogglePutsTheReaderAtTheTop(t *testing.T) {
+	m := inspectScreenModel(t)
+	m.inspectViewport.Height = 3
+	m.setInspectContent()
+	m.inspectViewport.SetYOffset(4)
+
+	result, _ := m.Update(keyMsgFor("r"))
+	if got := result.(Model); got.inspectViewport.YOffset != 0 {
+		t.Errorf("YOffset = %d, want 0 after the mode toggle", got.inspectViewport.YOffset)
+	}
+}

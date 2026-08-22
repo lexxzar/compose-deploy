@@ -722,6 +722,21 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 			m.configViewport.Height = h
 		}
+		if m.screen == screenInspect {
+			m.inspectViewport.Width = msg.Width - 4
+			// -6, the config sizing. NOT the logs -7, which reserves a row for
+			// the log bar the inspect screen does not have.
+			h := msg.Height - 6
+			if h < 3 {
+				h = 3
+			}
+			m.inspectViewport.Height = h
+			// The summary is wrapped to the viewport width, so it has to be
+			// rebuilt from the raw bytes — which survive, keeping raw mode
+			// byte-identical to `docker inspect` across a resize.
+			m.rebuildInspectSummary()
+			m.setInspectContent()
+		}
 		if m.screen == screenSelectContainers {
 			m.fixSvcOffset()
 			if m.searching {
@@ -2372,6 +2387,31 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			return m, cmd
 		}
 
+	case screenInspect:
+		switch key {
+		case "ctrl+c":
+			return m.tryQuit()
+		case "esc":
+			m.clearInspect()
+			// No refreshStatus(): the inspect screen is read-only and changes
+			// no container state, so it returns like screenConfig rather than
+			// like screenLogs/screenProgress.
+			m.screen = screenSelectContainers
+			return m, nil
+		case "r":
+			// Two-way toggle over two buffers already in hand — no refetch,
+			// unlike screenConfig's r, whose resolved half is lazily fetched.
+			m.inspectShowRaw = !m.inspectShowRaw
+			m.setInspectContent()
+			m.inspectViewport.GotoTop()
+			return m, nil
+		default:
+			// up/down/pgup/pgdown reach the viewport here, matching screenConfig.
+			var cmd tea.Cmd
+			m.inspectViewport, cmd = m.inspectViewport.Update(msg)
+			return m, cmd
+		}
+
 	case screenSettingsList:
 		if m.settingsDelete {
 			switch key {
@@ -3103,6 +3143,19 @@ func (m *Model) rebuildInspectSummary() {
 	}
 	m.inspectErr = nil
 	m.inspectSummary = buildInspectSummary(doc, m.inspectViewport.Width)
+}
+
+// clearInspect resets every inspect field on departure. The session is NOT
+// bumped here — enterInspect bumps it on the way in, which is what invalidates
+// an in-flight fetch; the handler's screen check already discards one that
+// lands after this.
+func (m *Model) clearInspect() {
+	m.inspectService = ""
+	m.inspectRaw = nil
+	m.inspectSummary = ""
+	m.inspectShowRaw = false
+	m.inspectViewport = viewport.Model{}
+	m.inspectErr = nil
 }
 
 // setInspectContent is the single SetContent chokepoint for the inspect
@@ -4307,6 +4360,8 @@ func (m Model) View() string {
 		return m.viewLogs()
 	case screenConfig:
 		return m.viewConfig()
+	case screenInspect:
+		return m.viewInspect()
 	case screenSettingsList:
 		return m.viewSettingsList()
 	case screenSettingsForm:
@@ -5201,6 +5256,38 @@ func (m Model) viewConfig() string {
 		help += "r resolved"
 	}
 	help += "  •  e edit  •  up/down scroll  •  q back"
+	b.WriteString(helpStyle.Render(help))
+	return b.String()
+}
+
+func (m Model) viewInspect() string {
+	var b strings.Builder
+	b.WriteString(titleStyle.Render(fmt.Sprintf("%s > inspect > %s", m.breadcrumb(), m.inspectService)))
+	b.WriteString("\n\n")
+
+	if m.inspectErr != nil {
+		b.WriteString(stepFailed.Render(fmt.Sprintf("  Error: %v", m.inspectErr)))
+		b.WriteString("\n")
+	}
+	switch {
+	case len(m.inspectRaw) > 0:
+		// A parse failure keeps the raw bytes, so the viewport stays on screen
+		// under the error line and r remains a working escape hatch.
+		b.WriteString(m.inspectViewport.View())
+		b.WriteString("\n")
+	case m.inspectErr == nil:
+		b.WriteString("  Loading...\n")
+	}
+
+	// Footer names only what the screen binds. pgup/pgdown and the esc alias
+	// live in the ? overlay, matching viewConfig's shorter legend.
+	help := "  "
+	if m.inspectShowRaw {
+		help += "r summary"
+	} else {
+		help += "r raw JSON"
+	}
+	help += "  •  up/down scroll  •  q back"
 	b.WriteString(helpStyle.Render(help))
 	return b.String()
 }

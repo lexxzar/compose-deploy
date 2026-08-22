@@ -491,12 +491,16 @@ Plus, outside the tables:
 - Modify: `internal/tui/app.go`
 - Modify: `internal/tui/app_test.go`
 
-- [ ] add `viewInspect()` rendering the breadcrumb (`cdeploy > … > inspect > <service>`), the viewport and a footer; reuse the existing error slot for `inspectErr`
-- [ ] add `View()`'s `case screenInspect`
-- [ ] add the `screenInspect` key case binding **exactly** the `bound` set from Task 7: `r` toggles `inspectShowRaw` and re-runs `SetContent`, arrows/pgup/pgdown reach the viewport, `esc` clears every `inspect*` field and returns to `screenSelectContainers` **without** a status refresh, `ctrl+c` goes through `tryQuit()`
-- [ ] add the `WindowSizeMsg` `screenInspect` branch (`m.height - 6`), rebuilding the summary at the new width without losing `inspectRaw`
-- [ ] write tests: `r` round-trips summary → raw → summary, `esc` clears and returns, `q` reaches the same path via the rewrite, resize rebuilds and preserves the raw bytes
-- [ ] run `go test ./internal/tui/` — must pass before task 10
+- [x] add `viewInspect()` rendering the breadcrumb (`cdeploy > … > inspect > <service>`), the viewport and a footer; reuse the existing error slot for `inspectErr`
+- [x] add `View()`'s `case screenInspect`
+- [x] add the `screenInspect` key case binding **exactly** the `bound` set from Task 7: `r` toggles `inspectShowRaw` and re-runs `SetContent`, arrows/pgup/pgdown reach the viewport, `esc` clears every `inspect*` field and returns to `screenSelectContainers` **without** a status refresh, `ctrl+c` goes through `tryQuit()`
+- [x] add the `WindowSizeMsg` `screenInspect` branch (`m.height - 6`), rebuilding the summary at the new width without losing `inspectRaw`
+- [x] write tests: `r` round-trips summary → raw → summary, `esc` clears and returns, `q` reaches the same path via the rewrite, resize rebuilds and preserves the raw bytes
+- [x] run `go test ./internal/tui/` — must pass before task 10
+- ➕ [x] `clearInspect()` extracted as the single departure-cleanup helper (the `esc` handler calls it), so a future departure site cannot reset a partial field set. It deliberately does **not** bump `inspectSession` — `enterInspect()` bumps on the way in, which is what invalidates an in-flight fetch, and the handler's screen check discards one that lands after departure. Same discipline as `configSession`.
+- ➕ [x] the `r` toggle calls `inspectViewport.GotoTop()` after the chokepoint: `SetContent` preserves `YOffset`, so a toggle from a scrolled summary into the much longer raw JSON would land the reader mid-document. Pinned by `TestInspectScreen_RTogglePutsTheReaderAtTheTop`.
+- ➕ [x] `viewInspect()` keeps the viewport on screen **beside** the error line when `inspectRaw` is non-empty (the parse-failure case), so `r` stays a working escape hatch; it reads as "Loading..." only when there are neither bytes nor an error. Pinned by `TestViewInspect_ParseErrorKeepsViewportOnScreen`.
+- ⚠️ pre-existing, untouched: `gofmt -l .` reports `cmd/list_test.go`. Not caused by this task and out of scope per the focus rule.
 
 ### Task 10: Pay the remaining screen tax — container key and the four silent tables
 
