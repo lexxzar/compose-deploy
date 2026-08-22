@@ -23,11 +23,26 @@ type helpGroup struct {
 	actions bool
 }
 
+// helpContext carries the per-render facts the key tables branch on. The two
+// booleans travel in named fields rather than as adjacent parameters: a
+// transposed pair would compile, and helpGroupsFor(s, true, false, ...) told a
+// reader nothing about which fact was which.
+type helpContext struct {
+	canGoBack bool
+	readOnly  bool
+	phase     progressPhase
+}
+
 // helpGroups returns the key reference for the current screen, with the LEAVE
-// group resolved from the same back-navigation predicate the footer uses and
-// the progress table resolved from the operation's phase.
+// group resolved from the same back-navigation predicate the footer uses, the
+// container table resolved from the same read-only predicate that gates the
+// write keys, and the progress table resolved from the operation's phase.
 func (m Model) helpGroups() []helpGroup {
-	return helpGroupsFor(m.screen, m.canGoBack(), m.progressPhase())
+	return helpGroupsFor(m.screen, helpContext{
+		canGoBack: m.canGoBack(),
+		readOnly:  m.readOnly(),
+		phase:     m.progressPhase(),
+	})
 }
 
 // progressPhase names the three key regimes of screenProgress. The predicate
@@ -103,17 +118,74 @@ func leaveGroup(canGoBack bool) helpGroup {
 	}}
 }
 
-// helpGroupsFor returns the key reference for one screen. Data only — the
-// layout (one column or two) is decided by layoutHelpColumns from the terminal
-// width. Every key a screen's handleKey case binds must be named here; the
-// drift pin in help_test.go fails otherwise.
+// findGroup is the container screen's search table, shared by both variants —
+// `/` and `n N` work the same whether or not the composer accepts writes.
+//
+// It is split out of MOVE, and flagged as actions, because the footer trim left
+// `/` and `n N` with no other home (see containerFooter for the six tokens the
+// footer does carry). Neither is guessable, so the group must survive
+// truncation.
+func findGroup() helpGroup {
+	return helpGroup{title: "FIND", actions: true, entries: []helpEntry{
+		{"/", "search"},
+		{"n N", "next / prev match"},
+		// esc appears here as well as in LEAVE because a committed search
+		// takes the first esc — and the q that rewrites to it — as "clear",
+		// and only the next one navigates back.
+		{"esc", "clear an active search"},
+	}}
+}
+
+// inspectGroup is the container screen's read-path table. The read-only variant
+// drops c (config needs a compose file) and gains enter, because the x prompt
+// still binds it and OPERATE — enter's only home on the writable table — is
+// gone whole there; the description names that sub-state, matching the
+// convention for every key bound only inside one.
+func inspectGroup(readOnly bool) helpGroup {
+	entries := []helpEntry{{"l", "logs"}}
+	if !readOnly {
+		entries = append(entries, helpEntry{"c", "config"})
+	}
+	entries = append(entries, helpEntry{"x", "exec"}, helpEntry{"U", "check updates"})
+	if readOnly {
+		entries = append(entries, helpEntry{"enter", "confirm the exec prompt"})
+	}
+	return helpGroup{title: "INSPECT", actions: true, entries: entries}
+}
+
+// readOnlyContainerGroups is the container table for a composer that refuses
+// every write (compose.HostContainers). SELECT and OPERATE are gone whole, and
+// c leaves INSPECT: space, a, d, r, s, R and c all early-return on a read-only
+// composer, and a table that still named them would advertise a no-op — the
+// exact failure the overlay exists to prevent.
+//
+// Group ORDER carries the same load as the writable table: LEAVE sits 3rd of 4
+// so splitHelpGroups leaves it in the left column, and the actions flags still
+// drive singleColumnOrder's truncation order.
+func readOnlyContainerGroups(canGoBack bool) []helpGroup {
+	return []helpGroup{
+		{title: "MOVE", entries: []helpEntry{
+			{"↑ k", "up"},
+			{"↓ j", "down"},
+		}},
+		findGroup(),
+		leaveGroup(canGoBack),
+		inspectGroup(true),
+	}
+}
+
+// helpGroupsFor returns the key reference for one screen, resolved against the
+// render context. Data only — the layout (one column or two) is decided by
+// layoutHelpColumns from the terminal width. Every key a screen's handleKey
+// case binds must be named here; the drift pin in help_test.go fails otherwise.
 //
 // Group ORDER is load-bearing, not cosmetic: splitHelpGroups cuts the slice
 // sequentially, so where a group sits decides which column it lands in. LEAVE
-// is 4th of 6 on screenSelectContainers and 3rd of 4 on screenLogs to keep it
-// in the left column; every other screen ends with it. Reordering a group for
-// readability changes the rendered layout.
-func helpGroupsFor(s screen, canGoBack bool, phase progressPhase) []helpGroup {
+// is 4th of 6 on screenSelectContainers, 3rd of 4 in readOnlyContainerGroups
+// and 3rd of 4 on screenLogs to keep it in the left column; every other screen
+// ends with it. Reordering a group for readability changes the rendered layout.
+func helpGroupsFor(s screen, hc helpContext) []helpGroup {
+	canGoBack := hc.canGoBack
 	switch s {
 	case screenSelectServer:
 		return []helpGroup{
@@ -144,23 +216,17 @@ func helpGroupsFor(s screen, canGoBack bool, phase progressPhase) []helpGroup {
 		}
 
 	case screenSelectContainers:
+		if hc.readOnly {
+			return readOnlyContainerGroups(canGoBack)
+		}
 		return []helpGroup{
 			{title: "MOVE", entries: []helpEntry{
 				{"↑ k", "up"},
 				{"↓ j", "down"},
 			}},
-			// FIND is split out of MOVE, and SELECT is flagged, because the
-			// footer trim left `/`, `n N` and `a` with no other home (see
-			// containerFooter for the six tokens the footer does carry).
-			// Neither is guessable, so both groups must survive truncation.
-			{title: "FIND", actions: true, entries: []helpEntry{
-				{"/", "search"},
-				{"n N", "next / prev match"},
-				// esc appears here as well as in LEAVE because a committed
-				// search takes the first esc — and the q that rewrites to it —
-				// as "clear", and only the next one navigates back.
-				{"esc", "clear an active search"},
-			}},
+			findGroup(),
+			// SELECT is flagged for the same reason FIND is: the footer trim
+			// left `a` with no other home.
 			{title: "SELECT", actions: true, entries: []helpEntry{
 				{"space", "toggle"},
 				{"a", "all"},
@@ -176,16 +242,11 @@ func helpGroupsFor(s screen, canGoBack bool, phase progressPhase) []helpGroup {
 				// be opened from the idle screen, where enter does nothing.
 				{"enter", "confirm the prompt"},
 			}},
-			{title: "INSPECT", actions: true, entries: []helpEntry{
-				{"l", "logs"},
-				{"c", "config"},
-				{"x", "exec"},
-				{"U", "check updates"},
-			}},
+			inspectGroup(false),
 		}
 
 	case screenProgress:
-		return progressGroups(phase)
+		return progressGroups(hc.phase)
 
 	case screenLogs:
 		return []helpGroup{

@@ -26,7 +26,7 @@ import (
 )
 
 func mockFactory(mc *mockComposer) ComposerFactory {
-	return func(string) runner.Composer { return mc }
+	return func(compose.Project) runner.Composer { return mc }
 }
 
 type mockComposer struct {
@@ -110,7 +110,7 @@ func (m *mockConfigComposer) ValidateConfig(ctx context.Context) error {
 }
 
 func mockConfigFactory(mc *mockConfigComposer) ComposerFactory {
-	return func(string) runner.Composer { return mc }
+	return func(compose.Project) runner.Composer { return mc }
 }
 
 // mockExecComposer implements both runner.Composer and ExecProvider.
@@ -127,7 +127,7 @@ func (m *mockExecComposer) ExecCommand(ctx context.Context, service string, comm
 }
 
 func mockExecFactory(mc *mockExecComposer) ComposerFactory {
-	return func(string) runner.Composer { return mc }
+	return func(compose.Project) runner.Composer { return mc }
 }
 
 func TestNewModel_InitialState(t *testing.T) {
@@ -845,6 +845,99 @@ func TestViewSelectProject_EmptyWithPicker(t *testing.T) {
 	}
 }
 
+func TestViewSelectProject_UnmanagedRow(t *testing.T) {
+	mc := &mockComposer{}
+	m := NewModel(nil, io.Discard, mockFactory(mc), nil, nil)
+	m.projects = []compose.Project{
+		{Name: "my-app", Status: "running(3)", ConfigDir: "/srv/my-app"},
+		{Name: compose.UnmanagedProjectName, Desc: "3 containers", Unmanaged: true},
+	}
+
+	v := m.View()
+	if !strings.Contains(v, compose.UnmanagedProjectName) {
+		t.Errorf("view should show %q:\n%s", compose.UnmanagedProjectName, v)
+	}
+	if !strings.Contains(v, "3 containers") {
+		t.Errorf("unmanaged row should show its count in the description column:\n%s", v)
+	}
+	if !strings.Contains(v, shortenPath("/srv/my-app")) {
+		t.Errorf("compose row should still show its config dir:\n%s", v)
+	}
+}
+
+func TestViewSelectProject_UnmanagedRowIsLast(t *testing.T) {
+	mc := &mockComposer{}
+	m := NewModel(nil, io.Discard, mockFactory(mc), nil, nil)
+	m.projects = []compose.Project{
+		{Name: "zebra", Status: "running(1)", ConfigDir: "/srv/zebra"},
+		{Name: compose.UnmanagedProjectName, Desc: "1 container", Unmanaged: true},
+	}
+
+	v := m.View()
+	// strings.Index returns -1 for an absent needle, and -1 is less than every
+	// valid index — so both rows must be proven present before the comparison
+	// means anything.
+	composeIdx := strings.Index(v, "zebra")
+	unmanagedIdx := strings.Index(v, compose.UnmanagedProjectName)
+	if composeIdx < 0 {
+		t.Fatalf("compose row missing from the render:\n%s", v)
+	}
+	if unmanagedIdx < 0 {
+		t.Fatalf("unmanaged row missing from the render:\n%s", v)
+	}
+	if composeIdx > unmanagedIdx {
+		t.Errorf("unmanaged row should render last:\n%s", v)
+	}
+}
+
+func TestComposerFactory_ReceivesWholeProject(t *testing.T) {
+	projects := []compose.Project{
+		{Name: "my-app", Status: "running(3)", ConfigDir: "/srv/my-app"},
+		{Name: compose.UnmanagedProjectName, Desc: "3 containers", Unmanaged: true},
+	}
+
+	tests := []struct {
+		name      string
+		cursor    int
+		wantDir   string
+		wantUnman bool
+	}{
+		{"compose project", 0, "/srv/my-app", false},
+		{"unmanaged row", 1, "", true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			mc := &mockComposer{}
+			var got compose.Project
+			factory := func(proj compose.Project) runner.Composer {
+				got = proj
+				return mc
+			}
+			m := NewModel(nil, io.Discard, factory, nil, nil)
+			m.screen = screenSelectProject
+			m.projects = projects
+			m.projCursor = tt.cursor
+
+			updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+			m = updated.(Model)
+
+			if got.Name != projects[tt.cursor].Name {
+				t.Errorf("factory got Name = %q, want %q", got.Name, projects[tt.cursor].Name)
+			}
+			if got.ConfigDir != tt.wantDir {
+				t.Errorf("factory got ConfigDir = %q, want %q", got.ConfigDir, tt.wantDir)
+			}
+			if got.Unmanaged != tt.wantUnman {
+				t.Errorf("factory got Unmanaged = %v, want %v", got.Unmanaged, tt.wantUnman)
+			}
+			if m.composer != runner.Composer(mc) {
+				t.Error("composer should be the one the factory returned")
+			}
+		})
+	}
+}
+
 func TestBreadcrumb_WithProjectName(t *testing.T) {
 	mc := &mockComposer{}
 	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
@@ -1397,7 +1490,7 @@ var testServers = []config.Server{
 func mockConnectCb(mc *mockComposer) ConnectCallback {
 	return func(server config.Server) (*exec.Cmd, ComposerFactory, ProjectLoader, func() error) {
 		cmd := exec.Command("echo", "connected")
-		factory := func(d string) runner.Composer { return mc }
+		factory := func(compose.Project) runner.Composer { return mc }
 		loader := func(ctx context.Context) ([]compose.Project, error) {
 			return []compose.Project{{Name: "remote-app", ConfigDir: "/remote"}}, nil
 		}
@@ -13484,7 +13577,7 @@ func (m *mockRollbackComposer) PrepareRollback(_ context.Context, _ map[string]c
 }
 
 func mockRollbackFactory(mc *mockRollbackComposer) ComposerFactory {
-	return func(string) runner.Composer { return mc }
+	return func(compose.Project) runner.Composer { return mc }
 }
 
 func rollbackTestSnapshot() *compose.Snapshot {
@@ -14232,5 +14325,908 @@ func TestViewProgress_RollbackPrepErrorRendered(t *testing.T) {
 	v := m.View()
 	if !strings.Contains(v, "rollback prep failed") {
 		t.Errorf("progress view should render the rollback prep error, got:\n%s", v)
+	}
+}
+
+// HostContainers satisfies tui.ExecProvider, so the `x` key works on the
+// read-only unmanaged screen. The assertion lives here rather than in the
+// compose package because internal/tui imports internal/compose, not the
+// other way round.
+var _ ExecProvider = (*compose.HostContainers)(nil)
+
+// TestHostContainers_CapabilityInterfaces pins both halves of the read-only
+// capability contract. The positive half is the compile-time assertion above;
+// the negative half must be a runtime check, because Go cannot express "does
+// NOT implement" at compile time. ConfigProvider and RollbackPreparer are the
+// self-gating pair from design decision 8: a container with no compose file
+// has no config to show and no deploy snapshot to roll back to, so the `c` and
+// `R` keys no-op through the same type-assert guards the mocks rely on.
+func TestHostContainers_CapabilityInterfaces(t *testing.T) {
+	var c runner.Composer = compose.NewLocalHostContainers(compose.New(t.TempDir()))
+
+	if _, ok := c.(ExecProvider); !ok {
+		t.Error("HostContainers must satisfy ExecProvider so the x key works")
+	}
+	if _, ok := c.(ConfigProvider); ok {
+		t.Error("HostContainers must NOT satisfy ConfigProvider; the c key has to gate itself")
+	}
+	if _, ok := c.(RollbackPreparer); ok {
+		t.Error("HostContainers must NOT satisfy RollbackPreparer; the R key has to gate itself")
+	}
+	if _, ok := c.(Snapshotter); ok {
+		t.Error("HostContainers must NOT satisfy Snapshotter; there is no compose project to snapshot")
+	}
+}
+
+// readOnlyMockComposer is a mockComposer that also satisfies ReadOnlyComposer
+// and ExecProvider — the exact capability set of *compose.HostContainers. The
+// real type is used for the interface pins above; this mock is used for key
+// dispatch so no test ever shells out to docker.
+type readOnlyMockComposer struct {
+	mockComposer
+	execErr error
+}
+
+func (m *readOnlyMockComposer) ReadOnlyComposer() bool { return true }
+
+func (m *readOnlyMockComposer) ExecCommand(ctx context.Context, service string, command []string) (*exec.Cmd, error) {
+	if m.execErr != nil {
+		return nil, m.execErr
+	}
+	return exec.CommandContext(ctx, "true"), nil
+}
+
+func newReadOnlyModel(t *testing.T, mc *readOnlyMockComposer) Model {
+	t.Helper()
+	// The factory must hand back the READ-ONLY composer: passing the embedded
+	// mockComposer would let any test that triggers m.composerFactory(...) swap
+	// in a writable one, and every read-only assertion after that would go
+	// quiet rather than fail.
+	m := NewModel(mc, io.Discard, func(compose.Project) runner.Composer { return mc }, nil, nil)
+	m.screen = screenSelectContainers
+	m.services = append([]string(nil), mc.services...)
+	// Copy rather than alias mc.status: hydrateUpdates mutates m.svcStatus in
+	// place, and an alias would write verdicts back into the composer double
+	// that later subtests share.
+	m.svcStatus = make(map[string]runner.ServiceStatus, len(mc.status))
+	for k, v := range mc.status {
+		m.svcStatus[k] = v
+	}
+	m.width, m.height = 120, 24
+	m.updateInFlight = false
+	m.refreshInFlight = false
+	installFakeTick(&m)
+	return m
+}
+
+// capableReadOnlyComposer is a read-only composer that ALSO satisfies
+// ConfigProvider and RollbackPreparer. No production composer looks like this
+// — HostContainers implements neither — but readOnlyMockComposer implements
+// neither either, so the c and R cases of TestReadOnly_GatesWriteKeys would
+// pass on the capability assertion that follows the gate rather than on the
+// gate itself. With this double the two m.readOnly() early returns are the only
+// thing standing between the key and its action.
+type capableReadOnlyComposer struct {
+	readOnlyMockComposer
+}
+
+func (c *capableReadOnlyComposer) ConfigFile(ctx context.Context) ([]byte, error) {
+	return []byte("services: {}\n"), nil
+}
+
+func (c *capableReadOnlyComposer) ConfigResolved(ctx context.Context) ([]byte, error) {
+	return []byte("services: {}\n"), nil
+}
+
+func (c *capableReadOnlyComposer) EditCommand(ctx context.Context) (*exec.Cmd, error) {
+	return exec.CommandContext(ctx, "true"), nil
+}
+
+func (c *capableReadOnlyComposer) ValidateConfig(ctx context.Context) error { return nil }
+
+func (c *capableReadOnlyComposer) ReadSnapshot(ctx context.Context) (*compose.Snapshot, error) {
+	return &compose.Snapshot{Schema: 1, Services: map[string]compose.SnapshotEntry{
+		"watchtower": {Image: "containrrr/watchtower:1.7", Digest: "sha256:abc"},
+	}}, nil
+}
+
+func (c *capableReadOnlyComposer) PrepareRollback(ctx context.Context, entries map[string]compose.SnapshotEntry, services []string, w io.Writer) (func(), error) {
+	return func() {}, nil
+}
+
+func readOnlyTestComposer() *readOnlyMockComposer {
+	return &readOnlyMockComposer{mockComposer: mockComposer{
+		services: []string{"watchtower", "portainer"},
+		status: map[string]runner.ServiceStatus{
+			"watchtower": {Running: true},
+			"portainer":  {Running: true},
+		},
+	}}
+}
+
+// TestReadOnly_Predicate pins the three cases the gate depends on: a zero-value
+// Model (the ~18 Model{} test literals) and a normal compose composer are both
+// writable, and only a composer that answers the named ReadOnlyComposer method
+// is read-only. A method-less marker interface would make all three true.
+func TestReadOnly_Predicate(t *testing.T) {
+	if (Model{}).readOnly() {
+		t.Error("zero-value Model must not be read-only (nil composer)")
+	}
+
+	mc := &mockComposer{}
+	if (Model{composer: mc}).readOnly() {
+		t.Error("a normal compose composer must not be read-only")
+	}
+
+	ro := &readOnlyMockComposer{}
+	if !(Model{composer: ro}).readOnly() {
+		t.Error("a ReadOnlyComposer must be read-only")
+	}
+
+	hc := compose.NewLocalHostContainers(compose.New(t.TempDir()))
+	if !(Model{composer: hc}).readOnly() {
+		t.Error("HostContainers must be read-only")
+	}
+}
+
+// TestReadOnly_GatesWriteKeys asserts every gated key is fully inert: no
+// confirmation armed, no pendingOp, no selection change, no warning, no cmd.
+// A key that changed state while the footer and the `?` overlay hide it would
+// be a silent surprise; a key that warned would be advertising a no-op.
+func TestReadOnly_GatesWriteKeys(t *testing.T) {
+	for _, key := range []string{"d", "r", "s", "R", "c", " ", "a"} {
+		t.Run(key, func(t *testing.T) {
+			mc := readOnlyTestComposer()
+			m := newReadOnlyModel(t, mc)
+
+			updated, cmd := m.Update(keyMsgFor(key))
+			got := updated.(Model)
+
+			if cmd != nil {
+				t.Errorf("key %q returned a command; want nil", key)
+			}
+			if got.screen != screenSelectContainers {
+				t.Errorf("key %q changed screen to %d", key, got.screen)
+			}
+			if got.confirming {
+				t.Errorf("key %q armed a confirmation", key)
+			}
+			if got.pendingOp != m.pendingOp {
+				t.Errorf("key %q set pendingOp = %v", key, got.pendingOp)
+			}
+			if got.pendingExec {
+				t.Errorf("key %q armed pendingExec", key)
+			}
+			if got.warning != "" {
+				t.Errorf("key %q set warning %q; a gated key must not advertise itself", key, got.warning)
+			}
+			if got.selectedCount() != 0 {
+				t.Errorf("key %q selected %d services", key, got.selectedCount())
+			}
+			if got.rollbackTargets != nil {
+				t.Errorf("key %q captured rollback targets", key)
+			}
+		})
+	}
+}
+
+// TestReadOnly_GatesWriteKeys_WithCapableComposer is the non-vacuous half of
+// the c and R cases above. readOnlyMockComposer implements neither
+// ConfigProvider nor RollbackPreparer, so those two keys return on the
+// capability assertion below the gate; here the composer answers both, leaving
+// the m.readOnly() early return as the only thing that keeps them inert.
+func TestReadOnly_GatesWriteKeys_WithCapableComposer(t *testing.T) {
+	for _, key := range []string{"c", "R"} {
+		t.Run(key, func(t *testing.T) {
+			mc := &capableReadOnlyComposer{readOnlyMockComposer: *readOnlyTestComposer()}
+			m := NewModel(mc, io.Discard, func(compose.Project) runner.Composer { return mc }, nil, nil)
+			m.screen = screenSelectContainers
+			m.services = append([]string(nil), mc.services...)
+			m.svcStatus = mc.status
+			m.width, m.height = 120, 24
+			m.updateInFlight = false
+			m.refreshInFlight = false
+			installFakeTick(&m)
+			// A selection is what R needs past its own empty-selection warning;
+			// it is unreachable through space on this composer, so set it
+			// directly to prove the gate — not the missing selection — is
+			// what stops the key.
+			m.selected[0] = true
+
+			// Precondition: the capability assertions the gates sit above
+			// would BOTH succeed on this composer.
+			if _, ok := m.composer.(ConfigProvider); !ok {
+				t.Fatal("precondition: the double must satisfy ConfigProvider")
+			}
+			if _, ok := m.composer.(RollbackPreparer); !ok {
+				t.Fatal("precondition: the double must satisfy RollbackPreparer")
+			}
+
+			updated, cmd := m.Update(keyMsgFor(key))
+			got := updated.(Model)
+
+			if cmd != nil {
+				t.Errorf("key %q returned a command; want nil", key)
+			}
+			if got.screen != screenSelectContainers {
+				t.Errorf("key %q changed screen to %d", key, got.screen)
+			}
+			if got.confirming {
+				t.Errorf("key %q armed a confirmation", key)
+			}
+			if got.rollbackTargets != nil {
+				t.Errorf("key %q captured rollback targets", key)
+			}
+			if got.warning != "" {
+				t.Errorf("key %q set warning %q; a gated key must not advertise itself", key, got.warning)
+			}
+		})
+	}
+}
+
+// TestReadOnly_GatedKeyReclampsOffset pins the reserved-bar side of the gates.
+// The container dispatch clears m.warning before the switch, which frees the
+// warning footer line and grows svcVisibleCount() by one. Every other case in
+// the switch re-clamps; a gated key that returns early without fixSvcOffset
+// leaves a too-large svcOffset and renders a blank row under the last service.
+func TestReadOnly_GatedKeyReclampsOffset(t *testing.T) {
+	for _, key := range []string{"d", "r", "s", "R", "c", " ", "a"} {
+		t.Run(key, func(t *testing.T) {
+			mc := readOnlyTestComposer()
+			mc.services = nil
+			for i := 0; i < 30; i++ {
+				mc.services = append(mc.services, fmt.Sprintf("svc-%02d", i))
+			}
+			m := newReadOnlyModel(t, mc)
+			m.height = 24
+			// The x-on-stopped warning is the state this reproduces from.
+			m.warning = "Container is not running"
+			m.svcCursor = len(m.services) - 1
+			m.fixSvcOffset()
+			if m.svcOffset == 0 {
+				t.Fatal("precondition: the list must scroll at this height")
+			}
+
+			updated, _ := m.Update(keyMsgFor(key))
+			got := updated.(Model)
+
+			if got.warning != "" {
+				t.Fatalf("precondition: the dispatch must clear the warning, got %q", got.warning)
+			}
+			want := len(got.services) - got.svcVisibleCount()
+			if got.svcOffset != want {
+				t.Errorf("svcOffset = %d, want %d; the gated key left a blank row at the bottom", got.svcOffset, want)
+			}
+		})
+	}
+}
+
+// TestReadOnly_KeepsReadKeys is the other half of AC4/AC5: the read keys must
+// still work on a read-only composer. Without this, gating by composer type
+// could over-reach and silently disable the whole screen.
+func TestReadOnly_KeepsReadKeys(t *testing.T) {
+	t.Run("l opens logs", func(t *testing.T) {
+		mc := readOnlyTestComposer()
+		m := newReadOnlyModel(t, mc)
+		updated, cmd := m.Update(keyMsgFor("l"))
+		got := updated.(Model)
+		if got.screen != screenLogs {
+			t.Errorf("screen = %d, want screenLogs", got.screen)
+		}
+		if cmd == nil {
+			t.Error("l should return the readLogChunk command")
+		}
+		if got.logsCancel != nil {
+			got.logsCancel()
+		}
+	})
+
+	t.Run("x arms the exec prompt", func(t *testing.T) {
+		mc := readOnlyTestComposer()
+		m := newReadOnlyModel(t, mc)
+		updated, _ := m.Update(keyMsgFor("x"))
+		got := updated.(Model)
+		if !got.confirming || !got.pendingExec {
+			t.Errorf("x should arm the exec prompt; confirming=%v pendingExec=%v", got.confirming, got.pendingExec)
+		}
+	})
+
+	t.Run("enter confirms the exec prompt", func(t *testing.T) {
+		mc := readOnlyTestComposer()
+		m := newReadOnlyModel(t, mc)
+		updated, _ := m.Update(keyMsgFor("x"))
+		updated, cmd := updated.(Model).Update(tea.KeyMsg{Type: tea.KeyEnter})
+		got := updated.(Model)
+		if cmd == nil {
+			t.Error("enter after x should return the exec command")
+		}
+		if got.warning != "" {
+			t.Errorf("exec should not warn, got %q", got.warning)
+		}
+	})
+
+	t.Run("/ opens search and n cycles", func(t *testing.T) {
+		mc := readOnlyTestComposer()
+		m := newReadOnlyModel(t, mc)
+		updated, _ := m.Update(keyMsgFor("/"))
+		got := updated.(Model)
+		if !got.searching {
+			t.Fatal("/ should open the search bar")
+		}
+		updated, _ = got.Update(keyMsgFor("p"))
+		updated, _ = updated.(Model).Update(tea.KeyMsg{Type: tea.KeyEnter})
+		got = updated.(Model)
+		if got.searchQuery != "p" || len(got.searchMatches) == 0 {
+			t.Fatalf("search should commit; query=%q matches=%v", got.searchQuery, got.searchMatches)
+		}
+		if got.svcCursor != got.searchMatches[0] {
+			t.Errorf("cursor = %d, want %d", got.svcCursor, got.searchMatches[0])
+		}
+		updated, _ = got.Update(keyMsgFor("n"))
+		if updated.(Model).searchQuery != "p" {
+			t.Error("n must not clear the committed search")
+		}
+	})
+
+	t.Run("U forces an update refresh", func(t *testing.T) {
+		mc := readOnlyTestComposer()
+		m := newReadOnlyModel(t, mc)
+		updated, cmd := m.Update(keyMsgFor("U"))
+		got := updated.(Model)
+		if cmd == nil {
+			t.Error("U should return a refreshUpdates command")
+		}
+		if !got.updateInFlight {
+			t.Error("U should mark updateInFlight")
+		}
+	})
+}
+
+// TestUpdatesCacheKey_UnmanagedIsolated is AC8. The unmanaged row has an empty
+// ConfigDir, so without the read-only prefix a local unmanaged view and the
+// local-fast-track entry would share the bare "|" slot.
+func TestUpdatesCacheKey_UnmanagedIsolated(t *testing.T) {
+	ro := readOnlyTestComposer()
+	fastTrack := Model{composer: &mockComposer{}}
+	unmanaged := Model{composer: ro}
+	if fastTrack.updatesCacheKey() == unmanaged.updatesCacheKey() {
+		t.Fatalf("unmanaged and local-fast-track share the cache key %q", fastTrack.updatesCacheKey())
+	}
+
+	// The same isolation must hold per server, and against a real project dir.
+	remoteUnmanaged := Model{composer: ro, serverName: "prod"}
+	remoteProject := Model{composer: &mockComposer{}, projDir: "/srv/app", serverName: "prod"}
+	if remoteUnmanaged.updatesCacheKey() == remoteProject.updatesCacheKey() {
+		t.Error("unmanaged and a remote project share a cache key")
+	}
+	if remoteUnmanaged.updatesCacheKey() == unmanaged.updatesCacheKey() {
+		t.Error("local and remote unmanaged share a cache key")
+	}
+}
+
+// TestUpdatesCacheKey_FollowsComposerAcrossNavigation is the regression pin for
+// the cleanup discipline the removed projUnmanaged field used to need: pick the
+// unmanaged row, walk back out with esc, then fast-track into the local
+// composer, and the key must return to the bare "|" slot. A stale unmanaged
+// marker would key the fast-track context as "unmanaged||" — the AC8 collision
+// in the opposite direction.
+func TestUpdatesCacheKey_FollowsComposerAcrossNavigation(t *testing.T) {
+	ro := readOnlyTestComposer()
+	local := &mockComposer{services: []string{"web"}}
+	m := NewModel(local, io.Discard, func(proj compose.Project) runner.Composer {
+		if proj.Unmanaged {
+			return ro
+		}
+		return local
+	}, []config.Server{{Name: "prod", Host: "prod.example.com"}}, nil)
+	installFakeTick(&m)
+	m.screen = screenSelectProject
+	m.showPicker = true
+	m.projects = []compose.Project{{Name: compose.UnmanagedProjectName, Desc: "2 containers", Unmanaged: true}}
+
+	updated, _ := m.Update(keyMsgFor("enter"))
+	m = updated.(Model)
+	if got := m.updatesCacheKey(); got != "unmanaged||" {
+		t.Fatalf("after picking the unmanaged row, key = %q, want %q", got, "unmanaged||")
+	}
+
+	updated, _ = m.Update(keyMsgFor("esc")) // containers -> project
+	m = updated.(Model)
+	updated, _ = m.Update(keyMsgFor("esc")) // project -> server
+	m = updated.(Model)
+	if m.screen != screenSelectServer {
+		t.Fatalf("screen = %d, want screenSelectServer", m.screen)
+	}
+
+	// Local entry is first in serverEntries; enter fast-tracks to containers.
+	m.serverCursor = 0
+	updated, _ = m.Update(keyMsgFor("enter"))
+	m = updated.(Model)
+	if got := m.updatesCacheKey(); got != "|" {
+		t.Errorf("after the local fast-track, key = %q, want %q", got, "|")
+	}
+}
+
+// TestUpdatesCache_UnmanagedDoesNotReplayFastTrackVerdicts is the behavioural
+// half of AC8: a colliding service name must not pick up the other context's
+// verdict. hydrateUpdates' phantom guard drops only UNKNOWN names, so a shared
+// key would write "web is out of date" straight onto the unmanaged web row.
+func TestUpdatesCache_UnmanagedDoesNotReplayFastTrackVerdicts(t *testing.T) {
+	mc := readOnlyTestComposer()
+	m := newReadOnlyModel(t, mc)
+	m.services = []string{"web"}
+	m.svcStatus = map[string]runner.ServiceStatus{"web": {Running: true}}
+	m.updateCache = map[string]updateEntry{
+		// The local-fast-track slot, populated by a previous compose context.
+		"|": {fetchedAt: time.Now(), results: map[string]bool{"web": true}},
+	}
+
+	updated, cmd := m.Update(statusMsg{
+		status:  map[string]runner.ServiceStatus{"web": {Running: true}},
+		session: m.statusSession,
+	})
+	got := updated.(Model)
+
+	if ua := got.svcStatus["web"].UpdateAvailable; ua != nil {
+		t.Errorf("UpdateAvailable = %v, want nil; the fast-track verdict leaked into the unmanaged view", *ua)
+	}
+
+	// The miss must NOT queue a fetch: the unmanaged view is opt-in, so the
+	// self-heal stays gated and U is the only trigger (see
+	// TestReadOnly_NoAutomaticUpdateFetch). The isolation above therefore comes
+	// from the key alone, which the writable control below confirms.
+	if cmd != nil || got.updateInFlight {
+		t.Error("a cache miss on the unmanaged key must not queue an automatic refreshUpdates")
+	}
+
+	// Control: on a writable composer the SAME cache entry does replay —
+	// proving the isolation above comes from the key, not from a dead lookup.
+	m.composer = &mc.mockComposer
+	updated, _ = m.Update(statusMsg{
+		status:  map[string]runner.ServiceStatus{"web": {Running: true}},
+		session: m.statusSession,
+	})
+	ua := updated.(Model).svcStatus["web"].UpdateAvailable
+	if ua == nil || !*ua {
+		t.Error("the fast-track context must still replay its own cached verdict")
+	}
+}
+
+// TestReadOnly_NoSelectionAffordances pins task 8: with d/r/s/R gated, both the
+// per-row checkbox and the title's (n/m selected) counter would advertise a dead
+// key. The writable control proves the assertions are not vacuous.
+func TestReadOnly_NoSelectionAffordances(t *testing.T) {
+	mc := readOnlyTestComposer()
+	m := newReadOnlyModel(t, mc)
+
+	view := ansi.Strip(m.viewSelectContainers())
+	if strings.Contains(view, "selected") {
+		t.Errorf("read-only view shows the selection counter:\n%s", view)
+	}
+	if strings.Contains(view, "[ ]") || strings.Contains(view, "[x]") {
+		t.Errorf("read-only view shows a row checkbox:\n%s", view)
+	}
+
+	wc := &mockComposer{services: mc.services, status: mc.status}
+	w := NewModel(wc, io.Discard, mockFactory(wc), nil, nil)
+	w.screen = screenSelectContainers
+	w.services = wc.services
+	w.svcStatus = wc.status
+	w.width, w.height = 120, 24
+	control := ansi.Strip(w.viewSelectContainers())
+	if !strings.Contains(control, "selected") || !strings.Contains(control, "[ ]") {
+		t.Errorf("the writable control must keep both affordances:\n%s", control)
+	}
+}
+
+// TestReadOnly_CaptionAlignment pins the caption pad against the row checkbox.
+// The pad is 10 cells with the checkbox and 7 without it, so dropping one
+// without the other misaligns every column against its caption.
+func TestReadOnly_CaptionAlignment(t *testing.T) {
+	status := map[string]runner.ServiceStatus{
+		"watchtower": {Running: true, Created: "2026-08-20 09:30", Uptime: "3h"},
+		"portainer":  {Running: true, Created: "2026-08-19 11:00", Uptime: "1d"},
+	}
+
+	for _, tt := range []struct {
+		name     string
+		readOnly bool
+	}{
+		{"read-only", true},
+		{"writable", false},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			var m Model
+			if tt.readOnly {
+				mc := readOnlyTestComposer()
+				mc.status = status
+				m = newReadOnlyModel(t, mc)
+			} else {
+				wc := &mockComposer{services: []string{"watchtower", "portainer"}, status: status}
+				m = NewModel(wc, io.Discard, mockFactory(wc), nil, nil)
+				m.screen = screenSelectContainers
+				m.services = wc.services
+				m.svcStatus = status
+				m.width, m.height = 120, 24
+			}
+
+			view := m.viewSelectContainers()
+			var caption string
+			rows := map[string]string{}
+			for _, line := range strings.Split(view, "\n") {
+				plain := ansi.Strip(line)
+				if strings.Contains(plain, "Service") && strings.Contains(plain, "Created") {
+					caption = plain
+					continue
+				}
+				if !strings.Contains(plain, "●") {
+					continue
+				}
+				for _, svc := range m.services {
+					if strings.Contains(plain, svc) {
+						rows[svc] = plain
+					}
+				}
+			}
+			if caption == "" {
+				t.Fatalf("no captions row rendered:\n%s", view)
+			}
+			if len(rows) != len(m.services) {
+				t.Fatalf("found %d data rows, want %d:\n%s", len(rows), len(m.services), view)
+			}
+
+			want := ansi.StringWidth(caption[:strings.Index(caption, "Service")])
+			wantPad := 10
+			if tt.readOnly {
+				wantPad = 7
+			}
+			if want != wantPad {
+				t.Errorf("caption pad = %d cells, want %d", want, wantPad)
+			}
+			for svc, row := range rows {
+				got := ansi.StringWidth(row[:strings.Index(row, svc)])
+				if got != want {
+					t.Errorf("%s starts at column %d; the Service caption is at %d\ncaption: %q\nrow:     %q",
+						svc, got, want, caption, row)
+				}
+			}
+		})
+	}
+}
+
+// TestReadOnly_UpdateGlyphHydrates pins task 12's user-visible half: the ⇧
+// column is the one thing HostContainers.CheckUpdates delivers, and it must
+// survive the read-only render path, which drops the checkbox the writable
+// path pads around.
+func TestReadOnly_UpdateGlyphHydrates(t *testing.T) {
+	mc := readOnlyTestComposer()
+	m := newReadOnlyModel(t, mc)
+
+	result, _ := m.Update(updatesMsg{
+		results: map[string]bool{"watchtower": true, "portainer": false},
+		session: m.updatesSession,
+	})
+	model := result.(Model)
+
+	if av := model.svcStatus["watchtower"].UpdateAvailable; av == nil || !*av {
+		t.Fatalf("watchtower UpdateAvailable = %v, want &true", av)
+	}
+	if av := model.svcStatus["portainer"].UpdateAvailable; av == nil || *av {
+		t.Fatalf("portainer UpdateAvailable = %v, want &false", av)
+	}
+
+	view := model.viewSelectContainers()
+	if !strings.Contains(view, compose.UpdateGlyph) {
+		t.Fatalf("read-only view shows no update glyph:\n%s", ansi.Strip(view))
+	}
+	for _, line := range strings.Split(view, "\n") {
+		if !strings.Contains(line, compose.UpdateGlyph) {
+			continue
+		}
+		plain := ansi.Strip(line)
+		if !strings.Contains(plain, "watchtower") {
+			t.Errorf("update glyph rendered on the wrong row: %q", plain)
+		}
+	}
+}
+
+// TestReadOnly_RendersAllStatusColumns is AC3a. The row builder is shared with
+// the writable path — only the checkbox and the caption pad branch on readOnly
+// — but "shared today" is exactly the kind of claim that rots silently, so the
+// full column set is pinned against the rendered read-only screen: name, status
+// dot, health icon, Created, Uptime, Ports, CPU and Mem.
+func TestReadOnly_RendersAllStatusColumns(t *testing.T) {
+	mc := readOnlyTestComposer()
+	mc.status = map[string]runner.ServiceStatus{
+		"watchtower": {
+			Running: true,
+			Health:  "healthy",
+			Created: "2026-08-20 09:30",
+			Uptime:  "3h",
+			Ports:   []runner.Port{{Host: "0.0.0.0", HostPort: 8080, ContainerPort: 80, Protocol: "tcp"}},
+		},
+		"portainer": {Running: false, Health: "unhealthy", Created: "2026-08-19 11:00"},
+	}
+	m := newReadOnlyModel(t, mc)
+	m.statsRequested = true
+	m.stats = map[string]runner.ServiceStats{
+		"watchtower": {CPUPercent: 12.5, MemoryUsed: 130023424, MemoryLimit: 2147483648},
+	}
+
+	view := ansi.Strip(m.viewSelectContainers())
+
+	var caption, running, stopped string
+	for _, line := range strings.Split(view, "\n") {
+		switch {
+		case strings.Contains(line, "Service") && strings.Contains(line, "Created"):
+			caption = line
+		case strings.Contains(line, "watchtower"):
+			running = line
+		case strings.Contains(line, "portainer"):
+			stopped = line
+		}
+	}
+	if caption == "" || running == "" || stopped == "" {
+		t.Fatalf("missing rows — caption=%q running=%q stopped=%q\n%s", caption, running, stopped, view)
+	}
+
+	for _, want := range []string{"Service", "Created", "Uptime", "CPU", "Mem", "Ports"} {
+		if !strings.Contains(caption, want) {
+			t.Errorf("caption row is missing the %q column: %q", want, caption)
+		}
+	}
+
+	for _, tt := range []struct{ what, want string }{
+		{"name", "watchtower"},
+		{"status dot", "●"},
+		{"health icon", "♥"},
+		{"Created", "2026-08-20 09:30"},
+		{"Uptime", "3h"},
+		{"Ports", compose.FormatPort(runner.Port{Host: "0.0.0.0", HostPort: 8080, ContainerPort: 80, Protocol: "tcp"})},
+		{"CPU", "12.5%"},
+		{"Mem", compose.FormatBytes(130023424)},
+	} {
+		if !strings.Contains(running, tt.want) {
+			t.Errorf("read-only row is missing %s (%q): %q", tt.what, tt.want, running)
+		}
+	}
+
+	// The unhealthy icon and the stopped dot share the row builder too, and a
+	// stopped container must still render its Created cell.
+	if !strings.Contains(stopped, "✗") {
+		t.Errorf("stopped row is missing the unhealthy icon: %q", stopped)
+	}
+	if !strings.Contains(stopped, "2026-08-19 11:00") {
+		t.Errorf("stopped row is missing its Created cell: %q", stopped)
+	}
+}
+
+// TestReadOnly_FetchErrorSurfacesInSvcErr pins the container screen's error
+// path for a read-only composer end to end: loadServices folds a ListServices
+// OR a ContainerStatus failure into servicesMsg.err, the handler stores it in
+// svcErr, and the renderer shows it. Without this the unmanaged view could fail
+// silently against an unreachable daemon or a dead SSH hop.
+func TestReadOnly_FetchErrorSurfacesInSvcErr(t *testing.T) {
+	for _, tt := range []struct {
+		name string
+		set  func(*readOnlyMockComposer)
+		want string
+	}{
+		{"ListServices fails", func(c *readOnlyMockComposer) { c.err = errors.New("docker ps failed") }, "docker ps failed"},
+		{"ContainerStatus fails", func(c *readOnlyMockComposer) { c.statusErr = errors.New("ssh hop down") }, "ssh hop down"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			mc := readOnlyTestComposer()
+			tt.set(mc)
+			m := newReadOnlyModel(t, mc)
+
+			msg := m.loadServices()()
+			sm, ok := msg.(servicesMsg)
+			if !ok {
+				t.Fatalf("loadServices returned %T, want servicesMsg", msg)
+			}
+			if sm.err == nil || sm.err.Error() != tt.want {
+				t.Fatalf("servicesMsg.err = %v, want %q", sm.err, tt.want)
+			}
+
+			updated, _ := m.Update(sm)
+			got := updated.(Model)
+			if got.svcErr == nil || got.svcErr.Error() != tt.want {
+				t.Fatalf("svcErr = %v, want %q", got.svcErr, tt.want)
+			}
+			if view := ansi.Strip(got.viewSelectContainers()); !strings.Contains(view, tt.want) {
+				t.Errorf("the error is not rendered on the container screen:\n%s", view)
+			}
+		})
+	}
+}
+
+// TestReadOnly_NoAutomaticUpdateFetch pins the opt-in contract for the
+// unmanaged view: nothing may fire CheckUpdates on its own there.
+//
+// The compose path bounds the check to one project's service list. The
+// unmanaged path is derived from `docker ps -a`, so the set grows with every
+// container ever left on the host and each distinct image costs a REGISTRY
+// manifest request. An automatic fan-out on screen entry — and again on every
+// 5-second status tick via the self-heal — can exhaust the anonymous Docker Hub
+// quota and break a real docker pull from the same host, so U is the only
+// trigger, matching the CLI's opt-in `list --updates`.
+//
+// Both automatic entry points are driven, each against a WRITABLE control: a
+// gate applied to only one of them leaves the other firing, and the self-heal
+// is the worse half (it repeats forever).
+func TestReadOnly_NoAutomaticUpdateFetch(t *testing.T) {
+	writable := func(t *testing.T) Model {
+		t.Helper()
+		mc := &mockComposer{services: []string{"web"}}
+		m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
+		m.screen = screenSelectContainers
+		m.updateInFlight = false
+		m.refreshInFlight = false
+		installFakeTick(&m)
+		return m
+	}
+
+	t.Run("screen entry", func(t *testing.T) {
+		ro := newReadOnlyModel(t, readOnlyTestComposer())
+		if cmd := ro.maybeRefreshUpdatesCmd(); cmd != nil {
+			t.Error("read-only entry fired an automatic CheckUpdates; U must be the only trigger")
+		}
+		if ro.updateInFlight {
+			t.Error("read-only entry set updateInFlight without fetching")
+		}
+		w := writable(t)
+		if cmd := w.maybeRefreshUpdatesCmd(); cmd == nil {
+			t.Error("control: a writable cache miss must still fetch")
+		}
+	})
+
+	t.Run("status-tick self-heal", func(t *testing.T) {
+		ro := newReadOnlyModel(t, readOnlyTestComposer())
+		result, cmd := ro.Update(statusMsg{
+			status:  map[string]runner.ServiceStatus{"watchtower": {Running: true}},
+			session: ro.statusSession,
+		})
+		if cmd != nil {
+			t.Error("the status self-heal fired an automatic CheckUpdates on the read-only screen")
+		}
+		if result.(Model).updateInFlight {
+			t.Error("the status self-heal set updateInFlight on the read-only screen")
+		}
+
+		w := writable(t)
+		_, wcmd := w.Update(statusMsg{
+			status:  map[string]runner.ServiceStatus{"web": {Running: true}},
+			session: w.statusSession,
+		})
+		if wcmd == nil {
+			t.Error("control: the writable status self-heal must still fetch on a cache miss")
+		}
+	})
+}
+
+// TestReadOnly_StaleUpdateWarningClears is the other side of the U-only opt-in.
+// A failed U caches a failure entry whose warning both self-heal paths restore
+// while it is fresh; once it expires, no automatic refetch will ever replace it
+// here, so the warning it explained is no longer current and must go — without
+// this, one failed U would keep its warning for the life of the screen.
+func TestReadOnly_StaleUpdateWarningClears(t *testing.T) {
+	const errText = "registry unreachable"
+
+	staleModel := func(t *testing.T, age time.Duration) Model {
+		t.Helper()
+		m := newReadOnlyModel(t, readOnlyTestComposer())
+		m.updatesErr = errText
+		m.updateCache = map[string]updateEntry{
+			m.updatesCacheKey(): {
+				fetchedAt: time.Now().Add(-age),
+				err:       true,
+				errMsg:    errText,
+			},
+		}
+		return m
+	}
+
+	tick := func(m Model) Model {
+		updated, _ := m.Update(statusMsg{
+			status:  map[string]runner.ServiceStatus{"watchtower": {Running: true}},
+			session: m.statusSession,
+		})
+		return updated.(Model)
+	}
+
+	t.Run("status tick drops an expired failure", func(t *testing.T) {
+		got := tick(staleModel(t, updatesErrorTTL+time.Second))
+		if got.updatesErr != "" {
+			t.Errorf("updatesErr = %q; an expired failure must not survive on a read-only screen", got.updatesErr)
+		}
+	})
+
+	t.Run("status tick keeps a fresh failure", func(t *testing.T) {
+		got := tick(staleModel(t, time.Second))
+		if got.updatesErr != errText {
+			t.Errorf("updatesErr = %q, want %q; a fresh failure is still the ground truth", got.updatesErr, errText)
+		}
+	})
+
+	t.Run("screen entry drops an expired failure", func(t *testing.T) {
+		m := staleModel(t, updatesErrorTTL+time.Second)
+		if cmd := m.maybeRefreshUpdatesCmd(); cmd != nil {
+			t.Error("read-only entry fired an automatic CheckUpdates; U must be the only trigger")
+		}
+		if m.updatesErr != "" {
+			t.Errorf("updatesErr = %q, want cleared", m.updatesErr)
+		}
+	})
+}
+
+// TestReadOnly_InitFastPathHonoursOptIn closes the third automatic entry point.
+// maybeRefreshUpdatesCmd and the statusMsg self-heal both consult
+// autoUpdatesAllowed, but Init()'s picker-skipped fast path calls
+// refreshUpdates() directly — a read-only composer handed straight to NewModel
+// would fan out to the registry on launch, exactly what the opt-in exists to
+// prevent. NewModel must leave updateInFlight clear in that case too: a flag
+// with no fetch behind it never clears, and maybeRefreshUpdatesCmd's in-flight
+// guard would then refuse every later fetch, including the one U asks for.
+func TestReadOnly_InitFastPathHonoursOptIn(t *testing.T) {
+	// drain runs the Cmd Init returns, unwrapping the tea.BatchMsg and
+	// invoking every inner Cmd, so the composer records the calls the batch
+	// actually makes rather than the ones it merely queued.
+	drain := func(t *testing.T, cmd tea.Cmd) {
+		t.Helper()
+		if cmd == nil {
+			t.Fatal("Init returned no Cmd")
+		}
+		batch, ok := cmd().(tea.BatchMsg)
+		if !ok {
+			t.Fatal("Init did not return a batch")
+		}
+		for _, inner := range batch {
+			if inner != nil {
+				inner()
+			}
+		}
+	}
+
+	t.Run("read-only", func(t *testing.T) {
+		mc := readOnlyTestComposer()
+		m := NewModel(mc, io.Discard, func(compose.Project) runner.Composer { return mc }, nil, nil)
+		installFakeTick(&m)
+		if m.updateInFlight {
+			t.Error("NewModel marked updateInFlight for a read-only composer that Init will not fetch for")
+		}
+		drain(t, m.Init())
+		if mc.updatesCalls != 0 {
+			t.Errorf("Init fast path ran CheckUpdates %d times on a read-only composer; U must be the only trigger", mc.updatesCalls)
+		}
+	})
+
+	t.Run("writable control", func(t *testing.T) {
+		wc := &mockComposer{services: []string{"web"}}
+		m := NewModel(wc, io.Discard, mockFactory(wc), nil, nil)
+		installFakeTick(&m)
+		if !m.updateInFlight {
+			t.Error("control: NewModel must mark updateInFlight for the fetch Init fires")
+		}
+		drain(t, m.Init())
+		if wc.updatesCalls != 1 {
+			t.Errorf("control: writable Init fast path ran CheckUpdates %d times, want 1", wc.updatesCalls)
+		}
+	})
+}
+
+// TestReadOnly_UpdateKeyStillFetches is the other half of the opt-in contract:
+// the automatic paths are gated, U is not. The `?` overlay advertises
+// `U check updates` on the read-only screen, so a gate that also caught the
+// keypress would leave the overlay promising a no-op.
+func TestReadOnly_UpdateKeyStillFetches(t *testing.T) {
+	m := newReadOnlyModel(t, readOnlyTestComposer())
+
+	result, cmd := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'U'}})
+	if cmd == nil {
+		t.Fatal("U must still force a CheckUpdates on the read-only screen")
+	}
+	if !result.(Model).updateInFlight {
+		t.Error("U did not mark updateInFlight")
 	}
 }

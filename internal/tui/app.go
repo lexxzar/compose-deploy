@@ -90,15 +90,28 @@ type RollbackPreparer interface {
 	PrepareRollback(ctx context.Context, entries map[string]compose.SnapshotEntry, services []string, w io.Writer) (func(), error)
 }
 
-// ComposerFactory creates a runner.Composer for the given project directory.
-type ComposerFactory func(projectDir string) runner.Composer
+// ReadOnlyComposer marks a composer whose write methods refuse. The method is
+// NAMED and returns a bool rather than being a marker: a method-less interface
+// is interface{}, which every composer satisfies, so m.readOnly() would be true
+// everywhere. Only *compose.HostContainers implements it; the TUI uses it to
+// gate the write keys (d/r/s/R/c/space/a), the selection widgets, the footer
+// and the `?` overlay.
+type ReadOnlyComposer interface {
+	ReadOnlyComposer() bool
+}
+
+// ComposerFactory creates a runner.Composer for the given project. It takes the
+// whole Project rather than a directory string because the synthetic unmanaged
+// row carries Unmanaged: true and an empty ConfigDir, and the factory must
+// branch on that to build a read-only *compose.HostContainers instead.
+type ComposerFactory func(proj compose.Project) runner.Composer
 
 // ProjectLoader loads the list of projects (local or remote).
 type ProjectLoader func(ctx context.Context) ([]compose.Project, error)
 
 // ConnectCallback is called when a remote server is selected. It returns
-// the SSH connect command (for tea.ExecProcess), a ComposerFactory,
-// a ProjectLoader, and a disconnect function.
+// the SSH connect command (for tea.ExecProcess), a ComposerFactory that takes
+// the selected compose.Project, a ProjectLoader, and a disconnect function.
 type ConnectCallback func(server config.Server) (connectCmd *exec.Cmd, factory ComposerFactory, loader ProjectLoader, disconnect func() error)
 
 const warnNoSelection = "No service is selected"
@@ -622,7 +635,11 @@ func NewModel(composer runner.Composer, logWriter io.Writer, factory ComposerFac
 		m.screen = screenSelectContainers
 		m.statsRequested = true
 		m.refreshInFlight = true // Init() will fire refreshStats; statsMsg arrival clears the flag
-		m.updateInFlight = true  // Init() will fire refreshUpdates on the fast-path; updatesMsg arrival clears the flag
+		// Init() fires refreshUpdates on the fast-path only when the composer
+		// permits an automatic check; a read-only one waits for U. The flag
+		// must track that decision — a true with no fetch behind it never
+		// clears, and maybeRefreshUpdatesCmd would refuse every later fetch.
+		m.updateInFlight = m.autoUpdatesAllowed()
 	}
 
 	return m
@@ -647,8 +664,15 @@ func (m Model) Init() tea.Cmd {
 	// Fast-path: standalone container screen on launch. updateInFlight was
 	// set by NewModel for the standalone case (mirrors refreshInFlight), so
 	// just fire the cmd directly. Cache is empty on first launch so no need
-	// for the maybe-fetch helper here.
-	return tea.Batch(m.loadServices(), m.refreshStats(), m.refreshUpdates(), tick)
+	// for the maybe-fetch helper here — but the opt-in gate still applies:
+	// a read-only composer handed straight to NewModel must not fan out to
+	// the registry before the user presses U. NewModel leaves updateInFlight
+	// clear in that case, so the two stay in step.
+	cmds := []tea.Cmd{m.loadServices(), m.refreshStats()}
+	if m.autoUpdatesAllowed() {
+		cmds = append(cmds, m.refreshUpdates())
+	}
+	return tea.Batch(append(cmds, tick)...)
 }
 
 func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
@@ -795,6 +819,13 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			} else if entry.results != nil {
 				m.hydrateUpdates(entry.results)
 			}
+		} else if !m.autoUpdatesAllowed() {
+			// The failure entry the warning described has expired and no
+			// automatic refetch will replace it here (U is the only trigger),
+			// so the warning is no longer current — drop it instead of leaving
+			// it on screen for the life of the read-only view. Cleared before
+			// fixSvcOffset below, which re-clamps the row the warning freed.
+			m.updatesErr = ""
 		}
 		m.fixSvcOffset()
 		// Self-heal: if no fresh cache entry exists (TTL expired or never
@@ -804,8 +835,10 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// periodic statusMsg — the overwrite above wipes UpdateAvailable
 		// and the cache lookup misses, so nothing replaces them. Mirror
 		// maybeRefreshUpdatesCmd's in-flight guard discipline so we never
-		// stack a second fetch.
-		if !fresh && !m.updateInFlight && m.composer != nil {
+		// stack a second fetch, and its autoUpdatesAllowed gate — otherwise
+		// the read-only screen would fire the unbounded host-wide registry
+		// fan-out on every 5-second status tick instead of never.
+		if !fresh && !m.updateInFlight && m.composer != nil && m.autoUpdatesAllowed() {
 			m.updateInFlight = true
 			return m, m.refreshUpdates()
 		}
@@ -1655,7 +1688,7 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			proj := m.projects[m.projCursor]
 			m.projName = proj.Name
 			m.projDir = proj.ConfigDir
-			m.composer = m.composerFactory(proj.ConfigDir)
+			m.composer = m.composerFactory(proj)
 			m.statsSession++
 			m.statusSession++
 			m.updatesSession++
@@ -1805,15 +1838,35 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			}
 			m.fixSvcOffset()
 		case " ":
+			// Multi-select exists only to feed d/r/s/R. On a read-only composer
+			// those are gated, so toggling would arm nothing — and the row
+			// checkbox is not rendered either (see viewSelectContainers).
+			//
+			// Every gated key below re-clamps before returning: the dispatch
+			// clears m.warning above, which frees the warning footer line and
+			// grows svcVisibleCount() by one, so a scrolled list would keep a
+			// too-large svcOffset and render a blank row at the bottom.
+			if m.readOnly() {
+				m.fixSvcOffset()
+				return m, nil
+			}
 			if len(m.services) > 0 {
 				m.selected[m.svcCursor] = !m.selected[m.svcCursor]
 			}
 		case "a":
+			if m.readOnly() {
+				m.fixSvcOffset()
+				return m, nil
+			}
 			allSel := m.allSelected()
 			for i := range m.services {
 				m.selected[i] = !allSel
 			}
 		case "r":
+			if m.readOnly() {
+				m.fixSvcOffset()
+				return m, nil
+			}
 			if m.selectedCount() > 0 {
 				m.pendingOp = runner.Restart
 				m.confirming = true
@@ -1822,6 +1875,10 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			}
 			m.fixSvcOffset()
 		case "d":
+			if m.readOnly() {
+				m.fixSvcOffset()
+				return m, nil
+			}
 			if m.selectedCount() > 0 {
 				m.pendingOp = runner.Deploy
 				m.confirming = true
@@ -1830,6 +1887,10 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			}
 			m.fixSvcOffset()
 		case "s":
+			if m.readOnly() {
+				m.fixSvcOffset()
+				return m, nil
+			}
 			if m.selectedCount() > 0 {
 				m.pendingOp = runner.StopOnly
 				m.confirming = true
@@ -1844,6 +1905,14 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			// the c/x type-assert guards). Guards mirror the action keys: an empty
 			// list is ignored (like l/x), an empty selection warns (like r/d/s).
 			// A fresh async ReadSnapshot decides warning vs confirmation.
+			// The readOnly gate is explicit rather than relying on the type
+			// assertion below (HostContainers is not a RollbackPreparer): an
+			// inert key that a help table still names is the failure mode this
+			// gate pairs with, so the gate and the table move together.
+			if m.readOnly() {
+				m.fixSvcOffset()
+				return m, nil
+			}
 			if _, ok := m.composer.(RollbackPreparer); !ok {
 				return m, nil
 			}
@@ -1902,6 +1971,13 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			}
 			return m.enterLogs()
 		case "c":
+			// Explicit gate for the same reason as R: HostContainers is not a
+			// ConfigProvider, so c already no-ops, but the gate keeps the key's
+			// absence from the read-only help table honest.
+			if m.readOnly() {
+				m.fixSvcOffset()
+				return m, nil
+			}
 			if _, ok := m.composer.(ConfigProvider); ok {
 				return m.enterConfig()
 			}
@@ -2459,10 +2535,10 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 				// invalidate otherwise (worst case: one extra CheckUpdates
 				// call). Skipping invalidation on `m.failed` keeps a stale
 				// cache rather than spuriously clearing user-visible state
-				// after a failed deploy. The cache key matches
-				// updatesCacheKey()'s format (projDir|serverName) so the
-				// next maybeRefreshUpdatesCmd misses, sees no in-flight
-				// fetch, and enqueues a fresh refresh. This block runs
+				// after a failed deploy. The key comes from
+				// updatesCacheKey(), so the next maybeRefreshUpdatesCmd
+				// misses, sees no in-flight fetch, and enqueues a fresh
+				// refresh. This block runs
 				// BEFORE the m.done/m.failed reset below — otherwise
 				// reading m.done after clearing it would always evaluate
 				// false and the invalidation would never fire.
@@ -3534,11 +3610,28 @@ func (m Model) refreshUpdates() tea.Cmd {
 }
 
 // updatesCacheKey returns the cache key for the current context. The format
-// is projDir + "|" + serverName. Empty serverName means local. For the
-// local-fast-track entry (no project picker), projDir is empty too, so the
-// key is just "|".
+// is projDir + "|" + serverName, prefixed with "unmanaged|" for the synthetic
+// unmanaged row. Empty serverName means local. For the local-fast-track entry
+// (no project picker), projDir is empty too, so the key is just "|".
+//
+// The prefix is load-bearing: the unmanaged row has an empty ConfigDir, so a
+// local unmanaged view would key "|" as well — a direct collision with the
+// fast-track slot. A fresh entry from either context would then suppress the
+// other's CheckUpdates for the full TTL, and hydrateUpdates would write one
+// context's verdicts onto any colliding service name (the phantom guard drops
+// only unknown names, not colliding ones).
+//
+// The prefix is derived from m.readOnly() rather than a parallel bool field:
+// the composer IS the context the cache describes, it is assigned and nil'd at
+// exactly the sites that would have had to clear such a field, and CLAUDE.md's
+// back-navigation cleanup discipline is the repo's most fragile invariant —
+// one forgotten site would silently mis-key the cache.
 func (m Model) updatesCacheKey() string {
-	return m.projDir + "|" + m.serverName
+	key := m.projDir + "|" + m.serverName
+	if m.readOnly() {
+		return "unmanaged|" + key
+	}
+	return key
 }
 
 // hydrateUpdates writes the verdicts from results into m.svcStatus, mutating
@@ -3643,8 +3736,34 @@ func (m *Model) maybeRefreshUpdatesCmd() tea.Cmd {
 		}
 		return nil
 	}
+	if !m.autoUpdatesAllowed() {
+		// Same reasoning as the statusMsg branch: the cached failure has
+		// expired and U is the only thing that can refresh it, so the stale
+		// warning must not survive into the new visit.
+		m.updatesErr = ""
+		return nil
+	}
 	m.updateInFlight = true
 	return m.refreshUpdates()
+}
+
+// autoUpdatesAllowed reports whether the update check may fire on its own.
+// It is false on a read-only composer, where U is the only trigger.
+//
+// A compose project bounds the check to one service list the user is actively
+// managing. The unmanaged view has no such bound: it is derived from
+// `docker ps -a`, so every leftover container on the host contributes a
+// distinct image, and every image costs one local inspect plus one REGISTRY
+// manifest request, run sequentially. Firing that on screen entry would spend
+// dozens of round-trips per visit and can exhaust the anonymous Docker Hub
+// manifest quota, which then breaks a real docker pull from the same host.
+//
+// The CLI reaches the same conclusion for the same reason — `list --updates`
+// is opt-in — so the read-only screen matches it: the glyph column stays blank
+// until the user asks for it, and the `?` overlay already advertises
+// `U check updates`.
+func (m Model) autoUpdatesAllowed() bool {
+	return !m.readOnly()
 }
 
 // refreshTick returns a Cmd that fires a refreshTickMsg after
@@ -4211,7 +4330,11 @@ func (m Model) viewSelectProject() string {
 		name := fmt.Sprintf("%-*s", maxNameLen, proj.Name)
 		b.WriteString(style.Render(cursor + name))
 		b.WriteString("   ")
-		b.WriteString(descStyle.Render(shortenPath(proj.ConfigDir)))
+		desc := shortenPath(proj.ConfigDir)
+		if proj.Desc != "" {
+			desc = proj.Desc
+		}
+		b.WriteString(descStyle.Render(desc))
 		b.WriteString("\n")
 	}
 
@@ -4254,12 +4377,33 @@ func (m Model) canGoBack() bool {
 	return true
 }
 
+// readOnly reports whether the active composer refuses every write. It gates
+// the write keys, the selection widgets, the footer and the `?` overlay, so
+// nothing advertises a no-op. Nil-safe: a Model{} test literal has no composer
+// and is not read-only, matching the compose path.
+func (m Model) readOnly() bool {
+	if m.composer == nil {
+		return false
+	}
+	ro, ok := m.composer.(ReadOnlyComposer)
+	return ok && ro.ReadOnlyComposer()
+}
+
 // containerHelpLines returns the IDLE container footer, the pair every other
 // footer state is measured against.
+//
+// A read-only composer gets a different pair: `space toggle` leaves line1
+// because multi-select is gated, and line2 swaps the three write-path tokens
+// for the two inspection keys that still work. containerFooterLines and
+// containerFooter both read this one helper, so the height math and the render
+// follow the variant for free.
 func (m Model) containerHelpLines() (line1, line2 string) {
 	back := "q quit"
 	if m.canGoBack() {
 		back = "q back"
+	}
+	if m.readOnly() {
+		return fmt.Sprintf("  %s  •  ? keys", back), "  l logs  •  x exec"
 	}
 	return fmt.Sprintf("  space toggle  •  %s  •  ? keys", back),
 		"  d deploy  •  r restart  •  l logs"
@@ -4270,7 +4414,15 @@ func (m Model) containerHelpLines() (line1, line2 string) {
 // substitution, and containerFooter pads the other states out to it:
 // svcVisibleCount reserves rows from this count, so a footer that shrank while
 // the search bar was open would grow the service list by one row and re-flow it
-// under the cursor. Idle is the widest of the three variants.
+// under the cursor. The count is therefore state-INDEPENDENT by design; do not
+// make it read the substituted footer.
+//
+// On the write path idle is also the widest variant, so the one-line branch it
+// picks always holds the substitutions too. The READ-ONLY pair inverts that:
+// its line2 (`l logs • x exec`, 19 cells) is SHORTER than the committed-search
+// substitution (`n/N cycle • esc clear`, 25), so the one-line branch chosen at
+// widths 43-46 does not hold. containerFooter clamps its rendered string for
+// that band rather than widening the count here, which would re-flow the list.
 //
 // line2[2:] strips its leading indent so the two halves join with a single
 // separator. ansi.StringWidth, not len: each • is 3 bytes but one display cell,
@@ -4285,13 +4437,20 @@ func (m Model) containerFooterLines() int {
 
 // containerFooter renders the container screen's help footer: six tokens —
 // `space toggle`, the back key and `? keys` on line1, `d deploy`, `r restart`
-// and `l logs` on line2. Every other binding on the screen lives only in the
-// `?` overlay (help.go).
+// and `l logs` on line2, or the read-only pair containerHelpLines returns for a
+// composer that refuses every write. Every other binding on the screen lives
+// only in the `?` overlay (help.go).
 //
 // line1 carries what must stay visible while line2 is replaced: a COMMITTED
 // search swaps line2 wholesale, and q and `?` still work in that state. While
 // the search input is OPEN neither key works, so the whole footer becomes the
 // two that do.
+//
+// Every rendered line is clamped to m.width, the same never-wrap guarantee
+// searchBarLine and logBarLine give. containerFooterLines picks one line or two
+// from the IDLE pair alone (it must stay state-independent, or the list
+// re-flows), so a substitution WIDER than the idle line2 can overrun a width
+// the idle pair fit — the read-only pair does exactly that at widths 43-46.
 func (m Model) containerFooter() string {
 	line1, line2 := m.containerHelpLines()
 	switch {
@@ -4305,23 +4464,23 @@ func (m Model) containerFooter() string {
 
 	if m.containerFooterLines() == 1 {
 		if line2 == "" {
-			return helpStyle.Render(line1)
+			return helpStyle.Render(clampToWidth(line1, m.width))
 		}
-		return helpStyle.Render(line1 + "  •  " + line2[2:])
+		return helpStyle.Render(clampToWidth(line1+"  •  "+line2[2:], m.width))
 	}
 	// A trailing newline pads the searching footer (line2 == "") out to the two
 	// reserved rows; lipgloss renders the empty half as a full-width blank line.
-	return helpStyle.Render(line1 + "\n" + line2)
+	return helpStyle.Render(clampToWidth(line1, m.width) + "\n" + clampToWidth(line2, m.width))
 }
 
 func (m Model) viewSelectContainers() string {
 	var b strings.Builder
-	b.WriteString(titleStyle.Render(fmt.Sprintf(
-		"%s > services (%d/%d selected)",
-		m.breadcrumb(),
-		m.selectedCount(),
-		len(m.services),
-	)))
+	readOnly := m.readOnly()
+	title := m.breadcrumb() + " > services"
+	if !readOnly {
+		title = fmt.Sprintf("%s (%d/%d selected)", title, m.selectedCount(), len(m.services))
+	}
+	b.WriteString(titleStyle.Render(title))
 
 	if m.services == nil && m.svcErr == nil {
 		b.WriteString("\n\n")
@@ -4462,8 +4621,13 @@ func (m Model) viewSelectContainers() string {
 			maxPorts = len("Ports")
 		}
 		// Left padding: cursor(2) + checkbox(3) + space(1) + health(1) + space(1) + dot(1) + space(1) = 10
+		// Read-only drops the checkbox but keeps the space that follows it: 10 - 3 = 7.
 		// Then the "Service" caption sits in the same column as service names.
-		header := strings.Repeat(" ", 10) + fmt.Sprintf("%-*s", maxName, "Service")
+		namePad := 10
+		if readOnly {
+			namePad = 7
+		}
+		header := strings.Repeat(" ", namePad) + fmt.Sprintf("%-*s", maxName, "Service")
 		if maxCreated > 0 {
 			header += fmt.Sprintf("  %-*s", maxCreated, "Created")
 		}
@@ -4492,9 +4656,14 @@ func (m Model) viewSelectContainers() string {
 			cursor = "> "
 		}
 
-		checkbox := checkboxOff.Render("[ ]")
-		if m.selected[i] {
-			checkbox = checkboxOn.Render("[x]")
+		// Read-only: no checkbox, and the space that follows it in the line format
+		// below keeps the 7-cell caption pad in lockstep.
+		checkbox := ""
+		if !readOnly {
+			checkbox = checkboxOff.Render("[ ]")
+			if m.selected[i] {
+				checkbox = checkboxOn.Render("[x]")
+			}
 		}
 
 		st := m.svcStatus[svc]

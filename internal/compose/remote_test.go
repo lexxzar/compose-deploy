@@ -2460,6 +2460,35 @@ func TestRemoteCheckUpdates_FallbackPath_ShellEscapesImage(t *testing.T) {
 	}
 }
 
+// TestRemoteCheckUpdates_NoDaemonCascade pins what keeps the daemon cascade
+// off the SSH path: the remote comparer never wraps errLocalImageInspect. The
+// docker CLI runs on the far side of the hop, so a daemon-shaped stderr there
+// is just a per-image docker failure — surfacing it as "local docker
+// unavailable" would name the wrong machine. Every image fails with a
+// daemon-shaped stderr and no service gets a verdict, which is exactly the
+// condition that fires the cascade on the local path.
+func TestRemoteCheckUpdates_NoDaemonCascade(t *testing.T) {
+	configJSON := `{"services":{"web":{"image":"nginx:latest"},"db":{"image":"postgres:16"}}}`
+	r := &RemoteCompose{
+		Host:       "user@example.com",
+		ProjectDir: "/app",
+		SocketPath: "/tmp/cdeploy-ctrl-abc-99",
+		outputCmd: func(cmd *exec.Cmd) ([]byte, error) {
+			if isRemoteShellCmd(cmd.Args, "compose") && isRemoteShellCmd(cmd.Args, "config") {
+				return []byte(configJSON), nil
+			}
+			return nil, fmt.Errorf("exit status 1: Cannot connect to the Docker daemon at unix:///var/run/docker.sock. Is the docker daemon running?")
+		},
+	}
+	got, err := r.CheckUpdates(context.Background(), nil)
+	if err != nil {
+		t.Fatalf("CheckUpdates: %v (the remote path must not run the daemon cascade)", err)
+	}
+	if len(got) != 0 {
+		t.Errorf("got = %#v, want empty map (every service unknown)", got)
+	}
+}
+
 // TestClassifySSHError_ControlMasterPatterns is the iteration-3 regression
 // for ControlMaster (persistent socket) failure modes: when the SSH mux
 // socket dies mid-batch, the stderr matches one of mux_client / client_loop /

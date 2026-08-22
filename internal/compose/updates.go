@@ -353,15 +353,46 @@ func (c *Compose) CheckUpdates(ctx context.Context, services []string) (map[stri
 	if err != nil {
 		return nil, err
 	}
-	wanted := filterServices(images, services)
+	return scanImageUpdates(ctx, filterServices(images, services), c.compareImageDigest)
+}
+
+// imageComparer is the per-image verdict function scanImageUpdates folds into
+// its result map. The contract matches compareImageDigestVia: (updated, ok,
+// err) where ok=true and err=nil is the only definitive verdict.
+type imageComparer func(ctx context.Context, image string) (bool, bool, error)
+
+// imageVerdict is one image's memoized comparison outcome inside
+// scanImageUpdates — the same (updated, ok, err) triple imageComparer returns.
+type imageVerdict struct {
+	updated bool
+	ok      bool
+	err     error
+}
+
+// scanImageUpdates compares every image in wanted and folds the per-image
+// outcomes into a verdict map plus the systemic-failure cascades. Services
+// whose comparison failed, or yielded no definitive answer, stay ABSENT from
+// the map so the caller renders the tri-state blank cell rather than a false
+// negative.
+//
+// All three diagnostics run unconditionally: which one can fire is decided by
+// the ERROR SHAPE the caller's comparer emits, not by a flag. Compose wraps a
+// failed local `docker image inspect` in errLocalImageInspect, and only that
+// sentinel reaches the daemon counters — RemoteCompose and HostContainers pass
+// a nil wrapper, so the daemon cascade cannot fire on the far side of an SSH
+// hop where "local docker unavailable" would name the wrong machine
+// (TestCompareImageDigest_SentinelBinding pins that binding on all three).
+// errSSHTransport likewise only exists on the remote runner, via
+// classifySSHError. A flag would only re-state what the sentinel already
+// decides — and fetchRemoteDigestVia already short-circuits on errSSHTransport
+// with no flag one call level below.
+//
+// A cascade fires only when NO service got a verdict — a partial hiccup (one
+// image not pulled while the rest resolve) must not blank an otherwise
+// correct screen. The transport abort is the one exception: it returns as soon
+// as the first errSSHTransport lands, verdicts collected so far included.
+func scanImageUpdates(ctx context.Context, wanted map[string]string, compare imageComparer) (map[string]bool, error) {
 	out := make(map[string]bool, len(wanted))
-	// Track per-image local AND remote-fetch outcomes so we can detect
-	// systemic failures. Two parallel cascades:
-	//   - localAttempts/localFailures/firstLocalErr drive the
-	//     "local docker unavailable" cascade (daemon stopped, socket
-	//     missing, no images pulled).
-	//   - remoteAttempts/networkFailures/firstNetErr drive the
-	//     "registry unreachable" cascade (DNS, x509, 429, etc.).
 	var (
 		localAttempts   int
 		localFailures   int
@@ -371,44 +402,66 @@ func (c *Compose) CheckUpdates(ctx context.Context, services []string) (map[stri
 		networkFailures int
 		firstNetErr     error
 	)
+	// Distinct images are compared ONCE. A compose project usually gives every
+	// service its own image, but host containers repeat one image constantly
+	// (three MCP sidecars off the same tag), and each comparison costs a local
+	// inspect plus up to two registry inspects — every one a separate SSH
+	// round-trip on a remote host. The cache also keeps the cascade ratios
+	// honest: each distinct image contributes exactly one attempt.
+	seen := make(map[string]imageVerdict, len(wanted))
 	for svc, img := range wanted {
-		localAttempts++
-		updated, ok, rerr := c.compareImageDigest(ctx, img)
-		if rerr != nil {
-			// Distinguish local-side vs remote-side errors. Local errors
-			// carry the errLocalImageInspect sentinel; everything else
-			// reached the remote fetch and failed there.
-			if errors.Is(rerr, errLocalImageInspect) {
-				localFailures++
-				// Only count this toward the cascade when the stderr
-				// looks like a daemon-down failure, not a benign per-
-				// image "No such image" (fresh deploy where images
-				// haven't been pulled yet). Without this gate, a multi-
-				// service fresh deploy fires the cascade and produces
-				// a confusing "local docker unavailable" diagnostic —
-				// matching RemoteCompose, which already classifies
-				// per-image failures via stderr content.
-				if looksLikeLocalDaemonErr(rerr) {
-					daemonFailures++
-					if firstDaemonErr == nil {
-						firstDaemonErr = rerr
+		v, cached := seen[img]
+		if !cached {
+			updated, ok, rerr := compare(ctx, img)
+			v = imageVerdict{updated: updated, ok: ok, err: rerr}
+			seen[img] = v
+			localAttempts++
+		}
+		if v.err != nil {
+			// Transport first: a dead SSH hop poisons every remaining
+			// image, so abort before any classification. Checked ahead of
+			// the sentinel dispatch below because the two buckets are
+			// independent and transport is the terminal one.
+			if errors.Is(v.err, errSSHTransport) {
+				return out, fmt.Errorf("remote update check transport failure: %w", v.err)
+			}
+			if !cached {
+				// Distinguish local-side vs remote-side errors. Local
+				// errors carry the errLocalImageInspect sentinel;
+				// everything else reached the remote fetch and failed
+				// there.
+				if errors.Is(v.err, errLocalImageInspect) {
+					localFailures++
+					// Only count this toward the cascade when the stderr
+					// looks like a daemon-down failure, not a benign per-
+					// image "No such image" (fresh deploy where images
+					// haven't been pulled yet). Without this gate, a multi-
+					// service fresh deploy fires the cascade and produces
+					// a confusing "local docker unavailable" diagnostic —
+					// matching RemoteCompose, which already classifies
+					// per-image failures via stderr content.
+					if looksLikeLocalDaemonErr(v.err) {
+						daemonFailures++
+						if firstDaemonErr == nil {
+							firstDaemonErr = v.err
+						}
+					}
+				} else {
+					remoteAttempts++
+					if looksLikeNetworkErr(v.err) {
+						networkFailures++
+						if firstNetErr == nil {
+							firstNetErr = v.err
+						}
 					}
 				}
-				continue
-			}
-			remoteAttempts++
-			if looksLikeNetworkErr(rerr) {
-				networkFailures++
-				if firstNetErr == nil {
-					firstNetErr = rerr
-				}
 			}
 			continue
 		}
-		if !ok {
+		if !v.ok {
 			continue
 		}
-		out[svc] = updated
+		out[svc] = v.updated
 	}
 	if len(out) == 0 {
 		// Local-docker cascade fires only when EVERY per-image local
@@ -427,11 +480,13 @@ func (c *Compose) CheckUpdates(ctx context.Context, services []string) (map[stri
 }
 
 // errLocalImageInspect is the sentinel wrapped around local
-// `docker image inspect` failures so CheckUpdates can distinguish local-
+// `docker image inspect` failures so scanImageUpdates can distinguish local-
 // side failures (daemon down, socket missing, image never pulled) from
 // remote-side failures (registry unreachable, manifest not found).
-// Sentinel-based dispatch keeps `compareImageDigest` returning a single
-// error type that callers can switch on via `errors.Is`.
+// Sentinel-based dispatch keeps `compareImageDigestVia` returning a single
+// error type that callers can switch on via `errors.Is`. Only the local
+// binding applies it (via wrapLocalImageInspectErr); the remote one passes a
+// nil wrapper, which is what keeps the daemon cascade off the SSH path.
 var errLocalImageInspect = errors.New("local image inspect failed")
 
 // Failure-classifier overview (three buckets, precedence enforced by callers):
@@ -567,28 +622,30 @@ func filterServices(all map[string]string, wanted []string) map[string]string {
 	return out
 }
 
-// compareImageDigest fetches the local and remote digests for image and
-// returns (updateAvailable, ok, err). ok=true with nil err means a
-// definitive verdict; ok=false with nil err means at least one side could
-// not be determined for a non-failure reason (parse returned empty, etc.).
-// ok=false with non-nil err means EITHER the local image inspect failed
-// (err wraps errLocalImageInspect — CheckUpdates uses errors.Is to drive
-// the local-docker cascade) OR the remote fetch failed with an error
-// that survived the imagetools→manifest fallback (caller inspects via
-// `looksLikeNetworkErr` to drive registry cascade).
+// wrapLocalImageInspectErr tags a failed local `docker image inspect` with the
+// errLocalImageInspect sentinel so scanImageUpdates routes it to the daemon
+// cascade instead of the registry one. It is the local half of
+// compareImageDigestVia's error-classification knob; the remote half passes nil
+// because a remote inspect failure is indistinguishable from any other
+// per-image docker error on the far side of the SSH hop.
+func wrapLocalImageInspectErr(err error) error {
+	return fmt.Errorf("%w: %w", errLocalImageInspect, err)
+}
+
+// compareImageDigestVia fetches the local and remote digests for image through
+// the dockerRunner seam and returns (updateAvailable, ok, err). ok=true with
+// nil err means a definitive verdict; ok=false with nil err means at least one
+// side could not be determined for a non-failure reason (parse returned empty,
+// etc.). ok=false with non-nil err means EITHER the local image inspect failed
+// (already passed through localErrWrap) OR the remote fetch failed with an
+// error that survived the imagetools→manifest fallback.
 //
-// The argv for both inspect calls bypasses c.command() because they are
-// top-level docker CLI commands, not compose subcommands; the outputCmd
-// test hook is still honored so the join logic is exercised without
-// invoking Docker.
-//
-// Stderr is captured explicitly via a strings.Builder (rather than relying
-// on cmd.Output's automatic ExitError.Stderr population, which works only
-// for *exec.ExitError) so test hooks producing non-ExitError failures still
-// surface stderr context, AND so the local Compose path mirrors the SSH
-// path's runRemoteDockerCmd capture convention. The classifier helpers
-// (looksLikeLocalDaemonErr, looksLikeNetworkErr) then inspect a single
-// uniform error text regardless of how the failure was produced.
+// The seam is the only local/remote variation point: every call is a TOP-LEVEL
+// docker CLI command, not a compose subcommand, so neither runner may route it
+// through command() / remoteCommand(). localErrWrap is the second variation
+// point — the two runners emit different error shapes, and only the local one
+// carries a sentinel the daemon cascade can dispatch on. A nil localErrWrap
+// passes the error through untouched.
 //
 // Multi-arch correctness: the remote-digest path tries
 // `docker buildx imagetools inspect` first (default human format —
@@ -598,24 +655,20 @@ func filterServices(all map[string]string, wanted []string) map[string]string {
 // imagetools call fails, we fall back to `docker manifest inspect
 // --verbose`. The fallback retains the multi-arch false-positive
 // limitation but preserves the feature on older Docker installs.
-func (c *Compose) compareImageDigest(ctx context.Context, image string) (bool, bool, error) {
-	localOut, lerr := c.runDockerCmd(ctx, imageInspectArgs(image))
+func compareImageDigestVia(ctx context.Context, d dockerRunner, image string, localErrWrap func(error) error) (bool, bool, error) {
+	localOut, lerr := d.run(ctx, imageInspectArgs(image)...)
 	if lerr != nil {
-		// Wrap with errLocalImageInspect so CheckUpdates can distinguish
-		// local-side failures (daemon down, socket missing, image never
-		// pulled) from remote-side failures (registry unreachable). Both
-		// cases are still "unknown" for the per-service render, but the
-		// systemic-failure cascade needs the distinction to pick the
-		// right diagnostic ("local docker unavailable" vs "registry
-		// unreachable").
-		return false, false, fmt.Errorf("%w: %w", errLocalImageInspect, lerr)
+		if localErrWrap != nil {
+			return false, false, localErrWrap(lerr)
+		}
+		return false, false, lerr
 	}
 	localDigest := parseLocalDigest(string(localOut), image)
 	if localDigest == "" {
 		return false, false, nil
 	}
 
-	remoteDigest, ok, rerr := c.fetchRemoteDigest(ctx, image)
+	remoteDigest, ok, rerr := fetchRemoteDigestVia(ctx, d, image)
 	if rerr != nil {
 		return false, false, rerr
 	}
@@ -625,34 +678,50 @@ func (c *Compose) compareImageDigest(ctx context.Context, image string) (bool, b
 	return localDigest != remoteDigest, true, nil
 }
 
-// fetchRemoteDigest queries the remote registry's manifest digest for
-// image, preferring `docker buildx imagetools inspect` (multi-arch-correct)
-// and falling back to `docker manifest inspect --verbose` when imagetools
-// is missing or fails. Returns (digest, true, nil) on a definitive verdict;
-// ("", false, nil) when the command succeeded but parsing yielded an
-// empty result (callers treat empty as "unknown" without polluting the
-// cascade counters); ("", false, err) only when BOTH paths failed AND the
-// last error survived — so the systemic-failure detector in CheckUpdates
-// sees a non-nil error only when both attempts hit something that
-// prevented digest retrieval.
-func (c *Compose) fetchRemoteDigest(ctx context.Context, image string) (string, bool, error) {
-	out, err := c.runDockerCmd(ctx, imagetoolsInspectArgs(image))
+// fetchRemoteDigestVia queries the registry's manifest digest for image through
+// the dockerRunner seam, preferring `docker buildx imagetools inspect`
+// (multi-arch-correct) and falling back to `docker manifest inspect --verbose`
+// when imagetools is missing or fails. Returns (digest, true, nil) on a
+// definitive verdict; ("", false, nil) when the command succeeded but parsing
+// yielded an empty result (callers treat empty as "unknown" without polluting
+// the cascade counters); ("", false, err) only when BOTH paths failed AND the
+// last error survived — so the systemic-failure detector in scanImageUpdates
+// sees a non-nil error only when both attempts hit something that prevented
+// digest retrieval.
+//
+// An errSSHTransport failure short-circuits the fallback: retrying over a dead
+// SSH hop only burns a round-trip, and the caller needs the sentinel intact to
+// abort the batch. The local runner never emits that sentinel, so the branch is
+// inert there.
+func fetchRemoteDigestVia(ctx context.Context, d dockerRunner, image string) (string, bool, error) {
+	out, err := d.run(ctx, imagetoolsInspectArgs(image)...)
 	if err == nil {
-		if d := parseImagetoolsDigest(out); d != "" {
-			return d, true, nil
+		if dg := parseImagetoolsDigest(out); dg != "" {
+			return dg, true, nil
 		}
+	} else if errors.Is(err, errSSHTransport) {
+		return "", false, err
 	}
 	// Fallback: `docker manifest inspect --verbose`. Multi-arch will be
 	// wrong here (per-platform descriptor digest); documented limitation.
-	out, err = c.runDockerCmd(ctx, manifestInspectArgs(image))
+	out, err = d.run(ctx, manifestInspectArgs(image)...)
 	if err != nil {
 		return "", false, err
 	}
-	d := parseManifestDigest(out)
-	if d == "" {
+	dg := parseManifestDigest(out)
+	if dg == "" {
 		return "", false, nil
 	}
-	return d, true, nil
+	return dg, true, nil
+}
+
+// compareImageDigest is Compose's binding of compareImageDigestVia: the local
+// dockerRunner (which routes through runDockerCmd, capturing stderr explicitly
+// so the classifier helpers see real stderr whether the command ran for real or
+// through the outputCmd test hook) plus the errLocalImageInspect wrapper that
+// drives the local-docker cascade.
+func (c *Compose) compareImageDigest(ctx context.Context, image string) (bool, bool, error) {
+	return compareImageDigestVia(ctx, localDockerRunner{c: c}, image, wrapLocalImageInspectErr)
 }
 
 // runDockerCmd runs a top-level `docker <args...>` command, bypassing

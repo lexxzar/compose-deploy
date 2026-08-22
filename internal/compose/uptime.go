@@ -59,8 +59,11 @@ func formatUptime(status string) string {
 	return compactDuration(remainder)
 }
 
-// healthSuffixRe matches trailing health annotations like (healthy), (unhealthy), (health: starting).
-var healthSuffixRe = regexp.MustCompile(`\s*\([^)]*\)\s*$`)
+// healthSuffixRe matches trailing health annotations like (healthy), (unhealthy),
+// (health: starting). The capture group holds the annotation body, which
+// parseHealthFromStatus (hostcontainers.go) reads; stripHealthSuffix below only
+// needs the whole match. One regex serves both so the grammar cannot drift.
+var healthSuffixRe = regexp.MustCompile(`\s*\(([^)]*)\)\s*$`)
 
 func stripHealthSuffix(s string) string {
 	return healthSuffixRe.ReplaceAllString(s, "")

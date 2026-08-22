@@ -98,12 +98,8 @@ Remote server configuration (~/.cdeploy/servers.yml):
 				return nil
 			}
 
-			factory := func(d string) runner.Composer {
-				lc := compose.New(d)
-				if localDetected {
-					lc.SetStandalone(localDetector.Standalone)
-				}
-				return lc
+			factory := func(proj compose.Project) runner.Composer {
+				return localComposerFor(proj, localDetector, localDetected)
 			}
 
 			// When the cwd has a compose file, try to detect the local
@@ -132,16 +128,14 @@ Remote server configuration (~/.cdeploy/servers.yml):
 					}
 					rc := compose.NewRemote(server.Host, projDir)
 					connectCmd := rc.ConnectCmd(cmd.Context())
-					remoteFactory := func(d string) runner.Composer {
-						newRC := compose.NewRemote(server.Host, d)
-						newRC.SetStandalone(rc.Standalone)
-						return newRC
+					remoteFactory := func(proj compose.Project) runner.Composer {
+						return remoteComposerFor(proj, rc)
 					}
 					loader := func(ctx context.Context) ([]compose.Project, error) {
 						if err := rc.Detect(ctx); err != nil {
 							return nil, err
 						}
-						return rc.ListProjects(ctx)
+						return projectsWithUnmanaged(ctx, rc, compose.NewRemoteHostContainers(rc))
 					}
 					return connectCmd, remoteFactory, loader, rc.Close
 				}
@@ -152,7 +146,7 @@ Remote server configuration (~/.cdeploy/servers.yml):
 				if err := detectLocal(ctx); err != nil {
 					return nil, err
 				}
-				return localDetector.ListProjects(ctx)
+				return projectsWithUnmanaged(ctx, localDetector, compose.NewLocalHostContainers(localDetector))
 			}
 
 			logger, err := logging.NewLogger(logDir)
@@ -202,4 +196,52 @@ Remote server configuration (~/.cdeploy/servers.yml):
 
 func Execute() error {
 	return NewRootCmd().Execute()
+}
+
+// projectLister is the ListProjects half of a composer, the only method
+// projectsWithUnmanaged needs. Both *compose.Compose and *compose.RemoteCompose
+// satisfy it.
+type projectLister interface {
+	ListProjects(ctx context.Context) ([]compose.Project, error)
+}
+
+// projectsWithUnmanaged is the body both TUI ProjectLoader literals share:
+// list the compose projects, then append the synthetic "(unmanaged)" row when
+// the host has containers carrying no compose project label. It lives at
+// package level because cmd/root_test.go cannot execute the root command
+// (the TUI needs a TTY), so a closure body would have no test seam.
+func projectsWithUnmanaged(ctx context.Context, lister projectLister, hc *compose.HostContainers) ([]compose.Project, error) {
+	projects, err := lister.ListProjects(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return compose.WithUnmanagedRow(ctx, hc, projects), nil
+}
+
+// localComposerFor is the local tui.ComposerFactory body. The synthetic
+// unmanaged row has no compose file and no ConfigDir, so it gets the read-only
+// host-container composer; every other row gets a Compose rooted at its config
+// directory, inheriting the plugin/standalone verdict when one was detected.
+func localComposerFor(proj compose.Project, detector *compose.Compose, detected bool) runner.Composer {
+	if proj.Unmanaged {
+		return compose.NewLocalHostContainers(detector)
+	}
+	lc := compose.New(proj.ConfigDir)
+	if detected {
+		lc.SetStandalone(detector.Standalone)
+	}
+	return lc
+}
+
+// remoteComposerFor is the remote twin of localComposerFor. The unmanaged row
+// reuses the LIVE RemoteCompose so the existing ControlMaster socket carries
+// the docker ps / stats / logs calls; a compose project gets a fresh composer
+// pointed at the same host.
+func remoteComposerFor(proj compose.Project, rc *compose.RemoteCompose) runner.Composer {
+	if proj.Unmanaged {
+		return compose.NewRemoteHostContainers(rc)
+	}
+	newRC := compose.NewRemote(rc.Host, proj.ConfigDir)
+	newRC.SetStandalone(rc.Standalone)
+	return newRC
 }
