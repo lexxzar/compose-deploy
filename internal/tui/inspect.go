@@ -33,7 +33,60 @@ const (
 	// level with the label of a value row rather than one step deeper — the
 	// entry is the whole row, not the value half of one.
 	inspectListIndent = 2
+
+	// inspectTabWidth is the tab stop tabs are expanded to before a value is
+	// measured. See expandTabs.
+	inspectTabWidth = 8
 )
+
+// expandTabs replaces every tab with spaces up to the next tab stop.
+// ansi.StringWidth counts a tab as ZERO cells while a terminal advances the
+// cursor to the next multiple of inspectTabWidth, so a tab-bearing value (a Go
+// or Java stack trace in a health probe's output, any env value carrying one)
+// measures narrow, wraps late and renders wider than the pane — which pushes
+// viewInspect past m.height and scrolls the title off. The substituted spaces
+// ARE what the terminal draws, so after this the measurement and the render
+// agree.
+func expandTabs(s string) string {
+	if !strings.Contains(s, "\t") {
+		return s
+	}
+	parts := strings.Split(s, "\t")
+	var out strings.Builder
+	col := 0
+	for i, part := range parts {
+		out.WriteString(part)
+		col += ansi.StringWidth(part)
+		if i == len(parts)-1 {
+			break
+		}
+		pad := inspectTabWidth - col%inspectTabWidth
+		out.WriteString(strings.Repeat(" ", pad))
+		col += pad
+	}
+	return out.String()
+}
+
+// sanitizeInspectLine makes one decoded line safe to write to a terminal.
+// Raw mode needs no equivalent: docker's JSON escapes a control byte into a
+// six-character backslash-u-0-0-1-b sequence, so it renders as text. The
+// summary decodes them back into real bytes, and an ENV value or a probe is
+// attacker-influenceable — a third-party image can carry an OSC 52 clipboard
+// write or a report/paste sequence, and ansi.StringWidth counts an escape
+// sequence as zero cells so both the wrap and the viewport pass it straight
+// through. ansi.Strip removes the escape sequences; the rune filter removes
+// what it leaves behind (BEL, CR, DEL, and the 8-bit C1 controls a terminal
+// reads as escape introducers). Tabs and newlines are dropped too: kv and
+// block split on the newline and expandTabs has already run, so a survivor
+// here is by definition not something to write out.
+func sanitizeInspectLine(line string) string {
+	return strings.Map(func(r rune) rune {
+		if r < 0x20 || r == 0x7f || (r >= 0x80 && r <= 0x9f) {
+			return -1
+		}
+		return r
+	}, ansi.Strip(line))
+}
 
 // wrapCells breaks one line into chunks of at most width display CELLS.
 // softWrapLine chunks by RUNE, which overruns the pane by up to 2x for a wide
@@ -45,6 +98,9 @@ const (
 // A single wide grapheme still occupies 2 cells, so a width of 1 is the one
 // case that cannot hold.
 func wrapCells(line string, width int) []string {
+	// Before the measurement, never after it: a tab expanded post-wrap would
+	// widen a chunk the wrap already declared to fit.
+	line = expandTabs(line)
 	if width <= 0 || ansi.StringWidth(line) <= width {
 		return []string{line}
 	}
@@ -59,17 +115,21 @@ type inspectBuilder struct {
 	lines []string
 }
 
-// push appends one already-fitted line, dropping trailing padding.
+// push appends one already-fitted line, dropping trailing padding. Every byte
+// docker decoded lands here, so this is the one chokepoint where a line is made
+// safe to write to a terminal — see sanitizeInspectLine.
 func (b *inspectBuilder) push(line string) {
-	b.lines = append(b.lines, strings.TrimRight(line, " "))
+	b.lines = append(b.lines, strings.TrimRight(sanitizeInspectLine(line), " "))
 }
 
 // section starts a named block, separated from the previous one by a blank line.
+// The title line bypasses push deliberately: it carries our own lipgloss style,
+// which IS an escape sequence, and push exists to strip those out.
 func (b *inspectBuilder) section(title string) {
 	if len(b.lines) > 0 {
 		b.push("")
 	}
-	b.push(clampToWidth("  "+helpGroupTitleStyle.Render(title), b.width))
+	b.lines = append(b.lines, clampToWidth("  "+helpGroupTitleStyle.Render(title), b.width))
 }
 
 // kv writes a "label   value" row. The value is soft-wrapped, with continuation

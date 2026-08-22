@@ -195,6 +195,41 @@ func TestBuildInspectSummary_NeverExceedsWidth(t *testing.T) {
 				RW:          true,
 			}},
 		}},
+		// A tab measures ZERO cells but a terminal advances to the next tab
+		// stop, so an unexpanded tab makes a line render wider than the pane it
+		// was measured against — the same class of failure as the wide runes
+		// below, reached through the whitespace a stack trace is full of.
+		"tabs": {doc: compose.InspectDoc{
+			Name: "tabbed",
+			State: compose.InspectState{
+				Status:  "running",
+				Running: true,
+				Health: &compose.InspectHealth{
+					Status:        "unhealthy",
+					FailingStreak: 1,
+					Log: []compose.InspectHealthLog{{
+						ExitCode: 1,
+						Output: "goroutine 1 [running]:\n\tmain.run()\n\t\t/app/main.go:42 +0x1c\n" +
+							strings.Repeat("\tframe\t", 10),
+					}},
+				},
+			},
+			Config: compose.InspectConfig{
+				Image: "app:1.0",
+				Cmd:   []string{"/app/server", "--flags\t--more"},
+				Env:   []string{"TABBED=a\tb\tc" + strings.Repeat("\tsegment", 8), "SHORT=1"},
+				Healthcheck: &compose.InspectHealthcheck{
+					Test:     []string{"CMD-SHELL", "printf 'a\tb'"},
+					Interval: 5 * time.Second,
+				},
+			},
+			Mounts: []compose.InspectMount{{
+				Type:        "bind",
+				Source:      "/srv/with\ttab",
+				Destination: "/data",
+				RW:          true,
+			}},
+		}},
 		"wide runes": {minWidth: 2, doc: compose.InspectDoc{
 			Name:         "\u30a6\u30a7\u30d6\u30b5\u30fc\u30d0\u30fc",
 			RestartCount: 1,
@@ -852,4 +887,118 @@ func envBlockLines(summary string) int {
 		return n
 	}
 	return 0
+}
+
+// TestExpandTabs pins the tab-stop expansion the width invariant depends on.
+// ansi.StringWidth counts a tab as zero cells, so a value carrying one measures
+// narrow, wraps late and renders past the pane edge.
+func TestExpandTabs(t *testing.T) {
+	tests := []struct {
+		name string
+		in   string
+		want string
+	}{
+		{"no tab", "plain value", "plain value"},
+		{"leading tab", "\tx", "        x"},
+		{"one column in", "a\tb", "a       b"},
+		{"exactly at a stop", "12345678\tx", "12345678        x"},
+		{"one before a stop", "1234567\tx", "1234567 x"},
+		{"consecutive", "a\t\tb", "a               b"},
+		{"stack trace", "\tmain.run()\n", "        main.run()\n"},
+		{"wide runes count cells", "\u3042\tx", "\u3042      x"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := expandTabs(tc.in); got != tc.want {
+				t.Errorf("expandTabs(%q) = %q, want %q", tc.in, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestBuildInspectSummary_StripsTerminalEscapes pins the sanitiser. Raw mode is
+// safe because docker's JSON escapes a control byte into printable text, but the
+// summary decodes them back, and an ENV value, a health probe's output, an image
+// ref or a mount path is attacker-influenceable: a third-party image can carry
+// an OSC 52 clipboard write, a title set or a report sequence straight onto the
+// operator's terminal. ansi.StringWidth counts an escape sequence as zero cells,
+// so neither the wrap nor the viewport would stop it.
+func TestBuildInspectSummary_StripsTerminalEscapes(t *testing.T) {
+	esc := "\x1b"
+	doc := compose.InspectDoc{
+		Name: "web" + esc + "]0;pwned\x07",
+		State: compose.InspectState{
+			Status:  "running",
+			Running: true,
+			Error:   "boom\x9b31m",
+			Health: &compose.InspectHealth{
+				Status: "unhealthy",
+				Log: []compose.InspectHealthLog{{
+					ExitCode: 1,
+					Output:   "probe failed " + esc + "[2J and " + esc + "]52;c;cGF5bG9hZA==\x07 done\rrewritten",
+				}},
+			},
+		},
+		Config: compose.InspectConfig{
+			Image: "nginx:1.27" + esc + "[31m",
+			Env: []string{
+				"MOTD=" + esc + "]0;pwned\x07hello",
+				"CLIP=" + esc + "]52;c;cGF5bG9hZA==\x07ok",
+			},
+			Healthcheck: &compose.InspectHealthcheck{Test: []string{"CMD", "true"}},
+		},
+		Mounts: []compose.InspectMount{{
+			Type:        "bind",
+			Source:      "/srv/" + esc + "[1;32mdata",
+			Destination: "/usr/share/nginx/html",
+			RW:          true,
+		}},
+	}
+
+	out := buildInspectSummary(doc, 120)
+	for _, banned := range []string{esc + "]", "\x07", "\r", "2J", "pwned", "cGF5bG9hZA==", "\x9b"} {
+		if strings.Contains(out, banned) {
+			t.Errorf("summary must not carry %q:\n%q", banned, out)
+		}
+	}
+	for _, want := range []string{"STATE", "ENV", "MOTD=hello", "CLIP=ok", "probe failed", "done", "nginx:1.27", "/srv/data"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("summary must keep the readable text %q:\n%s", want, out)
+		}
+	}
+}
+
+// TestBuildInspectSummary_ExpandsTabs pins the readable half of the tab fix.
+// The sanitiser drops a control byte, so a surviving tab would silently delete
+// the indentation of a stack trace instead of rendering it; expanding to the
+// tab stop first keeps the shape AND makes the measured width match what the
+// terminal draws.
+func TestBuildInspectSummary_ExpandsTabs(t *testing.T) {
+	doc := compose.InspectDoc{
+		State: compose.InspectState{
+			Status:  "running",
+			Running: true,
+			Health: &compose.InspectHealth{
+				Status: "unhealthy",
+				Log: []compose.InspectHealthLog{{
+					ExitCode: 1,
+					Output:   "goroutine 1 [running]:\n\tmain.run()\n\t\t/app/main.go:42",
+				}},
+			},
+		},
+	}
+
+	out := buildInspectSummary(doc, 120)
+	if strings.Contains(out, "\t") {
+		t.Errorf("no tab may reach the pane:\n%q", out)
+	}
+	// inspectBlockIndent (4) plus one and two tab stops (8 and 16).
+	for _, want := range []string{
+		strings.Repeat(" ", 12) + "main.run()",
+		strings.Repeat(" ", 20) + "/app/main.go:42",
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("probe indentation lost, missing %q:\n%s", want, out)
+		}
+	}
 }

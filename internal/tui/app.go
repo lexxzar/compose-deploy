@@ -2,6 +2,7 @@ package tui
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -1243,8 +1244,24 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.inspectErr = msg.err
 			return m, nil
 		}
+		if len(msg.data) == 0 {
+			// A call that succeeded and printed nothing. rebuildInspectSummary
+			// early-returns on empty bytes, so ParseInspect's own "empty
+			// output" error never fires and viewInspect would read
+			// "Loading..." for ever, with no error and no way to retry.
+			m.inspectErr = errors.New("docker inspect returned no output")
+			return m, nil
+		}
 		m.inspectRaw = msg.data
 		m.rebuildInspectSummary()
+		if m.inspectErr != nil {
+			// The parse failed and the raw bytes are the only content there is,
+			// so land the user on them instead of on an empty pane under an
+			// error line. Done HERE, on the transition into the error state,
+			// not in rebuildInspectSummary — that also runs on every resize,
+			// which would silently undo a later `r` back to the summary.
+			m.inspectShowRaw = true
+		}
 		m.setInspectContent()
 		return m, nil
 
@@ -3080,9 +3097,9 @@ func (m *Model) enterInspect() (tea.Model, tea.Cmd) {
 	// lines hundreds of columns wide (a LowerDir list, a JSON-escaped probe
 	// Output). The viewport hard-cuts at its width with no wrap, so without a
 	// horizontal step left/right are inert and everything past the edge is
-	// unreachable. 4 is the step enterLogs uses when wrap is off. The summary
-	// is wrapped to the width, so its longest line never exceeds the pane and
-	// SetXOffset clamps the offset to 0 there.
+	// unreachable. 4 is the step enterLogs uses when wrap is off. An offset
+	// left behind by a sideways scroll would blank the wrapped summary, so
+	// setInspectContent resets it on every buffer change.
 	m.inspectViewport.SetHorizontalStep(4)
 
 	m.screen = screenInspect
@@ -3155,10 +3172,9 @@ func (m *Model) rebuildInspectSummary() {
 	if err != nil {
 		m.inspectErr = err
 		m.inspectSummary = ""
-		// The raw bytes are the only content that exists now, so switch to
-		// them rather than leaving an error line above an empty pane and
-		// making the user guess that `r` is the way to the payload.
-		m.inspectShowRaw = true
+		// The mode is NOT forced here. The fetch handler switches to raw once,
+		// on the transition into the error state; this function also runs on
+		// every resize, and forcing it there would undo the user's `r`.
 		return
 	}
 	m.inspectErr = nil
@@ -3184,9 +3200,18 @@ func (m *Model) clearInspect() {
 func (m *Model) setInspectContent() {
 	if m.inspectShowRaw {
 		m.inspectViewport.SetContent(string(m.inspectRaw))
-		return
+	} else {
+		m.inspectViewport.SetContent(m.inspectSummary)
 	}
-	m.inspectViewport.SetContent(m.inspectSummary)
+	// The horizontal offset is reset with every buffer change, and that is
+	// load-bearing: SetContent keeps xOffset and GotoTop resets only YOffset,
+	// so a sideways scroll through the raw JSON would survive the `r` toggle.
+	// The summary is wrapped to the pane, so its longestLineWidth never exceeds
+	// the width — visibleLines() would then cut EVERY line at
+	// [xOffset, xOffset+width] and render a blank screen with no key that
+	// recovers it except an undocumented left. The raw path resets for the
+	// same reason on a resize that widens the pane past the longest line.
+	m.inspectViewport.SetXOffset(0)
 }
 
 // fetchInspect runs `docker inspect` for the service being inspected. The

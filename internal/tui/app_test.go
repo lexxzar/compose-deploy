@@ -16013,6 +16013,124 @@ func TestInspectScreen_RawModeScrollsSideways(t *testing.T) {
 	}
 }
 
+// inspectScrolledRawModel enters the inspect screen through the real `i` key,
+// switches to raw mode and scrolls it well to the right, which is the only way
+// to make the viewport's xOffset non-zero.
+func inspectScrolledRawModel(t *testing.T) Model {
+	t.Helper()
+	long := `[{"Name":"/proj-web-1","State":{"Status":"running","Running":true},` +
+		`"Config":{"Image":"` + strings.Repeat("very-long-image-segment-", 30) + `x"}}]`
+
+	mc := &mockInspectComposer{inspectRaw: []byte(long)}
+	mc.services = []string{"web"}
+	m := inspectTestModel(t, mc, mc.services)
+
+	result, cmd := m.Update(keyMsgFor("i"))
+	result, _ = result.(Model).Update(cmd())
+	result, _ = result.(Model).Update(keyMsgFor("r"))
+	raw := result.(Model)
+	if !raw.inspectShowRaw {
+		t.Fatal("precondition: r should enter raw mode")
+	}
+	for i := 0; i < 40; i++ {
+		result, _ = raw.Update(tea.KeyMsg{Type: tea.KeyRight})
+		raw = result.(Model)
+	}
+	if strings.Contains(raw.inspectViewport.View(), `"Name"`) {
+		t.Fatal("precondition: the pane should be scrolled past the left edge")
+	}
+	return raw
+}
+
+// TestInspectScreen_RToggleAfterSidewaysScrollKeepsSummaryOnScreen is the
+// companion pin to TestInspectScreen_RawModeScrollsSideways. The horizontal
+// step that test asks for is what makes xOffset reachable, and NEITHER
+// SetContent nor GotoTop resets one — SetContent recomputes the line widths and
+// GotoTop moves YOffset only. The summary is wrapped to the pane, so its
+// longest line never exceeds the width: visibleLines() then cuts EVERY line at
+// [xOffset, xOffset+width] and renders a blank pane under a correct title and
+// footer, with no key the footer advertises that recovers it.
+func TestInspectScreen_RToggleAfterSidewaysScrollKeepsSummaryOnScreen(t *testing.T) {
+	raw := inspectScrolledRawModel(t)
+
+	result, _ := raw.Update(keyMsgFor("r"))
+	back := result.(Model)
+	if back.inspectShowRaw {
+		t.Fatal("a second r should switch back to the summary")
+	}
+	view := back.inspectViewport.View()
+	for _, want := range []string{"STATE", "proj-web-1", "running"} {
+		if !strings.Contains(ansi.Strip(view), want) {
+			t.Errorf("the summary must still be on screen after a sideways scroll, missing %q:\n%s", want, view)
+		}
+	}
+}
+
+// TestInspectScreen_ResizeClearsStaleHorizontalOffset is the same stale offset
+// reached through the other writer: a resize that widens the pane past the raw
+// content's longest line leaves an offset that cuts the left edge off every
+// line. Both writers go through setInspectContent, so one reset covers them.
+func TestInspectScreen_ResizeClearsStaleHorizontalOffset(t *testing.T) {
+	raw := inspectScrolledRawModel(t)
+
+	result, _ := raw.Update(tea.WindowSizeMsg{Width: 200, Height: 40})
+	resized := result.(Model)
+	if !resized.inspectShowRaw {
+		t.Fatal("a resize must not change the mode")
+	}
+	if !strings.Contains(resized.inspectViewport.View(), `"Name"`) {
+		t.Errorf("the resized pane must show the left edge again:\n%s", resized.inspectViewport.View())
+	}
+}
+
+// TestInspectDataMsg_EmptyOutputIsAnError covers the one success shape that
+// produces no content: rebuildInspectSummary early-returns on empty bytes, so
+// ParseInspect's own "empty output" error never fires and the screen would read
+// "Loading..." for ever, with no error and nothing to retry.
+func TestInspectDataMsg_EmptyOutputIsAnError(t *testing.T) {
+	m := Model{screen: screenInspect, inspectSession: 1, inspectService: "web", width: 100, height: 24}
+	m.inspectViewport = viewport.New(96, 18)
+
+	result, _ := m.Update(inspectDataMsg{data: nil, session: 1})
+	model := result.(Model)
+
+	if model.inspectErr == nil {
+		t.Fatal("an empty payload should surface in the error slot")
+	}
+	view := ansi.Strip(model.viewInspect())
+	if strings.Contains(view, "Loading") {
+		t.Errorf("the fetch is over, so the screen must not read as loading:\n%s", view)
+	}
+	if !strings.Contains(view, "Error:") {
+		t.Errorf("the error line must render:\n%s", view)
+	}
+}
+
+// TestInspectScreen_ResizeKeepsTheChosenModeAfterAParseFailure pins where the
+// forced raw switch lives. rebuildInspectSummary runs on the fetch AND on every
+// resize; forcing the mode inside it would flip the user back to raw the next
+// time the terminal changed size, undoing their `r`.
+func TestInspectScreen_ResizeKeepsTheChosenModeAfterAParseFailure(t *testing.T) {
+	m := Model{screen: screenInspect, inspectSession: 1, inspectService: "web", width: 100, height: 24}
+	m.inspectViewport = viewport.New(96, 18)
+	result, _ := m.Update(inspectDataMsg{data: []byte("[]"), session: 1})
+	m = result.(Model)
+	if !m.inspectShowRaw {
+		t.Fatal("precondition: the fetch should switch to raw on a parse failure")
+	}
+
+	result, _ = m.Update(keyMsgFor("r"))
+	m = result.(Model)
+	if m.inspectShowRaw {
+		t.Fatal("precondition: r should leave raw mode")
+	}
+
+	result, _ = m.Update(tea.WindowSizeMsg{Width: 80, Height: 30})
+	if resized := result.(Model); resized.inspectShowRaw {
+		t.Error("a resize must not undo the user's r after a parse failure")
+	}
+}
+
 func TestViewInspect_RendersBreadcrumbAndFooter(t *testing.T) {
 	m := inspectScreenModel(t)
 	m.serverName = "prod"
