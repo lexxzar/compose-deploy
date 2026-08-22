@@ -15068,6 +15068,61 @@ func TestReadOnly_NoAutomaticUpdateFetch(t *testing.T) {
 	})
 }
 
+// TestReadOnly_InitFastPathHonoursOptIn closes the third automatic entry point.
+// maybeRefreshUpdatesCmd and the statusMsg self-heal both consult
+// autoUpdatesAllowed, but Init()'s picker-skipped fast path calls
+// refreshUpdates() directly — a read-only composer handed straight to NewModel
+// would fan out to the registry on launch, exactly what the opt-in exists to
+// prevent. NewModel must leave updateInFlight clear in that case too: a flag
+// with no fetch behind it never clears, and maybeRefreshUpdatesCmd's in-flight
+// guard would then refuse every later fetch, including the one U asks for.
+func TestReadOnly_InitFastPathHonoursOptIn(t *testing.T) {
+	// drain runs the Cmd Init returns, unwrapping the tea.BatchMsg and
+	// invoking every inner Cmd, so the composer records the calls the batch
+	// actually makes rather than the ones it merely queued.
+	drain := func(t *testing.T, cmd tea.Cmd) {
+		t.Helper()
+		if cmd == nil {
+			t.Fatal("Init returned no Cmd")
+		}
+		batch, ok := cmd().(tea.BatchMsg)
+		if !ok {
+			t.Fatal("Init did not return a batch")
+		}
+		for _, inner := range batch {
+			if inner != nil {
+				inner()
+			}
+		}
+	}
+
+	t.Run("read-only", func(t *testing.T) {
+		mc := readOnlyTestComposer()
+		m := NewModel(mc, io.Discard, func(compose.Project) runner.Composer { return mc }, nil, nil)
+		installFakeTick(&m)
+		if m.updateInFlight {
+			t.Error("NewModel marked updateInFlight for a read-only composer that Init will not fetch for")
+		}
+		drain(t, m.Init())
+		if mc.updatesCalls != 0 {
+			t.Errorf("Init fast path ran CheckUpdates %d times on a read-only composer; U must be the only trigger", mc.updatesCalls)
+		}
+	})
+
+	t.Run("writable control", func(t *testing.T) {
+		wc := &mockComposer{services: []string{"web"}}
+		m := NewModel(wc, io.Discard, mockFactory(wc), nil, nil)
+		installFakeTick(&m)
+		if !m.updateInFlight {
+			t.Error("control: NewModel must mark updateInFlight for the fetch Init fires")
+		}
+		drain(t, m.Init())
+		if wc.updatesCalls != 1 {
+			t.Errorf("control: writable Init fast path ran CheckUpdates %d times, want 1", wc.updatesCalls)
+		}
+	})
+}
+
 // TestReadOnly_UpdateKeyStillFetches is the other half of the opt-in contract:
 // the automatic paths are gated, U is not. The `?` overlay advertises
 // `U check updates` on the read-only screen, so a gate that also caught the

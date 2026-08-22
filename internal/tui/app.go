@@ -635,7 +635,11 @@ func NewModel(composer runner.Composer, logWriter io.Writer, factory ComposerFac
 		m.screen = screenSelectContainers
 		m.statsRequested = true
 		m.refreshInFlight = true // Init() will fire refreshStats; statsMsg arrival clears the flag
-		m.updateInFlight = true  // Init() will fire refreshUpdates on the fast-path; updatesMsg arrival clears the flag
+		// Init() fires refreshUpdates on the fast-path only when the composer
+		// permits an automatic check; a read-only one waits for U. The flag
+		// must track that decision — a true with no fetch behind it never
+		// clears, and maybeRefreshUpdatesCmd would refuse every later fetch.
+		m.updateInFlight = m.autoUpdatesAllowed()
 	}
 
 	return m
@@ -660,8 +664,15 @@ func (m Model) Init() tea.Cmd {
 	// Fast-path: standalone container screen on launch. updateInFlight was
 	// set by NewModel for the standalone case (mirrors refreshInFlight), so
 	// just fire the cmd directly. Cache is empty on first launch so no need
-	// for the maybe-fetch helper here.
-	return tea.Batch(m.loadServices(), m.refreshStats(), m.refreshUpdates(), tick)
+	// for the maybe-fetch helper here — but the opt-in gate still applies:
+	// a read-only composer handed straight to NewModel must not fan out to
+	// the registry before the user presses U. NewModel leaves updateInFlight
+	// clear in that case, so the two stay in step.
+	cmds := []tea.Cmd{m.loadServices(), m.refreshStats()}
+	if m.autoUpdatesAllowed() {
+		cmds = append(cmds, m.refreshUpdates())
+	}
+	return tea.Batch(append(cmds, tick)...)
 }
 
 func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
