@@ -170,14 +170,9 @@ func (rd remoteDockerRunner) stream(ctx context.Context, w io.Writer, args ...st
 }
 
 func (rd remoteDockerRunner) tty(ctx context.Context, args ...string) *exec.Cmd {
-	escaped := make([]string, 0, len(args)+1)
-	escaped = append(escaped, "docker")
-	for _, a := range args {
-		escaped = append(escaped, shellEscape(a))
-	}
 	sshArgv := rd.r.sshArgs(
 		[]string{"-t", "-S", rd.r.SocketPath, "-o", "ControlMaster=no"},
-		strings.Join(escaped, " "),
+		rd.r.remoteDockerCmdString(args),
 	)
 	return exec.CommandContext(ctx, "ssh", sshArgv...)
 }
@@ -326,54 +321,6 @@ func (h *HostContainers) ListServices(ctx context.Context) ([]string, error) {
 	return names, nil
 }
 
-// UnmanagedProjectName is the name of the synthetic project-picker row that
-// stands for the host containers carrying no compose project label. The
-// parentheses mark it as not a real project name.
-const UnmanagedProjectName = "(unmanaged)"
-
-// CountUnmanaged returns how many containers on the host carry no compose
-// project label.
-func (h *HostContainers) CountUnmanaged(ctx context.Context) (int, error) {
-	entries, err := h.unmanagedEntries(ctx)
-	if err != nil {
-		return 0, err
-	}
-	return len(entries), nil
-}
-
-// WithUnmanagedRow appends the synthetic unmanaged row to a project list when
-// the host has at least one unmanaged container. A count error is swallowed as
-// zero: the picker must still show the compose projects that did load.
-//
-// The append happens after ListProjects deliberately bypasses sortProjects —
-// that sorts case-insensitively by name, and "(" sorts before every letter, so
-// a sorted row would land first instead of last.
-func WithUnmanagedRow(ctx context.Context, hc *HostContainers, projects []Project) []Project {
-	if hc == nil {
-		return projects
-	}
-	n, err := hc.CountUnmanaged(ctx)
-	if err != nil {
-		// Deliberate swallow, kept as its own branch so it reads as a
-		// decision rather than sharing the empty-host path: a `docker ps`
-		// the SSH user cannot run must not cost the user the compose
-		// projects that DID load.
-		return projects
-	}
-	if n == 0 {
-		return projects
-	}
-	unit := "containers"
-	if n == 1 {
-		unit = "container"
-	}
-	return append(projects, Project{
-		Name:      UnmanagedProjectName,
-		Status:    fmt.Sprintf("%d %s", n, unit),
-		Unmanaged: true,
-	})
-}
-
 // hostContainerRunning reports whether a ps entry is up. State is the primary
 // source, but the `docker ps` JSON keys are reflected from the CLI's own
 // formatter and .State only exists on Docker CLI >= 20.10 — the same legacy
@@ -395,9 +342,6 @@ func (h *HostContainers) ContainerStatus(ctx context.Context) (map[string]runner
 	if err != nil {
 		return nil, err
 	}
-	if len(entries) == 0 {
-		return nil, nil
-	}
 	status := make(map[string]runner.ServiceStatus, len(entries))
 	for _, e := range entries {
 		st := runner.ServiceStatus{
@@ -416,13 +360,14 @@ func (h *HostContainers) ContainerStatus(ctx context.Context) (map[string]runner
 	return status, nil
 }
 
-// hostStatsArgs is the host-wide stats argv. It keeps the bare `json` keyword
-// that AllContainerStats already uses. That keyword needs Docker CLI >= 23.0,
-// so on the legacy hosts hostPsArgs takes the `{{json .}}` template form for,
-// this call renders the literal template and parseStatsOutput fails — the gap
-// is knowingly inherited from AllContainerStats rather than fixed only here,
-// and it degrades to the soft statsErr warning, leaving status intact.
-var hostStatsArgs = []string{"stats", "--no-stream", "--format", "json"}
+// hostStatsArgs is the host-wide stats argv. It takes the same `{{json .}}`
+// template form hostPsArgs does, for the same reason: the bare `json` keyword
+// only exists on Docker CLI >= 23.0, and this file supports the legacy hosts
+// Detect() does. The output is identical either way — the CLI rewrites the
+// keyword to exactly this template — so the two argv builders in this file
+// agree on one host-version position rather than arguing opposite ones.
+// AllContainerStats keeps the keyword; that is pre-existing and untouched here.
+var hostStatsArgs = []string{"stats", "--no-stream", "--format", "{{json .}}"}
 
 // ContainerStats returns CPU and memory usage for each unmanaged container,
 // keyed by container name.
@@ -444,7 +389,8 @@ func (h *HostContainers) ContainerStats(ctx context.Context) (map[string]runner.
 	// The join against an empty pair list is guaranteed empty, and
 	// `docker stats --no-stream` is a ~1.5s host-wide call (a full SSH
 	// round-trip remotely) that the 5s refresh tick would otherwise pay
-	// forever. Mirrors the early return ContainerStatus makes above.
+	// forever. The guard buys that saved call — ContainerStatus needs no
+	// counterpart, because its loop already yields an empty map for free.
 	if len(entries) == 0 {
 		return nil, nil
 	}

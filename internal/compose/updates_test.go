@@ -1110,3 +1110,74 @@ func TestFetchRemoteDigestVia_TransportErrorSkipsFallback(t *testing.T) {
 		t.Fatalf("run calls = %d (%v), want 1 — a dead hop must not be retried", len(f.runCalls), f.runCalls)
 	}
 }
+
+// --- transport abort ---
+//
+// scanImageUpdates aborts on the errSSHTransport sentinel, which only
+// RemoteCompose ever produces (via classifySSHError) — but the loop under test
+// is the shared one in updates.go, driven here with a stub comparer like every
+// other scanImageUpdates test in this file.
+
+// TestScanImageUpdates_TransportAbortStopsOnFirstError pins the early return:
+// a dead SSH hop fails every remaining image the same way, so the loop must
+// stop rather than burn the rest of the round-trips. The failure is injected
+// on the third call regardless of image, so the assertion does not depend on
+// Go's randomised map iteration order.
+func TestScanImageUpdates_TransportAbortStopsOnFirstError(t *testing.T) {
+	wanted := map[string]string{
+		"web":   "nginx:latest",
+		"db":    "postgres:16",
+		"cache": "redis:7",
+		"queue": "rabbitmq:3",
+		"proxy": "traefik:v3",
+	}
+	calls := 0
+	compare := func(_ context.Context, _ string) (bool, bool, error) {
+		calls++
+		if calls == 3 {
+			return false, false, fmt.Errorf("%w: exit status 255: ssh: connection lost", errSSHTransport)
+		}
+		return true, true, nil
+	}
+
+	got, err := scanImageUpdates(context.Background(), wanted, compare)
+	if err == nil {
+		t.Fatal("expected an error when the transport dies")
+	}
+	if !errors.Is(err, errSSHTransport) {
+		t.Errorf("err = %q, want errSSHTransport wrapped", err)
+	}
+	if !strings.Contains(err.Error(), "remote update check transport failure") {
+		t.Errorf("err = %q, want the remote transport diagnostic", err)
+	}
+	if calls != 3 {
+		t.Errorf("comparer called %d times, want 3 (abort on the failing call)", calls)
+	}
+	// The two verdicts collected before the abort still come back — the
+	// caller treats a partial map as untrusted, it is not discarded here.
+	if len(got) != 2 {
+		t.Errorf("partial map = %#v, want the 2 verdicts collected before the abort", got)
+	}
+}
+
+// TestScanImageUpdates_TransportAbortAbsorbsPerImageFailure is the negative
+// half: only errSSHTransport aborts. A per-image docker failure on the far
+// host (image not pulled, manifest auth) stays absorbed as the tri-state
+// absent, so a fresh deploy does not blank the column with a false transport
+// diagnostic.
+func TestScanImageUpdates_TransportAbortAbsorbsPerImageFailure(t *testing.T) {
+	wanted := map[string]string{"web": "nginx:latest", "db": "postgres:16"}
+	compare := scanFunc(t, map[string]scanOutcome{
+		"nginx:latest": {updated: true, ok: true},
+		"postgres:16":  {err: fmt.Errorf("exit status 1: Error: No such image: postgres:16")},
+	})
+
+	got, err := scanImageUpdates(context.Background(), wanted, compare)
+	if err != nil {
+		t.Fatalf("per-image failure aborted the batch: %v", err)
+	}
+	want := map[string]bool{"web": true}
+	if len(got) != len(want) || got["web"] != want["web"] {
+		t.Fatalf("results = %#v, want %#v (db absent → unknown)", got, want)
+	}
+}

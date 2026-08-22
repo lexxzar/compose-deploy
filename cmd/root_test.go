@@ -244,8 +244,8 @@ func TestProjectsWithUnmanaged_AppendsRow(t *testing.T) {
 	if last.Name != compose.UnmanagedProjectName || !last.Unmanaged {
 		t.Fatalf("last row = %+v, want the synthetic unmanaged row", last)
 	}
-	if last.Status != "2 containers" {
-		t.Errorf("unmanaged row status = %q, want %q", last.Status, "2 containers")
+	if last.Desc != "2 containers" {
+		t.Errorf("unmanaged row desc = %q, want %q", last.Desc, "2 containers")
 	}
 }
 
@@ -311,14 +311,14 @@ func TestRemoteComposerFor(t *testing.T) {
 	rc.SetStandalone(true)
 
 	t.Run("unmanaged row reuses the live RemoteCompose", func(t *testing.T) {
-		got := remoteComposerFor(compose.Project{Name: compose.UnmanagedProjectName, Unmanaged: true}, "prod.example.com", rc)
+		got := remoteComposerFor(compose.Project{Name: compose.UnmanagedProjectName, Unmanaged: true}, rc)
 		if _, ok := got.(*compose.HostContainers); !ok {
 			t.Fatalf("got %T, want *compose.HostContainers", got)
 		}
 	})
 
 	t.Run("compose row gets a RemoteCompose for its dir", func(t *testing.T) {
-		got := remoteComposerFor(compose.Project{Name: "my-app", ConfigDir: "/srv/my-app"}, "prod.example.com", rc)
+		got := remoteComposerFor(compose.Project{Name: "my-app", ConfigDir: "/srv/my-app"}, rc)
 		newRC, ok := got.(*compose.RemoteCompose)
 		if !ok {
 			t.Fatalf("got %T, want *compose.RemoteCompose", got)

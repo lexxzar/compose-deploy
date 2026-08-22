@@ -407,6 +407,70 @@ func TestHostContainers_ContainerStatus_CollapsesIPv6Mirror(t *testing.T) {
 	}
 }
 
+// TestHostContainers_ContainerStatus_RealFixture runs the fixture through the
+// whole ContainerStatus pipeline rather than only the field-name parse, so
+// parseCreatedAt, formatUptime, parseHealthFromStatus and parsePortsString are
+// all validated against real daemon output instead of the hand-written
+// hostPsMixed constant. The redis-scratch row is the one row appended by hand
+// to the capture: every real unmanaged container in it happened to publish no
+// ports, so without it the bracketed-IPv6 form never reaches the unmanaged
+// port pipeline in any test.
+func TestHostContainers_ContainerStatus_RealFixture(t *testing.T) {
+	data, err := os.ReadFile("testdata/docker_ps_host.json")
+	if err != nil {
+		t.Fatalf("reading fixture: %v", err)
+	}
+	h := &HostContainers{docker: &fakeDockerRunner{runOut: data}}
+
+	status, err := h.ContainerStatus(context.Background())
+	if err != nil {
+		t.Fatalf("ContainerStatus() error = %v", err)
+	}
+	for _, managed := range []string{"local-doc-mcp", "context7", "pgsql_local"} {
+		if _, ok := status[managed]; ok {
+			t.Errorf("compose-managed container %q leaked into the unmanaged status map", managed)
+		}
+	}
+
+	running, ok := status["elastic_dhawan"]
+	if !ok {
+		t.Fatalf("status has no elastic_dhawan: %+v", status)
+	}
+	if !running.Running {
+		t.Error("elastic_dhawan State is running; want Running true")
+	}
+	if running.Created != "2026-08-21 22:09" {
+		t.Errorf("Created = %q, want %q", running.Created, "2026-08-21 22:09")
+	}
+	if running.Uptime != "2h" {
+		t.Errorf("Uptime = %q, want %q", running.Uptime, "2h")
+	}
+
+	exited, ok := status["lucid_goodall"]
+	if !ok {
+		t.Fatalf("status has no lucid_goodall: %+v", status)
+	}
+	if exited.Running {
+		t.Error("lucid_goodall State is exited; want Running false")
+	}
+	if exited.Uptime != "" {
+		t.Errorf("Uptime = %q, want empty for an exited container", exited.Uptime)
+	}
+
+	ported, ok := status["redis-scratch"]
+	if !ok {
+		t.Fatalf("status has no redis-scratch: %+v", status)
+	}
+	if ported.Health != "healthy" {
+		t.Errorf("Health = %q, want %q", ported.Health, "healthy")
+	}
+	// The IPv4/IPv6 wildcard mirror collapses to one entry, exactly as the
+	// compose path does.
+	if got := FormatPorts(ported.Ports); got != "6379→6379" {
+		t.Errorf("Ports = %q, want %q", got, "6379→6379")
+	}
+}
+
 func TestHostContainers_ContainerStatus_Empty(t *testing.T) {
 	f := &fakeDockerRunner{runOut: []byte("")}
 	h := &HostContainers{docker: f}
@@ -415,8 +479,8 @@ func TestHostContainers_ContainerStatus_Empty(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ContainerStatus() error = %v", err)
 	}
-	if got != nil {
-		t.Errorf("got %v, want nil", got)
+	if len(got) != 0 {
+		t.Errorf("got %v, want an empty map", got)
 	}
 }
 
@@ -426,6 +490,54 @@ func TestHostContainers_ContainerStatus_RunError(t *testing.T) {
 
 	if _, err := h.ContainerStatus(context.Background()); err == nil {
 		t.Fatal("expected an error")
+	}
+}
+
+// TestHostContainerRunning pins the State fallback. .State only exists on
+// Docker CLI >= 20.10 — the same legacy hosts hostPsArgs takes the
+// `{{json .}}` template form for — and without the fallback every unmanaged
+// row on such a host renders a stopped dot beside a live Uptime, and x exec
+// refuses on a container that is plainly up.
+func TestHostContainerRunning(t *testing.T) {
+	tests := []struct {
+		name string
+		e    hostPsEntry
+		want bool
+	}{
+		{"state running", hostPsEntry{State: "running", Status: "Up 3 hours"}, true},
+		{"state exited", hostPsEntry{State: "exited", Status: "Exited (0) 2 hours ago"}, false},
+		{"state restarting", hostPsEntry{State: "restarting", Status: "Restarting (1) 3 seconds ago"}, false},
+		{"no state, status up", hostPsEntry{Status: "Up 3 hours (healthy)"}, true},
+		{"no state, status up padded", hostPsEntry{Status: "  Up 2 days"}, true},
+		{"no state, status exited", hostPsEntry{Status: "Exited (0) 2 hours ago"}, false},
+		{"no state, status created", hostPsEntry{Status: "Created"}, false},
+		{"no state, no status", hostPsEntry{}, false},
+		// State wins when present, even when Status disagrees — a container
+		// caught mid-transition must not be reported twice-over.
+		{"state beats status", hostPsEntry{State: "exited", Status: "Up 3 hours"}, false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := hostContainerRunning(tt.e); got != tt.want {
+				t.Errorf("hostContainerRunning(%+v) = %v, want %v", tt.e, got, tt.want)
+			}
+		})
+	}
+}
+
+// TestHostContainers_ContainerStatus_NoStateField is the end-to-end half of the
+// fallback: a legacy `docker ps` payload with no State key still renders the
+// running dot.
+func TestHostContainers_ContainerStatus_NoStateField(t *testing.T) {
+	legacy := `{"ID":"bbb444555666","Names":"watchtower","Image":"containrrr/watchtower","Status":"Up 2 days","Labels":""}`
+	h := &HostContainers{docker: &fakeDockerRunner{runOut: []byte(legacy)}}
+
+	status, err := h.ContainerStatus(context.Background())
+	if err != nil {
+		t.Fatalf("ContainerStatus() error = %v", err)
+	}
+	if !status["watchtower"].Running {
+		t.Errorf("status = %+v; a legacy ps with no State must fall back to Status", status)
 	}
 }
 
@@ -714,6 +826,84 @@ func TestHostContainers_CheckUpdates_DiscoveryError(t *testing.T) {
 	}
 }
 
+// TestHostContainers_CheckUpdates_MemoizesRepeatedImages pins the per-image
+// memo. A compose project usually gives every service its own image, but host
+// containers repeat one image constantly (the real capture has three
+// sequentialthinking sidecars), and each comparison costs a local inspect plus
+// a registry inspect — every one a separate SSH round-trip on a remote host.
+func TestHostContainers_CheckUpdates_MemoizesRepeatedImages(t *testing.T) {
+	ps := `{"ID":"aaa111222333","Names":"mcp-a","Image":"mcp/sequentialthinking","Labels":""}
+{"ID":"bbb444555666","Names":"mcp-b","Image":"mcp/sequentialthinking","Labels":""}
+{"ID":"ccc777888999","Names":"mcp-c","Image":"mcp/sequentialthinking","Labels":""}`
+	f := hostUpdatesRunner(ps, map[string]hostDigests{
+		"mcp/sequentialthinking": {local: "mcp/sequentialthinking@" + digestOld, remote: digestNew},
+	})
+	h := &HostContainers{docker: f}
+
+	got, err := h.CheckUpdates(context.Background(), nil)
+	if err != nil {
+		t.Fatalf("CheckUpdates() error = %v", err)
+	}
+	for _, svc := range []string{"mcp-a", "mcp-b", "mcp-c"} {
+		if !got[svc] {
+			t.Errorf("results[%q] = %v, want true for every container on the shared image", svc, got[svc])
+		}
+	}
+	var inspects int
+	for _, call := range f.runCalls {
+		if call[0] != "ps" {
+			inspects++
+		}
+	}
+	// One `docker image inspect` plus one `docker buildx imagetools inspect`
+	// for the ONE distinct image — not three of each.
+	if inspects != 2 {
+		t.Errorf("inspect calls = %d (%v), want 2 — the distinct image must be compared once", inspects, f.runCalls)
+	}
+}
+
+// TestCompareImageDigest_SentinelBinding pins each composer's local-error
+// wrapper directly. The daemon cascade dispatches on the errLocalImageInspect
+// sentinel alone, so which composer applies it IS the design decision — a test
+// that only drives CheckUpdates cannot tell a missing wrapper from a failure
+// the cascade classifier rejected.
+func TestCompareImageDigest_SentinelBinding(t *testing.T) {
+	daemonDown := errors.New("Cannot connect to the Docker daemon at unix:///var/run/docker.sock")
+
+	t.Run("Compose carries the sentinel", func(t *testing.T) {
+		c := New(t.TempDir())
+		c.SetTestHooks(nil, func(*exec.Cmd) ([]byte, error) { return nil, daemonDown })
+		_, _, err := c.compareImageDigest(context.Background(), "nginx:1.27")
+		if !errors.Is(err, errLocalImageInspect) {
+			t.Fatalf("err = %v, want the errLocalImageInspect sentinel — the local daemon cascade dispatches on it", err)
+		}
+	})
+
+	t.Run("RemoteCompose does not", func(t *testing.T) {
+		rc := NewRemote("prod.example.com", "/srv/app")
+		rc.SetTestHooks(nil, func(*exec.Cmd) ([]byte, error) { return nil, daemonDown })
+		_, _, err := rc.compareImageDigest(context.Background(), "nginx:1.27")
+		if err == nil {
+			t.Fatal("expected an error")
+		}
+		if errors.Is(err, errLocalImageInspect) {
+			t.Error("the remote path must NOT carry errLocalImageInspect: the docker CLI runs on the far side of the SSH hop, so 'local docker unavailable' would name the wrong machine")
+		}
+	})
+
+	t.Run("HostContainers does not", func(t *testing.T) {
+		f := &fakeDockerRunner{runErr: daemonDown}
+		h := &HostContainers{docker: f}
+		_, _, err := h.compareImageDigest(context.Background(), "nginx:1.27")
+		if err == nil {
+			t.Fatal("expected an error")
+		}
+		if errors.Is(err, errLocalImageInspect) {
+			t.Error("HostContainers must NOT carry errLocalImageInspect: the same binding serves the remote runner, where the failure is on the far side of the SSH hop")
+		}
+	})
+}
+
 // TestHostImageMap_DropsEmptyImage pins the guard: an entry with no image
 // reference would turn `docker image inspect` into a malformed call whose
 // failure would pollute the cascade counters.
@@ -724,6 +914,39 @@ func TestHostImageMap_DropsEmptyImage(t *testing.T) {
 	})
 	if len(got) != 1 || got["keeper"] != "nginx:1.27" {
 		t.Fatalf("hostImageMap() = %v, want only the entry with an image", got)
+	}
+}
+
+// TestHostImageMap_SkipsBareImageIDs pins the update-scan input filter. A
+// container whose image carries no repository tag reports a bare image ID, and
+// no registry can be asked about a ref with no repository — so it can only ever
+// produce the tri-state absent, while costing a wasted round-trip per
+// hand-started container and skewing the cascade ratios.
+func TestHostImageMap_SkipsBareImageIDs(t *testing.T) {
+	entries := []hostPsEntry{
+		{Names: "watchtower", Image: "containrrr/watchtower:1.7"},
+		{Names: "short-id", Image: "9c2ddb0e3cca"},
+		{Names: "long-id", Image: strings.Repeat("a", 64)},
+		{Names: "no-image", Image: ""},
+		{Names: "", Image: "nginx:1.27"},
+		// A repository that merely LOOKS hex-ish still has a tag, so it stays.
+		{Names: "tagged-hex", Image: "9c2ddb0e3cca:latest"},
+		{Names: "registry-hex", Image: "registry.example.com/9c2ddb0e3cca"},
+	}
+
+	got := hostImageMap(entries)
+	want := map[string]string{
+		"watchtower":   "containrrr/watchtower:1.7",
+		"tagged-hex":   "9c2ddb0e3cca:latest",
+		"registry-hex": "registry.example.com/9c2ddb0e3cca",
+	}
+	if len(got) != len(want) {
+		t.Fatalf("hostImageMap() = %v, want %v", got, want)
+	}
+	for k, v := range want {
+		if got[k] != v {
+			t.Errorf("hostImageMap()[%q] = %q, want %q", k, got[k], v)
+		}
 	}
 }
 
@@ -881,7 +1104,7 @@ func TestHostContainers_ContainerStats(t *testing.T) {
 	if len(f.runCalls) != 2 {
 		t.Fatalf("run calls = %v, want a ps call and a stats call", f.runCalls)
 	}
-	wantStats := "stats --no-stream --format json"
+	wantStats := "stats --no-stream --format {{json .}}"
 	if got := strings.Join(f.runCalls[1], " "); got != wantStats {
 		t.Errorf("stats argv = %q, want %q", got, wantStats)
 	}
@@ -915,6 +1138,29 @@ func TestHostContainers_ContainerStats_NoneRunning(t *testing.T) {
 	}
 	if len(got) != 0 {
 		t.Errorf("ContainerStats() = %+v, want empty", got)
+	}
+}
+
+// TestHostContainers_ContainerStats_SkipsStatsCallWhenEmpty pins the guard that
+// keeps the ~1.5s host-wide `docker stats` (a full SSH round-trip remotely) off
+// the 5s refresh tick when the host has no unmanaged containers at all: the
+// join against an empty pair list is guaranteed empty.
+func TestHostContainers_ContainerStats_SkipsStatsCallWhenEmpty(t *testing.T) {
+	allManaged := `{"ID":"aaa111222333","Names":"web","Labels":"com.docker.compose.project=my-app"}`
+	f := &fakeDockerRunner{runOut: []byte(allManaged)}
+	h := &HostContainers{docker: f}
+
+	got, err := h.ContainerStats(context.Background())
+	if err != nil {
+		t.Fatalf("ContainerStats() error = %v", err)
+	}
+	if len(got) != 0 {
+		t.Errorf("stats = %v, want empty", got)
+	}
+	for _, call := range f.runCalls {
+		if call[0] == "stats" {
+			t.Errorf("docker stats ran with zero unmanaged containers: %v", f.runCalls)
+		}
 	}
 }
 
@@ -1152,394 +1398,4 @@ func TestHostContainers_ExecCommand_RemoteAllocatesTTY(t *testing.T) {
 	if !strings.Contains(remoteCmd, "exec bash") {
 		t.Errorf("remote command = %q, want the DefaultExecCommand fallback shell", remoteCmd)
 	}
-}
-
-func TestHostContainers_CountUnmanaged(t *testing.T) {
-	tests := []struct {
-		name string
-		ps   string
-		want int
-	}{
-		{
-			name: "mixed",
-			ps:   hostPsMixed,
-			want: 3,
-		},
-		{
-			name: "all managed",
-			ps: `{"ID":"aaa111222333","Names":"web","State":"running","Labels":"com.docker.compose.project=my-app"}
-{"ID":"bbb444555666","Names":"db","State":"running","Labels":"com.docker.compose.project=my-app"}`,
-			want: 0,
-		},
-		{
-			name: "none at all",
-			ps:   "",
-			want: 0,
-		},
-		{
-			name: "single unmanaged",
-			ps:   `{"ID":"bbb444555666","Names":"watchtower","State":"running","Labels":""}`,
-			want: 1,
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			h := &HostContainers{docker: &fakeDockerRunner{runOut: []byte(tt.ps)}}
-			got, err := h.CountUnmanaged(context.Background())
-			if err != nil {
-				t.Fatalf("CountUnmanaged() error = %v", err)
-			}
-			if got != tt.want {
-				t.Errorf("CountUnmanaged() = %d, want %d", got, tt.want)
-			}
-		})
-	}
-}
-
-func TestHostContainers_CountUnmanaged_Error(t *testing.T) {
-	h := &HostContainers{docker: &fakeDockerRunner{runErr: errors.New("docker daemon not running")}}
-
-	got, err := h.CountUnmanaged(context.Background())
-	if err == nil {
-		t.Fatal("CountUnmanaged() error = nil, want error")
-	}
-	if got != 0 {
-		t.Errorf("CountUnmanaged() = %d, want 0 on error", got)
-	}
-}
-
-func TestWithUnmanagedRow(t *testing.T) {
-	base := []Project{
-		{Name: "my-app", Status: "running(3)", ConfigDir: "/srv/my-app"},
-		{Name: "other", Status: "running(1)", ConfigDir: "/srv/other"},
-	}
-
-	tests := []struct {
-		name       string
-		ps         string
-		runErr     error
-		wantExtra  bool
-		wantStatus string
-	}{
-		{name: "appended when non-zero", ps: hostPsMixed, wantExtra: true, wantStatus: "3 containers"},
-		{name: "singular when one", ps: `{"ID":"bbb444555666","Names":"watchtower","Labels":""}`, wantExtra: true, wantStatus: "1 container"},
-		{name: "absent when zero", ps: `{"ID":"aaa111222333","Names":"web","Labels":"com.docker.compose.project=my-app"}`},
-		// CountUnmanaged returns (0, err) on every failure, so this case can
-		// only ever exercise the same outcome as "absent when zero". It pins
-		// the CONTRACT — a discovery failure must never invent a row — and
-		// would catch a future CountUnmanaged that returned a partial count
-		// alongside an error.
-		{name: "absent on error", runErr: errors.New("boom")},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			h := &HostContainers{docker: &fakeDockerRunner{runOut: []byte(tt.ps), runErr: tt.runErr}}
-			got := WithUnmanagedRow(context.Background(), h, append([]Project(nil), base...))
-
-			if !tt.wantExtra {
-				if len(got) != len(base) {
-					t.Fatalf("projects = %+v, want no extra row", got)
-				}
-				return
-			}
-			if len(got) != len(base)+1 {
-				t.Fatalf("projects = %+v, want one extra row", got)
-			}
-			row := got[len(got)-1]
-			if row.Name != UnmanagedProjectName {
-				t.Errorf("row name = %q, want %q", row.Name, UnmanagedProjectName)
-			}
-			if row.Status != tt.wantStatus {
-				t.Errorf("row status = %q, want %q", row.Status, tt.wantStatus)
-			}
-			if !row.Unmanaged {
-				t.Error("row Unmanaged = false, want true")
-			}
-			if row.ConfigDir != "" {
-				t.Errorf("row ConfigDir = %q, want empty", row.ConfigDir)
-			}
-		})
-	}
-}
-
-// TestWithUnmanagedRow_AlwaysLast pins that the row bypasses sortProjects: "("
-// sorts before every letter, so a sorted row would land first.
-func TestWithUnmanagedRow_AlwaysLast(t *testing.T) {
-	projects := []Project{{Name: "zebra"}, {Name: "alpha"}}
-	h := &HostContainers{docker: &fakeDockerRunner{runOut: []byte(hostPsMixed)}}
-
-	got := WithUnmanagedRow(context.Background(), h, projects)
-	if len(got) != 3 {
-		t.Fatalf("projects = %+v, want 3 rows", got)
-	}
-	if got[0].Name != "zebra" || got[1].Name != "alpha" {
-		t.Errorf("existing order changed: %+v", got)
-	}
-	if !got[2].Unmanaged {
-		t.Errorf("last row = %+v, want the unmanaged row", got[2])
-	}
-}
-
-func TestWithUnmanagedRow_NilComposer(t *testing.T) {
-	projects := []Project{{Name: "my-app"}}
-	if got := WithUnmanagedRow(context.Background(), nil, projects); len(got) != 1 {
-		t.Errorf("projects = %+v, want the input unchanged", got)
-	}
-}
-
-func TestWithUnmanagedRow_EmptyProjectList(t *testing.T) {
-	h := &HostContainers{docker: &fakeDockerRunner{runOut: []byte(hostPsMixed)}}
-
-	got := WithUnmanagedRow(context.Background(), h, nil)
-	if len(got) != 1 || !got[0].Unmanaged {
-		t.Fatalf("projects = %+v, want the unmanaged row alone", got)
-	}
-}
-
-// TestHostContainers_ContainerStatus_RealFixture runs the fixture through the
-// whole ContainerStatus pipeline rather than only the field-name parse, so
-// parseCreatedAt, formatUptime, parseHealthFromStatus and parsePortsString are
-// all validated against real daemon output instead of the hand-written
-// hostPsMixed constant. The redis-scratch row is the one row appended by hand
-// to the capture: every real unmanaged container in it happened to publish no
-// ports, so without it the bracketed-IPv6 form never reaches the unmanaged
-// port pipeline in any test.
-func TestHostContainers_ContainerStatus_RealFixture(t *testing.T) {
-	data, err := os.ReadFile("testdata/docker_ps_host.json")
-	if err != nil {
-		t.Fatalf("reading fixture: %v", err)
-	}
-	h := &HostContainers{docker: &fakeDockerRunner{runOut: data}}
-
-	status, err := h.ContainerStatus(context.Background())
-	if err != nil {
-		t.Fatalf("ContainerStatus() error = %v", err)
-	}
-	for _, managed := range []string{"local-doc-mcp", "context7", "pgsql_local"} {
-		if _, ok := status[managed]; ok {
-			t.Errorf("compose-managed container %q leaked into the unmanaged status map", managed)
-		}
-	}
-
-	running, ok := status["elastic_dhawan"]
-	if !ok {
-		t.Fatalf("status has no elastic_dhawan: %+v", status)
-	}
-	if !running.Running {
-		t.Error("elastic_dhawan State is running; want Running true")
-	}
-	if running.Created != "2026-08-21 22:09" {
-		t.Errorf("Created = %q, want %q", running.Created, "2026-08-21 22:09")
-	}
-	if running.Uptime != "2h" {
-		t.Errorf("Uptime = %q, want %q", running.Uptime, "2h")
-	}
-
-	exited, ok := status["lucid_goodall"]
-	if !ok {
-		t.Fatalf("status has no lucid_goodall: %+v", status)
-	}
-	if exited.Running {
-		t.Error("lucid_goodall State is exited; want Running false")
-	}
-	if exited.Uptime != "" {
-		t.Errorf("Uptime = %q, want empty for an exited container", exited.Uptime)
-	}
-
-	ported, ok := status["redis-scratch"]
-	if !ok {
-		t.Fatalf("status has no redis-scratch: %+v", status)
-	}
-	if ported.Health != "healthy" {
-		t.Errorf("Health = %q, want %q", ported.Health, "healthy")
-	}
-	// The IPv4/IPv6 wildcard mirror collapses to one entry, exactly as the
-	// compose path does.
-	if got := FormatPorts(ported.Ports); got != "6379→6379" {
-		t.Errorf("Ports = %q, want %q", got, "6379→6379")
-	}
-}
-
-// TestHostContainerRunning pins the State fallback. .State only exists on
-// Docker CLI >= 20.10 — the same legacy hosts hostPsArgs takes the
-// `{{json .}}` template form for — and without the fallback every unmanaged
-// row on such a host renders a stopped dot beside a live Uptime, and x exec
-// refuses on a container that is plainly up.
-func TestHostContainerRunning(t *testing.T) {
-	tests := []struct {
-		name string
-		e    hostPsEntry
-		want bool
-	}{
-		{"state running", hostPsEntry{State: "running", Status: "Up 3 hours"}, true},
-		{"state exited", hostPsEntry{State: "exited", Status: "Exited (0) 2 hours ago"}, false},
-		{"state restarting", hostPsEntry{State: "restarting", Status: "Restarting (1) 3 seconds ago"}, false},
-		{"no state, status up", hostPsEntry{Status: "Up 3 hours (healthy)"}, true},
-		{"no state, status up padded", hostPsEntry{Status: "  Up 2 days"}, true},
-		{"no state, status exited", hostPsEntry{Status: "Exited (0) 2 hours ago"}, false},
-		{"no state, status created", hostPsEntry{Status: "Created"}, false},
-		{"no state, no status", hostPsEntry{}, false},
-		// State wins when present, even when Status disagrees — a container
-		// caught mid-transition must not be reported twice-over.
-		{"state beats status", hostPsEntry{State: "exited", Status: "Up 3 hours"}, false},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			if got := hostContainerRunning(tt.e); got != tt.want {
-				t.Errorf("hostContainerRunning(%+v) = %v, want %v", tt.e, got, tt.want)
-			}
-		})
-	}
-}
-
-// TestHostContainers_ContainerStatus_NoStateField is the end-to-end half of the
-// fallback: a legacy `docker ps` payload with no State key still renders the
-// running dot.
-func TestHostContainers_ContainerStatus_NoStateField(t *testing.T) {
-	legacy := `{"ID":"bbb444555666","Names":"watchtower","Image":"containrrr/watchtower","Status":"Up 2 days","Labels":""}`
-	h := &HostContainers{docker: &fakeDockerRunner{runOut: []byte(legacy)}}
-
-	status, err := h.ContainerStatus(context.Background())
-	if err != nil {
-		t.Fatalf("ContainerStatus() error = %v", err)
-	}
-	if !status["watchtower"].Running {
-		t.Errorf("status = %+v; a legacy ps with no State must fall back to Status", status)
-	}
-}
-
-// TestHostContainers_ContainerStats_SkipsStatsCallWhenEmpty pins the guard that
-// keeps the ~1.5s host-wide `docker stats` (a full SSH round-trip remotely) off
-// the 5s refresh tick when the host has no unmanaged containers at all: the
-// join against an empty pair list is guaranteed empty.
-func TestHostContainers_ContainerStats_SkipsStatsCallWhenEmpty(t *testing.T) {
-	allManaged := `{"ID":"aaa111222333","Names":"web","Labels":"com.docker.compose.project=my-app"}`
-	f := &fakeDockerRunner{runOut: []byte(allManaged)}
-	h := &HostContainers{docker: f}
-
-	got, err := h.ContainerStats(context.Background())
-	if err != nil {
-		t.Fatalf("ContainerStats() error = %v", err)
-	}
-	if len(got) != 0 {
-		t.Errorf("stats = %v, want empty", got)
-	}
-	for _, call := range f.runCalls {
-		if call[0] == "stats" {
-			t.Errorf("docker stats ran with zero unmanaged containers: %v", f.runCalls)
-		}
-	}
-}
-
-// TestHostImageMap_SkipsBareImageIDs pins the update-scan input filter. A
-// container whose image carries no repository tag reports a bare image ID, and
-// no registry can be asked about a ref with no repository — so it can only ever
-// produce the tri-state absent, while costing a wasted round-trip per
-// hand-started container and skewing the cascade ratios.
-func TestHostImageMap_SkipsBareImageIDs(t *testing.T) {
-	entries := []hostPsEntry{
-		{Names: "watchtower", Image: "containrrr/watchtower:1.7"},
-		{Names: "short-id", Image: "9c2ddb0e3cca"},
-		{Names: "long-id", Image: strings.Repeat("a", 64)},
-		{Names: "no-image", Image: ""},
-		{Names: "", Image: "nginx:1.27"},
-		// A repository that merely LOOKS hex-ish still has a tag, so it stays.
-		{Names: "tagged-hex", Image: "9c2ddb0e3cca:latest"},
-		{Names: "registry-hex", Image: "registry.example.com/9c2ddb0e3cca"},
-	}
-
-	got := hostImageMap(entries)
-	want := map[string]string{
-		"watchtower":   "containrrr/watchtower:1.7",
-		"tagged-hex":   "9c2ddb0e3cca:latest",
-		"registry-hex": "registry.example.com/9c2ddb0e3cca",
-	}
-	if len(got) != len(want) {
-		t.Fatalf("hostImageMap() = %v, want %v", got, want)
-	}
-	for k, v := range want {
-		if got[k] != v {
-			t.Errorf("hostImageMap()[%q] = %q, want %q", k, got[k], v)
-		}
-	}
-}
-
-// TestHostContainers_CheckUpdates_MemoizesRepeatedImages pins the per-image
-// memo. A compose project usually gives every service its own image, but host
-// containers repeat one image constantly (the real capture has three
-// sequentialthinking sidecars), and each comparison costs a local inspect plus
-// a registry inspect — every one a separate SSH round-trip on a remote host.
-func TestHostContainers_CheckUpdates_MemoizesRepeatedImages(t *testing.T) {
-	ps := `{"ID":"aaa111222333","Names":"mcp-a","Image":"mcp/sequentialthinking","Labels":""}
-{"ID":"bbb444555666","Names":"mcp-b","Image":"mcp/sequentialthinking","Labels":""}
-{"ID":"ccc777888999","Names":"mcp-c","Image":"mcp/sequentialthinking","Labels":""}`
-	f := hostUpdatesRunner(ps, map[string]hostDigests{
-		"mcp/sequentialthinking": {local: "mcp/sequentialthinking@" + digestOld, remote: digestNew},
-	})
-	h := &HostContainers{docker: f}
-
-	got, err := h.CheckUpdates(context.Background(), nil)
-	if err != nil {
-		t.Fatalf("CheckUpdates() error = %v", err)
-	}
-	for _, svc := range []string{"mcp-a", "mcp-b", "mcp-c"} {
-		if !got[svc] {
-			t.Errorf("results[%q] = %v, want true for every container on the shared image", svc, got[svc])
-		}
-	}
-	var inspects int
-	for _, call := range f.runCalls {
-		if call[0] != "ps" {
-			inspects++
-		}
-	}
-	// One `docker image inspect` plus one `docker buildx imagetools inspect`
-	// for the ONE distinct image — not three of each.
-	if inspects != 2 {
-		t.Errorf("inspect calls = %d (%v), want 2 — the distinct image must be compared once", inspects, f.runCalls)
-	}
-}
-
-// TestCompareImageDigest_SentinelBinding pins each composer's local-error
-// wrapper directly. The daemon cascade dispatches on the errLocalImageInspect
-// sentinel alone, so which composer applies it IS the design decision — a test
-// that only drives CheckUpdates cannot tell a missing wrapper from a failure
-// the cascade classifier rejected.
-func TestCompareImageDigest_SentinelBinding(t *testing.T) {
-	daemonDown := errors.New("Cannot connect to the Docker daemon at unix:///var/run/docker.sock")
-
-	t.Run("Compose carries the sentinel", func(t *testing.T) {
-		c := New(t.TempDir())
-		c.SetTestHooks(nil, func(*exec.Cmd) ([]byte, error) { return nil, daemonDown })
-		_, _, err := c.compareImageDigest(context.Background(), "nginx:1.27")
-		if !errors.Is(err, errLocalImageInspect) {
-			t.Fatalf("err = %v, want the errLocalImageInspect sentinel — the local daemon cascade dispatches on it", err)
-		}
-	})
-
-	t.Run("RemoteCompose does not", func(t *testing.T) {
-		rc := NewRemote("prod.example.com", "/srv/app")
-		rc.SetTestHooks(nil, func(*exec.Cmd) ([]byte, error) { return nil, daemonDown })
-		_, _, err := rc.compareImageDigest(context.Background(), "nginx:1.27")
-		if err == nil {
-			t.Fatal("expected an error")
-		}
-		if errors.Is(err, errLocalImageInspect) {
-			t.Error("the remote path must NOT carry errLocalImageInspect: the docker CLI runs on the far side of the SSH hop, so 'local docker unavailable' would name the wrong machine")
-		}
-	})
-
-	t.Run("HostContainers does not", func(t *testing.T) {
-		f := &fakeDockerRunner{runErr: daemonDown}
-		h := &HostContainers{docker: f}
-		_, _, err := h.compareImageDigest(context.Background(), "nginx:1.27")
-		if err == nil {
-			t.Fatal("expected an error")
-		}
-		if errors.Is(err, errLocalImageInspect) {
-			t.Error("HostContainers must NOT carry errLocalImageInspect: the same binding serves the remote runner, where the failure is on the far side of the SSH hop")
-		}
-	})
 }

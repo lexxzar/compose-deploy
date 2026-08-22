@@ -129,7 +129,7 @@ Remote server configuration (~/.cdeploy/servers.yml):
 					rc := compose.NewRemote(server.Host, projDir)
 					connectCmd := rc.ConnectCmd(cmd.Context())
 					remoteFactory := func(proj compose.Project) runner.Composer {
-						return remoteComposerFor(proj, server.Host, rc)
+						return remoteComposerFor(proj, rc)
 					}
 					loader := func(ctx context.Context) ([]compose.Project, error) {
 						if err := rc.Detect(ctx); err != nil {
@@ -235,12 +235,13 @@ func localComposerFor(proj compose.Project, detector *compose.Compose, detected 
 
 // remoteComposerFor is the remote twin of localComposerFor. The unmanaged row
 // reuses the LIVE RemoteCompose so the existing ControlMaster socket carries
-// the docker ps / stats / logs calls.
-func remoteComposerFor(proj compose.Project, host string, rc *compose.RemoteCompose) runner.Composer {
+// the docker ps / stats / logs calls; a compose project gets a fresh composer
+// pointed at the same host.
+func remoteComposerFor(proj compose.Project, rc *compose.RemoteCompose) runner.Composer {
 	if proj.Unmanaged {
 		return compose.NewRemoteHostContainers(rc)
 	}
-	newRC := compose.NewRemote(host, proj.ConfigDir)
+	newRC := compose.NewRemote(rc.Host, proj.ConfigDir)
 	newRC.SetStandalone(rc.Standalone)
 	return newRC
 }

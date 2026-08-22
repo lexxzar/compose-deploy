@@ -64,7 +64,7 @@ func TestAllScreens_Complete(t *testing.T) {
 func TestHelpGroups_EveryScreen(t *testing.T) {
 	for _, s := range allScreens {
 		for _, readOnly := range []bool{false, true} {
-			groups := helpGroupsFor(s, true, readOnly, progressRunning)
+			groups := helpGroupsFor(s, helpContext{canGoBack: true, readOnly: readOnly})
 			if len(groups) == 0 {
 				t.Errorf("screen %d readOnly=%v: helpGroups returned no groups", s, readOnly)
 				continue
@@ -107,7 +107,7 @@ var helpKeyAliases = map[string]string{
 func helpKeyTokens(s screen, canGoBack, readOnly bool) map[string]bool {
 	out := map[string]bool{}
 	for _, phase := range allProgressPhases {
-		for _, g := range helpGroupsFor(s, canGoBack, readOnly, phase) {
+		for _, g := range helpGroupsFor(s, helpContext{canGoBack: canGoBack, readOnly: readOnly, phase: phase}) {
 			for _, e := range g.entries {
 				for _, tok := range strings.Fields(e.keys) {
 					if alias, ok := helpKeyAliases[tok]; ok {
@@ -389,10 +389,10 @@ func TestViewHelp_ReadOnlyOverlay(t *testing.T) {
 // not among them, because the overlay title reads "cdeploy > keys > services".
 func TestReadOnly_NoGatedKeyAdvertised(t *testing.T) {
 	gatedTokens := []string{"d", "r", "s", "R", "c", " ", "a"}
-	gatedFooter := []string{
-		"space toggle", "d deploy", "r restart", "s stop",
-		"R rollback", "c config", "a all", "/ search",
-	}
+	// Only the three tokens the WRITABLE footer actually renders. The other
+	// gated keys live in the overlay alone, so asserting their absence from a
+	// footer that never carried them could not fail; gatedOverlay covers them.
+	gatedFooter := []string{"space toggle", "d deploy", "r restart"}
 	gatedOverlay := []string{"OPERATE", "SELECT", "toggle", "rollback", "config", "restart"}
 
 	for _, picker := range []bool{true, false} {
@@ -609,7 +609,7 @@ func TestViewHelp_NeverExceedsWidth(t *testing.T) {
 }
 
 func TestLayoutHelpColumns_SingleColumnFallback(t *testing.T) {
-	groups := helpGroupsFor(screenSelectContainers, true, false, progressRunning)
+	groups := helpGroupsFor(screenSelectContainers, helpContext{canGoBack: true})
 
 	wide := layoutHelpColumns(groups, 120)
 	narrow := layoutHelpColumns(groups, 40)
@@ -700,7 +700,7 @@ func TestLayoutHelpColumns_Empty(t *testing.T) {
 // disagree by one per column and only the rendered count decides the overlay's
 // height.
 func TestSplitHelpGroups_Balances(t *testing.T) {
-	left, right := splitHelpGroups(helpGroupsFor(screenSelectContainers, true, false, progressRunning))
+	left, right := splitHelpGroups(helpGroupsFor(screenSelectContainers, helpContext{canGoBack: true}))
 	if len(left) == 0 || len(right) == 0 {
 		t.Fatalf("container groups should split into two columns, got %d/%d", len(left), len(right))
 	}

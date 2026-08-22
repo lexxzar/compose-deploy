@@ -262,6 +262,20 @@ func (r *RemoteCompose) sshArgs(prefix []string, suffix ...string) []string {
 	return out
 }
 
+// remoteDockerCmdString renders a docker argv as the single shell command the
+// remote host runs: `docker` followed by every argument shell-escaped. Three
+// sites build it — runRemoteDockerCmd (captures), runRemoteDockerCmdStream
+// (streams) and remoteDockerRunner.tty (interactive) — so the escaping rule
+// lives here rather than in three copies.
+func (r *RemoteCompose) remoteDockerCmdString(dockerArgs []string) string {
+	escaped := make([]string, 0, len(dockerArgs)+1)
+	escaped = append(escaped, "docker")
+	for _, a := range dockerArgs {
+		escaped = append(escaped, shellEscape(a))
+	}
+	return strings.Join(escaped, " ")
+}
+
 // ConnectCmd returns the SSH ControlMaster connect command without running it.
 // The TUI uses this with tea.ExecProcess to give SSH full terminal access for
 // password prompts.
@@ -719,12 +733,7 @@ func (r *RemoteCompose) compareImageDigest(ctx context.Context, image string) (b
 // still surface stderr context, AND so the classifySSHError heuristic can
 // inspect stderr regardless of how the failure was produced.
 func (r *RemoteCompose) runRemoteDockerCmd(ctx context.Context, dockerArgs []string) ([]byte, error) {
-	escaped := make([]string, 0, len(dockerArgs)+1)
-	escaped = append(escaped, "docker")
-	for _, a := range dockerArgs {
-		escaped = append(escaped, shellEscape(a))
-	}
-	remoteCmd := strings.Join(escaped, " ")
+	remoteCmd := r.remoteDockerCmdString(dockerArgs)
 	sshArgv := r.sshArgs(
 		[]string{"-S", r.SocketPath, "-o", "ControlMaster=no"},
 		remoteCmd,
@@ -1045,12 +1054,7 @@ func (r *RemoteCompose) WriteSnapshot(ctx context.Context, fresh *Snapshot) erro
 // `docker pull <repo>@<digest>` live progress during rollback prep. The runCmd
 // test hook is honored so the argv is exercised without a real SSH hop.
 func (r *RemoteCompose) runRemoteDockerCmdStream(ctx context.Context, dockerArgs []string, w io.Writer) error {
-	escaped := make([]string, 0, len(dockerArgs)+1)
-	escaped = append(escaped, "docker")
-	for _, a := range dockerArgs {
-		escaped = append(escaped, shellEscape(a))
-	}
-	remoteCmd := strings.Join(escaped, " ")
+	remoteCmd := r.remoteDockerCmdString(dockerArgs)
 	sshArgv := r.sshArgs(
 		[]string{"-S", r.SocketPath, "-o", "ControlMaster=no"},
 		remoteCmd,

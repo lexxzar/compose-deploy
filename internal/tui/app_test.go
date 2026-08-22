@@ -850,7 +850,7 @@ func TestViewSelectProject_UnmanagedRow(t *testing.T) {
 	m := NewModel(nil, io.Discard, mockFactory(mc), nil, nil)
 	m.projects = []compose.Project{
 		{Name: "my-app", Status: "running(3)", ConfigDir: "/srv/my-app"},
-		{Name: compose.UnmanagedProjectName, Status: "3 containers", Unmanaged: true},
+		{Name: compose.UnmanagedProjectName, Desc: "3 containers", Unmanaged: true},
 	}
 
 	v := m.View()
@@ -870,7 +870,7 @@ func TestViewSelectProject_UnmanagedRowIsLast(t *testing.T) {
 	m := NewModel(nil, io.Discard, mockFactory(mc), nil, nil)
 	m.projects = []compose.Project{
 		{Name: "zebra", Status: "running(1)", ConfigDir: "/srv/zebra"},
-		{Name: compose.UnmanagedProjectName, Status: "1 container", Unmanaged: true},
+		{Name: compose.UnmanagedProjectName, Desc: "1 container", Unmanaged: true},
 	}
 
 	v := m.View()
@@ -893,7 +893,7 @@ func TestViewSelectProject_UnmanagedRowIsLast(t *testing.T) {
 func TestComposerFactory_ReceivesWholeProject(t *testing.T) {
 	projects := []compose.Project{
 		{Name: "my-app", Status: "running(3)", ConfigDir: "/srv/my-app"},
-		{Name: compose.UnmanagedProjectName, Status: "3 containers", Unmanaged: true},
+		{Name: compose.UnmanagedProjectName, Desc: "3 containers", Unmanaged: true},
 	}
 
 	tests := []struct {
@@ -14685,7 +14685,7 @@ func TestUpdatesCacheKey_FollowsComposerAcrossNavigation(t *testing.T) {
 	installFakeTick(&m)
 	m.screen = screenSelectProject
 	m.showPicker = true
-	m.projects = []compose.Project{{Name: compose.UnmanagedProjectName, Status: "2 containers", Unmanaged: true}}
+	m.projects = []compose.Project{{Name: compose.UnmanagedProjectName, Desc: "2 containers", Unmanaged: true}}
 
 	updated, _ := m.Update(keyMsgFor("enter"))
 	m = updated.(Model)

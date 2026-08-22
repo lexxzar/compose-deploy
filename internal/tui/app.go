@@ -2505,10 +2505,10 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 				// invalidate otherwise (worst case: one extra CheckUpdates
 				// call). Skipping invalidation on `m.failed` keeps a stale
 				// cache rather than spuriously clearing user-visible state
-				// after a failed deploy. The cache key matches
-				// updatesCacheKey()'s format (projDir|serverName) so the
-				// next maybeRefreshUpdatesCmd misses, sees no in-flight
-				// fetch, and enqueues a fresh refresh. This block runs
+				// after a failed deploy. The key comes from
+				// updatesCacheKey(), so the next maybeRefreshUpdatesCmd
+				// misses, sees no in-flight fetch, and enqueues a fresh
+				// refresh. This block runs
 				// BEFORE the m.done/m.failed reset below — otherwise
 				// reading m.done after clearing it would always evaluate
 				// false and the invalidation would never fire.
@@ -4297,8 +4297,8 @@ func (m Model) viewSelectProject() string {
 		b.WriteString(style.Render(cursor + name))
 		b.WriteString("   ")
 		desc := shortenPath(proj.ConfigDir)
-		if proj.Unmanaged {
-			desc = proj.Status
+		if proj.Desc != "" {
+			desc = proj.Desc
 		}
 		b.WriteString(descStyle.Render(desc))
 		b.WriteString("\n")
