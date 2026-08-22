@@ -99,14 +99,7 @@ Remote server configuration (~/.cdeploy/servers.yml):
 			}
 
 			factory := func(proj compose.Project) runner.Composer {
-				if proj.Unmanaged {
-					return compose.NewLocalHostContainers(localDetector)
-				}
-				lc := compose.New(proj.ConfigDir)
-				if localDetected {
-					lc.SetStandalone(localDetector.Standalone)
-				}
-				return lc
+				return localComposerFor(proj, localDetector, localDetected)
 			}
 
 			// When the cwd has a compose file, try to detect the local
@@ -136,22 +129,13 @@ Remote server configuration (~/.cdeploy/servers.yml):
 					rc := compose.NewRemote(server.Host, projDir)
 					connectCmd := rc.ConnectCmd(cmd.Context())
 					remoteFactory := func(proj compose.Project) runner.Composer {
-						if proj.Unmanaged {
-							return compose.NewRemoteHostContainers(rc)
-						}
-						newRC := compose.NewRemote(server.Host, proj.ConfigDir)
-						newRC.SetStandalone(rc.Standalone)
-						return newRC
+						return remoteComposerFor(proj, server.Host, rc)
 					}
 					loader := func(ctx context.Context) ([]compose.Project, error) {
 						if err := rc.Detect(ctx); err != nil {
 							return nil, err
 						}
-						projects, err := rc.ListProjects(ctx)
-						if err != nil {
-							return nil, err
-						}
-						return compose.WithUnmanagedRow(ctx, compose.NewRemoteHostContainers(rc), projects), nil
+						return projectsWithUnmanaged(ctx, rc, compose.NewRemoteHostContainers(rc))
 					}
 					return connectCmd, remoteFactory, loader, rc.Close
 				}
@@ -162,11 +146,7 @@ Remote server configuration (~/.cdeploy/servers.yml):
 				if err := detectLocal(ctx); err != nil {
 					return nil, err
 				}
-				projects, err := localDetector.ListProjects(ctx)
-				if err != nil {
-					return nil, err
-				}
-				return compose.WithUnmanagedRow(ctx, compose.NewLocalHostContainers(localDetector), projects), nil
+				return projectsWithUnmanaged(ctx, localDetector, compose.NewLocalHostContainers(localDetector))
 			}
 
 			logger, err := logging.NewLogger(logDir)
@@ -216,4 +196,51 @@ Remote server configuration (~/.cdeploy/servers.yml):
 
 func Execute() error {
 	return NewRootCmd().Execute()
+}
+
+// projectLister is the ListProjects half of a composer, the only method
+// projectsWithUnmanaged needs. Both *compose.Compose and *compose.RemoteCompose
+// satisfy it.
+type projectLister interface {
+	ListProjects(ctx context.Context) ([]compose.Project, error)
+}
+
+// projectsWithUnmanaged is the body both TUI ProjectLoader literals share:
+// list the compose projects, then append the synthetic "(unmanaged)" row when
+// the host has containers carrying no compose project label. It lives at
+// package level because cmd/root_test.go cannot execute the root command
+// (the TUI needs a TTY), so a closure body would have no test seam.
+func projectsWithUnmanaged(ctx context.Context, lister projectLister, hc *compose.HostContainers) ([]compose.Project, error) {
+	projects, err := lister.ListProjects(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return compose.WithUnmanagedRow(ctx, hc, projects), nil
+}
+
+// localComposerFor is the local tui.ComposerFactory body. The synthetic
+// unmanaged row has no compose file and no ConfigDir, so it gets the read-only
+// host-container composer; every other row gets a Compose rooted at its config
+// directory, inheriting the plugin/standalone verdict when one was detected.
+func localComposerFor(proj compose.Project, detector *compose.Compose, detected bool) runner.Composer {
+	if proj.Unmanaged {
+		return compose.NewLocalHostContainers(detector)
+	}
+	lc := compose.New(proj.ConfigDir)
+	if detected {
+		lc.SetStandalone(detector.Standalone)
+	}
+	return lc
+}
+
+// remoteComposerFor is the remote twin of localComposerFor. The unmanaged row
+// reuses the LIVE RemoteCompose so the existing ControlMaster socket carries
+// the docker ps / stats / logs calls.
+func remoteComposerFor(proj compose.Project, host string, rc *compose.RemoteCompose) runner.Composer {
+	if proj.Unmanaged {
+		return compose.NewRemoteHostContainers(rc)
+	}
+	newRC := compose.NewRemote(host, proj.ConfigDir)
+	newRC.SetStandalone(rc.Standalone)
+	return newRC
 }

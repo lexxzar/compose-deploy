@@ -67,34 +67,26 @@ func parseHostContainers(data []byte) ([]hostPsEntry, error) {
 // isComposeManaged reports whether the comma-joined label string carries a
 // com.docker.compose.project key.
 //
-// The scan walks tokens rather than splitting into k=v pairs: a label VALUE may
-// legally contain a comma, so a split-and-map can mis-slice. Checking the prefix
-// only at a token start means a false verdict would need a label value containing
-// the literal ",com.docker.compose.project=".
+// The match is anchored at a token start rather than done by splitting into k=v
+// pairs: a label VALUE may legally contain a comma, so a split-and-map can
+// mis-slice. A false verdict would need a label value containing the literal
+// ",com.docker.compose.project=".
 func isComposeManaged(labels string) bool {
-	for rest := labels; rest != ""; {
-		if strings.HasPrefix(rest, composeProjectLabel) {
-			return true
-		}
-		i := strings.IndexByte(rest, ',')
-		if i < 0 {
-			return false
-		}
-		rest = rest[i+1:]
-	}
-	return false
+	return strings.HasPrefix(labels, composeProjectLabel) ||
+		strings.Contains(labels, ","+composeProjectLabel)
 }
-
-// healthSuffixCaptureRe captures the contents of a trailing "(...)" annotation.
-// It is anchored at the end so "Exited (255) 3 months ago" does not match.
-var healthSuffixCaptureRe = regexp.MustCompile(`\(([^)]*)\)\s*$`)
 
 // parseHealthFromStatus extracts the health value from a host-level Status string.
 // Host-level `docker ps` has no separate Health field — it lives in the trailing
 // annotation, e.g. "Up 2 hours (healthy)". Returns "healthy", "unhealthy",
 // "starting", or "" when the container has no healthcheck.
+//
+// It reads the SAME healthSuffixRe that formatUptime strips (uptime.go), so the
+// two consumers of the trailing-annotation grammar cannot drift apart. The
+// end anchor is load-bearing: without it "Exited (255) 3 months ago" would match
+// its first paren group.
 func parseHealthFromStatus(status string) string {
-	m := healthSuffixCaptureRe.FindStringSubmatch(strings.TrimSpace(status))
+	m := healthSuffixRe.FindStringSubmatch(strings.TrimSpace(status))
 	if m == nil {
 		return ""
 	}
@@ -132,7 +124,9 @@ var ErrReadOnly = errors.New("read-only: container is not managed by docker comp
 type dockerRunner interface {
 	run(ctx context.Context, args ...string) ([]byte, error)
 	stream(ctx context.Context, w io.Writer, args ...string) error
-	tty(ctx context.Context, args ...string) (*exec.Cmd, error)
+	// tty builds the interactive argv without running it. It returns no
+	// error because both implementations are pure argv construction.
+	tty(ctx context.Context, args ...string) *exec.Cmd
 }
 
 // HostContainers is a read-only runner.Composer over the containers on a docker
@@ -165,8 +159,8 @@ func (l localDockerRunner) stream(ctx context.Context, w io.Writer, args ...stri
 	return l.c.runDockerCmdStream(ctx, args, w)
 }
 
-func (l localDockerRunner) tty(ctx context.Context, args ...string) (*exec.Cmd, error) {
-	return exec.CommandContext(ctx, "docker", args...), nil
+func (l localDockerRunner) tty(ctx context.Context, args ...string) *exec.Cmd {
+	return exec.CommandContext(ctx, "docker", args...)
 }
 
 // remoteDockerRunner adapts *RemoteCompose. Every form goes through sshArgs()
@@ -181,7 +175,7 @@ func (rd remoteDockerRunner) stream(ctx context.Context, w io.Writer, args ...st
 	return rd.r.runRemoteDockerCmdStream(ctx, args, w)
 }
 
-func (rd remoteDockerRunner) tty(ctx context.Context, args ...string) (*exec.Cmd, error) {
+func (rd remoteDockerRunner) tty(ctx context.Context, args ...string) *exec.Cmd {
 	escaped := make([]string, 0, len(args)+1)
 	escaped = append(escaped, "docker")
 	for _, a := range args {
@@ -191,7 +185,7 @@ func (rd remoteDockerRunner) tty(ctx context.Context, args ...string) (*exec.Cmd
 		[]string{"-t", "-S", rd.r.SocketPath, "-o", "ControlMaster=no"},
 		strings.Join(escaped, " "),
 	)
-	return exec.CommandContext(ctx, "ssh", sshArgv...), nil
+	return exec.CommandContext(ctx, "ssh", sshArgv...)
 }
 
 // NewLocalHostContainers returns a HostContainers reading the local docker host.
@@ -265,15 +259,25 @@ func (h *HostContainers) CheckUpdates(ctx context.Context, services []string) (m
 		updateCascades{registry: true, transportAbort: true})
 }
 
+// bareImageIDRe matches the image-ID form `docker ps` reports for a container
+// whose image carries no repository tag — a 12-char short ID or the full
+// 64-char digest hex, with no registry, repository or tag.
+var bareImageIDRe = regexp.MustCompile(`^[0-9a-f]{12}([0-9a-f]{52})?$`)
+
 // hostImageMap builds the container-name → image map that scanImageUpdates
-// consumes. Entries with no image reference are dropped — an empty ref would
-// turn `docker image inspect` into a malformed call whose failure would pollute
-// the cascade counters.
+// consumes. Two kinds of entry are dropped:
+//
+//   - no image reference at all — an empty ref would turn `docker image inspect`
+//     into a malformed call whose failure would pollute the cascade counters;
+//   - a bare image ID — no registry can be asked about a ref with no repository,
+//     so the verdict is the tri-state absent either way, and including it would
+//     only buy a wasted registry round-trip per hand-started container and skew
+//     the cascade ratios.
 func hostImageMap(entries []hostPsEntry) map[string]string {
 	out := make(map[string]string, len(entries))
 	for _, e := range entries {
 		name := hostContainerName(e.Names)
-		if name == "" || e.Image == "" {
+		if name == "" || e.Image == "" || bareImageIDRe.MatchString(e.Image) {
 			continue
 		}
 		out[name] = e.Image
@@ -358,7 +362,14 @@ func WithUnmanagedRow(ctx context.Context, hc *HostContainers, projects []Projec
 		return projects
 	}
 	n, err := hc.CountUnmanaged(ctx)
-	if err != nil || n == 0 {
+	if err != nil {
+		// Deliberate swallow, kept as its own branch so it reads as a
+		// decision rather than sharing the empty-host path: a `docker ps`
+		// the SSH user cannot run must not cost the user the compose
+		// projects that DID load.
+		return projects
+	}
+	if n == 0 {
 		return projects
 	}
 	unit := "containers"
@@ -370,6 +381,19 @@ func WithUnmanagedRow(ctx context.Context, hc *HostContainers, projects []Projec
 		Status:    fmt.Sprintf("%d %s", n, unit),
 		Unmanaged: true,
 	})
+}
+
+// hostContainerRunning reports whether a ps entry is up. State is the primary
+// source, but the `docker ps` JSON keys are reflected from the CLI's own
+// formatter and .State only exists on Docker CLI >= 20.10 — the same legacy
+// hosts hostPsArgs uses the `{{json .}}` template for. Status carries the same
+// fact ("Up 2 hours"), so an absent State falls back to it rather than
+// rendering a live container as stopped and refusing x exec on it.
+func hostContainerRunning(e hostPsEntry) bool {
+	if e.State != "" {
+		return e.State == "running"
+	}
+	return strings.HasPrefix(strings.TrimSpace(e.Status), "Up ")
 }
 
 // ContainerStatus maps each unmanaged container name to its status. There is no
@@ -386,7 +410,7 @@ func (h *HostContainers) ContainerStatus(ctx context.Context) (map[string]runner
 	status := make(map[string]runner.ServiceStatus, len(entries))
 	for _, e := range entries {
 		st := runner.ServiceStatus{
-			Running: e.State == "running",
+			Running: hostContainerRunning(e),
 			Health:  parseHealthFromStatus(e.Status),
 			Uptime:  formatUptime(e.Status),
 		}
@@ -402,8 +426,11 @@ func (h *HostContainers) ContainerStatus(ctx context.Context) (map[string]runner
 }
 
 // hostStatsArgs is the host-wide stats argv. It keeps the bare `json` keyword
-// that AllContainerStats already uses, rather than the ps template form: only
-// `docker ps` needed the template workaround for legacy CLIs.
+// that AllContainerStats already uses. That keyword needs Docker CLI >= 23.0,
+// so on the legacy hosts hostPsArgs takes the `{{json .}}` template form for,
+// this call renders the literal template and parseStatsOutput fails — the gap
+// is knowingly inherited from AllContainerStats rather than fixed only here,
+// and it degrades to the soft statsErr warning, leaving status intact.
 var hostStatsArgs = []string{"stats", "--no-stream", "--format", "json"}
 
 // ContainerStats returns CPU and memory usage for each unmanaged container,
@@ -422,6 +449,13 @@ func (h *HostContainers) ContainerStats(ctx context.Context) (map[string]runner.
 	entries, err := h.unmanagedEntries(ctx)
 	if err != nil {
 		return nil, err
+	}
+	// The join against an empty pair list is guaranteed empty, and
+	// `docker stats --no-stream` is a ~1.5s host-wide call (a full SSH
+	// round-trip remotely) that the 5s refresh tick would otherwise pay
+	// forever. Mirrors the early return ContainerStatus makes above.
+	if len(entries) == 0 {
+		return nil, nil
 	}
 	out, err := h.docker.run(ctx, hostStatsArgs...)
 	if err != nil {
@@ -473,5 +507,5 @@ func (h *HostContainers) ExecCommand(ctx context.Context, service string, comman
 		command = DefaultExecCommand
 	}
 	args := append([]string{"exec", "-it", service}, command...)
-	return h.docker.tty(ctx, args...)
+	return h.docker.tty(ctx, args...), nil
 }

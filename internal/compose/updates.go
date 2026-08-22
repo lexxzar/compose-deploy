@@ -362,6 +362,14 @@ func (c *Compose) CheckUpdates(ctx context.Context, services []string) (map[stri
 // err) where ok=true and err=nil is the only definitive verdict.
 type imageComparer func(ctx context.Context, image string) (bool, bool, error)
 
+// imageVerdict is one image's memoized comparison outcome inside
+// scanImageUpdates — the same (updated, ok, err) triple imageComparer returns.
+type imageVerdict struct {
+	updated bool
+	ok      bool
+	err     error
+}
+
 // updateCascades selects which systemic-failure diagnostics scanImageUpdates
 // may return in place of an all-blank verdict map. Every knob is opt-in, so
 // the zero value scans with no diagnostic at all.
@@ -414,51 +422,66 @@ func scanImageUpdates(ctx context.Context, wanted map[string]string, compare ima
 		networkFailures int
 		firstNetErr     error
 	)
+	// Distinct images are compared ONCE. A compose project usually gives every
+	// service its own image, but host containers repeat one image constantly
+	// (three MCP sidecars off the same tag), and each comparison costs a local
+	// inspect plus up to two registry inspects — every one a separate SSH
+	// round-trip on a remote host. The cache also keeps the cascade ratios
+	// honest: each distinct image contributes exactly one attempt.
+	seen := make(map[string]imageVerdict, len(wanted))
 	for svc, img := range wanted {
-		localAttempts++
-		updated, ok, rerr := compare(ctx, img)
-		if rerr != nil {
+		v, cached := seen[img]
+		if !cached {
+			updated, ok, rerr := compare(ctx, img)
+			v = imageVerdict{updated: updated, ok: ok, err: rerr}
+			seen[img] = v
+			localAttempts++
+		}
+		if v.err != nil {
 			// Transport first: a dead SSH hop poisons every remaining
 			// image, so abort before any classification. Checked ahead of
 			// the sentinel dispatch below because the two buckets are
 			// independent and transport is the terminal one.
-			if cascades.transportAbort && errors.Is(rerr, errSSHTransport) {
-				return out, fmt.Errorf("remote update check transport failure: %w", rerr)
+			if cascades.transportAbort && errors.Is(v.err, errSSHTransport) {
+				return out, fmt.Errorf("remote update check transport failure: %w", v.err)
 			}
-			// Distinguish local-side vs remote-side errors. Local errors
-			// carry the errLocalImageInspect sentinel; everything else
-			// reached the remote fetch and failed there.
-			if errors.Is(rerr, errLocalImageInspect) {
-				localFailures++
-				// Only count this toward the cascade when the stderr
-				// looks like a daemon-down failure, not a benign per-
-				// image "No such image" (fresh deploy where images
-				// haven't been pulled yet). Without this gate, a multi-
-				// service fresh deploy fires the cascade and produces
-				// a confusing "local docker unavailable" diagnostic —
-				// matching RemoteCompose, which already classifies
-				// per-image failures via stderr content.
-				if looksLikeLocalDaemonErr(rerr) {
-					daemonFailures++
-					if firstDaemonErr == nil {
-						firstDaemonErr = rerr
+			if !cached {
+				// Distinguish local-side vs remote-side errors. Local
+				// errors carry the errLocalImageInspect sentinel;
+				// everything else reached the remote fetch and failed
+				// there.
+				if errors.Is(v.err, errLocalImageInspect) {
+					localFailures++
+					// Only count this toward the cascade when the stderr
+					// looks like a daemon-down failure, not a benign per-
+					// image "No such image" (fresh deploy where images
+					// haven't been pulled yet). Without this gate, a multi-
+					// service fresh deploy fires the cascade and produces
+					// a confusing "local docker unavailable" diagnostic —
+					// matching RemoteCompose, which already classifies
+					// per-image failures via stderr content.
+					if looksLikeLocalDaemonErr(v.err) {
+						daemonFailures++
+						if firstDaemonErr == nil {
+							firstDaemonErr = v.err
+						}
+					}
+				} else {
+					remoteAttempts++
+					if looksLikeNetworkErr(v.err) {
+						networkFailures++
+						if firstNetErr == nil {
+							firstNetErr = v.err
+						}
 					}
 				}
-				continue
-			}
-			remoteAttempts++
-			if looksLikeNetworkErr(rerr) {
-				networkFailures++
-				if firstNetErr == nil {
-					firstNetErr = rerr
-				}
 			}
 			continue
 		}
-		if !ok {
+		if !v.ok {
 			continue
 		}
-		out[svc] = updated
+		out[svc] = v.updated
 	}
 	if len(out) == 0 {
 		// Local-docker cascade fires only when EVERY per-image local

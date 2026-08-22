@@ -121,19 +121,6 @@ func helpKeyTokens(s screen, canGoBack, readOnly bool) map[string]bool {
 	return out
 }
 
-// helpKeyTokensFor unions helpKeyTokens over both readOnly values, the same way
-// helpKeyTokens unions over the phases. Only screenSelectContainers varies by
-// readOnly, and the read-only table is a strict subset, so the union equals the
-// writable set today — but a key added to the read-only table alone still has to
-// pass the names-nothing-unbound direction of the drift pin.
-func helpKeyTokensFor(s screen, canGoBack bool) map[string]bool {
-	out := helpKeyTokens(s, canGoBack, false)
-	for k := range helpKeyTokens(s, canGoBack, true) {
-		out[k] = true
-	}
-	return out
-}
-
 // TestHelpGroups_NamesEveryBoundKey is the drift pin. The expected sets are
 // hand-maintained from each screen's handleKey case in app.go — a new binding
 // must be added to both places.
@@ -161,7 +148,11 @@ func TestHelpGroups_NamesEveryBoundKey(t *testing.T) {
 			t.Errorf("screen %d has no expected key set", s)
 			continue
 		}
-		named := helpKeyTokensFor(s, true)
+		// The WRITABLE variant only. Unioning the read-only table in would
+		// weaken this direction of the pin: a key deleted from the writable
+		// table but still named by the read-only one would go unnoticed. The
+		// read-only table has its own two-directional pin below.
+		named := helpKeyTokens(s, true, false)
 		boundSet := map[string]bool{}
 		for _, k := range keys {
 			boundSet[k] = true
@@ -184,7 +175,7 @@ func TestHelpGroups_NamesEveryBoundKey(t *testing.T) {
 		// advertise it as a way out, and on a standalone project screen esc is
 		// a no-op. What the LEAVE group says in that variant is pinned exactly
 		// by TestHelpGroups_LeaveGroupMatchesFooter.
-		for k := range helpKeyTokensFor(s, false) {
+		for k := range helpKeyTokens(s, false, false) {
 			if !boundSet[k] {
 				t.Errorf("screen %s (standalone): help table names %q, which the screen does not bind", screenName(s), k)
 			}

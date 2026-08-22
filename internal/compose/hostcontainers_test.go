@@ -198,6 +198,12 @@ func TestParseHealthFromStatus(t *testing.T) {
 		{"Up 2 hours (Paused)", ""},
 		{"Up 2 hours (HEALTHY)", "healthy"},
 		{"Up 2 hours (healthy)  ", "healthy"},
+		// The end anchor is what makes the reading TRAILING rather than
+		// first-match. Without it this reads "healthy" from the leading
+		// annotation and reports a paused container as healthy; the Exited /
+		// Restarting rows above cannot catch that, because their first group
+		// is a numeric exit code the switch rejects anyway.
+		{"Up 2 hours (healthy) (paused)", ""},
 	}
 	for _, tt := range tests {
 		t.Run(tt.in, func(t *testing.T) {
@@ -239,7 +245,6 @@ type fakeDockerRunner struct {
 	streamOut   string
 	streamErr   error
 	ttyCalls    [][]string
-	ttyErr      error
 }
 
 func (f *fakeDockerRunner) run(ctx context.Context, args ...string) ([]byte, error) {
@@ -260,12 +265,9 @@ func (f *fakeDockerRunner) stream(ctx context.Context, w io.Writer, args ...stri
 	return f.streamErr
 }
 
-func (f *fakeDockerRunner) tty(ctx context.Context, args ...string) (*exec.Cmd, error) {
+func (f *fakeDockerRunner) tty(ctx context.Context, args ...string) *exec.Cmd {
 	f.ttyCalls = append(f.ttyCalls, append([]string(nil), args...))
-	if f.ttyErr != nil {
-		return nil, f.ttyErr
-	}
-	return exec.CommandContext(ctx, "docker", args...), nil
+	return exec.CommandContext(ctx, "docker", args...)
 }
 
 const hostPsMixed = `{"ID":"aaa111222333","Names":"web","Image":"nginx:1.27","State":"running","Status":"Up 3 hours (healthy)","Ports":"0.0.0.0:8080->80/tcp, :::8080->80/tcp","Labels":"com.docker.compose.project=my-app,com.docker.compose.service=web","CreatedAt":"2026-08-19 10:00:00 +0300 EEST"}
@@ -817,10 +819,7 @@ func TestNewRemoteHostContainers_SplicesSSHExtraArgs(t *testing.T) {
 			SSHExtraArgs: extras,
 		}
 		rd := remoteDockerRunner{r: r}
-		cmd, err := rd.tty(context.Background(), "exec", "-it", "web", "sh")
-		if err != nil {
-			t.Fatalf("tty() error = %v", err)
-		}
+		cmd := rd.tty(context.Background(), "exec", "-it", "web", "sh")
 		assertExtraBeforeHost(t, "HostContainers tty", cmd.Args, host, extras)
 		if !slices.Contains(cmd.Args, "-t") {
 			t.Errorf("tty argv %v has no -t; the remote exec path must allocate a TTY", cmd.Args)
@@ -1135,15 +1134,6 @@ func TestHostContainers_ExecCommand_ExplicitCommand(t *testing.T) {
 	}
 }
 
-func TestHostContainers_ExecCommand_TTYError(t *testing.T) {
-	f := &fakeDockerRunner{ttyErr: errors.New("no socket")}
-	h := &HostContainers{docker: f}
-
-	if cmd, err := h.ExecCommand(context.Background(), "web", nil); err == nil {
-		t.Fatalf("expected an error, got %v", cmd)
-	}
-}
-
 func TestHostContainers_ExecCommand_LocalArgv(t *testing.T) {
 	c := New(t.TempDir())
 	cmd, err := NewLocalHostContainers(c).ExecCommand(context.Background(), "web", []string{"sh"})
@@ -1251,6 +1241,11 @@ func TestWithUnmanagedRow(t *testing.T) {
 		{name: "appended when non-zero", ps: hostPsMixed, wantExtra: true, wantStatus: "3 containers"},
 		{name: "singular when one", ps: `{"ID":"bbb444555666","Names":"watchtower","Labels":""}`, wantExtra: true, wantStatus: "1 container"},
 		{name: "absent when zero", ps: `{"ID":"aaa111222333","Names":"web","Labels":"com.docker.compose.project=my-app"}`},
+		// CountUnmanaged returns (0, err) on every failure, so this case can
+		// only ever exercise the same outcome as "absent when zero". It pins
+		// the CONTRACT — a discovery failure must never invent a row — and
+		// would catch a future CountUnmanaged that returned a partial count
+		// alongside an error.
 		{name: "absent on error", runErr: errors.New("boom")},
 	}
 
@@ -1317,4 +1312,250 @@ func TestWithUnmanagedRow_EmptyProjectList(t *testing.T) {
 	if len(got) != 1 || !got[0].Unmanaged {
 		t.Fatalf("projects = %+v, want the unmanaged row alone", got)
 	}
+}
+
+// TestHostContainers_ContainerStatus_RealFixture runs the fixture through the
+// whole ContainerStatus pipeline rather than only the field-name parse, so
+// parseCreatedAt, formatUptime, parseHealthFromStatus and parsePortsString are
+// all validated against real daemon output instead of the hand-written
+// hostPsMixed constant. The redis-scratch row is the one row appended by hand
+// to the capture: every real unmanaged container in it happened to publish no
+// ports, so without it the bracketed-IPv6 form never reaches the unmanaged
+// port pipeline in any test.
+func TestHostContainers_ContainerStatus_RealFixture(t *testing.T) {
+	data, err := os.ReadFile("testdata/docker_ps_host.json")
+	if err != nil {
+		t.Fatalf("reading fixture: %v", err)
+	}
+	h := &HostContainers{docker: &fakeDockerRunner{runOut: data}}
+
+	status, err := h.ContainerStatus(context.Background())
+	if err != nil {
+		t.Fatalf("ContainerStatus() error = %v", err)
+	}
+	for _, managed := range []string{"local-doc-mcp", "context7", "pgsql_local"} {
+		if _, ok := status[managed]; ok {
+			t.Errorf("compose-managed container %q leaked into the unmanaged status map", managed)
+		}
+	}
+
+	running, ok := status["elastic_dhawan"]
+	if !ok {
+		t.Fatalf("status has no elastic_dhawan: %+v", status)
+	}
+	if !running.Running {
+		t.Error("elastic_dhawan State is running; want Running true")
+	}
+	if running.Created != "2026-08-21 22:09" {
+		t.Errorf("Created = %q, want %q", running.Created, "2026-08-21 22:09")
+	}
+	if running.Uptime != "2h" {
+		t.Errorf("Uptime = %q, want %q", running.Uptime, "2h")
+	}
+
+	exited, ok := status["lucid_goodall"]
+	if !ok {
+		t.Fatalf("status has no lucid_goodall: %+v", status)
+	}
+	if exited.Running {
+		t.Error("lucid_goodall State is exited; want Running false")
+	}
+	if exited.Uptime != "" {
+		t.Errorf("Uptime = %q, want empty for an exited container", exited.Uptime)
+	}
+
+	ported, ok := status["redis-scratch"]
+	if !ok {
+		t.Fatalf("status has no redis-scratch: %+v", status)
+	}
+	if ported.Health != "healthy" {
+		t.Errorf("Health = %q, want %q", ported.Health, "healthy")
+	}
+	// The IPv4/IPv6 wildcard mirror collapses to one entry, exactly as the
+	// compose path does.
+	if got := FormatPorts(ported.Ports); got != "6379→6379" {
+		t.Errorf("Ports = %q, want %q", got, "6379→6379")
+	}
+}
+
+// TestHostContainerRunning pins the State fallback. .State only exists on
+// Docker CLI >= 20.10 — the same legacy hosts hostPsArgs takes the
+// `{{json .}}` template form for — and without the fallback every unmanaged
+// row on such a host renders a stopped dot beside a live Uptime, and x exec
+// refuses on a container that is plainly up.
+func TestHostContainerRunning(t *testing.T) {
+	tests := []struct {
+		name string
+		e    hostPsEntry
+		want bool
+	}{
+		{"state running", hostPsEntry{State: "running", Status: "Up 3 hours"}, true},
+		{"state exited", hostPsEntry{State: "exited", Status: "Exited (0) 2 hours ago"}, false},
+		{"state restarting", hostPsEntry{State: "restarting", Status: "Restarting (1) 3 seconds ago"}, false},
+		{"no state, status up", hostPsEntry{Status: "Up 3 hours (healthy)"}, true},
+		{"no state, status up padded", hostPsEntry{Status: "  Up 2 days"}, true},
+		{"no state, status exited", hostPsEntry{Status: "Exited (0) 2 hours ago"}, false},
+		{"no state, status created", hostPsEntry{Status: "Created"}, false},
+		{"no state, no status", hostPsEntry{}, false},
+		// State wins when present, even when Status disagrees — a container
+		// caught mid-transition must not be reported twice-over.
+		{"state beats status", hostPsEntry{State: "exited", Status: "Up 3 hours"}, false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := hostContainerRunning(tt.e); got != tt.want {
+				t.Errorf("hostContainerRunning(%+v) = %v, want %v", tt.e, got, tt.want)
+			}
+		})
+	}
+}
+
+// TestHostContainers_ContainerStatus_NoStateField is the end-to-end half of the
+// fallback: a legacy `docker ps` payload with no State key still renders the
+// running dot.
+func TestHostContainers_ContainerStatus_NoStateField(t *testing.T) {
+	legacy := `{"ID":"bbb444555666","Names":"watchtower","Image":"containrrr/watchtower","Status":"Up 2 days","Labels":""}`
+	h := &HostContainers{docker: &fakeDockerRunner{runOut: []byte(legacy)}}
+
+	status, err := h.ContainerStatus(context.Background())
+	if err != nil {
+		t.Fatalf("ContainerStatus() error = %v", err)
+	}
+	if !status["watchtower"].Running {
+		t.Errorf("status = %+v; a legacy ps with no State must fall back to Status", status)
+	}
+}
+
+// TestHostContainers_ContainerStats_SkipsStatsCallWhenEmpty pins the guard that
+// keeps the ~1.5s host-wide `docker stats` (a full SSH round-trip remotely) off
+// the 5s refresh tick when the host has no unmanaged containers at all: the
+// join against an empty pair list is guaranteed empty.
+func TestHostContainers_ContainerStats_SkipsStatsCallWhenEmpty(t *testing.T) {
+	allManaged := `{"ID":"aaa111222333","Names":"web","Labels":"com.docker.compose.project=my-app"}`
+	f := &fakeDockerRunner{runOut: []byte(allManaged)}
+	h := &HostContainers{docker: f}
+
+	got, err := h.ContainerStats(context.Background())
+	if err != nil {
+		t.Fatalf("ContainerStats() error = %v", err)
+	}
+	if len(got) != 0 {
+		t.Errorf("stats = %v, want empty", got)
+	}
+	for _, call := range f.runCalls {
+		if call[0] == "stats" {
+			t.Errorf("docker stats ran with zero unmanaged containers: %v", f.runCalls)
+		}
+	}
+}
+
+// TestHostImageMap_SkipsBareImageIDs pins the update-scan input filter. A
+// container whose image carries no repository tag reports a bare image ID, and
+// no registry can be asked about a ref with no repository — so it can only ever
+// produce the tri-state absent, while costing a wasted round-trip per
+// hand-started container and skewing the cascade ratios.
+func TestHostImageMap_SkipsBareImageIDs(t *testing.T) {
+	entries := []hostPsEntry{
+		{Names: "watchtower", Image: "containrrr/watchtower:1.7"},
+		{Names: "short-id", Image: "9c2ddb0e3cca"},
+		{Names: "long-id", Image: strings.Repeat("a", 64)},
+		{Names: "no-image", Image: ""},
+		{Names: "", Image: "nginx:1.27"},
+		// A repository that merely LOOKS hex-ish still has a tag, so it stays.
+		{Names: "tagged-hex", Image: "9c2ddb0e3cca:latest"},
+		{Names: "registry-hex", Image: "registry.example.com/9c2ddb0e3cca"},
+	}
+
+	got := hostImageMap(entries)
+	want := map[string]string{
+		"watchtower":   "containrrr/watchtower:1.7",
+		"tagged-hex":   "9c2ddb0e3cca:latest",
+		"registry-hex": "registry.example.com/9c2ddb0e3cca",
+	}
+	if len(got) != len(want) {
+		t.Fatalf("hostImageMap() = %v, want %v", got, want)
+	}
+	for k, v := range want {
+		if got[k] != v {
+			t.Errorf("hostImageMap()[%q] = %q, want %q", k, got[k], v)
+		}
+	}
+}
+
+// TestHostContainers_CheckUpdates_MemoizesRepeatedImages pins the per-image
+// memo. A compose project usually gives every service its own image, but host
+// containers repeat one image constantly (the real capture has three
+// sequentialthinking sidecars), and each comparison costs a local inspect plus
+// a registry inspect — every one a separate SSH round-trip on a remote host.
+func TestHostContainers_CheckUpdates_MemoizesRepeatedImages(t *testing.T) {
+	ps := `{"ID":"aaa111222333","Names":"mcp-a","Image":"mcp/sequentialthinking","Labels":""}
+{"ID":"bbb444555666","Names":"mcp-b","Image":"mcp/sequentialthinking","Labels":""}
+{"ID":"ccc777888999","Names":"mcp-c","Image":"mcp/sequentialthinking","Labels":""}`
+	f := hostUpdatesRunner(ps, map[string]hostDigests{
+		"mcp/sequentialthinking": {local: "mcp/sequentialthinking@" + digestOld, remote: digestNew},
+	})
+	h := &HostContainers{docker: f}
+
+	got, err := h.CheckUpdates(context.Background(), nil)
+	if err != nil {
+		t.Fatalf("CheckUpdates() error = %v", err)
+	}
+	for _, svc := range []string{"mcp-a", "mcp-b", "mcp-c"} {
+		if !got[svc] {
+			t.Errorf("results[%q] = %v, want true for every container on the shared image", svc, got[svc])
+		}
+	}
+	var inspects int
+	for _, call := range f.runCalls {
+		if call[0] != "ps" {
+			inspects++
+		}
+	}
+	// One `docker image inspect` plus one `docker buildx imagetools inspect`
+	// for the ONE distinct image — not three of each.
+	if inspects != 2 {
+		t.Errorf("inspect calls = %d (%v), want 2 — the distinct image must be compared once", inspects, f.runCalls)
+	}
+}
+
+// TestCompareImageDigest_SentinelBinding pins each composer's local-error
+// wrapper INDEPENDENTLY of the cascade knob. The daemon cascade needs both the
+// knob and the sentinel, so a test that only drives CheckUpdates passes when
+// either one alone is flipped; asserting the wrapper directly makes the second
+// variable mutation-sensitive on its own.
+func TestCompareImageDigest_SentinelBinding(t *testing.T) {
+	daemonDown := errors.New("Cannot connect to the Docker daemon at unix:///var/run/docker.sock")
+
+	t.Run("Compose carries the sentinel", func(t *testing.T) {
+		c := New(t.TempDir())
+		c.SetTestHooks(nil, func(*exec.Cmd) ([]byte, error) { return nil, daemonDown })
+		_, _, err := c.compareImageDigest(context.Background(), "nginx:1.27")
+		if !errors.Is(err, errLocalImageInspect) {
+			t.Fatalf("err = %v, want the errLocalImageInspect sentinel — the local daemon cascade dispatches on it", err)
+		}
+	})
+
+	t.Run("RemoteCompose does not", func(t *testing.T) {
+		rc := NewRemote("prod.example.com", "/srv/app")
+		rc.SetTestHooks(nil, func(*exec.Cmd) ([]byte, error) { return nil, daemonDown })
+		_, _, err := rc.compareImageDigest(context.Background(), "nginx:1.27")
+		if err == nil {
+			t.Fatal("expected an error")
+		}
+		if errors.Is(err, errLocalImageInspect) {
+			t.Error("the remote path must NOT carry errLocalImageInspect: the docker CLI runs on the far side of the SSH hop, so 'local docker unavailable' would name the wrong machine")
+		}
+	})
+
+	t.Run("HostContainers does not", func(t *testing.T) {
+		f := &fakeDockerRunner{runErr: daemonDown}
+		h := &HostContainers{docker: f}
+		_, _, err := h.compareImageDigest(context.Background(), "nginx:1.27")
+		if err == nil {
+			t.Fatal("expected an error")
+		}
+		if errors.Is(err, errLocalImageInspect) {
+			t.Error("HostContainers must NOT carry errLocalImageInspect: the same binding serves the remote runner, where the failure is on the far side of the SSH hop")
+		}
+	})
 }

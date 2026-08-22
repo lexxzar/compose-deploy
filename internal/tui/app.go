@@ -267,7 +267,6 @@ type Model struct {
 	updateInFlight bool   // mirror of refreshInFlight for refreshUpdates — prevents a slow CheckUpdates from stacking on the next screen entry / `U` press
 	updatesErr     string // last error from CheckUpdates; rendered as soft warning below statsErr (priority: svcErr > statsErr > updatesErr)
 	projDir        string // active project's config dir; used for the updateCache key
-	projUnmanaged  bool   // true when the active "project" is the synthetic unmanaged row; folded into updatesCacheKey because its ConfigDir is empty and would otherwise collide with the local-fast-track slot
 	selected       map[int]bool
 	svcCursor      int
 	svcOffset      int // index of first visible service in scroll window
@@ -1555,7 +1554,6 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 				// slot. updatesErr left over from a prior remote session
 				// would leak into the local view's soft-warning slot.
 				m.projDir = ""
-				m.projUnmanaged = false
 				m.projName = ""
 				m.updatesErr = ""
 				m.rollbackSnapshot = nil
@@ -1641,7 +1639,6 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 				m.updatesErr = ""
 				m.projName = ""
 				m.projDir = ""
-				m.projUnmanaged = false
 				m.projects = nil
 				m.projCursor = 0
 				m.projErr = nil
@@ -1671,7 +1668,6 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			proj := m.projects[m.projCursor]
 			m.projName = proj.Name
 			m.projDir = proj.ConfigDir
-			m.projUnmanaged = proj.Unmanaged
 			m.composer = m.composerFactory(proj)
 			m.statsSession++
 			m.statusSession++
@@ -1792,7 +1788,6 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 				m.updatesErr = ""
 				m.projName = ""
 				m.projDir = ""
-				m.projUnmanaged = false
 				m.services = nil
 				m.svcStatus = nil
 				m.stats = nil
@@ -3593,9 +3588,15 @@ func (m Model) refreshUpdates() tea.Cmd {
 // other's CheckUpdates for the full TTL, and hydrateUpdates would write one
 // context's verdicts onto any colliding service name (the phantom guard drops
 // only unknown names, not colliding ones).
+//
+// The prefix is derived from m.readOnly() rather than a parallel bool field:
+// the composer IS the context the cache describes, it is assigned and nil'd at
+// exactly the sites that would have had to clear such a field, and CLAUDE.md's
+// back-navigation cleanup discipline is the repo's most fragile invariant —
+// one forgotten site would silently mis-key the cache.
 func (m Model) updatesCacheKey() string {
 	key := m.projDir + "|" + m.serverName
-	if m.projUnmanaged {
+	if m.readOnly() {
 		return "unmanaged|" + key
 	}
 	return key
@@ -4403,9 +4404,9 @@ func (m Model) containerFooter() string {
 func (m Model) viewSelectContainers() string {
 	var b strings.Builder
 	readOnly := m.readOnly()
-	title := fmt.Sprintf("%s > services (%d/%d selected)", m.breadcrumb(), m.selectedCount(), len(m.services))
-	if readOnly {
-		title = m.breadcrumb() + " > services"
+	title := m.breadcrumb() + " > services"
+	if !readOnly {
+		title = fmt.Sprintf("%s (%d/%d selected)", title, m.selectedCount(), len(m.services))
 	}
 	b.WriteString(titleStyle.Render(title))
 
