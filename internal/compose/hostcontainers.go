@@ -455,3 +455,33 @@ func (h *HostContainers) ExecCommand(ctx context.Context, service string, comman
 	args := append([]string{"exec", "-it", service}, command...)
 	return h.docker.tty(ctx, args...), nil
 }
+
+// Inspect returns the raw `docker inspect` JSON for one unmanaged container.
+//
+// Two calls, mirroring Compose.Inspect: unmanagedEntries resolves the container
+// name to an ID, then `docker inspect <id>` goes through the same run seam. No
+// new plumbing is needed — run already captures stderr and, on the remote
+// adapter, classifies an SSH failure as errSSHTransport, so a dead hop reaches
+// the caller as a transport error rather than a per-container docker failure.
+//
+// Resolution goes through the unmanaged set, so a compose-managed container is
+// deliberately not addressable here — the compose composers own those.
+//
+// The bytes are returned verbatim, so the caller's raw view is byte-identical to
+// what `docker inspect` prints. This is the tui.Inspector capability, not a
+// runner.Composer method.
+func (h *HostContainers) Inspect(ctx context.Context, name string) ([]byte, error) {
+	entries, err := h.unmanagedEntries(ctx)
+	if err != nil {
+		return nil, err
+	}
+	id, ok := pickHostInspectContainer(entries, name)
+	if !ok {
+		return nil, fmt.Errorf("no container found for %q", name)
+	}
+	raw, err := h.docker.run(ctx, "inspect", id)
+	if err != nil {
+		return nil, fmt.Errorf("inspecting container %s: %w", id, err)
+	}
+	return raw, nil
+}

@@ -402,10 +402,10 @@ Plus, outside the tables:
 - Modify: `internal/compose/hostcontainers.go`
 - Modify: `internal/compose/hostcontainers_test.go`
 
-- [ ] add `HostContainers.Inspect(ctx, name)`: `unmanagedEntries(ctx)` → `pickHostInspectContainer` → `h.docker.run(ctx, "inspect", id)` — the field is **`docker`**, not `runner`
-- [ ] confirm no new plumbing is needed — `run` already captures stderr and classifies `errSSHTransport` on the remote adapter
-- [ ] write tests through the existing fake `dockerRunner`: correct argv, local and remote adapters, no-match error, transport-error propagation
-- [ ] run `go test ./internal/compose/` — must pass before task 4
+- [x] add `HostContainers.Inspect(ctx, name)`: `unmanagedEntries(ctx)` → `pickHostInspectContainer` → `h.docker.run(ctx, "inspect", id)` — the field is **`docker`**, not `runner`
+- [x] confirm no new plumbing is needed — `run` already captures stderr and classifies `errSSHTransport` on the remote adapter
+- [x] write tests through the existing fake `dockerRunner`: correct argv, local and remote adapters, no-match error, transport-error propagation
+- [x] run `go test ./internal/compose/` — must pass before task 4
 
 ### Task 4: Parse docker inspect JSON in compose
 

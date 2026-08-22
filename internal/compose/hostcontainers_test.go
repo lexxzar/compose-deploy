@@ -1399,3 +1399,197 @@ func TestHostContainers_ExecCommand_RemoteAllocatesTTY(t *testing.T) {
 		t.Errorf("remote command = %q, want the DefaultExecCommand fallback shell", remoteCmd)
 	}
 }
+
+// --- Inspect ---
+
+// hostInspectRunFunc dispatches a fakeDockerRunner by subcommand so a single
+// fake serves both calls Inspect makes: the `ps` discovery and the `inspect`
+// itself.
+func hostInspectRunFunc(ps, inspect string, inspectErr error) func(args []string) ([]byte, error) {
+	return func(args []string) ([]byte, error) {
+		if len(args) > 0 && args[0] == "inspect" {
+			return []byte(inspect), inspectErr
+		}
+		return []byte(ps), nil
+	}
+}
+
+func TestHostContainers_Inspect(t *testing.T) {
+	f := &fakeDockerRunner{runFunc: hostInspectRunFunc(hostPsMixed, `[{"Name":"/watchtower"}]`, nil)}
+	h := &HostContainers{docker: f}
+
+	raw, err := h.Inspect(context.Background(), "watchtower")
+	if err != nil {
+		t.Fatalf("Inspect() error = %v", err)
+	}
+	if got, want := string(raw), `[{"Name":"/watchtower"}]`; got != want {
+		t.Errorf("raw = %q, want %q (bytes must be verbatim)", got, want)
+	}
+	if len(f.runCalls) != 2 {
+		t.Fatalf("run calls = %v, want exactly 2 (ps + inspect)", f.runCalls)
+	}
+	if got, want := strings.Join(f.runCalls[0], " "), strings.Join(hostPsArgs, " "); got != want {
+		t.Errorf("discovery argv = %q, want %q", got, want)
+	}
+	if got, want := strings.Join(f.runCalls[1], " "), "inspect bbb444555666"; got != want {
+		t.Errorf("inspect argv = %q, want %q", got, want)
+	}
+}
+
+// TestHostContainers_Inspect_CommaJoinedNames pins that resolution reuses
+// hostContainerName, so a container with aliases is addressed by its first name
+// — the same name ListServices and ContainerStatus key on.
+func TestHostContainers_Inspect_CommaJoinedNames(t *testing.T) {
+	f := &fakeDockerRunner{runFunc: hostInspectRunFunc(hostPsMixed, `[{"Name":"/pg-scratch"}]`, nil)}
+	h := &HostContainers{docker: f}
+
+	if _, err := h.Inspect(context.Background(), "pg-scratch"); err != nil {
+		t.Fatalf("Inspect() error = %v", err)
+	}
+	if got, want := strings.Join(f.runCalls[1], " "), "inspect ccc777888999"; got != want {
+		t.Errorf("inspect argv = %q, want %q", got, want)
+	}
+}
+
+func TestHostContainers_Inspect_NoMatch(t *testing.T) {
+	f := &fakeDockerRunner{runFunc: hostInspectRunFunc(hostPsMixed, `[{}]`, nil)}
+	h := &HostContainers{docker: f}
+
+	_, err := h.Inspect(context.Background(), "nope")
+	if err == nil {
+		t.Fatal("expected an error for a name with no container")
+	}
+	if want := `no container found for "nope"`; !strings.Contains(err.Error(), want) {
+		t.Errorf("error = %q, want it to contain %q", err, want)
+	}
+	if len(f.runCalls) != 1 {
+		t.Errorf("run calls = %v, want only the ps call", f.runCalls)
+	}
+}
+
+// TestHostContainers_Inspect_ComposeManagedNotAddressable pins that resolution
+// goes through the unmanaged set: a compose-managed container is owned by the
+// compose composers, so it must not be reachable from this view.
+func TestHostContainers_Inspect_ComposeManagedNotAddressable(t *testing.T) {
+	f := &fakeDockerRunner{runFunc: hostInspectRunFunc(hostPsMixed, `[{"Name":"/web"}]`, nil)}
+	h := &HostContainers{docker: f}
+
+	if _, err := h.Inspect(context.Background(), "web"); err == nil {
+		t.Fatal("expected the compose-managed container to be unreachable")
+	} else if want := `no container found for "web"`; !strings.Contains(err.Error(), want) {
+		t.Errorf("error = %q, want it to contain %q", err, want)
+	}
+}
+
+func TestHostContainers_Inspect_PsFailurePropagates(t *testing.T) {
+	f := &fakeDockerRunner{runErr: errors.New("docker daemon not running")}
+	h := &HostContainers{docker: f}
+
+	_, err := h.Inspect(context.Background(), "watchtower")
+	if err == nil {
+		t.Fatal("expected the ps failure to propagate")
+	}
+	if !strings.Contains(err.Error(), "listing host containers") ||
+		!strings.Contains(err.Error(), "docker daemon not running") {
+		t.Errorf("error = %v, want it to wrap the discovery failure", err)
+	}
+}
+
+func TestHostContainers_Inspect_InspectFailurePropagates(t *testing.T) {
+	f := &fakeDockerRunner{
+		runFunc: hostInspectRunFunc(hostPsMixed, "", errors.New("No such object: bbb444555666")),
+	}
+	h := &HostContainers{docker: f}
+
+	_, err := h.Inspect(context.Background(), "watchtower")
+	if err == nil {
+		t.Fatal("expected the inspect failure to propagate")
+	}
+	if !strings.Contains(err.Error(), "inspecting container bbb444555666") ||
+		!strings.Contains(err.Error(), "No such object") {
+		t.Errorf("error = %v, want it to name the container and carry the docker failure", err)
+	}
+}
+
+// TestHostContainers_Inspect_TransportErrorPropagates pins the "no new
+// plumbing" claim: the run seam already classifies an SSH failure, so the
+// sentinel must survive Inspect's wrapping and reach the caller intact.
+func TestHostContainers_Inspect_TransportErrorPropagates(t *testing.T) {
+	f := &fakeDockerRunner{runFunc: func(args []string) ([]byte, error) {
+		if len(args) > 0 && args[0] == "inspect" {
+			return nil, fmt.Errorf("%w: ssh: connect to host db1 port 22: no route to host", errSSHTransport)
+		}
+		return []byte(hostPsMixed), nil
+	}}
+	h := &HostContainers{docker: f}
+
+	_, err := h.Inspect(context.Background(), "watchtower")
+	if err == nil {
+		t.Fatal("expected the transport failure to propagate")
+	}
+	if !errors.Is(err, errSSHTransport) {
+		t.Errorf("error = %v, want it to wrap errSSHTransport", err)
+	}
+}
+
+func TestNewLocalHostContainers_InspectArgv(t *testing.T) {
+	var captured [][]string
+	c := New(t.TempDir())
+	c.SetTestHooks(nil, func(cmd *exec.Cmd) ([]byte, error) {
+		captured = append(captured, append([]string(nil), cmd.Args...))
+		if slices.Contains(cmd.Args, "inspect") {
+			return []byte(`[{"Name":"/watchtower"}]`), nil
+		}
+		return []byte(hostPsMixed), nil
+	})
+
+	if _, err := NewLocalHostContainers(c).Inspect(context.Background(), "watchtower"); err != nil {
+		t.Fatalf("Inspect() error = %v", err)
+	}
+	if len(captured) != 2 {
+		t.Fatalf("argv calls = %v, want 2 (ps + inspect)", captured)
+	}
+	want := []string{"docker", "inspect", "bbb444555666"}
+	if !slices.Equal(captured[1], want) {
+		t.Errorf("inspect argv = %v, want %v", captured[1], want)
+	}
+	if slices.Contains(captured[1], "compose") {
+		t.Errorf("inspect argv %v must not go through compose", captured[1])
+	}
+}
+
+func TestNewRemoteHostContainers_InspectSplicesSSHExtraArgs(t *testing.T) {
+	extras := []string{"-p", "2222"}
+	host := "user@example.com"
+	var captured [][]string
+
+	r := &RemoteCompose{Host: host, SocketPath: "/tmp/cdeploy-ctrl-abc-99", SSHExtraArgs: extras}
+	r.SetTestHooks(nil, func(cmd *exec.Cmd) ([]byte, error) {
+		captured = append(captured, append([]string(nil), cmd.Args...))
+		if strings.Contains(cmd.Args[len(cmd.Args)-1], "'inspect'") {
+			return []byte(`[{"Name":"/watchtower"}]`), nil
+		}
+		return []byte(hostPsMixed), nil
+	})
+
+	raw, err := NewRemoteHostContainers(r).Inspect(context.Background(), "watchtower")
+	if err != nil {
+		t.Fatalf("Inspect() error = %v", err)
+	}
+	if got, want := string(raw), `[{"Name":"/watchtower"}]`; got != want {
+		t.Errorf("raw = %q, want %q", got, want)
+	}
+	if len(captured) != 2 {
+		t.Fatalf("argv calls = %v, want 2 (ps + inspect)", captured)
+	}
+	assertExtraBeforeHost(t, "HostContainers inspect ps", captured[0], host, extras)
+	assertExtraBeforeHost(t, "HostContainers inspect", captured[1], host, extras)
+
+	remoteCmd := captured[1][len(captured[1])-1]
+	if want := `docker 'inspect' 'bbb444555666'`; remoteCmd != want {
+		t.Errorf("remote inspect command = %q, want %q (container ID shell-escaped)", remoteCmd, want)
+	}
+	if strings.Contains(remoteCmd, "compose") {
+		t.Errorf("remote inspect command must NOT go through compose: %q", remoteCmd)
+	}
+}
