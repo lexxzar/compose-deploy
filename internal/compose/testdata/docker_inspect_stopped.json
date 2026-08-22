@@ -1,0 +1,235 @@
+[
+    {
+        "Id": "e7a4f17695a7dba805719be55797a521d8d0cd3e35c640c1df09c9168db195df",
+        "Created": "2026-08-22T03:09:23.070035046Z",
+        "Path": "/bin/sh",
+        "Args": [
+            "-c",
+            "echo 'migration failed: relation \"users\" does not exist' \u003e\u00262; exit 3"
+        ],
+        "State": {
+            "Status": "exited",
+            "Running": false,
+            "Paused": false,
+            "Restarting": false,
+            "OOMKilled": false,
+            "Dead": false,
+            "Pid": 0,
+            "ExitCode": 3,
+            "Error": "",
+            "StartedAt": "2026-08-22T03:09:23.118711004Z",
+            "FinishedAt": "2026-08-22T03:09:23.176422213Z"
+        },
+        "Image": "sha256:d090ef0c3fa38df49d89dfcca52ce77f71d88a8db6bd8388d78817cad20a0c1f",
+        "ResolvConfPath": "/var/lib/docker/containers/e7a4f17695a7dba805719be55797a521d8d0cd3e35c640c1df09c9168db195df/resolv.conf",
+        "HostnamePath": "/var/lib/docker/containers/e7a4f17695a7dba805719be55797a521d8d0cd3e35c640c1df09c9168db195df/hostname",
+        "HostsPath": "/var/lib/docker/containers/e7a4f17695a7dba805719be55797a521d8d0cd3e35c640c1df09c9168db195df/hosts",
+        "LogPath": "/var/lib/docker/containers/e7a4f17695a7dba805719be55797a521d8d0cd3e35c640c1df09c9168db195df/e7a4f17695a7dba805719be55797a521d8d0cd3e35c640c1df09c9168db195df-json.log",
+        "Name": "/cdeployfixture-crashjob-1",
+        "RestartCount": 0,
+        "Driver": "overlay2",
+        "Platform": "linux",
+        "MountLabel": "",
+        "ProcessLabel": "",
+        "AppArmorProfile": "",
+        "ExecIDs": null,
+        "HostConfig": {
+            "Binds": null,
+            "ContainerIDFile": "",
+            "LogConfig": {
+                "Type": "json-file",
+                "Config": {}
+            },
+            "NetworkMode": "cdeployfixture_default",
+            "PortBindings": {},
+            "RestartPolicy": {
+                "Name": "no",
+                "MaximumRetryCount": 0
+            },
+            "AutoRemove": false,
+            "VolumeDriver": "",
+            "VolumesFrom": null,
+            "ConsoleSize": [
+                0,
+                0
+            ],
+            "CapAdd": null,
+            "CapDrop": null,
+            "CgroupnsMode": "private",
+            "Dns": null,
+            "DnsOptions": null,
+            "DnsSearch": null,
+            "ExtraHosts": [],
+            "GroupAdd": null,
+            "IpcMode": "private",
+            "Cgroup": "",
+            "Links": null,
+            "OomScoreAdj": 0,
+            "PidMode": "",
+            "Privileged": false,
+            "PublishAllPorts": false,
+            "ReadonlyRootfs": false,
+            "SecurityOpt": null,
+            "UTSMode": "",
+            "UsernsMode": "",
+            "ShmSize": 67108864,
+            "Runtime": "runc",
+            "Isolation": "",
+            "CpuShares": 0,
+            "Memory": 0,
+            "NanoCpus": 0,
+            "CgroupParent": "",
+            "BlkioWeight": 0,
+            "BlkioWeightDevice": null,
+            "BlkioDeviceReadBps": null,
+            "BlkioDeviceWriteBps": null,
+            "BlkioDeviceReadIOps": null,
+            "BlkioDeviceWriteIOps": null,
+            "CpuPeriod": 0,
+            "CpuQuota": 0,
+            "CpuRealtimePeriod": 0,
+            "CpuRealtimeRuntime": 0,
+            "CpusetCpus": "",
+            "CpusetMems": "",
+            "Devices": null,
+            "DeviceCgroupRules": null,
+            "DeviceRequests": null,
+            "MemoryReservation": 0,
+            "MemorySwap": 0,
+            "MemorySwappiness": null,
+            "OomKillDisable": null,
+            "PidsLimit": null,
+            "Ulimits": null,
+            "CpuCount": 0,
+            "CpuPercent": 0,
+            "IOMaximumIOps": 0,
+            "IOMaximumBandwidth": 0,
+            "MaskedPaths": [
+                "/proc/acpi",
+                "/proc/asound",
+                "/proc/interrupts",
+                "/proc/kcore",
+                "/proc/keys",
+                "/proc/latency_stats",
+                "/proc/sched_debug",
+                "/proc/scsi",
+                "/proc/timer_list",
+                "/proc/timer_stats",
+                "/sys/devices/virtual/powercap",
+                "/sys/firmware"
+            ],
+            "ReadonlyPaths": [
+                "/proc/bus",
+                "/proc/fs",
+                "/proc/irq",
+                "/proc/sys",
+                "/proc/sysrq-trigger"
+            ]
+        },
+        "GraphDriver": {
+            "Data": {
+                "ID": "e7a4f17695a7dba805719be55797a521d8d0cd3e35c640c1df09c9168db195df",
+                "LowerDir": "/var/lib/docker/overlay2/ed92e225564427fd24ec3e2a8c26cebcfe7c2fd7607aa2efa11578052dc215d8-init/diff:/var/lib/docker/overlay2/0706f6638ad30fcfa320d90551d504677672419dfccadc7ba376d6ab0ab2575b/diff:/var/lib/docker/overlay2/366c0bdfce693277e0f5bb1112dae61c60e6d9edd35f2c443baed2dcb35d2a79/diff:/var/lib/docker/overlay2/43751efd0a469a2521badede43182c35548e3c7cd096b99fb5ee1b6840da74b0/diff:/var/lib/docker/overlay2/40b79e2748fa0864569b8e75e757d45f934534884c4886d1d9b7843e1ea3bdee/diff:/var/lib/docker/overlay2/ed282b3b111937b8f72755decd120c9ef77461fe79dcc173b4452de665371195/diff:/var/lib/docker/overlay2/dd9c8d342462dc6343b8e522c7c7fddc5481217311ac056eef99ecf334985812/diff:/var/lib/docker/overlay2/ddbe6bb6391c775ef12b39d7d24bebf43d7082a6a8a03d55251af6cbfcbcfafd/diff",
+                "MergedDir": "/var/lib/docker/overlay2/ed92e225564427fd24ec3e2a8c26cebcfe7c2fd7607aa2efa11578052dc215d8/merged",
+                "UpperDir": "/var/lib/docker/overlay2/ed92e225564427fd24ec3e2a8c26cebcfe7c2fd7607aa2efa11578052dc215d8/diff",
+                "WorkDir": "/var/lib/docker/overlay2/ed92e225564427fd24ec3e2a8c26cebcfe7c2fd7607aa2efa11578052dc215d8/work"
+            },
+            "Name": "overlay2"
+        },
+        "Mounts": [],
+        "Config": {
+            "Hostname": "e7a4f17695a7",
+            "Domainname": "",
+            "User": "",
+            "AttachStdin": false,
+            "AttachStdout": true,
+            "AttachStderr": true,
+            "ExposedPorts": {
+                "80/tcp": {}
+            },
+            "Tty": false,
+            "OpenStdin": false,
+            "StdinOnce": false,
+            "Env": [
+                "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+                "NGINX_VERSION=1.31.0",
+                "NJS_VERSION=0.9.8",
+                "NJS_RELEASE=1~trixie",
+                "ACME_VERSION=0.4.1",
+                "PKG_RELEASE=1~trixie",
+                "DYNPKG_RELEASE=1~trixie"
+            ],
+            "Cmd": [
+                "echo 'migration failed: relation \"users\" does not exist' \u003e\u00262; exit 3"
+            ],
+            "Image": "nginx:latest",
+            "Volumes": null,
+            "WorkingDir": "",
+            "Entrypoint": [
+                "/bin/sh",
+                "-c"
+            ],
+            "OnBuild": null,
+            "Labels": {
+                "com.docker.compose.config-hash": "3500a8d53aef55f3c396f307544f86af4e3f39865060ed400938d5c0db598cb7",
+                "com.docker.compose.container-number": "1",
+                "com.docker.compose.depends_on": "",
+                "com.docker.compose.image": "sha256:d090ef0c3fa38df49d89dfcca52ce77f71d88a8db6bd8388d78817cad20a0c1f",
+                "com.docker.compose.oneoff": "False",
+                "com.docker.compose.project": "cdeployfixture",
+                "com.docker.compose.project.config_files": "/private/tmp/claude-501/-Users-zavulon-GolandProjects-compose-deploy/11dab8dd-84f6-477d-bc59-f5cd2ebc41ff/scratchpad/fixtures/compose.yml",
+                "com.docker.compose.project.working_dir": "/private/tmp/claude-501/-Users-zavulon-GolandProjects-compose-deploy/11dab8dd-84f6-477d-bc59-f5cd2ebc41ff/scratchpad/fixtures",
+                "com.docker.compose.service": "crashjob",
+                "com.docker.compose.version": "2.40.3",
+                "maintainer": "NGINX Docker Maintainers \u003cdocker-maint@nginx.com\u003e"
+            },
+            "StopSignal": "SIGQUIT",
+            "StopTimeout": 1
+        },
+        "NetworkSettings": {
+            "Bridge": "",
+            "SandboxID": "",
+            "SandboxKey": "",
+            "Ports": {},
+            "HairpinMode": false,
+            "LinkLocalIPv6Address": "",
+            "LinkLocalIPv6PrefixLen": 0,
+            "SecondaryIPAddresses": null,
+            "SecondaryIPv6Addresses": null,
+            "EndpointID": "",
+            "Gateway": "",
+            "GlobalIPv6Address": "",
+            "GlobalIPv6PrefixLen": 0,
+            "IPAddress": "",
+            "IPPrefixLen": 0,
+            "IPv6Gateway": "",
+            "MacAddress": "",
+            "Networks": {
+                "cdeployfixture_default": {
+                    "IPAMConfig": null,
+                    "Links": null,
+                    "Aliases": [
+                        "cdeployfixture-crashjob-1",
+                        "crashjob"
+                    ],
+                    "MacAddress": "",
+                    "DriverOpts": null,
+                    "GwPriority": 0,
+                    "NetworkID": "4584003678ee100a009ea9ef91b9ed69af5aee3b0c8e1f4329e26d175a748863",
+                    "EndpointID": "",
+                    "Gateway": "",
+                    "IPAddress": "",
+                    "IPPrefixLen": 0,
+                    "IPv6Gateway": "",
+                    "GlobalIPv6Address": "",
+                    "GlobalIPv6PrefixLen": 0,
+                    "DNSNames": [
+                        "cdeployfixture-crashjob-1",
+                        "crashjob",
+                        "e7a4f17695a7"
+                    ]
+                }
+            }
+        }
+    }
+]

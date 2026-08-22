@@ -416,11 +416,11 @@ Plus, outside the tables:
 - Create: `internal/compose/testdata/docker_inspect_unhealthy.json`
 - Create: `internal/compose/testdata/docker_inspect_stopped.json`
 
-- [ ] capture three **real** `docker inspect` outputs into `internal/compose/testdata/` (healthy with a healthcheck, unhealthy with a failing probe, stopped with a non-zero exit code)
-- [ ] add the exported `InspectDoc` struct family to `internal/compose/inspect.go` — narrow, only the fields the five sections render
-- [ ] add `ParseInspect(raw []byte) (InspectDoc, error)` handling the single-element JSON array
-- [ ] write tests against all three fixtures: fields populate correctly, an empty array errors, malformed JSON errors, a multi-element array takes the first
-- [ ] run `go test ./internal/compose/` — must pass before task 5
+- [x] capture three **real** `docker inspect` outputs into `internal/compose/testdata/` (healthy with a healthcheck, unhealthy with a failing probe, stopped with a non-zero exit code)
+- [x] add the exported `InspectDoc` struct family to `internal/compose/inspect.go` — narrow, only the fields the five sections render
+- [x] add `ParseInspect(raw []byte) (InspectDoc, error)` handling the single-element JSON array
+- [x] write tests against all three fixtures: fields populate correctly, an empty array errors, malformed JSON errors, a multi-element array takes the first
+- [x] run `go test ./internal/compose/` — must pass before task 5
 
 ### Task 5: Render the STATE and HEALTH sections
 

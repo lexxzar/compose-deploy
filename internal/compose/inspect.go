@@ -2,6 +2,7 @@ package compose
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strings"
 	"time"
@@ -107,4 +108,124 @@ func parsePsEntries(data []byte) ([]psEntry, error) {
 		entries = append(entries, e)
 	}
 	return entries, nil
+}
+
+// InspectDoc is the narrow projection of `docker inspect` that the summary
+// renderer consumes — only the fields the five summary sections draw, not a full
+// Docker API type. Raw mode reads the original bytes, so nothing here has to
+// round-trip.
+//
+// The whole family is exported because the renderer lives in internal/tui and
+// builds these values directly in its table tests; an exported field carrying an
+// unexported type would be readable there but not constructible.
+type InspectDoc struct {
+	Name         string            `json:"Name"`
+	Image        string            `json:"Image"`
+	RestartCount int               `json:"RestartCount"`
+	State        InspectState      `json:"State"`
+	Config       InspectConfig     `json:"Config"`
+	HostConfig   InspectHostConfig `json:"HostConfig"`
+	Mounts       []InspectMount    `json:"Mounts"`
+}
+
+// InspectState mirrors the `.State` object. Health is a pointer because docker
+// omits the key entirely for an image with no healthcheck, and the HEALTH section
+// is dropped on exactly that distinction — a zero-valued struct could not carry it.
+type InspectState struct {
+	Status     string         `json:"Status"`
+	Running    bool           `json:"Running"`
+	Paused     bool           `json:"Paused"`
+	Restarting bool           `json:"Restarting"`
+	OOMKilled  bool           `json:"OOMKilled"`
+	Dead       bool           `json:"Dead"`
+	ExitCode   int            `json:"ExitCode"`
+	Error      string         `json:"Error"`
+	StartedAt  string         `json:"StartedAt"`
+	FinishedAt string         `json:"FinishedAt"`
+	Health     *InspectHealth `json:"Health"`
+}
+
+// InspectHealth mirrors `.State.Health`.
+type InspectHealth struct {
+	Status        string             `json:"Status"`
+	FailingStreak int                `json:"FailingStreak"`
+	Log           []InspectHealthLog `json:"Log"`
+}
+
+// InspectHealthLog is one probe result in `.State.Health.Log`. Output is the
+// probe's combined stdout/stderr — the field the inspect screen exists for.
+type InspectHealthLog struct {
+	Start    string `json:"Start"`
+	End      string `json:"End"`
+	ExitCode int    `json:"ExitCode"`
+	Output   string `json:"Output"`
+}
+
+// InspectConfig mirrors the `.Config` object.
+type InspectConfig struct {
+	Image       string              `json:"Image"`
+	Cmd         []string            `json:"Cmd"`
+	Entrypoint  []string            `json:"Entrypoint"`
+	Env         []string            `json:"Env"`
+	Healthcheck *InspectHealthcheck `json:"Healthcheck"`
+}
+
+// InspectHealthcheck mirrors `.Config.Healthcheck`. Docker reports the three
+// intervals as nanosecond counts, which unmarshal into time.Duration directly, so
+// the renderer gets "5s" from String() with no conversion of its own.
+type InspectHealthcheck struct {
+	Test        []string      `json:"Test"`
+	Interval    time.Duration `json:"Interval"`
+	Timeout     time.Duration `json:"Timeout"`
+	StartPeriod time.Duration `json:"StartPeriod"`
+	Retries     int           `json:"Retries"`
+}
+
+// InspectHostConfig mirrors the `.HostConfig` fields the STATE section renders.
+type InspectHostConfig struct {
+	RestartPolicy InspectRestartPolicy `json:"RestartPolicy"`
+}
+
+// InspectRestartPolicy mirrors `.HostConfig.RestartPolicy`.
+type InspectRestartPolicy struct {
+	Name              string `json:"Name"`
+	MaximumRetryCount int    `json:"MaximumRetryCount"`
+}
+
+// InspectMount is one entry of the top-level `.Mounts` array. Name is set for
+// named volumes and empty for bind mounts.
+type InspectMount struct {
+	Type        string `json:"Type"`
+	Name        string `json:"Name"`
+	Source      string `json:"Source"`
+	Destination string `json:"Destination"`
+	Mode        string `json:"Mode"`
+	RW          bool   `json:"RW"`
+}
+
+// ParseInspect parses `docker inspect` output into an InspectDoc.
+//
+// docker inspect always emits a JSON array, even for one container. cdeploy asks
+// about exactly one, so the first element is the answer; a multi-element array is
+// not an error, it just takes the first. An empty array means the ID resolved to
+// nothing and is reported as such rather than yielding a blank summary.
+func ParseInspect(raw []byte) (InspectDoc, error) {
+	s := strings.TrimSpace(string(raw))
+	if s == "" {
+		return InspectDoc{}, errors.New("parsing docker inspect: empty output")
+	}
+
+	var docs []InspectDoc
+	if err := json.Unmarshal([]byte(s), &docs); err != nil {
+		return InspectDoc{}, fmt.Errorf("parsing docker inspect: %w", err)
+	}
+	if len(docs) == 0 {
+		return InspectDoc{}, errors.New("parsing docker inspect: no container in output")
+	}
+
+	doc := docs[0]
+	// docker reports the container name with a leading slash; every other name in
+	// this package is bare, so it is stripped here rather than in the renderer.
+	doc.Name = strings.TrimPrefix(doc.Name, "/")
+	return doc, nil
 }

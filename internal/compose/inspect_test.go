@@ -5,10 +5,12 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"os"
 	"os/exec"
 	"reflect"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestPickInspectContainer(t *testing.T) {
@@ -583,5 +585,252 @@ func TestRemoteInspect_TransportFailurePropagates(t *testing.T) {
 	}
 	if !errors.Is(err, errSSHTransport) {
 		t.Errorf("error = %v, want it to wrap errSSHTransport", err)
+	}
+}
+
+// readInspectFixture loads one of the captured `docker inspect` outputs. The three
+// fixtures are real captures from a live daemon (nginx:latest under docker
+// compose), not hand-authored, so a field-shape change in a future Docker release
+// surfaces here rather than in production.
+func readInspectFixture(t *testing.T, name string) []byte {
+	t.Helper()
+	data, err := os.ReadFile("testdata/docker_inspect_" + name + ".json")
+	if err != nil {
+		t.Fatalf("read fixture %q: %v", name, err)
+	}
+	return data
+}
+
+func TestParseInspect_HealthyFixture(t *testing.T) {
+	doc, err := ParseInspect(readInspectFixture(t, "healthy"))
+	if err != nil {
+		t.Fatalf("ParseInspect: %v", err)
+	}
+
+	if doc.Name != "cdeployfixture-healthyweb-1" {
+		t.Errorf("Name = %q, want the leading slash stripped", doc.Name)
+	}
+	if want := "sha256:d090ef0c3fa38df49d89dfcca52ce77f71d88a8db6bd8388d78817cad20a0c1f"; doc.Image != want {
+		t.Errorf("Image = %q, want %q", doc.Image, want)
+	}
+	if doc.RestartCount != 0 {
+		t.Errorf("RestartCount = %d, want 0", doc.RestartCount)
+	}
+
+	if doc.State.Status != "running" || !doc.State.Running {
+		t.Errorf("State = %+v, want a running container", doc.State)
+	}
+	if doc.State.OOMKilled || doc.State.ExitCode != 0 {
+		t.Errorf("State OOMKilled = %v, ExitCode = %d, want false/0", doc.State.OOMKilled, doc.State.ExitCode)
+	}
+	if want := "2026-08-22T03:09:23.122582588Z"; doc.State.StartedAt != want {
+		t.Errorf("StartedAt = %q, want %q", doc.State.StartedAt, want)
+	}
+
+	if doc.State.Health == nil {
+		t.Fatal("State.Health = nil, want the healthy probe block")
+	}
+	if doc.State.Health.Status != "healthy" || doc.State.Health.FailingStreak != 0 {
+		t.Errorf("Health = %+v, want healthy with a zero streak", *doc.State.Health)
+	}
+	if len(doc.State.Health.Log) != 3 {
+		t.Fatalf("Health.Log has %d entries, want 3", len(doc.State.Health.Log))
+	}
+	if last := doc.State.Health.Log[len(doc.State.Health.Log)-1]; last.ExitCode != 0 || last.Start == "" || last.End == "" {
+		t.Errorf("last probe = %+v, want a zero exit with both timestamps", last)
+	}
+
+	if doc.Config.Image != "nginx:latest" {
+		t.Errorf("Config.Image = %q, want %q", doc.Config.Image, "nginx:latest")
+	}
+	if want := []string{"nginx", "-g", "daemon off;"}; !reflect.DeepEqual(doc.Config.Cmd, want) {
+		t.Errorf("Config.Cmd = %v, want %v", doc.Config.Cmd, want)
+	}
+	if want := []string{"/docker-entrypoint.sh"}; !reflect.DeepEqual(doc.Config.Entrypoint, want) {
+		t.Errorf("Config.Entrypoint = %v, want %v", doc.Config.Entrypoint, want)
+	}
+	if len(doc.Config.Env) != 10 {
+		t.Errorf("Config.Env has %d entries, want 10", len(doc.Config.Env))
+	}
+	// env is carried verbatim, secrets included — see the no-masking decision
+	if want := "POSTGRES_PASSWORD=s3cr3t-pw"; doc.Config.Env[0] != want {
+		t.Errorf("Config.Env[0] = %q, want %q", doc.Config.Env[0], want)
+	}
+
+	hc := doc.Config.Healthcheck
+	if hc == nil {
+		t.Fatal("Config.Healthcheck = nil, want the declared probe")
+	}
+	if want := []string{"CMD-SHELL", "curl -fsS http://localhost/ >/dev/null || exit 1"}; !reflect.DeepEqual(hc.Test, want) {
+		t.Errorf("Healthcheck.Test = %v, want %v", hc.Test, want)
+	}
+	// docker reports nanosecond counts; they must land as real durations
+	if hc.Interval != 5*time.Second || hc.Timeout != 3*time.Second || hc.StartPeriod != 2*time.Second {
+		t.Errorf("Healthcheck durations = %v/%v/%v, want 5s/3s/2s", hc.Interval, hc.Timeout, hc.StartPeriod)
+	}
+	if hc.Retries != 3 {
+		t.Errorf("Healthcheck.Retries = %d, want 3", hc.Retries)
+	}
+
+	if got := doc.HostConfig.RestartPolicy; got.Name != "no" || got.MaximumRetryCount != 0 {
+		t.Errorf("RestartPolicy = %+v, want {no 0}", got)
+	}
+
+	if len(doc.Mounts) != 2 {
+		t.Fatalf("Mounts has %d entries, want 2", len(doc.Mounts))
+	}
+	bind := doc.Mounts[0]
+	if bind.Type != "bind" || bind.Destination != "/usr/share/nginx/html" || bind.RW || bind.Source == "" {
+		t.Errorf("bind mount = %+v, want a read-only bind onto the nginx docroot", bind)
+	}
+	vol := doc.Mounts[1]
+	if vol.Type != "volume" || vol.Name != "cdeployfixture_webdata" || vol.Destination != "/var/cache/nginx" || !vol.RW {
+		t.Errorf("volume mount = %+v, want the rw named volume", vol)
+	}
+}
+
+func TestParseInspect_UnhealthyFixture(t *testing.T) {
+	doc, err := ParseInspect(readInspectFixture(t, "unhealthy"))
+	if err != nil {
+		t.Fatalf("ParseInspect: %v", err)
+	}
+
+	if doc.Name != "cdeployfixture-sickweb-1" {
+		t.Errorf("Name = %q, want %q", doc.Name, "cdeployfixture-sickweb-1")
+	}
+	// a container can be running and unhealthy at once
+	if doc.State.Status != "running" || !doc.State.Running {
+		t.Errorf("State = %+v, want a running container", doc.State)
+	}
+
+	h := doc.State.Health
+	if h == nil {
+		t.Fatal("State.Health = nil, want the failing probe block")
+	}
+	if h.Status != "unhealthy" {
+		t.Errorf("Health.Status = %q, want %q", h.Status, "unhealthy")
+	}
+	if h.FailingStreak != 5 {
+		t.Errorf("Health.FailingStreak = %d, want 5", h.FailingStreak)
+	}
+	if len(h.Log) == 0 {
+		t.Fatal("Health.Log is empty, want the failing probes")
+	}
+
+	// the last probe Output is the whole reason the inspect screen exists
+	last := h.Log[len(h.Log)-1]
+	if last.ExitCode != 7 {
+		t.Errorf("last probe ExitCode = %d, want 7", last.ExitCode)
+	}
+	if !strings.Contains(last.Output, "Failed to connect to localhost port 9999") {
+		t.Errorf("last probe Output = %q, want the curl connect failure", last.Output)
+	}
+
+	if doc.Config.Healthcheck == nil {
+		t.Fatal("Config.Healthcheck = nil, want the declared probe")
+	}
+	if got := doc.Config.Healthcheck.Retries; got != 2 {
+		t.Errorf("Healthcheck.Retries = %d, want 2", got)
+	}
+	// no start_period was declared, so the field must stay zero rather than default
+	if got := doc.Config.Healthcheck.StartPeriod; got != 0 {
+		t.Errorf("Healthcheck.StartPeriod = %v, want 0", got)
+	}
+	if len(doc.Mounts) != 0 {
+		t.Errorf("Mounts = %v, want none", doc.Mounts)
+	}
+}
+
+func TestParseInspect_StoppedFixture(t *testing.T) {
+	doc, err := ParseInspect(readInspectFixture(t, "stopped"))
+	if err != nil {
+		t.Fatalf("ParseInspect: %v", err)
+	}
+
+	if doc.Name != "cdeployfixture-crashjob-1" {
+		t.Errorf("Name = %q, want %q", doc.Name, "cdeployfixture-crashjob-1")
+	}
+	if doc.State.Status != "exited" || doc.State.Running {
+		t.Errorf("State = %+v, want an exited container", doc.State)
+	}
+	if doc.State.ExitCode != 3 {
+		t.Errorf("State.ExitCode = %d, want 3", doc.State.ExitCode)
+	}
+	if doc.State.FinishedAt == "" || doc.State.FinishedAt == "0001-01-01T00:00:00Z" {
+		t.Errorf("State.FinishedAt = %q, want a real finish time", doc.State.FinishedAt)
+	}
+
+	// no healthcheck on this container: docker omits .State.Health entirely, and
+	// the nil is what makes the renderer drop the whole HEALTH section
+	if doc.State.Health != nil {
+		t.Errorf("State.Health = %+v, want nil for a container with no healthcheck", *doc.State.Health)
+	}
+	if doc.Config.Healthcheck != nil {
+		t.Errorf("Config.Healthcheck = %+v, want nil", *doc.Config.Healthcheck)
+	}
+
+	if want := []string{"/bin/sh", "-c"}; !reflect.DeepEqual(doc.Config.Entrypoint, want) {
+		t.Errorf("Config.Entrypoint = %v, want %v", doc.Config.Entrypoint, want)
+	}
+	if len(doc.Config.Cmd) != 1 || !strings.Contains(doc.Config.Cmd[0], "migration failed") {
+		t.Errorf("Config.Cmd = %v, want the failing migration command", doc.Config.Cmd)
+	}
+}
+
+func TestParseInspect_Errors(t *testing.T) {
+	tests := []struct {
+		name    string
+		raw     string
+		wantErr string
+	}{
+		{name: "empty input", raw: "", wantErr: "empty output"},
+		{name: "whitespace only", raw: "   \n\t ", wantErr: "empty output"},
+		{name: "empty array", raw: "[]", wantErr: "no container in output"},
+		{name: "empty array with whitespace", raw: "  [ ]  ", wantErr: "no container in output"},
+		{name: "malformed json", raw: `[{"Name": `, wantErr: "parsing docker inspect"},
+		{name: "not an array", raw: `{"Name":"/web"}`, wantErr: "parsing docker inspect"},
+		{name: "docker error text", raw: "Error: No such object: web", wantErr: "parsing docker inspect"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			doc, err := ParseInspect([]byte(tt.raw))
+			if err == nil {
+				t.Fatalf("ParseInspect(%q) = %+v, want an error", tt.raw, doc)
+			}
+			if !strings.Contains(err.Error(), tt.wantErr) {
+				t.Errorf("error = %q, want it to contain %q", err, tt.wantErr)
+			}
+		})
+	}
+}
+
+func TestParseInspect_MultiElementTakesFirst(t *testing.T) {
+	raw := `[{"Name":"/first","State":{"Status":"running"}},{"Name":"/second","State":{"Status":"exited"}}]`
+
+	doc, err := ParseInspect([]byte(raw))
+	if err != nil {
+		t.Fatalf("ParseInspect: %v", err)
+	}
+	if doc.Name != "first" {
+		t.Errorf("Name = %q, want the first element", doc.Name)
+	}
+	if doc.State.Status != "running" {
+		t.Errorf("State.Status = %q, want the first element's state", doc.State.Status)
+	}
+}
+
+// TestParseInspect_UnknownFieldsIgnored pins the narrow-by-design choice: docker
+// inspect returns ~200 lines per container and InspectDoc declares only what the
+// summary renders, so an undeclared field must be dropped, never an error.
+func TestParseInspect_UnknownFieldsIgnored(t *testing.T) {
+	raw := `[{"Name":"/web","GraphDriver":{"Data":{"UpperDir":"/x"}},"NetworkSettings":{"Ports":{}},"State":{"Status":"running"}}]`
+
+	doc, err := ParseInspect([]byte(raw))
+	if err != nil {
+		t.Fatalf("ParseInspect: %v", err)
+	}
+	if doc.Name != "web" || doc.State.Status != "running" {
+		t.Errorf("doc = %+v, want the declared fields populated", doc)
 	}
 }
