@@ -279,7 +279,7 @@ func TestHostContainers_ListServices(t *testing.T) {
 	if len(f.runCalls) != 1 {
 		t.Fatalf("run calls = %d, want 1", len(f.runCalls))
 	}
-	wantArgs := []string{"ps", "-a", "--format", "{{json .}}"}
+	wantArgs := []string{"ps", "-a", "--size=false", "--format", "{{json .}}"}
 	if strings.Join(f.runCalls[0], " ") != strings.Join(wantArgs, " ") {
 		t.Errorf("run args = %v, want %v", f.runCalls[0], wantArgs)
 	}
@@ -961,7 +961,7 @@ func TestNewLocalHostContainers_Argv(t *testing.T) {
 	if _, err := NewLocalHostContainers(c).ListServices(context.Background()); err != nil {
 		t.Fatalf("ListServices() error = %v", err)
 	}
-	want := []string{"docker", "ps", "-a", "--format", "{{json .}}"}
+	want := []string{"docker", "ps", "-a", "--size=false", "--format", "{{json .}}"}
 	if len(captured) != len(want) {
 		t.Fatalf("argv = %v, want %v", captured, want)
 	}
@@ -996,7 +996,7 @@ func TestNewRemoteHostContainers_SplicesSSHExtraArgs(t *testing.T) {
 		}
 		assertExtraBeforeHost(t, "HostContainers run", captured, host, extras)
 		remoteCmd := captured[len(captured)-1]
-		if remoteCmd != `docker 'ps' '-a' '--format' '{{json .}}'` {
+		if remoteCmd != `docker 'ps' '-a' '--size=false' '--format' '{{json .}}'` {
 			t.Errorf("remote command = %q", remoteCmd)
 		}
 	})

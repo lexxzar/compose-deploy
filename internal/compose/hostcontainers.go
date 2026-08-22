@@ -283,7 +283,16 @@ func (h *HostContainers) compareImageDigest(ctx context.Context, image string) (
 // rather than the bare `json` keyword, which only exists on Docker CLI >= 23.0;
 // this repo deliberately supports legacy hosts via Detect(), and the template
 // produces identical output on every CLI version.
-var hostPsArgs = []string{"ps", "-a", "--format", "{{json .}}"}
+//
+// `--size=false` is load-bearing for latency. The CLI cannot tell which fields
+// `{{json .}}` reads, so it conservatively requests container sizes, and
+// SizeRw/SizeRootFs make the daemon walk every container's read-write layer —
+// tens of seconds on a host with many or large containers. hostPsEntry has no
+// Size field, so that walk is pure cost. An explicit false wins over the
+// format inference; naming the fields individually would avoid it too, but
+// an unknown field is a hard template error, so `.State` (CLI >= 20.10) would
+// break the legacy hosts this template form exists to support.
+var hostPsArgs = []string{"ps", "-a", "--size=false", "--format", "{{json .}}"}
 
 // unmanagedEntries lists the host containers that carry no compose project
 // label. Entries whose first name is empty are dropped — an unnamed row could
