@@ -65,6 +65,17 @@ type ExecProvider interface {
 	ExecCommand(ctx context.Context, service string, command []string) (*exec.Cmd, error)
 }
 
+// Inspector returns the raw `docker inspect` JSON for one service's container.
+// Declared in the tui package beside ConfigProvider/ExecProvider and
+// type-asserted on the concrete composer — a composer that does not implement
+// it (a test mock) makes the `i` key a silent no-op. All three composers
+// satisfy it, including the read-only *compose.HostContainers: inspect is
+// read-only by nature, so unlike every other recent container key it is NOT
+// gated on m.readOnly().
+type Inspector interface {
+	Inspect(ctx context.Context, service string) ([]byte, error)
+}
+
 // Snapshotter records the currently-running image digests before a deploy so
 // that `cdeploy rollback` can later restore them. Defined in the tui package
 // (like ConfigProvider/ExecProvider) and type-asserted on the concrete composer
@@ -207,6 +218,7 @@ const (
 	screenConfig
 	screenSettingsList
 	screenSettingsForm
+	screenInspect
 )
 
 // Model is the Bubble Tea model for the cdeploy TUI.
@@ -374,6 +386,15 @@ type Model struct {
 	configValid    *bool          // nil = not checked, true = valid, false = invalid
 	configValidMsg string         // validation error message
 	configSession  uint64         // monotonic counter for stale message rejection
+
+	// Screen: inspect
+	inspectService  string         // service whose container is being inspected
+	inspectRaw      []byte         // raw `docker inspect` JSON, verbatim (raw mode)
+	inspectSummary  string         // rendered curated summary (cached; rebuilt on resize)
+	inspectShowRaw  bool           // false = summary (default), true = raw JSON
+	inspectViewport viewport.Model // viewport for whichever mode is active
+	inspectErr      error          // fetch or parse failure
+	inspectSession  uint64         // monotonic counter for stale message rejection
 
 	// Screen: settings list
 	settingsCursor int  // cursor in settings list
@@ -554,6 +575,11 @@ type configValidateMsg struct {
 	err     error
 	session uint64
 }
+type inspectDataMsg struct {
+	data    []byte
+	err     error
+	session uint64
+}
 
 // NewModel creates a new TUI model.
 //
@@ -695,6 +721,14 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				h = 3
 			}
 			m.configViewport.Height = h
+		}
+		if m.screen == screenInspect {
+			m.inspectViewport.Width, m.inspectViewport.Height = inspectViewportSize(msg.Width, msg.Height)
+			// The summary is wrapped to the viewport width, so it has to be
+			// rebuilt from the raw bytes — which survive, keeping raw mode
+			// byte-identical to `docker inspect` across a resize.
+			m.rebuildInspectSummary()
+			m.setInspectContent()
 		}
 		if m.screen == screenSelectContainers {
 			m.fixSvcOffset()
@@ -1184,6 +1218,35 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.configValid = &v
 			m.configValidMsg = ""
 		}
+		return m, nil
+
+	case inspectDataMsg:
+		if m.screen != screenInspect || msg.session != m.inspectSession {
+			return m, nil
+		}
+		if msg.err != nil {
+			m.inspectErr = msg.err
+			return m, nil
+		}
+		if len(msg.data) == 0 {
+			// A call that succeeded and printed nothing. rebuildInspectSummary
+			// early-returns on empty bytes, so ParseInspect's own "empty
+			// output" error never fires and viewInspect would read
+			// "Loading..." for ever, with no error and no way to retry.
+			m.inspectErr = fmt.Errorf("docker inspect returned no output")
+			return m, nil
+		}
+		m.inspectRaw = msg.data
+		m.rebuildInspectSummary()
+		if m.inspectErr != nil {
+			// The parse failed and the raw bytes are the only content there is,
+			// so land the user on them instead of on an empty pane under an
+			// error line. Done HERE, on the transition into the error state,
+			// not in rebuildInspectSummary — that also runs on every resize,
+			// which would silently undo a later `r` back to the summary.
+			m.inspectShowRaw = true
+		}
+		m.setInspectContent()
 		return m, nil
 
 	case execDoneMsg:
@@ -1981,6 +2044,17 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			if _, ok := m.composer.(ConfigProvider); ok {
 				return m.enterConfig()
 			}
+		case "i":
+			// Deliberately NOT gated on m.readOnly(): inspect is read-only by
+			// nature and works identically on both container variants, so it is
+			// named in both help tables.
+			if len(m.services) == 0 {
+				return m, nil
+			}
+			if _, ok := m.composer.(Inspector); !ok {
+				return m, nil
+			}
+			return m.enterInspect()
 		case "x":
 			if _, ok := m.composer.(ExecProvider); !ok {
 				return m, nil
@@ -2313,6 +2387,40 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		default:
 			var cmd tea.Cmd
 			m.configViewport, cmd = m.configViewport.Update(msg)
+			return m, cmd
+		}
+
+	case screenInspect:
+		switch key {
+		case "ctrl+c":
+			return m.tryQuit()
+		case "esc":
+			m.clearInspect()
+			// No refreshStatus(): the inspect screen is read-only and changes
+			// no container state, so it returns like screenConfig rather than
+			// like screenLogs/screenProgress.
+			m.screen = screenSelectContainers
+			return m, nil
+		case "r":
+			// Two-way toggle over two buffers already in hand — no refetch,
+			// unlike screenConfig's r, whose resolved half is lazily fetched.
+			// The gate reads the TARGET buffer, not just the raw one: a failed
+			// FETCH leaves neither buffer and a failed PARSE leaves the raw
+			// bytes but no summary, so in both states the toggle would only
+			// flip the footer's own label over an empty pane. viewInspect drops
+			// the token from the same predicate, so the key and the footer
+			// cannot disagree.
+			if !m.inspectToggleAvailable() {
+				return m, nil
+			}
+			m.inspectShowRaw = !m.inspectShowRaw
+			m.setInspectContent()
+			m.inspectViewport.GotoTop()
+			return m, nil
+		default:
+			// up/down/pgup/pgdown reach the viewport here, matching screenConfig.
+			var cmd tea.Cmd
+			m.inspectViewport, cmd = m.inspectViewport.Update(msg)
 			return m, cmd
 		}
 
@@ -2951,6 +3059,52 @@ func (m *Model) enterConfig() (tea.Model, tea.Cmd) {
 	return *m, m.fetchConfigFile()
 }
 
+// inspectViewportSize is the one home for the inspect pane's chrome budget, so
+// enterInspect and the WindowSizeMsg branch cannot drift apart. The height uses
+// the config sizing (-6), NOT the logs -7, which reserves a row for the log bar
+// the inspect screen does not have. Both floors are load-bearing: an unguarded
+// width goes negative on a very narrow pane, and buildInspectSummary would then
+// wrap to its 80-column fallback for a viewport that renders nothing.
+func inspectViewportSize(width, height int) (int, int) {
+	w := width - 4
+	if w < 10 {
+		w = 40
+	}
+	h := height - 6
+	if h < 3 {
+		h = 3
+	}
+	return w, h
+}
+
+// enterInspect opens the read-only inspect screen for the service under the
+// cursor. Modelled on enterConfig: bump the session, reset every inspect field,
+// size the viewport, then return the fetch command.
+func (m *Model) enterInspect() (tea.Model, tea.Cmd) {
+	m.inspectSession++
+	m.inspectService = m.services[m.svcCursor]
+	m.inspectRaw = nil
+	m.inspectSummary = ""
+	m.inspectShowRaw = false
+	m.inspectErr = nil
+
+	w, vpHeight := inspectViewportSize(m.width, m.height)
+	m.inspectViewport = viewport.New(w, vpHeight)
+	// Raw mode is the escape hatch, and real `docker inspect` output carries
+	// lines hundreds of columns wide (a LowerDir list, a JSON-escaped probe
+	// Output). The viewport hard-cuts at its width with no wrap, so without a
+	// horizontal step left/right are inert and everything past the edge is
+	// unreachable. 4 is the step enterLogs uses when wrap is off. An offset
+	// left behind by a sideways scroll would blank the wrapped summary, so
+	// setInspectContent resets it on every buffer change.
+	m.inspectViewport.SetHorizontalStep(4)
+
+	m.screen = screenInspect
+	// Leaving screenSelectContainers for the inspect screen: search is ephemeral.
+	m.clearSearch()
+	return *m, m.fetchInspect()
+}
+
 func (m *Model) enterExec() (tea.Model, tea.Cmd) {
 	ep, ok := m.composer.(ExecProvider)
 	if !ok {
@@ -2999,6 +3153,92 @@ func (m Model) fetchConfigResolved() tea.Cmd {
 	return func() tea.Msg {
 		data, err := cp.ConfigResolved(ctx)
 		return configResolvedMsg{data: data, err: err, session: session}
+	}
+}
+
+// rebuildInspectSummary re-parses the cached raw bytes and re-renders the
+// curated summary at the viewport's current width. A parse failure is surfaced
+// in the error slot and leaves the summary empty — the raw bytes are still
+// intact, so the `r` toggle remains a working escape hatch.
+func (m *Model) rebuildInspectSummary() {
+	if len(m.inspectRaw) == 0 {
+		m.inspectSummary = ""
+		return
+	}
+	doc, err := compose.ParseInspect(m.inspectRaw)
+	if err != nil {
+		m.inspectErr = err
+		m.inspectSummary = ""
+		// The mode is NOT forced here. The fetch handler switches to raw once,
+		// on the transition into the error state; this function also runs on
+		// every resize, and forcing it there would undo the user's `r`.
+		return
+	}
+	m.inspectErr = nil
+	m.inspectSummary = buildInspectSummary(doc, m.inspectViewport.Width)
+}
+
+// clearInspect resets every inspect field on departure. The session is NOT
+// bumped here — enterInspect bumps it on the way in, which is what invalidates
+// an in-flight fetch; the handler's screen check already discards one that
+// lands after this.
+func (m *Model) clearInspect() {
+	m.inspectService = ""
+	m.inspectRaw = nil
+	m.inspectSummary = ""
+	m.inspectShowRaw = false
+	m.inspectViewport = viewport.Model{}
+	m.inspectErr = nil
+}
+
+// setInspectContent is the single SetContent chokepoint for the inspect
+// viewport, so the mode toggle, the fetch handler and the resize branch cannot
+// disagree about which buffer is on screen.
+func (m *Model) setInspectContent() {
+	if m.inspectShowRaw {
+		// The raw bytes are filtered, not rewritten: docker's JSON escapes only
+		// the C0 block, so DEL and the C1 escape introducers still arrive raw.
+		// See sanitizeInspectRaw.
+		m.inspectViewport.SetContent(sanitizeInspectRaw(m.inspectRaw))
+	} else {
+		m.inspectViewport.SetContent(m.inspectSummary)
+	}
+	// The horizontal offset is reset with every buffer change, and that is
+	// load-bearing: SetContent keeps xOffset and GotoTop resets only YOffset,
+	// so a sideways scroll through the raw JSON would survive the `r` toggle.
+	// The summary is wrapped to the pane, so its longestLineWidth never exceeds
+	// the width — visibleLines() would then cut EVERY line at
+	// [xOffset, xOffset+width] and render a blank screen with no key that
+	// recovers it except an undocumented left. The raw path resets for the
+	// same reason on a resize that widens the pane past the longest line.
+	m.inspectViewport.SetXOffset(0)
+}
+
+// inspectToggleAvailable reports whether the buffer `r` would switch TO holds
+// anything. A failed FETCH leaves neither buffer; a failed PARSE leaves the raw
+// bytes but no summary. Both the key handler and viewInspect's footer read this
+// one predicate, so the screen can never advertise a toggle it then refuses.
+func (m Model) inspectToggleAvailable() bool {
+	if m.inspectShowRaw {
+		return m.inspectSummary != ""
+	}
+	return len(m.inspectRaw) > 0
+}
+
+// fetchInspect runs `docker inspect` for the service being inspected. The
+// returned inspectDataMsg carries the session live when the command was built,
+// so a response that lands after a departure is dropped by the handler.
+func (m Model) fetchInspect() tea.Cmd {
+	ins, ok := m.composer.(Inspector)
+	if !ok {
+		return nil
+	}
+	ctx := m.ctx
+	service := m.inspectService
+	session := m.inspectSession
+	return func() tea.Msg {
+		data, err := ins.Inspect(ctx, service)
+		return inspectDataMsg{data: data, err: err, session: session}
 	}
 }
 
@@ -4177,6 +4417,8 @@ func (m Model) View() string {
 		return m.viewLogs()
 	case screenConfig:
 		return m.viewConfig()
+	case screenInspect:
+		return m.viewInspect()
 	case screenSettingsList:
 		return m.viewSettingsList()
 	case screenSettingsForm:
@@ -5072,6 +5314,79 @@ func (m Model) viewConfig() string {
 	}
 	help += "  •  e edit  •  up/down scroll  •  q back"
 	b.WriteString(helpStyle.Render(help))
+	return b.String()
+}
+
+func (m Model) viewInspect() string {
+	var b strings.Builder
+	// Clamped like the error line and the footer below, so all three chrome
+	// lines this view owns obey one width rule. It is the deterministic-output
+	// half of that rule, not a height fix: measured against the pinned
+	// bubbletea v1.3.10, standardRenderer.flush truncates every line at r.width
+	// with ansi.Truncate before writing it, so an over-WIDE line cannot add a
+	// physical row — only extra NEWLINES can, which is what the error collapse
+	// below is for. Clamping here keeps the cut in View, where the width sweeps
+	// can see it, and holds titleStyle's MarginBottom line too: lipgloss pads
+	// that blank row out to the CONTENT width, so an unclamped 200-cell
+	// breadcrumb widens two rows, not one.
+	b.WriteString(titleStyle.Render(clampToWidth(fmt.Sprintf("%s > inspect > %s", m.breadcrumb(), m.inspectService), m.width)))
+	b.WriteString("\n\n")
+
+	if m.inspectErr != nil {
+		// The chrome is budgeted for exactly ONE extra line, but the compose
+		// layer feeds raw stderr in here (an SSH banner, a multi-line docker
+		// failure), so the message is collapsed to one line. THAT part is
+		// load-bearing for the height budget: the renderer splits View() on
+		// "\n" and keeps only the last m.height lines, so a second physical
+		// line really would cost the title.
+		//
+		// The collapse is not a sanitiser, though. strings.Fields drops only
+		// what unicode.IsSpace covers, so ESC, BEL, DEL and the C1 introducers
+		// survive it, and both stepFailed.Render and clampToWidth are
+		// ANSI-aware and pass them straight through. withStderr embeds the
+		// remote's stderr verbatim, so an SSH banner or a docker failure
+		// naming a hostile image ref reaches the terminal — the same
+		// attacker-influenceable path the summary already guards. Reuse
+		// sanitizeInspectLine so the error slot and the pane cannot disagree
+		// about what is safe; it runs AFTER the collapse so a newline reads as
+		// a word break instead of gluing two words together.
+		oneLine := sanitizeInspectLine(strings.Join(strings.Fields(m.inspectErr.Error()), " "))
+		b.WriteString(stepFailed.Render(clampToWidth("  Error: "+oneLine, m.width)))
+		b.WriteString("\n")
+	}
+	switch {
+	case len(m.inspectRaw) > 0:
+		// A parse failure keeps the raw bytes, so the viewport stays on screen
+		// under the error line and r remains a working escape hatch.
+		b.WriteString(m.inspectViewport.View())
+		b.WriteString("\n")
+	case m.inspectErr == nil:
+		b.WriteString("  Loading...\n")
+	}
+
+	// Footer names only what the screen binds. pgup/pgdown and the esc alias
+	// live in the ? overlay, matching viewConfig's shorter legend. The r token
+	// is dropped whenever the buffer it would switch TO is empty — a failed
+	// fetch leaves neither, a failed parse leaves no summary — because the
+	// toggle could then only relabel itself over an empty pane, and this repo
+	// does not advertise a no-op.
+	help := "  "
+	if m.inspectToggleAvailable() {
+		if m.inspectShowRaw {
+			help += "r summary"
+		} else {
+			help += "r raw JSON"
+		}
+		help += "  •  "
+	}
+	help += "up/down scroll  •  q back"
+	// Clamped for the same reason as the title above, and the same way
+	// containerFooter does it: the footer is 42 cells, so below 42 columns both
+	// it and the helpStyle margin line overrun the pane. See the title comment
+	// for what the renderer does with an over-wide line — it truncates, so the
+	// clamp is about keeping the cut deterministic and visible to the width
+	// sweeps, not about buying back a row.
+	b.WriteString(helpStyle.Render(clampToWidth(help, m.width)))
 	return b.String()
 }
 

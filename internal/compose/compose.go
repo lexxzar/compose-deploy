@@ -725,6 +725,41 @@ func (c *Compose) ContainerStatus(ctx context.Context) (map[string]runner.Servic
 	return parseContainerStatus(out)
 }
 
+// Inspect returns the raw `docker inspect` JSON for one service's container.
+//
+// Two calls: `docker compose ps -a --format json` through command() resolves the
+// service name to a container ID, then `docker inspect <id>` runs through
+// runDockerCmd. The second call MUST bypass command(): `inspect` is a top-level
+// docker CLI command, not a compose subcommand, so command() would build a
+// malformed `docker compose inspect` argv — the same rule `docker stats` and
+// `docker image inspect` already follow.
+//
+// The bytes are returned verbatim so the caller's raw view is byte-identical to
+// what `docker inspect` prints. A service with no container yields a named
+// error rather than an empty result.
+func (c *Compose) Inspect(ctx context.Context, service string) ([]byte, error) {
+	cmd := c.command(ctx, "ps", "-a", "--format", "json")
+	var out []byte
+	var err error
+	if c.outputCmd != nil {
+		out, err = c.outputCmd(cmd)
+	} else {
+		out, err = cmd.Output()
+	}
+	if err != nil {
+		return nil, fmt.Errorf("listing containers for inspect: %w", withStderr(err))
+	}
+	id, err := resolveInspectID(out, service)
+	if err != nil {
+		return nil, err
+	}
+	raw, err := c.runDockerCmd(ctx, []string{"inspect", id})
+	if err != nil {
+		return nil, fmt.Errorf("inspecting container %s: %w", id, err)
+	}
+	return raw, nil
+}
+
 // ContainerStats returns CPU and memory usage for each running service in this
 // project. It fetches the project's container IDs via `docker compose ps`, calls
 // AllContainerStats to retrieve host-wide stats, then joins by container ID and

@@ -8082,6 +8082,10 @@ func TestCtrlCConfirmation_AllRemoteScreens(t *testing.T) {
 		{"progress failed", screenProgress, "ctrl+c", func(m *Model) {
 			m.failed = true
 		}},
+		{"inspect", screenInspect, "ctrl+c", func(m *Model) {
+			m.inspectService = "nginx"
+			m.inspectRaw = []byte(`[{"Name":"/nginx"}]`)
+		}},
 	}
 
 	for _, tt := range tests {
@@ -14334,6 +14338,18 @@ func TestViewProgress_RollbackPrepErrorRendered(t *testing.T) {
 // other way round.
 var _ ExecProvider = (*compose.HostContainers)(nil)
 
+// The `i` key works entirely through a runtime type assertion on Inspector, and
+// every TUI test drives a hand-written double that satisfies it by
+// construction. Without these three lines a rename or a signature drift on any
+// real Inspect method leaves the whole suite green while `i` becomes a silent
+// no-op in production. Inspector is the one capability ALL THREE composers must
+// implement — it has no readOnly gate to make its absence visible.
+var (
+	_ Inspector = (*compose.Compose)(nil)
+	_ Inspector = (*compose.RemoteCompose)(nil)
+	_ Inspector = (*compose.HostContainers)(nil)
+)
+
 // TestHostContainers_CapabilityInterfaces pins both halves of the read-only
 // capability contract. The positive half is the compile-time assertion above;
 // the negative half must be a runtime check, because Go cannot express "does
@@ -14347,6 +14363,9 @@ func TestHostContainers_CapabilityInterfaces(t *testing.T) {
 	if _, ok := c.(ExecProvider); !ok {
 		t.Error("HostContainers must satisfy ExecProvider so the x key works")
 	}
+	if _, ok := c.(Inspector); !ok {
+		t.Error("HostContainers must satisfy Inspector so the i key works on the unmanaged screen")
+	}
 	if _, ok := c.(ConfigProvider); ok {
 		t.Error("HostContainers must NOT satisfy ConfigProvider; the c key has to gate itself")
 	}
@@ -14359,9 +14378,10 @@ func TestHostContainers_CapabilityInterfaces(t *testing.T) {
 }
 
 // readOnlyMockComposer is a mockComposer that also satisfies ReadOnlyComposer
-// and ExecProvider — the exact capability set of *compose.HostContainers. The
-// real type is used for the interface pins above; this mock is used for key
-// dispatch so no test ever shells out to docker.
+// and ExecProvider — the read-only-plus-exec subset of *compose.HostContainers,
+// which also implements Inspector (readOnlyInspectComposer models that whole
+// set). The real type is used for the interface pins above; this mock is used
+// for key dispatch so no test ever shells out to docker.
 type readOnlyMockComposer struct {
 	mockComposer
 	execErr error
@@ -14378,13 +14398,12 @@ func (m *readOnlyMockComposer) ExecCommand(ctx context.Context, service string, 
 
 func newReadOnlyModel(t *testing.T, mc *readOnlyMockComposer) Model {
 	t.Helper()
-	// The factory must hand back the READ-ONLY composer: passing the embedded
-	// mockComposer would let any test that triggers m.composerFactory(...) swap
-	// in a writable one, and every read-only assertion after that would go
-	// quiet rather than fail.
-	m := NewModel(mc, io.Discard, func(compose.Project) runner.Composer { return mc }, nil, nil)
-	m.screen = screenSelectContainers
-	m.services = append([]string(nil), mc.services...)
+	// inspectTestModel supplies the shared container-screen setup, and it hands
+	// the composer to NewModel as the factory too — load-bearing here, because a
+	// factory returning the embedded writable mockComposer would let any test
+	// that triggers m.composerFactory(...) swap the read-only one out, and every
+	// read-only assertion after that would go quiet rather than fail.
+	m := inspectTestModel(t, mc, mc.services)
 	// Copy rather than alias mc.status: hydrateUpdates mutates m.svcStatus in
 	// place, and an alias would write verdicts back into the composer double
 	// that later subtests share.
@@ -14392,10 +14411,6 @@ func newReadOnlyModel(t *testing.T, mc *readOnlyMockComposer) Model {
 	for k, v := range mc.status {
 		m.svcStatus[k] = v
 	}
-	m.width, m.height = 120, 24
-	m.updateInFlight = false
-	m.refreshInFlight = false
-	installFakeTick(&m)
 	return m
 }
 
@@ -15228,5 +15243,1299 @@ func TestReadOnly_UpdateKeyStillFetches(t *testing.T) {
 	}
 	if !result.(Model).updateInFlight {
 		t.Error("U did not mark updateInFlight")
+	}
+}
+
+// mockInspectComposer implements both runner.Composer and Inspector, so the
+// `i` key's type assertion succeeds. Follows the
+// TestReadOnly_GatesWriteKeys_WithCapableComposer precedent: a mock that lacks
+// the capability would let a test pass on the assertion rather than on the
+// behaviour under test.
+type mockInspectComposer struct {
+	mockComposer
+	inspectRaw     []byte
+	inspectErr     error
+	inspectCalls   int
+	inspectService string
+}
+
+func (m *mockInspectComposer) Inspect(ctx context.Context, service string) ([]byte, error) {
+	m.inspectCalls++
+	m.inspectService = service
+	return m.inspectRaw, m.inspectErr
+}
+
+// inspectFixtureJSON is a minimal but structurally real `docker inspect`
+// payload: the single-element array, the leading-slash name and a healthcheck,
+// so the handler exercises the parse and the renderer, not just the plumbing.
+const inspectFixtureJSON = `[{
+  "Name": "/proj-web-1",
+  "Image": "sha256:0123456789abcdef",
+  "RestartCount": 2,
+  "State": {
+    "Status": "running",
+    "Running": true,
+    "StartedAt": "2026-08-22T03:00:00.000000000Z",
+    "Health": {"Status": "healthy", "FailingStreak": 0,
+      "Log": [{"Start": "2026-08-22T03:09:35.0Z", "End": "2026-08-22T03:09:38.0Z", "ExitCode": 0, "Output": "ok\n"}]}
+  },
+  "Config": {"Image": "nginx:1.27", "Env": ["TZ=UTC"],
+    "Healthcheck": {"Test": ["CMD-SHELL", "curl -fsS http://localhost/"], "Interval": 3000000000, "Timeout": 2000000000, "Retries": 2}},
+  "HostConfig": {"RestartPolicy": {"Name": "unless-stopped"}},
+  "Mounts": [{"Type": "volume", "Name": "data", "Source": "/var/lib/docker/volumes/data/_data", "Destination": "/data", "RW": true}]
+}]`
+
+func TestInspectDataMsg_CurrentSessionPopulates(t *testing.T) {
+	m := Model{screen: screenInspect, inspectSession: 5, inspectService: "web"}
+	m.inspectViewport = viewport.New(100, 10)
+
+	result, _ := m.Update(inspectDataMsg{data: []byte(inspectFixtureJSON), session: 5})
+	model := result.(Model)
+
+	if model.inspectErr != nil {
+		t.Fatalf("inspectErr = %v, want nil", model.inspectErr)
+	}
+	if string(model.inspectRaw) != inspectFixtureJSON {
+		t.Error("inspectRaw should hold the bytes verbatim")
+	}
+	if model.inspectSummary == "" {
+		t.Fatal("inspectSummary should be rendered")
+	}
+	for _, want := range []string{"STATE", "running", "HEALTH", "healthy", "IMAGE", "nginx:1.27"} {
+		if !strings.Contains(model.inspectSummary, want) {
+			t.Errorf("summary missing %q:\n%s", want, model.inspectSummary)
+		}
+	}
+	if got := model.inspectViewport.View(); !strings.Contains(got, "STATE") {
+		t.Errorf("viewport should show the summary, got:\n%s", got)
+	}
+}
+
+func TestInspectDataMsg_RawModeShowsVerbatimBytes(t *testing.T) {
+	m := Model{screen: screenInspect, inspectSession: 1, inspectShowRaw: true}
+	m.inspectViewport = viewport.New(200, 10)
+
+	result, _ := m.Update(inspectDataMsg{data: []byte(inspectFixtureJSON), session: 1})
+	model := result.(Model)
+
+	if got := model.inspectViewport.View(); !strings.Contains(got, `"Name": "/proj-web-1"`) {
+		t.Errorf("raw mode should render the inspect bytes, got:\n%s", got)
+	}
+}
+
+// TestInspectDataMsg_RawModeFiltersControlBytes pins the raw buffer's own
+// sanitiser pass. docker's JSON escapes ONLY the C0 block — Go's encoding/json
+// emits DEL and the C1 code points as RAW bytes — so an ENV value or a probe
+// output set by a third-party image can still carry U+009B (CSI) or U+009D
+// (OSC, an OSC 52 clipboard write) onto the operator's terminal one keypress
+// away. inspectRaw itself stays verbatim: it is what ParseInspect reads.
+func TestInspectDataMsg_RawModeFiltersControlBytes(t *testing.T) {
+	payload := "[{\"Name\": \"/proj-web-1\", \"Config\": {\"Image\": \"nginx:1.27\", " +
+		"\"Env\": [\"MOTD=hi\u007fthere\u009d52;c;cGF5bG9hZA==ok\", \"CSI=a\u009b31mb\", \"ESC=x\\u001b[31my\"]}}]"
+
+	m := Model{screen: screenInspect, inspectSession: 1, inspectShowRaw: true}
+	m.inspectViewport = viewport.New(400, 20)
+
+	result, _ := m.Update(inspectDataMsg{data: []byte(payload), session: 1})
+	model := result.(Model)
+
+	if string(model.inspectRaw) != payload {
+		t.Error("inspectRaw must stay verbatim — it is the parser's input")
+	}
+	shown := model.inspectViewport.View()
+	for _, banned := range []string{"\u007f", "\u009b", "\u009d"} {
+		if strings.Contains(shown, banned) {
+			t.Errorf("raw mode must not write %q to the terminal:\n%q", banned, shown)
+		}
+	}
+	// Everything JSON already escaped stays byte-identical, the escaped ESC
+	// included: it is six printable characters, not an escape sequence.
+	for _, want := range []string{"nginx:1.27", "MOTD=hi", "there", "52;c;cGF5bG9hZA==ok", "CSI=a", "31mb", `ESC=x\u001b[31my`} {
+		if !strings.Contains(shown, want) {
+			t.Errorf("raw mode must keep the readable text %q:\n%s", want, shown)
+		}
+	}
+}
+
+func TestInspectDataMsg_StaleSessionDiscarded(t *testing.T) {
+	m := Model{screen: screenInspect, inspectSession: 5}
+	m.inspectViewport = viewport.New(100, 10)
+
+	result, _ := m.Update(inspectDataMsg{data: []byte(inspectFixtureJSON), session: 3})
+	model := result.(Model)
+
+	if model.inspectRaw != nil || model.inspectSummary != "" {
+		t.Error("stale inspectDataMsg should be discarded")
+	}
+}
+
+func TestInspectDataMsg_OffScreenDiscarded(t *testing.T) {
+	m := Model{screen: screenSelectContainers, inspectSession: 5}
+	m.inspectViewport = viewport.New(100, 10)
+
+	result, _ := m.Update(inspectDataMsg{data: []byte(inspectFixtureJSON), session: 5})
+	model := result.(Model)
+
+	if model.inspectRaw != nil || model.inspectSummary != "" {
+		t.Error("inspectDataMsg should be discarded when not on the inspect screen")
+	}
+}
+
+func TestInspectDataMsg_FetchError(t *testing.T) {
+	m := Model{screen: screenInspect, inspectSession: 2}
+	m.inspectViewport = viewport.New(100, 10)
+
+	result, _ := m.Update(inspectDataMsg{err: fmt.Errorf("no container found for \"web\""), session: 2})
+	model := result.(Model)
+
+	if model.inspectErr == nil {
+		t.Fatal("inspectErr should be set on a fetch failure")
+	}
+	if !strings.Contains(model.inspectErr.Error(), "no container found") {
+		t.Errorf("inspectErr = %q", model.inspectErr.Error())
+	}
+	if model.inspectRaw != nil {
+		t.Error("a failed fetch must not populate inspectRaw")
+	}
+}
+
+// TestInspectDataMsg_ParseErrorKeepsRaw pins the escape hatch: a payload the
+// narrow parser cannot read still reaches raw mode, so the user is never left
+// with a blank screen and no way to see what docker actually returned.
+func TestInspectDataMsg_ParseErrorKeepsRaw(t *testing.T) {
+	m := Model{screen: screenInspect, inspectSession: 1}
+	m.inspectViewport = viewport.New(100, 10)
+
+	result, _ := m.Update(inspectDataMsg{data: []byte("[]"), session: 1})
+	model := result.(Model)
+
+	if model.inspectErr == nil {
+		t.Fatal("a parse failure should surface in inspectErr")
+	}
+	if string(model.inspectRaw) != "[]" {
+		t.Errorf("inspectRaw = %q, want the bytes kept for raw mode", string(model.inspectRaw))
+	}
+	if model.inspectSummary != "" {
+		t.Error("summary should be empty when the parse failed")
+	}
+}
+
+func TestFetchInspect_SendsSessionAndService(t *testing.T) {
+	mc := &mockInspectComposer{inspectRaw: []byte(inspectFixtureJSON)}
+	m := Model{composer: mc, ctx: context.Background(), inspectService: "web", inspectSession: 7}
+
+	cmd := m.fetchInspect()
+	if cmd == nil {
+		t.Fatal("fetchInspect returned nil for an Inspector composer")
+	}
+	msg, ok := cmd().(inspectDataMsg)
+	if !ok {
+		t.Fatalf("fetchInspect produced %T, want inspectDataMsg", cmd())
+	}
+	if msg.session != 7 {
+		t.Errorf("session = %d, want 7", msg.session)
+	}
+	if string(msg.data) != inspectFixtureJSON {
+		t.Error("fetchInspect should carry the composer's bytes verbatim")
+	}
+	if mc.inspectService != "web" {
+		t.Errorf("Inspect called with %q, want \"web\"", mc.inspectService)
+	}
+}
+
+func TestFetchInspect_NilForNonInspector(t *testing.T) {
+	m := Model{composer: &mockComposer{}, ctx: context.Background(), inspectService: "web"}
+	if cmd := m.fetchInspect(); cmd != nil {
+		t.Error("fetchInspect should return nil when the composer is not an Inspector")
+	}
+}
+
+func TestFetchInspect_PropagatesError(t *testing.T) {
+	mc := &mockInspectComposer{inspectErr: fmt.Errorf("boom")}
+	m := Model{composer: mc, ctx: context.Background(), inspectService: "web"}
+
+	msg, ok := m.fetchInspect()().(inspectDataMsg)
+	if !ok {
+		t.Fatal("want inspectDataMsg")
+	}
+	if msg.err == nil || !strings.Contains(msg.err.Error(), "boom") {
+		t.Errorf("err = %v, want boom", msg.err)
+	}
+}
+
+// readOnlyInspectComposer is the read-only counterpart of mockInspectComposer:
+// the exact capability set of *compose.HostContainers, which is ReadOnlyComposer
+// + ExecProvider + Inspector (all three pinned against the real type by the
+// compile-time assertions above). The `i` key is the one container key that is
+// NOT gated on m.readOnly(), so this double is what proves the key reaches
+// enterInspect on the unmanaged screen.
+type readOnlyInspectComposer struct {
+	readOnlyMockComposer
+	inspectRaw []byte
+}
+
+func (m *readOnlyInspectComposer) Inspect(ctx context.Context, service string) ([]byte, error) {
+	return m.inspectRaw, nil
+}
+
+// inspectTestModel builds a container screen sitting on the given composer,
+// with every service running. The composer is also the composerFactory's return
+// value, so a test that trips a factory call keeps the same double.
+// newReadOnlyModel delegates here and then reseeds svcStatus from its mock.
+func inspectTestModel(t *testing.T, c runner.Composer, services []string) Model {
+	t.Helper()
+	m := NewModel(c, io.Discard, func(compose.Project) runner.Composer { return c }, nil, nil)
+	m.screen = screenSelectContainers
+	m.services = append([]string(nil), services...)
+	m.svcStatus = map[string]runner.ServiceStatus{}
+	for _, s := range services {
+		m.svcStatus[s] = runner.ServiceStatus{Running: true}
+	}
+	m.width, m.height = 120, 24
+	m.updateInFlight = false
+	m.refreshInFlight = false
+	installFakeTick(&m)
+	return m
+}
+
+func TestInspectKey_EntersOnWritableComposer(t *testing.T) {
+	mc := &mockInspectComposer{inspectRaw: []byte(inspectFixtureJSON)}
+	mc.services = []string{"web", "db"}
+	m := inspectTestModel(t, mc, mc.services)
+	m.svcCursor = 1
+
+	result, cmd := m.Update(keyMsgFor("i"))
+	got := result.(Model)
+
+	if got.screen != screenInspect {
+		t.Fatalf("screen = %d, want screenInspect", got.screen)
+	}
+	if got.inspectService != "db" {
+		t.Errorf("inspectService = %q, want \"db\" (the cursor row)", got.inspectService)
+	}
+	if got.inspectSession == 0 {
+		t.Error("enterInspect must bump inspectSession")
+	}
+	if got.inspectShowRaw {
+		t.Error("the summary is the default mode")
+	}
+	if got.inspectViewport.Height != m.height-6 {
+		t.Errorf("viewport height = %d, want %d (the config sizing)", got.inspectViewport.Height, m.height-6)
+	}
+	if cmd == nil {
+		t.Fatal("enterInspect must return the fetch command")
+	}
+	msg, ok := cmd().(inspectDataMsg)
+	if !ok {
+		t.Fatalf("the returned command produced %T, want inspectDataMsg", cmd())
+	}
+	// Close the loop. Without feeding the message back, a mismatch between the
+	// session fetchInspect carries and the one enterInspect left on the Model
+	// would blank the screen forever on the SUCCESS path — only the error path
+	// would catch it, and only by accident.
+	result, _ = got.Update(msg)
+	loaded := result.(Model)
+	if loaded.inspectErr != nil {
+		t.Fatalf("inspectErr = %v, want nil", loaded.inspectErr)
+	}
+	for _, want := range []string{"STATE", "running", "nginx:1.27"} {
+		if !strings.Contains(loaded.inspectSummary, want) {
+			t.Errorf("summary missing %q:\n%s", want, loaded.inspectSummary)
+		}
+	}
+	if view := loaded.viewInspect(); strings.Contains(view, "Loading") {
+		t.Errorf("the screen must not still read as loading:\n%s", view)
+	}
+}
+
+// TestEnterInspect_FloorsATinyPane pins enterInspect's own clamps, the pair the
+// WindowSizeMsg branch mirrors. A raw m.width - 4 goes negative on a 5-column
+// pane and buildInspectSummary would then wrap to its 80-column fallback.
+func TestEnterInspect_FloorsATinyPane(t *testing.T) {
+	mc := &mockInspectComposer{inspectRaw: []byte(inspectFixtureJSON)}
+	mc.services = []string{"web"}
+	m := inspectTestModel(t, mc, mc.services)
+	m.width, m.height = 5, 2
+
+	result, cmd := m.Update(keyMsgFor("i"))
+	got := result.(Model)
+
+	if got.inspectViewport.Width != 40 {
+		t.Errorf("viewport width = %d, want the floor of 40", got.inspectViewport.Width)
+	}
+	if got.inspectViewport.Height != 3 {
+		t.Errorf("viewport height = %d, want the floor of 3", got.inspectViewport.Height)
+	}
+	result, _ = got.Update(cmd())
+	for _, line := range strings.Split(result.(Model).inspectSummary, "\n") {
+		if ansi.StringWidth(line) > 40 {
+			t.Errorf("line exceeds the floored width: %q", line)
+		}
+	}
+}
+
+// TestInspectKey_SessionIsMonotonic pins the counter's PROPERTY, not just that
+// it is non-zero: a second visit must invalidate the first visit's in-flight
+// fetch. Replacing the ++ with `= 1` keeps every other inspect test green.
+func TestInspectKey_SessionIsMonotonic(t *testing.T) {
+	mc := &mockInspectComposer{inspectRaw: []byte(inspectFixtureJSON)}
+	mc.services = []string{"web"}
+	m := inspectTestModel(t, mc, mc.services)
+
+	result, firstCmd := m.Update(keyMsgFor("i"))
+	first := result.(Model)
+	firstMsg := firstCmd().(inspectDataMsg)
+
+	result, _ = first.Update(keyMsgFor("esc"))
+	back := result.(Model)
+	if back.screen != screenSelectContainers {
+		t.Fatalf("esc left screen = %d, want screenSelectContainers", back.screen)
+	}
+
+	result, secondCmd := back.Update(keyMsgFor("i"))
+	second := result.(Model)
+	if second.inspectSession <= first.inspectSession {
+		t.Fatalf("second visit session = %d, want > %d", second.inspectSession, first.inspectSession)
+	}
+	if got := secondCmd().(inspectDataMsg).session; got != second.inspectSession {
+		t.Errorf("the second fetch carries session %d, want %d", got, second.inspectSession)
+	}
+	// The first visit's fetch, landing late, must be discarded.
+	result, _ = second.Update(firstMsg)
+	if late := result.(Model); late.inspectRaw != nil {
+		t.Error("the first visit's in-flight fetch must not populate the second visit")
+	}
+}
+
+// TestInspectKey_EntersOnReadOnlyComposer pins the deliberate asymmetry: every
+// other container key added recently is gated on m.readOnly(), and i is not.
+func TestInspectKey_EntersOnReadOnlyComposer(t *testing.T) {
+	mc := &readOnlyInspectComposer{
+		readOnlyMockComposer: *readOnlyTestComposer(),
+		inspectRaw:           []byte(inspectFixtureJSON),
+	}
+	m := inspectTestModel(t, mc, mc.services)
+
+	if !m.readOnly() {
+		t.Fatal("precondition: the double must be read-only")
+	}
+
+	result, cmd := m.Update(keyMsgFor("i"))
+	got := result.(Model)
+
+	if got.screen != screenInspect {
+		t.Fatalf("screen = %d, want screenInspect — i must not be gated on readOnly", got.screen)
+	}
+	if cmd == nil {
+		t.Fatal("enterInspect must return the fetch command on the read-only screen too")
+	}
+}
+
+func TestInspectKey_NoOpOnEmptyList(t *testing.T) {
+	mc := &mockInspectComposer{inspectRaw: []byte(inspectFixtureJSON)}
+	m := inspectTestModel(t, mc, nil)
+
+	result, cmd := m.Update(keyMsgFor("i"))
+	got := result.(Model)
+
+	if got.screen != screenSelectContainers {
+		t.Errorf("screen = %d, want screenSelectContainers", got.screen)
+	}
+	if cmd != nil {
+		t.Error("i on an empty list must not fetch")
+	}
+	if mc.inspectCalls != 0 {
+		t.Errorf("Inspect called %d times, want 0", mc.inspectCalls)
+	}
+}
+
+func TestInspectKey_NoOpWhenNotInspector(t *testing.T) {
+	mc := &mockComposer{services: []string{"web"}}
+	m := inspectTestModel(t, mc, mc.services)
+
+	if _, ok := m.composer.(Inspector); ok {
+		t.Fatal("precondition: the plain mock must not be an Inspector")
+	}
+
+	result, cmd := m.Update(keyMsgFor("i"))
+	got := result.(Model)
+
+	if got.screen != screenSelectContainers {
+		t.Errorf("screen = %d, want screenSelectContainers", got.screen)
+	}
+	if cmd != nil {
+		t.Error("i must not fetch when the composer is not an Inspector")
+	}
+	if got.warning != "" {
+		t.Errorf("warning = %q; a silent no-op must not advertise itself", got.warning)
+	}
+}
+
+// TestInspectKey_SwallowedWhileConfirming pins that `i` cannot open a screen
+// from behind an armed destructive prompt. It is structurally safe (the
+// confirming block returns above the action switch), but `i` is a plain letter
+// and the repo pins the analogous `q` case.
+func TestInspectKey_SwallowedWhileConfirming(t *testing.T) {
+	mc := &mockInspectComposer{inspectRaw: []byte(inspectFixtureJSON)}
+	mc.services = []string{"web"}
+	m := inspectTestModel(t, mc, mc.services)
+	m.selected = map[int]bool{0: true}
+
+	result, _ := m.Update(keyMsgFor("d"))
+	armed := result.(Model)
+	if !armed.confirming {
+		t.Fatal("precondition: d must arm the confirmation")
+	}
+
+	result, cmd := armed.Update(keyMsgFor("i"))
+	got := result.(Model)
+	if got.screen != screenSelectContainers {
+		t.Errorf("screen = %d; i must not open the inspect screen from behind a prompt", got.screen)
+	}
+	if !got.confirming {
+		t.Error("i must not disarm the prompt")
+	}
+	if cmd != nil {
+		t.Error("i must not fetch while a confirmation is armed")
+	}
+	if mc.inspectCalls != 0 {
+		t.Errorf("Inspect called %d times, want 0", mc.inspectCalls)
+	}
+}
+
+// TestInspectKey_TypedIntoSearchInput is the other swallow case: with the
+// search bar open every rune is a literal, so a service named "api" stays
+// typeable.
+func TestInspectKey_TypedIntoSearchInput(t *testing.T) {
+	mc := &mockInspectComposer{inspectRaw: []byte(inspectFixtureJSON)}
+	mc.services = []string{"ingest", "web"}
+	m := inspectTestModel(t, mc, mc.services)
+
+	result, _ := m.Update(keyMsgFor("/"))
+	m = result.(Model)
+	if !m.searching {
+		t.Fatal("precondition: search must be open")
+	}
+
+	result, _ = m.Update(keyMsgFor("i"))
+	got := result.(Model)
+	if got.screen != screenSelectContainers {
+		t.Errorf("screen = %d; i must not navigate while the search input is open", got.screen)
+	}
+	if got.searchInput.Value() != "i" {
+		t.Errorf("searchInput = %q, want %q", got.searchInput.Value(), "i")
+	}
+	if mc.inspectCalls != 0 {
+		t.Errorf("Inspect called %d times, want 0", mc.inspectCalls)
+	}
+}
+
+// TestInspectKey_ClearsCommittedSearch pins departure site #10 of the
+// clearSearch checklist: leaving screenSelectContainers must never carry a
+// committed search (and its stale match indices) into a nested screen.
+func TestInspectKey_ClearsCommittedSearch(t *testing.T) {
+	mc := &mockInspectComposer{inspectRaw: []byte(inspectFixtureJSON)}
+	mc.services = []string{"web", "webhook", "db"}
+	m := inspectTestModel(t, mc, mc.services)
+	m.searchQuery = "web"
+	m.searchMatches = []int{0, 1}
+	m.svcCursor = 1
+
+	result, _ := m.Update(keyMsgFor("i"))
+	got := result.(Model)
+
+	if got.screen != screenInspect {
+		t.Fatalf("screen = %d, want screenInspect", got.screen)
+	}
+	if got.searchQuery != "" || got.searchMatches != nil || got.searching {
+		t.Errorf("committed search survived enterInspect: query=%q matches=%v searching=%v",
+			got.searchQuery, got.searchMatches, got.searching)
+	}
+}
+
+// inspectScreenModel builds a populated inspect screen the way enterInspect
+// leaves it: raw bytes in hand, summary rendered and the viewport filled.
+func inspectScreenModel(t *testing.T) Model {
+	t.Helper()
+	m := Model{screen: screenInspect, inspectSession: 1, inspectService: "web"}
+	m.width, m.height = 120, 24
+	m.inspectViewport = viewport.New(m.width-4, m.height-6)
+	result, _ := m.Update(inspectDataMsg{data: []byte(inspectFixtureJSON), session: 1})
+	got := result.(Model)
+	if got.inspectSummary == "" {
+		t.Fatal("precondition: the summary should be rendered")
+	}
+	return got
+}
+
+func TestInspectScreen_RToggleRoundTrips(t *testing.T) {
+	m := inspectScreenModel(t)
+
+	if m.inspectShowRaw {
+		t.Fatal("precondition: the summary is the default mode")
+	}
+	if got := m.inspectViewport.View(); !strings.Contains(got, "STATE") {
+		t.Fatalf("summary mode should show the summary, got:\n%s", got)
+	}
+
+	result, _ := m.Update(keyMsgFor("r"))
+	raw := result.(Model)
+	if !raw.inspectShowRaw {
+		t.Fatal("r should switch to raw mode")
+	}
+	if got := raw.inspectViewport.View(); !strings.Contains(got, `"Name": "/proj-web-1"`) {
+		t.Errorf("raw mode should show the verbatim bytes, got:\n%s", got)
+	}
+	if !strings.Contains(raw.viewInspect(), "r summary") {
+		t.Error("the footer should offer the way back to the summary")
+	}
+
+	result, _ = raw.Update(keyMsgFor("r"))
+	back := result.(Model)
+	if back.inspectShowRaw {
+		t.Fatal("a second r should switch back to the summary")
+	}
+	if got := back.inspectViewport.View(); !strings.Contains(got, "STATE") {
+		t.Errorf("summary should be restored, got:\n%s", got)
+	}
+	if string(back.inspectRaw) != inspectFixtureJSON {
+		t.Error("the round trip must not disturb the raw bytes")
+	}
+	if !strings.Contains(back.viewInspect(), "r raw JSON") {
+		t.Error("the footer should offer raw mode again")
+	}
+}
+
+// TestInspectScreen_RTogglesWithoutRefetch pins the difference from
+// screenConfig's r: both buffers are already in hand, so the toggle issues no
+// command.
+func TestInspectScreen_RTogglesWithoutRefetch(t *testing.T) {
+	m := inspectScreenModel(t)
+	if _, cmd := m.Update(keyMsgFor("r")); cmd != nil {
+		t.Error("the r toggle must not fetch — the raw bytes are already held")
+	}
+}
+
+func TestInspectScreen_EscClearsAndReturns(t *testing.T) {
+	m := inspectScreenModel(t)
+	m.inspectShowRaw = true
+
+	result, cmd := m.Update(tea.KeyMsg{Type: tea.KeyEsc})
+	got := result.(Model)
+
+	if got.screen != screenSelectContainers {
+		t.Fatalf("screen = %d, want screenSelectContainers", got.screen)
+	}
+	if got.inspectService != "" || got.inspectRaw != nil || got.inspectSummary != "" ||
+		got.inspectShowRaw || got.inspectErr != nil {
+		t.Errorf("esc left inspect state behind: service=%q raw=%d summary=%d showRaw=%v err=%v",
+			got.inspectService, len(got.inspectRaw), len(got.inspectSummary),
+			got.inspectShowRaw, got.inspectErr)
+	}
+	if got.inspectViewport.Height != 0 {
+		t.Error("esc should reset the viewport")
+	}
+	// Read-only screen: no status refresh on the way out, matching screenConfig
+	// rather than screenLogs/screenProgress.
+	if cmd != nil {
+		t.Error("esc from the inspect screen must not refresh status")
+	}
+}
+
+// TestInspectScreen_EscClearsErrorSlot covers the failed-fetch departure: the
+// error must not survive into the next visit.
+func TestInspectScreen_EscClearsErrorSlot(t *testing.T) {
+	m := Model{screen: screenInspect, inspectSession: 1, inspectService: "web"}
+	m.inspectViewport = viewport.New(100, 10)
+	result, _ := m.Update(inspectDataMsg{err: fmt.Errorf("boom"), session: 1})
+	m = result.(Model)
+	if m.inspectErr == nil {
+		t.Fatal("precondition: the error should be set")
+	}
+
+	result, _ = m.Update(tea.KeyMsg{Type: tea.KeyEsc})
+	got := result.(Model)
+	if got.inspectErr != nil {
+		t.Errorf("inspectErr = %v, want nil after esc", got.inspectErr)
+	}
+	if got.screen != screenSelectContainers {
+		t.Errorf("screen = %d, want screenSelectContainers", got.screen)
+	}
+}
+
+// TestInspectScreen_QTakesTheSamePath pins the q→esc rewrite: screenInspect
+// opens no text input, so it falls into the rewrite block's default case and
+// needs no typingInInput() entry of its own.
+func TestInspectScreen_QTakesTheSamePath(t *testing.T) {
+	m := inspectScreenModel(t)
+
+	result, _ := m.Update(keyMsgFor("q"))
+	got := result.(Model)
+
+	if got.screen != screenSelectContainers {
+		t.Fatalf("screen = %d, want screenSelectContainers — q must rewrite to esc", got.screen)
+	}
+	if got.inspectRaw != nil || got.inspectSummary != "" {
+		t.Error("q should clear the inspect state exactly like esc")
+	}
+}
+
+func TestInspectScreen_ResizeRebuildsAndKeepsRaw(t *testing.T) {
+	m := inspectScreenModel(t)
+	wide := m.inspectSummary
+
+	result, _ := m.Update(tea.WindowSizeMsg{Width: 44, Height: 30})
+	got := result.(Model)
+
+	if got.inspectViewport.Width != 40 {
+		t.Errorf("viewport width = %d, want 40 (msg.Width - 4)", got.inspectViewport.Width)
+	}
+	if got.inspectViewport.Height != 24 {
+		t.Errorf("viewport height = %d, want 24 (msg.Height - 6, the config sizing)", got.inspectViewport.Height)
+	}
+	if string(got.inspectRaw) != inspectFixtureJSON {
+		t.Error("a resize must preserve the raw bytes verbatim")
+	}
+	if got.inspectSummary == "" {
+		t.Fatal("the summary should be rebuilt at the new width")
+	}
+	if got.inspectSummary == wide {
+		t.Error("the summary should be re-wrapped, not reused at the old width")
+	}
+	for _, line := range strings.Split(got.inspectSummary, "\n") {
+		if ansi.StringWidth(line) > 40 {
+			t.Errorf("rebuilt line exceeds the new width: %q", line)
+		}
+	}
+}
+
+// TestInspectScreen_ResizeInRawModeKeepsBuffer pins the chokepoint: a resize
+// while raw mode is on must leave raw mode on and the viewport showing bytes.
+func TestInspectScreen_ResizeInRawModeKeepsBuffer(t *testing.T) {
+	m := inspectScreenModel(t)
+	result, _ := m.Update(keyMsgFor("r"))
+	m = result.(Model)
+
+	result, _ = m.Update(tea.WindowSizeMsg{Width: 200, Height: 40})
+	got := result.(Model)
+
+	if !got.inspectShowRaw {
+		t.Fatal("a resize must not change the mode")
+	}
+	if view := got.inspectViewport.View(); !strings.Contains(view, `"Name": "/proj-web-1"`) {
+		t.Errorf("raw mode should still show the bytes after a resize, got:\n%s", view)
+	}
+}
+
+// TestInspectScreen_ResizeOffScreenIsInert guards the branch condition: a
+// WindowSizeMsg that lands on another screen must not touch inspect state.
+func TestInspectScreen_ResizeOffScreenIsInert(t *testing.T) {
+	m := inspectScreenModel(t)
+	m.screen = screenSelectContainers
+	wantSummary, wantContent := m.inspectSummary, m.inspectViewport.View()
+
+	result, _ := m.Update(tea.WindowSizeMsg{Width: 44, Height: 30})
+	got := result.(Model)
+
+	if got.inspectViewport.Width != 116 {
+		t.Errorf("viewport width = %d, want the untouched 116", got.inspectViewport.Width)
+	}
+	// The guarded branch also calls rebuildInspectSummary and setInspectContent,
+	// so a guard that regressed to "width only" has to fail here too.
+	if got.inspectSummary != wantSummary {
+		t.Error("an off-screen resize must not rebuild the summary")
+	}
+	if got.inspectViewport.View() != wantContent {
+		t.Error("an off-screen resize must not re-set the viewport content")
+	}
+}
+
+// TestInspectScreen_ResizeBeforeFetch is a live sequence, not a synthetic one:
+// resizing while the screen still reads "Loading..." on a slow SSH host reaches
+// rebuildInspectSummary with no bytes in hand.
+func TestInspectScreen_ResizeBeforeFetch(t *testing.T) {
+	m := Model{screen: screenInspect, inspectSession: 1, inspectService: "web", width: 120, height: 24}
+	m.inspectViewport = viewport.New(116, 18)
+
+	result, _ := m.Update(tea.WindowSizeMsg{Width: 60, Height: 20})
+	got := result.(Model)
+
+	if got.inspectSummary != "" || got.inspectRaw != nil {
+		t.Error("a resize with no bytes in hand must not invent content")
+	}
+	if got.inspectErr != nil {
+		t.Errorf("inspectErr = %v; an empty buffer is not a parse failure", got.inspectErr)
+	}
+	if !strings.Contains(got.viewInspect(), "Loading") {
+		t.Errorf("the screen should still read as loading:\n%s", got.viewInspect())
+	}
+	// And the fetch that lands afterwards still renders, at the NEW width.
+	result, _ = got.Update(inspectDataMsg{data: []byte(inspectFixtureJSON), session: 1})
+	loaded := result.(Model)
+	if loaded.inspectSummary == "" {
+		t.Fatal("the fetch after a resize should still render")
+	}
+	for _, line := range strings.Split(loaded.inspectSummary, "\n") {
+		if ansi.StringWidth(line) > 56 {
+			t.Errorf("line exceeds the resized width: %q", line)
+		}
+	}
+}
+
+// TestInspectScreen_ResizeFloorsMatchEnterInspect pins the two sizing sites
+// against each other. enterInspect floors width at 10 and height at 3; an
+// unguarded resize branch would set a NEGATIVE width, and buildInspectSummary
+// would then wrap to its 80-column fallback for a pane that renders nothing.
+func TestInspectScreen_ResizeFloorsMatchEnterInspect(t *testing.T) {
+	m := inspectScreenModel(t)
+
+	result, _ := m.Update(tea.WindowSizeMsg{Width: 3, Height: 1})
+	got := result.(Model)
+
+	if got.inspectViewport.Width != 40 {
+		t.Errorf("viewport width = %d, want the 40 enterInspect floors to", got.inspectViewport.Width)
+	}
+	if got.inspectViewport.Height != 3 {
+		t.Errorf("viewport height = %d, want the floor of 3", got.inspectViewport.Height)
+	}
+	if got.inspectSummary == "" {
+		t.Fatal("the summary should still be rebuilt at the floored width")
+	}
+	for _, line := range strings.Split(got.inspectSummary, "\n") {
+		if ansi.StringWidth(line) > 40 {
+			t.Errorf("line exceeds the floored width: %q", line)
+		}
+	}
+}
+
+// TestInspectScreen_RawModeScrollsSideways pins the escape hatch's reach, and
+// it drives the real `i` entry point because enterInspect is where the step is
+// set. Real `docker inspect` output carries lines hundreds of columns wide and
+// the viewport hard-cuts at its width with no wrap, so with a zero horizontal
+// step left/right are inert and everything past the edge is unreachable — in
+// exactly the mode that exists for the payload the parser could not read.
+func TestInspectScreen_RawModeScrollsSideways(t *testing.T) {
+	long := `[{"Name":"/proj-web-1","State":{"Status":"running","Running":true},` +
+		`"Config":{"Image":"` + strings.Repeat("very-long-image-segment-", 30) + `x"}}]`
+
+	mc := &mockInspectComposer{inspectRaw: []byte(long)}
+	mc.services = []string{"web"}
+	m := inspectTestModel(t, mc, mc.services)
+
+	result, cmd := m.Update(keyMsgFor("i"))
+	m = result.(Model)
+	result, _ = m.Update(cmd())
+	result, _ = result.(Model).Update(keyMsgFor("r"))
+	raw := result.(Model)
+	if !raw.inspectShowRaw {
+		t.Fatal("precondition: r should enter raw mode")
+	}
+	before := raw.inspectViewport.View()
+	if !strings.Contains(before, "very-long-image-segment") {
+		t.Fatalf("precondition: raw mode should show the payload:\n%s", before)
+	}
+
+	result, _ = raw.Update(tea.KeyMsg{Type: tea.KeyRight})
+	scrolled := result.(Model)
+	if scrolled.inspectViewport.View() == before {
+		t.Error("right must scroll the raw pane sideways; enterInspect has to call SetHorizontalStep")
+	}
+
+	result, _ = scrolled.Update(tea.KeyMsg{Type: tea.KeyLeft})
+	if back := result.(Model); back.inspectViewport.View() != before {
+		t.Error("left must scroll back")
+	}
+}
+
+// inspectScrolledRawModel enters the inspect screen through the real `i` key,
+// switches to raw mode and scrolls it well to the right, which is the only way
+// to make the viewport's xOffset non-zero.
+func inspectScrolledRawModel(t *testing.T) Model {
+	t.Helper()
+	long := `[{"Name":"/proj-web-1","State":{"Status":"running","Running":true},` +
+		`"Config":{"Image":"` + strings.Repeat("very-long-image-segment-", 30) + `x"}}]`
+
+	mc := &mockInspectComposer{inspectRaw: []byte(long)}
+	mc.services = []string{"web"}
+	m := inspectTestModel(t, mc, mc.services)
+
+	result, cmd := m.Update(keyMsgFor("i"))
+	result, _ = result.(Model).Update(cmd())
+	result, _ = result.(Model).Update(keyMsgFor("r"))
+	raw := result.(Model)
+	if !raw.inspectShowRaw {
+		t.Fatal("precondition: r should enter raw mode")
+	}
+	for i := 0; i < 40; i++ {
+		result, _ = raw.Update(tea.KeyMsg{Type: tea.KeyRight})
+		raw = result.(Model)
+	}
+	if strings.Contains(raw.inspectViewport.View(), `"Name"`) {
+		t.Fatal("precondition: the pane should be scrolled past the left edge")
+	}
+	return raw
+}
+
+// TestInspectScreen_RToggleAfterSidewaysScrollKeepsSummaryOnScreen is the
+// companion pin to TestInspectScreen_RawModeScrollsSideways. The horizontal
+// step that test asks for is what makes xOffset reachable, and NEITHER
+// SetContent nor GotoTop resets one — SetContent recomputes the line widths and
+// GotoTop moves YOffset only. The summary is wrapped to the pane, so its
+// longest line never exceeds the width: visibleLines() then cuts EVERY line at
+// [xOffset, xOffset+width] and renders a blank pane under a correct title and
+// footer, with no key the footer advertises that recovers it.
+func TestInspectScreen_RToggleAfterSidewaysScrollKeepsSummaryOnScreen(t *testing.T) {
+	raw := inspectScrolledRawModel(t)
+
+	result, _ := raw.Update(keyMsgFor("r"))
+	back := result.(Model)
+	if back.inspectShowRaw {
+		t.Fatal("a second r should switch back to the summary")
+	}
+	view := back.inspectViewport.View()
+	for _, want := range []string{"STATE", "proj-web-1", "running"} {
+		if !strings.Contains(ansi.Strip(view), want) {
+			t.Errorf("the summary must still be on screen after a sideways scroll, missing %q:\n%s", want, view)
+		}
+	}
+}
+
+// TestInspectScreen_ResizeClearsStaleHorizontalOffset is the same stale offset
+// reached through the other writer: a resize that widens the pane past the raw
+// content's longest line leaves an offset that cuts the left edge off every
+// line. Both writers go through setInspectContent, so one reset covers them.
+func TestInspectScreen_ResizeClearsStaleHorizontalOffset(t *testing.T) {
+	raw := inspectScrolledRawModel(t)
+
+	result, _ := raw.Update(tea.WindowSizeMsg{Width: 200, Height: 40})
+	resized := result.(Model)
+	if !resized.inspectShowRaw {
+		t.Fatal("a resize must not change the mode")
+	}
+	if !strings.Contains(resized.inspectViewport.View(), `"Name"`) {
+		t.Errorf("the resized pane must show the left edge again:\n%s", resized.inspectViewport.View())
+	}
+}
+
+// TestInspectDataMsg_EmptyOutputIsAnError covers the one success shape that
+// produces no content: rebuildInspectSummary early-returns on empty bytes, so
+// ParseInspect's own "empty output" error never fires and the screen would read
+// "Loading..." for ever, with no error and nothing to retry.
+func TestInspectDataMsg_EmptyOutputIsAnError(t *testing.T) {
+	m := Model{screen: screenInspect, inspectSession: 1, inspectService: "web", width: 100, height: 24}
+	m.inspectViewport = viewport.New(96, 18)
+
+	result, _ := m.Update(inspectDataMsg{data: nil, session: 1})
+	model := result.(Model)
+
+	if model.inspectErr == nil {
+		t.Fatal("an empty payload should surface in the error slot")
+	}
+	view := ansi.Strip(model.viewInspect())
+	if strings.Contains(view, "Loading") {
+		t.Errorf("the fetch is over, so the screen must not read as loading:\n%s", view)
+	}
+	if !strings.Contains(view, "Error:") {
+		t.Errorf("the error line must render:\n%s", view)
+	}
+}
+
+// TestInspectScreen_ResizeKeepsTheChosenModeAfterAParseFailure pins where the
+// forced raw switch lives. rebuildInspectSummary runs on the fetch AND on every
+// resize; forcing the mode inside it would flip the reader back to raw the next
+// time the terminal changed size. The mode is cleared on the model directly
+// rather than through `r`, because the toggle is inert while the summary is
+// empty — this pins the resize branch, not how the mode got there.
+func TestInspectScreen_ResizeKeepsTheChosenModeAfterAParseFailure(t *testing.T) {
+	m := Model{screen: screenInspect, inspectSession: 1, inspectService: "web", width: 100, height: 24}
+	m.inspectViewport = viewport.New(96, 18)
+	result, _ := m.Update(inspectDataMsg{data: []byte("[]"), session: 1})
+	m = result.(Model)
+	if !m.inspectShowRaw {
+		t.Fatal("precondition: the fetch should switch to raw on a parse failure")
+	}
+
+	m.inspectShowRaw = false
+	result, _ = m.Update(tea.WindowSizeMsg{Width: 80, Height: 30})
+	if resized := result.(Model); resized.inspectShowRaw {
+		t.Error("a resize must not force raw mode; only the fetch handler does")
+	}
+}
+
+func TestViewInspect_RendersBreadcrumbAndFooter(t *testing.T) {
+	m := inspectScreenModel(t)
+	m.serverName = "prod"
+	m.projName = "shop"
+
+	view := m.viewInspect()
+	for _, want := range []string{"cdeploy > prod > shop > inspect > web", "STATE", "r raw JSON", "q back"} {
+		if !strings.Contains(view, want) {
+			t.Errorf("view missing %q:\n%s", want, view)
+		}
+	}
+}
+
+func TestViewInspect_LoadingBeforeFetch(t *testing.T) {
+	m := Model{screen: screenInspect, inspectService: "web"}
+	m.inspectViewport = viewport.New(100, 10)
+
+	if view := m.viewInspect(); !strings.Contains(view, "Loading") {
+		t.Errorf("view should show a loading line before the fetch lands:\n%s", view)
+	}
+}
+
+func TestViewInspect_ShowsFetchError(t *testing.T) {
+	m := Model{screen: screenInspect, inspectService: "web", inspectErr: fmt.Errorf("no container found for \"web\"")}
+	m.inspectViewport = viewport.New(100, 10)
+
+	view := m.viewInspect()
+	if !strings.Contains(view, "no container found") {
+		t.Errorf("view should surface inspectErr:\n%s", view)
+	}
+	if strings.Contains(view, "Loading") {
+		t.Error("an errored fetch must not still read as loading")
+	}
+}
+
+// TestViewInspect_ParseErrorShowsTheRawBytes pins the escape hatch end to end:
+// when the narrow parser refuses the payload the raw bytes are the only content
+// that exists, so the screen switches to them rather than leaving an error line
+// above an empty pane and making the user guess that `r` is the way out.
+func TestViewInspect_ParseErrorShowsTheRawBytes(t *testing.T) {
+	m := Model{screen: screenInspect, inspectSession: 1, inspectService: "web", width: 100}
+	m.inspectViewport = viewport.New(100, 10)
+	result, _ := m.Update(inspectDataMsg{data: []byte("[]"), session: 1})
+	m = result.(Model)
+
+	if !m.inspectShowRaw {
+		t.Fatal("a parse failure must switch to raw mode; the summary is empty")
+	}
+	view := m.viewInspect()
+	if !strings.Contains(view, "Error:") {
+		t.Errorf("the parse failure should show in the error slot:\n%s", view)
+	}
+	if strings.Contains(view, "Loading") {
+		t.Error("bytes are in hand, so the screen must not read as loading")
+	}
+	if !strings.Contains(view, "[]") {
+		t.Errorf("the pane must show the payload the parser choked on:\n%s", view)
+	}
+	// The summary the toggle would switch to is empty, so the footer must not
+	// name r — the same no-op rule TestViewInspect_FooterDropsRWithoutBuffers
+	// pins for a failed fetch, applied to the target buffer rather than to the
+	// raw one.
+	if strings.Contains(view, "r summary") {
+		t.Errorf("an empty summary must not be advertised:\n%s", view)
+	}
+	result, _ = m.Update(keyMsgFor("r"))
+	if again := result.(Model); !again.inspectShowRaw {
+		t.Error("r must be inert while the summary is empty; it left raw mode")
+	}
+}
+
+// TestViewInspect_ErrorIsOneClampedLine pins the chrome budget: viewInspect
+// reserves exactly ONE line for the error, but the compose layer feeds raw
+// stderr in (an SSH banner, a multi-line docker failure). A wrapped or
+// multi-line error pushes the title off the top, because bubbletea keeps only
+// the last m.height lines.
+func TestViewInspect_ErrorIsOneClampedLine(t *testing.T) {
+	// The sweep runs 40-120, not one sample: at width 60 the footer happens to
+	// fit, so a single sample cannot see a chrome line that overflows a narrow
+	// pane. 40 is the narrowest width this repo supports and sweeps elsewhere
+	// (TestContainerFooterReservation runs 40-180).
+	for width := 40; width <= 120; width++ {
+		m := Model{screen: screenInspect, inspectService: "web", width: width, height: 24}
+		m.inspectViewport = viewport.New(width-4, 18)
+		m.inspectErr = fmt.Errorf("listing containers for inspect: %s",
+			"ssh: connect to host prod port 22\nbanner line two\nbanner line three that is really quite long indeed")
+
+		for _, line := range strings.Split(m.viewInspect(), "\n") {
+			if w := ansi.StringWidth(line); w > m.width {
+				t.Errorf("width %d: line is %d cells wide, want <= %d: %q", width, w, m.width, line)
+			}
+		}
+		lines := strings.Split(ansi.Strip(m.viewInspect()), "\n")
+		errIdx := -1
+		for i, line := range lines {
+			if strings.Contains(line, "Error: listing") {
+				errIdx = i
+			}
+		}
+		if errIdx == -1 {
+			t.Errorf("width %d: the error must keep its head, which names what failed:\n%s", width, strings.Join(lines, "\n"))
+			continue
+		}
+		for i, line := range lines {
+			if i != errIdx && strings.Contains(line, "banner line") {
+				t.Errorf("width %d: the error must occupy one line, line %d also carries it: %q", width, i, line)
+			}
+		}
+	}
+}
+
+// TestViewInspect_ErrorLineIsSanitised pins the OTHER thing the error slot has
+// to do to its input. The compose layer builds this string with withStderr,
+// which embeds the remote's stderr verbatim, so a docker failure echoing a
+// hostile image ref or an SSH banner lands here — and strings.Fields, the only
+// pass the slot used to run, drops nothing but unicode whitespace: ESC, BEL,
+// DEL and the 8-bit C1 introducers all survive it, and stepFailed.Render plus
+// clampToWidth are both ANSI-aware and hand them straight to the terminal.
+// sanitizeInspectLine is the same pass every decoded summary line goes through,
+// so the two cannot disagree about what is safe.
+func TestViewInspect_ErrorLineIsSanitised(t *testing.T) {
+	hostile := "listing containers for inspect: \x1b]52;c;cGF5bG9hZA==\x07banner " +
+		"\x1b[31mred\x1b[0m \x9b31mCSI \x9d52;OSC\x07 tail\x7fDEL"
+
+	m := Model{screen: screenInspect, inspectService: "web", width: 300, height: 24}
+	m.inspectViewport = viewport.New(296, 18)
+	m.inspectErr = errors.New(hostile)
+
+	out := m.viewInspect()
+	for _, banned := range []string{"\x1b", "\x07", "\x7f", "\u009b", "\u009d"} {
+		if strings.Contains(out, banned) {
+			t.Errorf("viewInspect must not write %q to the terminal:\n%q", banned, out)
+		}
+	}
+	// The whole sequence goes, not just its introducer: a bare rune filter
+	// would leave the OSC 52 clipboard payload and the SGR parameters behind as
+	// readable text, which is how ansi.Strip earns its place in the pass.
+	for _, banned := range []string{"52;c;", "cGF5bG9hZA==", "31m"} {
+		if strings.Contains(out, banned) {
+			t.Errorf("viewInspect must strip the whole escape sequence, %q survived:\n%q", banned, out)
+		}
+	}
+	// What is left must still read as the error, and still be one line.
+	if !strings.Contains(out, "Error: listing containers for inspect: banner red") {
+		t.Errorf("the readable head must survive the pass:\n%s", out)
+	}
+	if got := strings.Count(out, "Error:"); got != 1 {
+		t.Errorf("the error must occupy one line, found %d:\n%q", got, out)
+	}
+}
+
+// TestViewInspect_TitleNeverExceedsWidth pins the last of the three chrome
+// lines this view owns. The title interpolates the breadcrumb — a server name,
+// a project name — and the service name, none of them bounded, so at a narrow
+// pane it is the one line that could still overrun. Measured against the pinned
+// bubbletea v1.3.10: standardRenderer.flush truncates each line at r.width, so
+// the overrun costs no row on its own; the clamp is what keeps the cut
+// deterministic in View and holds titleStyle's MarginBottom line too, which
+// lipgloss pads out to the CONTENT width.
+func TestViewInspect_TitleNeverExceedsWidth(t *testing.T) {
+	for _, withErr := range []bool{false, true} {
+		for width := 40; width <= 120; width++ {
+			m := Model{screen: screenInspect, width: width, height: 24}
+			m.serverName = strings.Repeat("prod-", 12) + "server"
+			m.serverColor = "red"
+			m.projName = strings.Repeat("project-", 6)
+			m.inspectService = strings.Repeat("service-", 6)
+			m.inspectViewport = viewport.New(width-4, 18)
+			m.inspectRaw = []byte(inspectFixtureJSON)
+			m.rebuildInspectSummary()
+			m.setInspectContent()
+			if withErr {
+				m.inspectErr = fmt.Errorf("listing containers for inspect: ssh: connect to host prod port 22")
+			}
+
+			lines := strings.Split(m.viewInspect(), "\n")
+			for _, line := range lines {
+				if w := ansi.StringWidth(line); w > width {
+					t.Errorf("err=%v width %d: line is %d cells wide, want <= %d: %q", withErr, width, w, width, line)
+				}
+			}
+			if len(lines) > m.height {
+				t.Errorf("err=%v width %d: render is %d lines, want <= %d", withErr, width, len(lines), m.height)
+			}
+			// Truncation keeps the head, so the breadcrumb still says where the
+			// user is even when the tail is cut.
+			if !strings.HasPrefix(ansi.Strip(lines[0]), "cdeploy") {
+				t.Errorf("err=%v width %d: the first line must still be the title, got %q", withErr, width, lines[0])
+			}
+		}
+	}
+}
+
+// TestViewInspect_FooterNeverExceedsWidth pins the other half of the same
+// budget. viewInspect fits the whole render into exactly m.height (title 3 +
+// viewport m.height-6 + one optional error line + footer 2). The footer
+// measures 42 cells, so it overruns every width below 42 in both modes;
+// clampToWidth is what holds it, the way containerFooter already does. See
+// TestViewInspect_TitleNeverExceedsWidth for what the renderer does with an
+// over-wide line — it truncates, so what the sweep protects is the pane's own
+// width contract, not a row.
+func TestViewInspect_FooterNeverExceedsWidth(t *testing.T) {
+	for _, raw := range []bool{false, true} {
+		for width := 40; width <= 120; width++ {
+			m := Model{screen: screenInspect, inspectService: "web", width: width, height: 24, inspectShowRaw: raw}
+			m.inspectViewport = viewport.New(width-4, 18)
+			m.inspectRaw = []byte(inspectFixtureJSON)
+			m.rebuildInspectSummary()
+			m.setInspectContent()
+
+			lines := strings.Split(m.viewInspect(), "\n")
+			for _, line := range lines {
+				if w := ansi.StringWidth(line); w > width {
+					t.Errorf("raw=%v width %d: line is %d cells wide, want <= %d: %q", raw, width, w, width, line)
+				}
+			}
+			if len(lines) > m.height {
+				t.Errorf("raw=%v width %d: render is %d lines, want <= %d", raw, width, len(lines), m.height)
+			}
+			if !strings.Contains(ansi.Strip(lines[0]), "inspect") {
+				t.Errorf("raw=%v width %d: the first line must still be the title, got %q", raw, width, lines[0])
+			}
+		}
+	}
+}
+
+// TestViewInspect_FitsShortTerminal is the height half of the same budget the
+// width sweeps pin, and the sibling of TestViewHelp_FitsShortTerminal. The
+// render is title 3 + viewport + optional error 1 + footer 2, so a viewport
+// sized anywhere but inspectViewportSize's -6 spills past the pane and
+// bubbletea's renderer — which keeps only the LAST m.height lines — drops the
+// title with no key that brings it back.
+//
+// The sweep starts at 9: inspectViewportSize floors the viewport at 3 rows, so
+// below that the chrome alone (3 + 3 + 2 = 8, plus an error line) is taller than
+// the pane, the same floor the ? overlay bottoms out at.
+func TestViewInspect_FitsShortTerminal(t *testing.T) {
+	for _, withErr := range []bool{false, true} {
+		for _, width := range []int{40, 80, 120} {
+			for height := 9; height <= 30; height++ {
+				m := Model{screen: screenInspect, inspectSession: 1, inspectService: "web", width: width, height: height}
+				w, h := inspectViewportSize(width, height)
+				m.inspectViewport = viewport.New(w, h)
+				result, _ := m.Update(inspectDataMsg{data: []byte(inspectFixtureJSON), session: 1})
+				m = result.(Model)
+				if withErr {
+					m.inspectErr = fmt.Errorf("listing containers for inspect: ssh: connect to host prod port 22")
+				}
+
+				// The RAW view string, with no TrimSuffix: bubbletea splits on
+				// "\n" and a trailing newline is a whole extra element, so a
+				// trimming test would hide exactly the overflow this pins.
+				lines := strings.Split(m.viewInspect(), "\n")
+				if len(lines) > height {
+					t.Errorf("err=%v %dx%d: render is %d lines, want <= %d", withErr, width, height, len(lines), height)
+				}
+				if !strings.Contains(ansi.Strip(lines[0]), "inspect") {
+					t.Errorf("err=%v %dx%d: the first line must still be the title, got %q", withErr, width, height, lines[0])
+				}
+			}
+		}
+	}
+}
+
+// TestViewInspect_NoTrailingNewline pins the invariant the height budget rests
+// on, so a regression names the cause rather than the symptom. bubbletea hands
+// View() straight to the renderer, which splits on "\n" with no TrimSuffix and
+// keeps the last m.height elements — a trailing newline therefore renders the
+// screen one line too tall and costs the title. viewSelectContainers, viewLogs
+// and viewHelp end without one for the same reason.
+func TestViewInspect_NoTrailingNewline(t *testing.T) {
+	m := inspectScreenModel(t)
+	if strings.HasSuffix(m.viewInspect(), "\n") {
+		t.Error("viewInspect must not end in a newline")
+	}
+}
+
+// TestViewInspect_FooterDropsRWithoutBuffers pins the no-op rule on the one
+// state where the toggle has nothing to toggle: a FETCH failure leaves neither
+// buffer, so an advertised r could only relabel itself over an empty pane.
+func TestViewInspect_FooterDropsRWithoutBuffers(t *testing.T) {
+	m := Model{screen: screenInspect, inspectSession: 1, inspectService: "web", width: 100, height: 24}
+	m.inspectViewport = viewport.New(96, 18)
+	result, _ := m.Update(inspectDataMsg{err: fmt.Errorf("no container found for %q", "web"), session: 1})
+	m = result.(Model)
+
+	view := ansi.Strip(m.viewInspect())
+	for _, unwanted := range []string{"r raw JSON", "r summary"} {
+		if strings.Contains(view, unwanted) {
+			t.Errorf("a failed fetch must not advertise %q:\n%s", unwanted, view)
+		}
+	}
+	for _, want := range []string{"up/down scroll", "q back"} {
+		if !strings.Contains(view, want) {
+			t.Errorf("footer missing %q:\n%s", want, view)
+		}
+	}
+}
+
+// TestInspectScreen_RIsInertWithoutBuffers is the key half of the same rule:
+// the footer stops naming r, so r has to stop doing anything — otherwise the
+// mode flag drifts behind an unadvertised key and a later resize would render
+// the wrong buffer.
+func TestInspectScreen_RIsInertWithoutBuffers(t *testing.T) {
+	m := Model{screen: screenInspect, inspectSession: 1, inspectService: "web", width: 100, height: 24}
+	m.inspectViewport = viewport.New(96, 18)
+	result, _ := m.Update(inspectDataMsg{err: fmt.Errorf("boom"), session: 1})
+	m = result.(Model)
+
+	result, _ = m.Update(keyMsgFor("r"))
+	if got := result.(Model); got.inspectShowRaw {
+		t.Error("r must not flip the mode when a failed fetch left no bytes")
+	}
+}
+
+func TestInspectScreen_ArrowsReachTheViewport(t *testing.T) {
+	m := inspectScreenModel(t)
+	m.inspectViewport.Height = 3
+	m.setInspectContent()
+	if m.inspectViewport.AtBottom() {
+		t.Fatal("precondition: the summary must overflow a 3-line viewport")
+	}
+
+	result, _ := m.Update(tea.KeyMsg{Type: tea.KeyDown})
+	got := result.(Model)
+	if got.inspectViewport.YOffset == 0 {
+		t.Error("down should scroll the inspect viewport")
+	}
+
+	result, _ = got.Update(tea.KeyMsg{Type: tea.KeyPgDown})
+	if result.(Model).inspectViewport.YOffset <= got.inspectViewport.YOffset {
+		t.Error("pgdown should page the inspect viewport")
+	}
+}
+
+// TestInspectScreen_RTogglePutsTheReaderAtTheTop pins the small courtesy the
+// chokepoint alone does not give: SetContent preserves YOffset, so a toggle
+// from a scrolled summary into the much longer raw JSON would otherwise land
+// the reader mid-document.
+func TestInspectScreen_RTogglePutsTheReaderAtTheTop(t *testing.T) {
+	m := inspectScreenModel(t)
+	m.inspectViewport.Height = 3
+	m.setInspectContent()
+	m.inspectViewport.SetYOffset(4)
+
+	result, _ := m.Update(keyMsgFor("r"))
+	if got := result.(Model); got.inspectViewport.YOffset != 0 {
+		t.Errorf("YOffset = %d, want 0 after the mode toggle", got.inspectViewport.YOffset)
+	}
+}
+
+// TestInspectKey_MissingContainerSurfacesNamedError drives AC4 end to end: the
+// composer's `no container found` error must travel from the key press through
+// the fetch and the message handler into the rendered screen, so the user reads
+// the name of the service that has no container rather than a blank viewport.
+func TestInspectKey_MissingContainerSurfacesNamedError(t *testing.T) {
+	mc := &mockInspectComposer{inspectErr: fmt.Errorf("no container found for %q", "web")}
+	mc.services = []string{"web"}
+	m := inspectTestModel(t, mc, mc.services)
+
+	result, cmd := m.Update(keyMsgFor("i"))
+	m = result.(Model)
+	if cmd == nil {
+		t.Fatal("i should return the fetch command")
+	}
+
+	result, _ = m.Update(cmd())
+	m = result.(Model)
+
+	view := m.viewInspect()
+	if !strings.Contains(view, `no container found for "web"`) {
+		t.Errorf("the named error should reach the screen:\n%s", view)
+	}
+	if strings.Contains(view, "Loading") {
+		t.Error("a failed fetch must not leave the screen reading as loading")
 	}
 }

@@ -141,8 +141,17 @@ func findGroup() helpGroup {
 // still binds it and OPERATE — enter's only home on the writable table — is
 // gone whole there; the description names that sub-state, matching the
 // convention for every key bound only inside one.
+//
+// i sits SECOND, not last, and the position is load-bearing. It is a shared
+// append (i is not gated on readOnly, so it lands in both variants), and this
+// group is the LAST action group singleColumnOrder emits — so its trailing
+// entries are the first keys the height budget sacrifices on a short narrow
+// pane. i lives nowhere but here (the footer carries six tokens and i is not
+// one of them), so appending it after U would make it the first key dropped.
+// Second keeps the existing sacrifice order (U, then x, then c) unchanged, and
+// TestViewHelp_InspectSurvivesTheFirstTruncation pins that.
 func inspectGroup(readOnly bool) helpGroup {
-	entries := []helpEntry{{"l", "logs"}}
+	entries := []helpEntry{{"l", "logs"}, {"i", "inspect"}}
 	if !readOnly {
 		entries = append(entries, helpEntry{"c", "config"})
 	}
@@ -323,6 +332,22 @@ func helpGroupsFor(s screen, hc helpContext) []helpGroup {
 				{"ctrl+c", "quit"},
 			}},
 		}
+
+	case screenInspect:
+		return []helpGroup{
+			{title: "MOVE", entries: []helpEntry{
+				{"↑ ↓", "scroll"},
+				{"← →", "scroll sideways"},
+				{"pgup pgdown", "page"},
+			}},
+			{title: "VIEW", actions: true, entries: []helpEntry{
+				{"r", "summary / raw JSON"},
+			}},
+			{title: "LEAVE", entries: []helpEntry{
+				{"q esc", "back"},
+				{"ctrl+c", "quit"},
+			}},
+		}
 	}
 	return nil
 }
@@ -346,6 +371,8 @@ func screenName(s screen) string {
 		return "settings"
 	case screenSettingsForm:
 		return "settings form"
+	case screenInspect:
+		return "inspect"
 	}
 	return ""
 }

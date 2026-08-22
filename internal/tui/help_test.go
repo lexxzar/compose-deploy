@@ -14,7 +14,7 @@ import (
 
 // allScreens is every screen constant, pinned complete by
 // TestAllScreens_Complete below: the constants are a contiguous iota run, so a
-// 9th screen that is not listed here fails that test instead of silently
+// new screen that is not listed here fails that test instead of silently
 // skipping every screen-table test in this file.
 var allScreens = []screen{
 	screenSelectServer,
@@ -25,6 +25,7 @@ var allScreens = []screen{
 	screenConfig,
 	screenSettingsList,
 	screenSettingsForm,
+	screenInspect,
 }
 
 // allProgressPhases is every progressPhase constant, pinned complete by
@@ -47,10 +48,13 @@ func TestAllProgressPhases_Complete(t *testing.T) {
 }
 
 // TestAllScreens_Complete closes the loop the other screen-table tests depend
-// on. screen is a contiguous iota run (screenSelectServer..screenSettingsForm),
-// so the count is the whole check.
+// on. screen is a contiguous iota run (screenSelectServer..screenInspect), so
+// the count is the whole check. The bound anchors to the LAST constant, so
+// appending a new screen without listing it here goes red — see the residual
+// recorded in CLAUDE.md: it used to anchor to screenSettingsForm, which made
+// the promise above false.
 func TestAllScreens_Complete(t *testing.T) {
-	if want := int(screenSettingsForm) + 1; len(allScreens) != want {
+	if want := int(screenInspect) + 1; len(allScreens) != want {
 		t.Fatalf("allScreens has %d entries, want %d — add the new screen here and to helpGroupsFor()",
 			len(allScreens), want)
 	}
@@ -130,7 +134,7 @@ func TestHelpGroups_NamesEveryBoundKey(t *testing.T) {
 		screenSelectProject: {"q", "ctrl+c", "esc", "up", "k", "down", "j", "enter"},
 		screenSelectContainers: {
 			"q", "ctrl+c", "esc", "enter", "up", "k", "down", "j", " ", "a",
-			"r", "d", "s", "R", "n", "N", "/", "l", "c", "x", "U",
+			"r", "d", "s", "R", "n", "N", "/", "l", "c", "x", "U", "i",
 		},
 		screenProgress: {"q", "ctrl+c", "esc"},
 		screenLogs: {
@@ -140,6 +144,10 @@ func TestHelpGroups_NamesEveryBoundKey(t *testing.T) {
 		screenConfig:       {"q", "ctrl+c", "esc", "r", "e", "up", "down", "pgup", "pgdown"},
 		screenSettingsList: {"q", "ctrl+c", "esc", "up", "k", "down", "j", "a", "enter", "e", "d", "y", "n"},
 		screenSettingsForm: {"q", "ctrl+c", "esc", "tab", "shift+tab", "up", "down", "left", "right", "enter"},
+		screenInspect: {
+			"q", "ctrl+c", "esc", "r", "up", "down", "left", "right",
+			"pgup", "pgdown",
+		},
 	}
 
 	for _, s := range allScreens {
@@ -187,11 +195,13 @@ func TestHelpGroups_NamesEveryBoundKey(t *testing.T) {
 // container table a read-only composer gets. The set below is what survives the
 // gates in handleKey: d, r, s, R, c, space and a early-return, so naming any of
 // them would advertise a no-op — and enter, bound only by the x prompt, must
-// survive the loss of OPERATE, which was its only home.
+// survive the loss of OPERATE, which was its only home. i is the one container
+// key added without a read-only gate (inspect needs no compose file), so it is
+// named by BOTH variants and appears in both bound sets.
 func TestHelpGroups_ReadOnlyNamesEveryBoundKey(t *testing.T) {
 	bound := []string{
 		"q", "ctrl+c", "esc", "enter", "up", "k", "down", "j",
-		"n", "N", "/", "l", "x", "U",
+		"n", "N", "/", "l", "x", "U", "i",
 	}
 	boundSet := map[string]bool{}
 	for _, k := range bound {
@@ -665,14 +675,14 @@ func TestLayoutHelpColumns_SingleColumnFallback(t *testing.T) {
 // this case; the want list below is the full set of action-group keys.
 func TestViewHelp_NarrowTerminalKeepsActionKeys(t *testing.T) {
 	// Descriptions, not key letters: a bare "R" or "a" would match anything.
-	// The first seven have no other home at all; `deploy`, `restart` and `logs`
+	// The first eight have no other home at all; `deploy`, `restart` and `logs`
 	// hold a footer slot today but must not be the first thing a narrow pane
 	// drops either. `all` and `search` were the round-4 gap: the footer trim
 	// removed `a all` and `/ search` from line1 while SELECT and the search keys
 	// were still unflagged, so both fell off the bottom of a 50-column pane.
 	want := []string{
 		"all", "search", "next / prev match",
-		"rollback", "config", "exec", "check updates",
+		"rollback", "config", "exec", "check updates", "inspect",
 		"deploy", "restart", "stop", "logs",
 	}
 	// Below 65 columns the overlay stacks to one column, which is where the
@@ -685,6 +695,41 @@ func TestViewHelp_NarrowTerminalKeepsActionKeys(t *testing.T) {
 				t.Errorf("width %d: truncated overlay dropped %q:\n%s", w, s, view)
 			}
 		}
+	}
+}
+
+// TestViewHelp_InspectSurvivesTheFirstTruncation pins i's POSITION inside
+// inspectGroup, which TestViewHelp_NarrowTerminalKeepsActionKeys cannot: that
+// test samples height 24, where all 19 action rows still fit, so appending i
+// last would pass it. INSPECT is the last action group singleColumnOrder emits,
+// so its trailing entries are the first keys the budget sacrifices — and i
+// lives nowhere but the overlay. The re-measured single-column table (widths
+// 30-64, identical across them): height >= 24 keeps everything, 23 loses
+// `U check updates`, 22 loses `x exec` too, 21 loses `c config` too, 20 loses
+// `i inspect` too, 19 loses `l logs` too.
+func TestViewHelp_InspectSurvivesTheFirstTruncation(t *testing.T) {
+	for _, w := range []int{30, 40, 50, 59} {
+		// 23 is one below the height that fits every action row, so it is
+		// exactly the first notch where something must go.
+		m := Model{screen: screenSelectContainers, width: w, height: 23, showPicker: true, helpOpen: true}
+		view := ansi.Strip(m.View())
+		if !strings.Contains(view, "inspect") {
+			t.Errorf("width %d: i was the first key sacrificed; move it up inside inspectGroup:\n%s", w, view)
+		}
+	}
+	// The full-fit height, so a future row added to any action group shows up
+	// here as the threshold moving rather than as a silent loss — and i's
+	// POSITION, as an ordering against the key the budget sacrifices first.
+	// Asserting `check updates` is ABSENT at height 23 instead would pin the
+	// whole overlay's first sacrifice, so any future row in any action group
+	// would fail this test with a message about inspect.
+	m := Model{screen: screenSelectContainers, width: 50, height: 24, showPicker: true, helpOpen: true}
+	view := ansi.Strip(m.View())
+	if !strings.Contains(view, "check updates") {
+		t.Fatalf("height 24 no longer fits every action row:\n%s", view)
+	}
+	if at, uAt := strings.Index(view, "inspect"), strings.Index(view, "check updates"); at > uAt {
+		t.Errorf("inspect renders below check updates, so it goes first under the budget:\n%s", view)
 	}
 }
 
@@ -1029,6 +1074,10 @@ func TestHelpOverlay_OpensFromEveryScreen(t *testing.T) {
 		// TestHelpOverlay_QuestionReachesSettingsFormInput.
 		{s: screenSettingsForm, setup: func(m *Model) { m.settingsField = 4 },
 			want: "cycle color", notWant: "delete server"},
+		// notWant is screenConfig's $EDITOR: inspect is the other viewport
+		// screen with an `r` toggle, so config is the table it could be
+		// confused with.
+		{s: screenInspect, want: "summary / raw JSON", notWant: "$EDITOR"},
 	}
 
 	for _, tt := range tests {
@@ -1449,10 +1498,10 @@ func TestHelpOverlay_YieldsToQuitPrompt(t *testing.T) {
 
 // TestHelpOverlay_SwallowsEveryActionKey widens the swallow pin past the single
 // `d` case. The keys that matter most are the ones that would change m.screen
-// from under the overlay (l/c/x), start work (U), open an input (/), or mutate
-// the selection (space/enter/a).
+// from under the overlay (l/c/x/i), start work (U), open an input (/), or
+// mutate the selection (space/enter/a).
 func TestHelpOverlay_SwallowsEveryActionKey(t *testing.T) {
-	containerKeys := []string{"l", "c", "x", "/", "U", "r", "s", "R", "a", " ", "j", "k", "n", "N", "enter"}
+	containerKeys := []string{"l", "c", "x", "i", "/", "U", "r", "s", "R", "a", " ", "j", "k", "n", "N", "enter"}
 	for _, key := range containerKeys {
 		m := helpContainerModel()
 		m.selected[0] = true

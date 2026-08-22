@@ -432,6 +432,38 @@ func (r *RemoteCompose) ContainerStatus(ctx context.Context) (map[string]runner.
 	return parseContainerStatus(out)
 }
 
+// Inspect returns the raw `docker inspect` JSON for one service's container on
+// the remote host. Mirrors Compose.Inspect exactly (see its doc comment for the
+// two-call flow and the no-container error); only the transport differs:
+//
+//   - `docker compose ps` is a compose subcommand, so it goes through
+//     remoteCommand.
+//   - `docker inspect` is a TOP-LEVEL docker CLI command, so it goes through
+//     runRemoteDockerCmd, which shell-escapes the container ID and splices
+//     SSHExtraArgs immediately before the host argument.
+func (r *RemoteCompose) Inspect(ctx context.Context, service string) ([]byte, error) {
+	cmd := r.remoteCommand(ctx, "ps", "-a", "--format", "json")
+	var out []byte
+	var err error
+	if r.outputCmd != nil {
+		out, err = r.outputCmd(cmd)
+	} else {
+		out, err = cmd.Output()
+	}
+	if err != nil {
+		return nil, fmt.Errorf("listing remote containers for inspect: %w", withStderr(err))
+	}
+	id, err := resolveInspectID(out, service)
+	if err != nil {
+		return nil, err
+	}
+	raw, err := r.runRemoteDockerCmd(ctx, []string{"inspect", id})
+	if err != nil {
+		return nil, fmt.Errorf("inspecting remote container %s: %w", id, err)
+	}
+	return raw, nil
+}
+
 // ContainerStats returns CPU and memory usage for each running service in this
 // remote project. It fetches the project's container IDs via `docker compose ps`,
 // calls AllContainerStatsRemote to retrieve host-wide stats over the same SSH
