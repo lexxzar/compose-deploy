@@ -8082,6 +8082,10 @@ func TestCtrlCConfirmation_AllRemoteScreens(t *testing.T) {
 		{"progress failed", screenProgress, "ctrl+c", func(m *Model) {
 			m.failed = true
 		}},
+		{"inspect", screenInspect, "ctrl+c", func(m *Model) {
+			m.inspectService = "nginx"
+			m.inspectRaw = []byte(`[{"Name":"/nginx"}]`)
+		}},
 	}
 
 	for _, tt := range tests {

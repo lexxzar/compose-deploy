@@ -509,14 +509,56 @@ Plus, outside the tables:
 - Modify: `internal/tui/help_test.go`
 - Modify: `internal/tui/app_test.go`
 
-- [ ] tax 7: add `{"i", "inspect"}` to `inspectGroup()` — **one shared append, not two branches**; it lands in both the writable and read-only variants
-- [ ] add `i` to the `screenSelectContainers` row of the `bound` map, and confirm both drift-pin directions pass for the writable and read-only variants
-- [ ] tax 8: add a `screenInspect` row to `TestCtrlCConfirmation_AllRemoteScreens` (`app_test.go:8043`) — the screen is reachable on a remote session by design, so this is the exact configuration that would otherwise be unpinned
-- [ ] tax 9: add a `screenInspect` row to `TestHelpOverlay_OpensFromEveryScreen` (`help_test.go:1011`)
-- [ ] tax 10: add `i` to `containerKeys` in `TestHelpOverlay_SwallowsEveryActionKey` (`help_test.go:1454`)
-- [ ] tax 11: add `"inspect"` to the want-list in `TestViewHelp_NarrowTerminalKeepsActionKeys` (`help_test.go:666-678`)
-- [ ] **re-measure the single-column truncation table** at width 50 for heights 21-24 and choose `i`'s insert position in `inspectGroup` deliberately — a 19th action row shifts what falls off, and `i` must not be the first key sacrificed given it is absent from the footer
-- [ ] run `go test ./internal/tui/` — must pass before task 11
+- [x] tax 7: add `{"i", "inspect"}` to `inspectGroup()` — **one shared append, not two branches**; it lands in both the writable and read-only variants
+- [x] add `i` to the `screenSelectContainers` row of the `bound` map, and confirm both drift-pin directions pass for the writable and read-only variants — the read-only `bound` list in `TestHelpGroups_ReadOnlyNamesEveryBoundKey` needed it too, since `i` is the one container key added without a `readOnly` gate
+- [x] tax 8: add a `screenInspect` row to `TestCtrlCConfirmation_AllRemoteScreens` (`app_test.go:8043`) — the screen is reachable on a remote session by design, so this is the exact configuration that would otherwise be unpinned
+- [x] tax 9: add a `screenInspect` row to `TestHelpOverlay_OpensFromEveryScreen` (`help_test.go:1011`) — want `summary / raw JSON`, notWant `$EDITOR` (screenConfig is the table inspect could be confused with)
+- [x] tax 10: add `i` to `containerKeys` in `TestHelpOverlay_SwallowsEveryActionKey` (`help_test.go:1454`)
+- [x] tax 11: add `"inspect"` to the want-list in `TestViewHelp_NarrowTerminalKeepsActionKeys` (`help_test.go:666-678`)
+- [x] **re-measure the single-column truncation table** at width 50 for heights 21-24 and choose `i`'s insert position in `inspectGroup` deliberately — a 19th action row shifts what falls off, and `i` must not be the first key sacrificed given it is absent from the footer
+- [x] run `go test ./internal/tui/` — must pass before task 11
+
+➕ **Re-measured single-column truncation table — the numbers Task 12 must copy into
+CLAUDE.md.** Measured by rendering `Model{screen: screenSelectContainers, showPicker:
+true, helpOpen: true}` and diffing the full nowhere-else action-key set out of the
+stripped view. Verified **identical at widths 30, 40, 50, 59 and 64** (below the
+65-column two-column threshold, width does not change the row count):
+
+| pane height | what the overlay still names |
+|---|---|
+| >= 24 | everything (all 19 action rows fit the 20 a 24-line pane keeps) |
+| 23 | loses `U check updates` |
+| 22 | loses `x exec` too |
+| 21 | loses `c config` too |
+| 20 | loses `i inspect` too |
+| 19 | loses `l logs` too |
+
+Every threshold moved up by exactly one from the pre-`i` table (which read: >= 23
+keeps everything, 22 loses `U`, 21 loses `x`, 20 loses `c`). Row counts changed from
+**18 action rows / 24 stacked rows** to **19 action rows / 25 stacked rows**; the
+read-only variant went from 15 to 16 stacked rows and still fits every action row at
+every height >= 19, so it never truncates an action key.
+
+**CLAUDE.md sentences that are now stale** (Task 12 replaces them):
+- "Truncation table at width < 65 (below the two-column threshold): height >= 23
+  keeps everything, 22 loses `U check updates`, 21 loses `x exec` too."
+- "that takes the container table from 29 rows to 24, and 24 is what makes all 18
+  action rows fit the 19 a 24-line pane keeps" — now 30 → 25, 19 action rows, and a
+  24-line pane keeps 20 rows (19 real + the `▼ N more` marker).
+- the "17-row container key table" and "six tokens … `a all`, `/ search`, `n N`,
+  `R rollback`, `c config`, `x exec` and `U check updates`" nowhere-else list must
+  gain `i inspect` (18 rows, eight nowhere-else keys).
+
+➕ [x] **`i`'s position is now test-pinned, not just commented.**
+`TestViewHelp_NarrowTerminalKeepsActionKeys` samples height 24, where all 19 action
+rows still fit — so appending `i` last would have passed it and left the position
+unguarded. `TestViewHelp_InspectSurvivesTheFirstTruncation` (new, `help_test.go`)
+samples height **23**, the first notch where something must go, and asserts `inspect`
+survives while `check updates` is the key sacrificed; it also re-asserts the
+full-fit height so a future 20th action row surfaces as a moved threshold rather than
+a silent loss. Verified mutation-sensitive by moving `{"i", "inspect"}` to the end of
+`inspectGroup` — the new test goes red at all four widths while every other test
+stays green.
 
 ### Task 11: Verify acceptance criteria
 
