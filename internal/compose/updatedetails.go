@@ -3,6 +3,7 @@ package compose
 import (
 	"encoding/json"
 	"fmt"
+	"sort"
 	"strings"
 	"time"
 )
@@ -221,4 +222,159 @@ func validImagetoolsDigest(s string) string {
 		return ""
 	}
 	return "sha256:" + strings.ToLower(s[len("sha256:"):])
+}
+
+// rawManifestArgs builds the step-3 argv: the RAW manifest bytes of a pinned
+// image ref, whose config.digest is the docker image ID the image gets once it
+// is pulled. `--raw` is used rather than a template because the digest lives on
+// the manifest document itself, not on anything the --format tree exposes.
+func rawManifestArgs(image string) []string {
+	return []string{"buildx", "imagetools", "inspect", "--raw", image}
+}
+
+// imageConfigFormat is the Go template step 4 hands `docker buildx imagetools
+// inspect`. Like manifestIndexFormat this is one of the two forms verified to
+// substitute on buildx v0.30.1; the dotted-field forms fall through to the
+// human block.
+const imageConfigFormat = "{{json .Image}}"
+
+// imageConfigArgs builds the step-4 argv: the OCI image config of an image, as
+// JSON. On a PINNED ref this returns a bare config object and costs ~1.2s; on a
+// bare tag it returns a platform-keyed map and costs ~4.3s, so callers pin
+// whenever step 2 gave them a digest.
+func imageConfigArgs(image string) []string {
+	return []string{"buildx", "imagetools", "inspect", "--format", imageConfigFormat, image}
+}
+
+// rawManifestDoc decodes only the config descriptor of a raw manifest. The
+// layers, annotations and mediaType are deliberately absent — nothing draws
+// them.
+type rawManifestDoc struct {
+	Config struct {
+		Digest string `json:"digest"`
+	} `json:"config"`
+}
+
+// parseConfigDigest reads config.digest out of the raw manifest bytes
+// rawManifestArgs returns. That digest is the registry image's config digest,
+// which equals the docker image ID the local daemon assigns after a pull — so
+// it is directly comparable with the inspect screen's `image id` row.
+//
+// Anything it cannot validate as a canonical sha256 digest yields "": an index
+// document (which has no config key), a fallen-through --format line, and
+// malformed JSON all take that path, and the `update id` row is then omitted
+// rather than drawn wrong.
+func parseConfigDigest(raw []byte) string {
+	var doc rawManifestDoc
+	if err := json.Unmarshal(raw, &doc); err != nil {
+		return ""
+	}
+	return validImagetoolsDigest(doc.Config.Digest)
+}
+
+// imageConfigDoc decodes only the build timestamp of an OCI image config.
+type imageConfigDoc struct {
+	Created string `json:"created"`
+}
+
+// parseImageCreated reads the build timestamp out of the JSON imageConfigArgs
+// returns, accepting BOTH shapes that command produces:
+//
+//	bare object          a pinned ref returns the OCI image config directly
+//	platform-keyed map   a bare tag returns {"linux/amd64": {...}, ...}
+//
+// Both must be handled because a single-arch ref reaches step 4 unpinned — the
+// index step returns hasIndex=false for it, so there is no digest to pin with.
+//
+// The bare-object form is trusted without a platform cross-check: it is only
+// reached for a ref that resolves to exactly one manifest, so its config is the
+// only one there is. The map form IS matched on the requested platform, with
+// variant as a tie-breaker exactly as parseIndexPlatformDigest applies it —
+// an unqualified `os/arch` key wins, and among variant-qualified keys the
+// lexicographically first wins, since Go map iteration order is not stable.
+//
+// The false return covers every doubt: malformed JSON, a shape that is neither
+// form, an absent platform, and the 1970-01-01 reproducible-build sentinel that
+// parseImageTimestamp rejects.
+func parseImageCreated(data []byte, os, arch string) (time.Time, bool) {
+	var doc map[string]json.RawMessage
+	if err := json.Unmarshal(data, &doc); err != nil || len(doc) == 0 {
+		return time.Time{}, false
+	}
+	raw, ok := pickImageConfig(doc, data, os, arch)
+	if !ok {
+		return time.Time{}, false
+	}
+	var cfg imageConfigDoc
+	if err := json.Unmarshal(raw, &cfg); err != nil {
+		return time.Time{}, false
+	}
+	t := parseImageTimestamp(strings.TrimSpace(cfg.Created))
+	if t.IsZero() {
+		return time.Time{}, false
+	}
+	return t, true
+}
+
+// imageConfigKeys are top-level fields only an OCI image config carries. A
+// platform-keyed map's keys always contain a "/" instead, which is the primary
+// discriminator; this set is the fail-closed second opinion, so a document that
+// is neither shape returns "absent" rather than being read as one of them.
+var imageConfigKeys = []string{"created", "architecture", "rootfs", "config", "history"}
+
+// pickImageConfig returns the raw config object for the requested platform out
+// of either shape parseImageCreated accepts, or ok=false when the document is
+// neither shape or the platform is absent.
+func pickImageConfig(doc map[string]json.RawMessage, data []byte, os, arch string) (json.RawMessage, bool) {
+	platformKeyed := false
+	for k := range doc {
+		if strings.Contains(k, "/") {
+			platformKeyed = true
+			break
+		}
+	}
+	if !platformKeyed {
+		for _, k := range imageConfigKeys {
+			if _, ok := doc[k]; ok {
+				return data, true
+			}
+		}
+		return nil, false
+	}
+	if os == "" || arch == "" {
+		return nil, false
+	}
+	var qualified []string
+	for k := range doc {
+		exact, match := platformKeyMatches(k, os, arch)
+		if !match {
+			continue
+		}
+		if exact {
+			return doc[k], true
+		}
+		qualified = append(qualified, k)
+	}
+	if len(qualified) == 0 {
+		return nil, false
+	}
+	sort.Strings(qualified)
+	return doc[qualified[0]], true
+}
+
+// platformKeyMatches reports whether a platform map key names the requested
+// os/arch, and whether it does so without a variant suffix. An entry whose os
+// or architecture is "unknown" is an attestation and never matches.
+func platformKeyMatches(key, os, arch string) (exact, match bool) {
+	parts := strings.Split(key, "/")
+	if len(parts) != 2 && len(parts) != 3 {
+		return false, false
+	}
+	if parts[0] == unknownPlatform || parts[1] == unknownPlatform {
+		return false, false
+	}
+	if !strings.EqualFold(parts[0], os) || !strings.EqualFold(parts[1], arch) {
+		return false, false
+	}
+	return len(parts) == 2, true
 }

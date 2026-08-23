@@ -385,15 +385,29 @@ would accept a fallen-through `--format` line as a digest.
 - Create: `internal/compose/testdata/imagetools_image_config_map.json`
 - Create: `internal/compose/testdata/imagetools_image_config_object.json`
 
-- [ ] add `rawManifestArgs` and `imageConfigArgs` for steps 3 and 4
-- [ ] add `parseConfigDigest(raw []byte) string` reading `config.digest`, validated against
+- [x] add `rawManifestArgs` and `imageConfigArgs` for steps 3 and 4
+- [x] add `parseConfigDigest(raw []byte) string` reading `config.digest`, validated against
       `imagetoolsDigestRE`, returning `""` on anything else
-- [ ] add `parseImageCreated(data []byte, os, arch string) (time.Time, bool)` accepting BOTH
+- [x] add `parseImageCreated(data []byte, os, arch string) (time.Time, bool)` accepting BOTH
       the platform-keyed map and the bare object, and rejecting `Unix() <= 0`
-- [ ] hand-author the three fixtures from the shapes in Technical Details
-- [ ] write tests for `parseConfigDigest`: valid, missing `config`, non-sha256 value, malformed JSON
-- [ ] write tests for `parseImageCreated`: map form, object form, epoch rejection, absent platform
-- [ ] run `go test ./internal/compose/` — must pass before task 5
+- [x] hand-author the three fixtures from the shapes in Technical Details
+- [x] write tests for `parseConfigDigest`: valid, missing `config`, non-sha256 value, malformed JSON
+- [x] write tests for `parseImageCreated`: map form, object form, epoch rejection, absent platform
+- [x] run `go test ./internal/compose/` — must pass before task 5
+
+➕ Shape discrimination in `parseImageCreated`: a top-level key CONTAINING `/` marks the
+platform-keyed map; otherwise a top-level key from `imageConfigKeys` (`created`,
+`architecture`, `rootfs`, `config`, `history`) marks the bare object. A document that is
+neither returns "absent" rather than being read as one of them.
+
+➕ The bare object is trusted WITHOUT a platform cross-check. It is only reached for a ref that
+resolves to exactly one manifest, so its config is the only one there is; rejecting it on a
+platform mismatch would drop the row for every legitimate single-arch image.
+
+➕ Map-key tie-breaker, mirroring `parseIndexPlatformDigest` but with an extra determinism rule:
+an unqualified `os/arch` key wins, and among variant-qualified keys the LEXICOGRAPHICALLY first
+wins — Go map iteration order is not stable, so "index order" does not exist here. A key whose os
+or arch segment is `unknown` is an attestation and never matches.
 
 ### Task 5: Add the shared `scanUpdateDetails` loop
 

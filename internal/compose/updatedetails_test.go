@@ -426,3 +426,260 @@ func readFixture(t *testing.T, name string) []byte {
 	}
 	return data
 }
+
+func TestRawManifestArgs(t *testing.T) {
+	args := rawManifestArgs("nginx@sha256:" + strings.Repeat("a", 64))
+	want := []string{"buildx", "imagetools", "inspect", "--raw", "nginx@sha256:" + strings.Repeat("a", 64)}
+	if len(args) != len(want) {
+		t.Fatalf("rawManifestArgs() = %v, want %v", args, want)
+	}
+	for i := range want {
+		if args[i] != want[i] {
+			t.Errorf("rawManifestArgs()[%d] = %q, want %q", i, args[i], want[i])
+		}
+	}
+	for _, a := range args {
+		if a == "compose" {
+			t.Fatalf("rawManifestArgs() must carry no compose element: %v", args)
+		}
+	}
+}
+
+func TestImageConfigArgs(t *testing.T) {
+	args := imageConfigArgs("nginx:1.27")
+	want := []string{"buildx", "imagetools", "inspect", "--format", "{{json .Image}}", "nginx:1.27"}
+	if len(args) != len(want) {
+		t.Fatalf("imageConfigArgs() = %v, want %v", args, want)
+	}
+	for i := range want {
+		if args[i] != want[i] {
+			t.Errorf("imageConfigArgs()[%d] = %q, want %q", i, args[i], want[i])
+		}
+	}
+	for _, a := range args {
+		if a == "compose" {
+			t.Fatalf("imageConfigArgs() must carry no compose element: %v", args)
+		}
+	}
+	// Only the {{json .X}} forms substitute on buildx v0.30.1; the dotted
+	// forms silently fall through to the human block.
+	if imageConfigFormat != "{{json .Image}}" {
+		t.Errorf("imageConfigFormat = %q, want {{json .Image}}", imageConfigFormat)
+	}
+}
+
+func TestParseConfigDigest_Fixture(t *testing.T) {
+	raw := readFixture(t, "imagetools_raw_manifest.json")
+	want := "sha256:c05eced01234567890abcdef1234567890abcdef1234567890abcdef12345678"
+	if got := parseConfigDigest(raw); got != want {
+		t.Errorf("parseConfigDigest() = %q, want %q", got, want)
+	}
+}
+
+func TestParseConfigDigest_OmitsOnDoubt(t *testing.T) {
+	hex64 := strings.Repeat("d", 64)
+	tests := []struct {
+		name string
+		in   string
+	}{
+		{name: "malformed json", in: `{"config":`},
+		{name: "not json at all", in: "Name: docker.io/library/nginx:latest"},
+		{name: "empty input", in: ""},
+		{name: "no config key", in: `{"schemaVersion":2,"layers":[]}`},
+		{name: "config is null", in: `{"config":null}`},
+		{name: "config has no digest", in: `{"config":{"size":7443}}`},
+		{name: "digest is empty", in: `{"config":{"digest":""}}`},
+		{name: "digest is a tag", in: `{"config":{"digest":"latest"}}`},
+		{name: "digest is truncated", in: `{"config":{"digest":"sha256:abc"}}`},
+		{name: "digest is sha512", in: `{"config":{"digest":"sha512:` + hex64 + `"}}`},
+		{name: "digest carries trailing junk", in: `{"config":{"digest":"sha256:` + hex64 + ` extra"}}`},
+		// An INDEX has manifests and no config: running --raw against one is
+		// exactly what the hasIndex=true/found=false abort exists to prevent,
+		// and if it ever happens the row must drop rather than be guessed.
+		{name: "index document", in: `{"manifests":[{"digest":"sha256:` + hex64 + `"}]}`},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := parseConfigDigest([]byte(tt.in)); got != "" {
+				t.Errorf("parseConfigDigest(%q) = %q, want \"\"", tt.in, got)
+			}
+		})
+	}
+}
+
+func TestParseConfigDigest_NormalizesCase(t *testing.T) {
+	hex64 := strings.Repeat("A", 64)
+	want := "sha256:" + strings.Repeat("a", 64)
+	if got := parseConfigDigest([]byte(`{"config":{"digest":"sha256:` + hex64 + `"}}`)); got != want {
+		t.Errorf("parseConfigDigest() = %q, want %q", got, want)
+	}
+}
+
+func TestParseImageCreated_ObjectForm(t *testing.T) {
+	// A PINNED ref returns the OCI image config directly.
+	data := readFixture(t, "imagetools_image_config_object.json")
+	want := time.Date(2026, 8, 19, 19, 14, 43, 123456789, time.UTC)
+	got, ok := parseImageCreated(data, "linux", "arm64")
+	if !ok {
+		t.Fatalf("parseImageCreated() ok = false, want true")
+	}
+	if !got.Equal(want) {
+		t.Errorf("created = %v, want %v", got, want)
+	}
+	// The bare object is the only config there is, so the requested platform
+	// does not gate it — a single-arch ref reaches step 4 unpinned.
+	got, ok = parseImageCreated(data, "linux", "amd64")
+	if !ok || !got.Equal(want) {
+		t.Errorf("parseImageCreated(mismatched platform) = %v/%v, want %v/true", got, ok, want)
+	}
+}
+
+func TestParseImageCreated_MapForm(t *testing.T) {
+	// A BARE tag returns a platform-keyed map.
+	data := readFixture(t, "imagetools_image_config_map.json")
+	tests := []struct {
+		name     string
+		os, arch string
+		want     time.Time
+	}{
+		{
+			name: "linux/arm64", os: "linux", arch: "arm64",
+			want: time.Date(2026, 8, 19, 19, 14, 43, 123456789, time.UTC),
+		},
+		{
+			name: "linux/amd64", os: "linux", arch: "amd64",
+			want: time.Date(2026, 8, 19, 19, 14, 40, 500000000, time.UTC),
+		},
+		{
+			// The variant-qualified key still matches on os+arch alone.
+			name: "linux/arm resolves the v7 key", os: "linux", arch: "arm",
+			want: time.Date(2026, 8, 19, 19, 14, 38, 250000000, time.UTC),
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, ok := parseImageCreated(data, tt.os, tt.arch)
+			if !ok {
+				t.Fatalf("parseImageCreated() ok = false, want true")
+			}
+			if !got.Equal(tt.want) {
+				t.Errorf("created = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestParseImageCreated_EpochSentinel(t *testing.T) {
+	// Reproducible builds (distroless, ko, Bazel, nix) report 1970-01-01.
+	// That is a placeholder, not a build date, so the row must drop.
+	data := readFixture(t, "imagetools_image_config_map.json")
+	if got, ok := parseImageCreated(data, "linux", "386"); ok {
+		t.Errorf("parseImageCreated(linux/386) = %v/true, want zero/false", got)
+	}
+	obj := []byte(`{"created":"1970-01-01T00:00:00Z","architecture":"amd64","os":"linux"}`)
+	if got, ok := parseImageCreated(obj, "linux", "amd64"); ok {
+		t.Errorf("parseImageCreated(epoch object) = %v/true, want zero/false", got)
+	}
+}
+
+func TestParseImageCreated_OmitsOnDoubt(t *testing.T) {
+	tests := []struct {
+		name     string
+		in       string
+		os, arch string
+	}{
+		{name: "malformed json", in: `{"created":`, os: "linux", arch: "amd64"},
+		{name: "not json at all", in: "Name: docker.io/library/nginx:latest", os: "linux", arch: "amd64"},
+		{name: "empty input", in: "", os: "linux", arch: "amd64"},
+		{name: "empty object", in: `{}`, os: "linux", arch: "amd64"},
+		{name: "json array", in: `[{"created":"2026-08-19T19:14:43Z"}]`, os: "linux", arch: "amd64"},
+		// Neither shape: no "/" in the keys and no image-config field either.
+		{name: "unrecognised shape", in: `{"foo":1,"bar":2}`, os: "linux", arch: "amd64"},
+		{name: "object with no created", in: `{"architecture":"amd64","os":"linux","rootfs":{}}`, os: "linux", arch: "amd64"},
+		{name: "object created is garbage", in: `{"created":"yesterday","rootfs":{}}`, os: "linux", arch: "amd64"},
+		{
+			name: "map platform absent",
+			in:   `{"linux/amd64":{"created":"2026-08-19T19:14:43Z"}}`,
+			os:   "windows", arch: "amd64",
+		},
+		{
+			name: "map arch absent",
+			in:   `{"linux/amd64":{"created":"2026-08-19T19:14:43Z"}}`,
+			os:   "linux", arch: "s390x",
+		},
+		{
+			// An attestation entry must never satisfy a platform request.
+			name: "map only unknown platform",
+			in:   `{"unknown/unknown":{"created":"2026-08-19T19:14:43Z"}}`,
+			os:   "unknown", arch: "unknown",
+		},
+		{
+			name: "map with empty os argument",
+			in:   `{"linux/amd64":{"created":"2026-08-19T19:14:43Z"}}`,
+			os:   "", arch: "amd64",
+		},
+		{
+			name: "map with empty arch argument",
+			in:   `{"linux/amd64":{"created":"2026-08-19T19:14:43Z"}}`,
+			os:   "linux", arch: "",
+		},
+		{
+			name: "map value is not an object",
+			in:   `{"linux/amd64":"2026-08-19T19:14:43Z"}`,
+			os:   "linux", arch: "amd64",
+		},
+		{
+			name: "map key has too many segments",
+			in:   `{"linux/arm/v7/extra":{"created":"2026-08-19T19:14:43Z"}}`,
+			os:   "linux", arch: "arm",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, ok := parseImageCreated([]byte(tt.in), tt.os, tt.arch)
+			if ok || !got.IsZero() {
+				t.Errorf("parseImageCreated(%q) = %v/%v, want zero/false", tt.in, got, ok)
+			}
+		})
+	}
+}
+
+func TestParseImageCreated_VariantTieBreaker(t *testing.T) {
+	// Go map iteration order is not stable, so the choice among matching keys
+	// must not depend on it: an unqualified key wins, and among qualified keys
+	// the lexicographically first wins.
+	unqualified := `"linux/arm":{"created":"2026-08-19T10:00:00Z"}`
+	v6 := `"linux/arm/v6":{"created":"2026-08-19T11:00:00Z"}`
+	v7 := `"linux/arm/v7":{"created":"2026-08-19T12:00:00Z"}`
+
+	tests := []struct {
+		name string
+		in   string
+		want time.Time
+	}{
+		{
+			name: "unqualified key wins",
+			in:   `{` + v7 + `,` + unqualified + `,` + v6 + `}`,
+			want: time.Date(2026, 8, 19, 10, 0, 0, 0, time.UTC),
+		},
+		{
+			name: "lowest variant key wins when no unqualified key exists",
+			in:   `{` + v7 + `,` + v6 + `}`,
+			want: time.Date(2026, 8, 19, 11, 0, 0, 0, time.UTC),
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			// Repeat so a map-order-dependent implementation cannot pass by luck.
+			for i := 0; i < 50; i++ {
+				got, ok := parseImageCreated([]byte(tt.in), "linux", "arm")
+				if !ok {
+					t.Fatalf("parseImageCreated() ok = false, want true")
+				}
+				if !got.Equal(tt.want) {
+					t.Fatalf("created = %v, want %v", got, tt.want)
+				}
+			}
+		})
+	}
+}
