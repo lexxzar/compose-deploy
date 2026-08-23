@@ -616,19 +616,32 @@ cache, with the differing summary as the control).
 
 ### Task 12: Update documentation
 
-- [ ] add the rule digest to `CLAUDE.md` under the update-detection paragraphs — the fetch
+- [x] add the rule digest to `CLAUDE.md` under the update-detection paragraphs — the fetch
       sequence, the three-state index result, the `.Variant` prohibition, the non-fatal-detail
       rule and the epoch sentinel
-- [ ] add the full rationale to `docs/architecture/update-detection.md`, including the measured
+- [x] add the full rationale to `docs/architecture/update-detection.md`, including the measured
       429, the three mitigations, and the rejected index-reuse option
-- [ ] add the new IMAGE rows and the `buildInspectSummary` signature change to
+- [x] add the new IMAGE rows and the `buildInspectSummary` signature change to
       `docs/architecture/tui-inspect-screen.md`
-- [ ] update `README.md` in four places: line 67 and line 110 (both say "image digest"), line
+- [x] update `README.md` in four places: line 67 and line 110 (both say "image digest"), line
       440 (the IMAGE section description) and line 195 (which enumerates the exact docker
       commands the update check runs and would otherwise undercount them)
-- [ ] confirm `skills/cdeploy/SKILL.md` needs no edit — no CLI behaviour changed — and that its
+- [x] confirm `skills/cdeploy/SKILL.md` needs no edit — no CLI behaviour changed — and that its
       content pins still pass
-- [ ] move this plan to `docs/plans/completed/`
+- [x] move this plan to `docs/plans/completed/` (deferred — the exec run moves it in its final step, after the review phases)
+
+➕ The README's update-check enumeration (line ~195) was left describing the CHECK alone and the three
+extra calls got their own paragraph, "Detail rows on the inspect screen (TUI only)", after the TUI-cache
+paragraph. Folding four more commands into the one sentence that explains the verdict would have made a
+reader believe every service pays them; they are only spent on a service whose verdict is already `true`,
+and that gate is the rate-limit mitigation, so it needed the room to be stated.
+
+➕ A FIFTH README edit beyond the four named: the inspect screen's "The screen is a snapshot" paragraph now
+names the update rows as its one exception. The `updatesMsg` handler's `screenInspect` rebuild is exactly a
+self-refresh, so leaving that sentence absolute would have documented the opposite of Task 7's behaviour.
+
+➕ No new `docs/architecture/` file was created — the rationale extends the two existing subsystem files, so
+the "Six subsystems" sentence at the top of `CLAUDE.md` still counts correctly.
 
 ## Residuals
 
