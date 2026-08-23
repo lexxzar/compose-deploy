@@ -532,11 +532,11 @@ Isolated because it is a user-visible rename with its own broken assertions.
 - Modify: `internal/tui/inspect.go`
 - Modify: `internal/tui/inspect_test.go`
 
-- [ ] relabel the `digest` row in `inspectImageSection` (`inspect.go:292`) to `image id` — it is
+- [x] relabel the `digest` row in `inspectImageSection` (`inspect.go:292`) to `image id` — it is
       the local image ID, and an `update id` row beside a row labelled `digest` invites exactly
       the false comparison this feature must avoid
-- [ ] update the four assertions that pin the old label (`inspect_test.go:578, 617, 625, 638`)
-- [ ] run `go test ./internal/tui/` — must pass before task 9
+- [x] update the four assertions that pin the old label (`inspect_test.go:578, 617, 625, 638`)
+- [x] run `go test ./internal/tui/` — must pass before task 9
 
 ### Task 9: Widen the `buildInspectSummary` signature
 

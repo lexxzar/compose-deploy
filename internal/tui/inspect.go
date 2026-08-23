@@ -274,9 +274,9 @@ func inspectHealthSection(b *inspectBuilder, doc compose.InspectDoc) {
 }
 
 // inspectImageSection renders what the container actually runs: the ref the
-// compose file asked for, the digest docker resolved it to, and the command
-// pair. The digest is the row that answers "did my deploy take?" — a stale
-// container keeps the old digest under an unchanged tag.
+// compose file asked for, the local image ID docker resolved it to, and the
+// command pair. The image ID is the row that answers "did my deploy take?" — a
+// stale container keeps the old image ID under an unchanged tag.
 func inspectImageSection(b *inspectBuilder, doc compose.InspectDoc) {
 	cmd := strings.Join(doc.Config.Cmd, " ")
 	entrypoint := strings.Join(doc.Config.Entrypoint, " ")
@@ -289,7 +289,7 @@ func inspectImageSection(b *inspectBuilder, doc compose.InspectDoc) {
 		b.kv("image", doc.Config.Image)
 	}
 	if doc.Image != "" {
-		b.kv("digest", doc.Image)
+		b.kv("image id", doc.Image)
 	}
 	if cmd != "" {
 		b.kv("command", cmd)

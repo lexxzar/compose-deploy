@@ -641,7 +641,7 @@ func TestBuildInspectSummary_ImageSection(t *testing.T) {
 	for _, want := range []string{
 		"IMAGE",
 		inspectRow("image", "nginx:latest"),
-		inspectRow("digest", "sha256:d090ef0c3fa38df49d89dfcca52ce77f71d88a8db6bd8388d78817cad20a0c1f"),
+		inspectRow("image id", "sha256:d090ef0c3fa38df49d89dfcca52ce77f71d88a8db6bd8388d78817cad20a0c1f"),
 		inspectRow("command", "nginx -g daemon off;"),
 		inspectRow("entrypoint", "/docker-entrypoint.sh"),
 	} {
@@ -677,10 +677,10 @@ func TestBuildInspectSummary_ImageSectionPresence(t *testing.T) {
 	}{
 		{name: "nothing to say", want: false},
 		{
-			name:    "digest only",
+			name:    "image id only",
 			doc:     compose.InspectDoc{Image: "sha256:abc"},
 			want:    true,
-			wantRow: inspectRow("digest", "sha256:abc"),
+			wantRow: inspectRow("image id", "sha256:abc"),
 			skipRow: "image  ",
 		},
 		{
@@ -688,7 +688,7 @@ func TestBuildInspectSummary_ImageSectionPresence(t *testing.T) {
 			doc:     compose.InspectDoc{Config: compose.InspectConfig{Image: "redis:7"}},
 			want:    true,
 			wantRow: inspectRow("image", "redis:7"),
-			skipRow: "digest",
+			skipRow: "image id",
 		},
 		{
 			name:    "command only",
@@ -701,7 +701,7 @@ func TestBuildInspectSummary_ImageSectionPresence(t *testing.T) {
 			name:    "empty command slice is not a command",
 			doc:     compose.InspectDoc{Image: "sha256:abc", Config: compose.InspectConfig{Cmd: []string{}}},
 			want:    true,
-			wantRow: inspectRow("digest", "sha256:abc"),
+			wantRow: inspectRow("image id", "sha256:abc"),
 			skipRow: "command",
 		},
 	}
