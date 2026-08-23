@@ -415,18 +415,35 @@ or arch segment is `unknown` is an attestation and never matches.
 - Modify: `internal/compose/updatedetails.go`
 - Modify: `internal/compose/updatedetails_test.go`
 
-- [ ] add `scanUpdateDetails(ctx, wanted map[string]string, d dockerRunner) (map[string]UpdateDetail, error)`
+- [x] add `scanUpdateDetails(ctx, wanted map[string]string, d dockerRunner) (map[string]UpdateDetail, error)`
       mirroring `scanImageUpdates`: memoise by image ref, one entry per distinct image
-- [ ] chain steps 1→4; build the pinned ref with `StripTag(ref) + "@" + digest`
-- [ ] branch on the three-state index result: `hasIndex=false` → use the original ref;
+- [x] chain steps 1→4; build the pinned ref with `StripTag(ref) + "@" + digest`
+- [x] branch on the three-state index result: `hasIndex=false` → use the original ref;
       `hasIndex=true, found=false` → **abort this image**
-- [ ] on any per-image failure, omit that service and continue — a partial result is valid
-- [ ] short-circuit the whole scan on `errSSHTransport`, matching `scanImageUpdates`, and
+- [x] on any per-image failure, omit that service and continue — a partial result is valid
+- [x] short-circuit the whole scan on `errSSHTransport`, matching `scanImageUpdates`, and
       return the partial map alongside the error per the untrusted-partial-map contract
-- [ ] write tests with a fake `dockerRunner`: happy path, single-manifest path, platform-absent
+- [x] write tests with a fake `dockerRunner`: happy path, single-manifest path, platform-absent
       abort, step-3 failure, step-4 failure, transport abort
-- [ ] write a memoisation test — one image across three services issues one call set
-- [ ] run `go test ./internal/compose/` — must pass before task 6
+- [x] write a memoisation test — one image across three services issues one call set
+- [x] run `go test ./internal/compose/` — must pass before task 6
+
+➕ Services are visited in SORTED order. Each image costs four round-trips, three of them to the
+registry, so which images are reached before a transport abort must not depend on Go's map
+iteration order — otherwise the abort test is flaky and the quota cost is nondeterministic.
+
+➕ A per-image FAILURE (a command error, or a `parseLocalProbe` error) omits the whole entry and
+stops the sequence at that step, so a wasted registry round-trip is never spent on an image that
+is already lost. A step that SUCCEEDS but whose parser returns "absent" is NOT a failure: only its
+own field stays zero, and the rows the other steps filled still render.
+
+➕ Failures are memoised alongside successes, so a repeated image that cannot resolve costs one
+call set rather than one per service. The memoised error is kept rather than discarded, so an
+`errSSHTransport` still aborts the batch when it arrives from the cache.
+
+➕ The three-state branch lives in a named `pinnedImageRef(image, indexOut, probe)` helper rather
+than inline in the step chain: it is the one place the abort and the single-manifest fall-through
+are told apart, and it is testable without driving all four steps.
 
 ### Task 6: Bind `UpdateDetails` on all three composers
 

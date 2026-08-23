@@ -1,6 +1,9 @@
 package compose
 
 import (
+	"context"
+	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -679,6 +682,535 @@ func TestParseImageCreated_VariantTieBreaker(t *testing.T) {
 				if !got.Equal(tt.want) {
 					t.Fatalf("created = %v, want %v", got, tt.want)
 				}
+			}
+		})
+	}
+}
+
+// detailStep names one of the four round-trips fetchUpdateDetail makes, so a
+// test can reply per step instead of matching whole argv slices.
+type detailStep int
+
+const (
+	stepUnknown detailStep = iota
+	stepLocal
+	stepIndex
+	stepRaw
+	stepConfig
+)
+
+func (s detailStep) String() string {
+	switch s {
+	case stepLocal:
+		return "local probe"
+	case stepIndex:
+		return "manifest index"
+	case stepRaw:
+		return "raw manifest"
+	case stepConfig:
+		return "image config"
+	}
+	return "unknown"
+}
+
+func classifyDetailCall(args []string) detailStep {
+	if len(args) >= 2 && args[0] == "image" && args[1] == "inspect" {
+		return stepLocal
+	}
+	for _, a := range args {
+		switch a {
+		case "--raw":
+			return stepRaw
+		case manifestIndexFormat:
+			return stepIndex
+		case imageConfigFormat:
+			return stepConfig
+		}
+	}
+	return stepUnknown
+}
+
+// detailRunner wires a per-step reply function into the same dockerRunner seam
+// production uses, so the whole four-step sequence is exercised without Docker.
+// The image reference is always the LAST argv element on all four shapes.
+func detailRunner(t *testing.T, reply func(step detailStep, ref string) ([]byte, error)) *fakeDockerRunner {
+	t.Helper()
+	f := &fakeDockerRunner{}
+	f.runFunc = func(args []string) ([]byte, error) {
+		for _, a := range args {
+			if a == "compose" {
+				t.Errorf("update-detail argv must carry no compose element: %v", args)
+			}
+		}
+		step := classifyDetailCall(args)
+		if step == stepUnknown {
+			t.Errorf("unexpected docker call: %v", args)
+			return nil, fmt.Errorf("unexpected docker call")
+		}
+		return reply(step, args[len(args)-1])
+	}
+	return f
+}
+
+// stepRefs returns the reference each recorded call addressed, in order.
+func stepRefs(f *fakeDockerRunner) []string {
+	out := make([]string, 0, len(f.runCalls))
+	for _, args := range f.runCalls {
+		out = append(out, args[len(args)-1])
+	}
+	return out
+}
+
+const (
+	detailLocalProbeARM64 = "2026-07-07T17:47:22Z|linux|arm64\n"
+	detailNginxARM64      = "sha256:40ea9867eb2d91315bb6831f40286f77c086df2a132c36bce50019a54581aea7"
+	detailNewID           = "sha256:c05eced01234567890abcdef1234567890abcdef1234567890abcdef12345678"
+)
+
+var (
+	detailWantLocalCreated = time.Date(2026, 7, 7, 17, 47, 22, 0, time.UTC)
+	detailWantNewCreated   = time.Date(2026, 8, 19, 19, 14, 43, 123456789, time.UTC)
+)
+
+func TestScanUpdateDetails_HappyPath(t *testing.T) {
+	index := readFixture(t, "imagetools_manifest_index_nginx.json")
+	raw := readFixture(t, "imagetools_raw_manifest.json")
+	config := readFixture(t, "imagetools_image_config_object.json")
+
+	f := detailRunner(t, func(step detailStep, ref string) ([]byte, error) {
+		switch step {
+		case stepLocal:
+			return []byte(detailLocalProbeARM64), nil
+		case stepIndex:
+			return index, nil
+		case stepRaw:
+			return raw, nil
+		default:
+			return config, nil
+		}
+	})
+
+	out, err := scanUpdateDetails(context.Background(), map[string]string{"web": "nginx:1.27"}, f)
+	if err != nil {
+		t.Fatalf("scanUpdateDetails() error = %v, want nil", err)
+	}
+	det, ok := out["web"]
+	if !ok {
+		t.Fatalf("scanUpdateDetails() = %v, want an entry for web", out)
+	}
+	if !det.LocalCreated.Equal(detailWantLocalCreated) {
+		t.Errorf("LocalCreated = %v, want %v", det.LocalCreated, detailWantLocalCreated)
+	}
+	if det.NewID != detailNewID {
+		t.Errorf("NewID = %q, want %q", det.NewID, detailNewID)
+	}
+	if !det.NewCreated.Equal(detailWantNewCreated) {
+		t.Errorf("NewCreated = %v, want %v", det.NewCreated, detailWantNewCreated)
+	}
+
+	if len(f.runCalls) != 4 {
+		t.Fatalf("made %d docker calls, want 4: %v", len(f.runCalls), f.runCalls)
+	}
+	// Steps 3 and 4 must address the PINNED ref: an unpinned bare tag costs
+	// ~4.3s and returns a platform-keyed map from which the wrong platform
+	// could be picked.
+	pinned := "nginx@" + detailNginxARM64
+	refs := stepRefs(f)
+	want := []string{"nginx:1.27", "nginx:1.27", pinned, pinned}
+	for i := range want {
+		if refs[i] != want[i] {
+			t.Errorf("call %d addressed %q, want %q", i, refs[i], want[i])
+		}
+	}
+}
+
+func TestScanUpdateDetails_SingleManifest(t *testing.T) {
+	// A single-manifest ref has no manifests key, so there is nothing to pin
+	// to and the ORIGINAL ref must carry the last two steps. Step 4 then
+	// returns the platform-keyed map form rather than a bare object.
+	raw := readFixture(t, "imagetools_raw_manifest.json")
+	config := readFixture(t, "imagetools_image_config_map.json")
+
+	f := detailRunner(t, func(step detailStep, ref string) ([]byte, error) {
+		switch step {
+		case stepLocal:
+			return []byte(detailLocalProbeARM64), nil
+		case stepIndex:
+			return raw, nil // no manifests key
+		case stepRaw:
+			return raw, nil
+		default:
+			return config, nil
+		}
+	})
+
+	out, err := scanUpdateDetails(context.Background(), map[string]string{"web": "internal/app:v3"}, f)
+	if err != nil {
+		t.Fatalf("scanUpdateDetails() error = %v, want nil", err)
+	}
+	det, ok := out["web"]
+	if !ok {
+		t.Fatalf("scanUpdateDetails() = %v, want an entry for web", out)
+	}
+	if det.NewID != detailNewID {
+		t.Errorf("NewID = %q, want %q", det.NewID, detailNewID)
+	}
+	if !det.NewCreated.Equal(detailWantNewCreated) {
+		t.Errorf("NewCreated = %v, want %v", det.NewCreated, detailWantNewCreated)
+	}
+	for i, ref := range stepRefs(f) {
+		if ref != "internal/app:v3" {
+			t.Errorf("call %d addressed %q, want the original ref", i, ref)
+		}
+	}
+}
+
+func TestScanUpdateDetails_PlatformAbsentAborts(t *testing.T) {
+	// An index that does not carry the host's platform must abort the image
+	// rather than fall through to the single-manifest path: --raw against an
+	// index yields no config.digest, and the config step would return a map
+	// from which any platform could be picked.
+	index := readFixture(t, "imagetools_manifest_index_nginx.json")
+	f := detailRunner(t, func(step detailStep, ref string) ([]byte, error) {
+		switch step {
+		case stepLocal:
+			return []byte("2026-07-07T17:47:22Z|windows|amd64"), nil
+		case stepIndex:
+			return index, nil
+		}
+		t.Errorf("step %v must not run after the platform-absent abort", step)
+		return nil, fmt.Errorf("unreachable")
+	})
+
+	out, err := scanUpdateDetails(context.Background(), map[string]string{"web": "nginx:1.27"}, f)
+	if err != nil {
+		t.Fatalf("scanUpdateDetails() error = %v, want nil — a per-image abort is not a scan failure", err)
+	}
+	if len(out) != 0 {
+		t.Errorf("scanUpdateDetails() = %v, want no entries", out)
+	}
+	if len(f.runCalls) != 2 {
+		t.Errorf("made %d docker calls, want 2 — the registry steps must be skipped", len(f.runCalls))
+	}
+}
+
+func TestScanUpdateDetails_PerImageFailureOmitsService(t *testing.T) {
+	index := readFixture(t, "imagetools_manifest_index_nginx.json")
+	raw := readFixture(t, "imagetools_raw_manifest.json")
+	config := readFixture(t, "imagetools_image_config_object.json")
+
+	tests := []struct {
+		name      string
+		failAt    detailStep
+		localOut  string
+		wantCalls int
+	}{
+		{name: "local probe fails", failAt: stepLocal, wantCalls: 1},
+		{name: "manifest index fails", failAt: stepIndex, wantCalls: 2},
+		{name: "raw manifest fails", failAt: stepRaw, wantCalls: 3},
+		{name: "image config fails", failAt: stepConfig, wantCalls: 4},
+		{name: "local probe unparseable", localOut: "not-a-probe-line", wantCalls: 1},
+		{name: "local probe has no platform", localOut: "2026-07-07T17:47:22Z||", wantCalls: 1},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			f := detailRunner(t, func(step detailStep, ref string) ([]byte, error) {
+				if tt.failAt != stepUnknown && step == tt.failAt {
+					return nil, fmt.Errorf("docker: boom")
+				}
+				switch step {
+				case stepLocal:
+					if tt.localOut != "" {
+						return []byte(tt.localOut), nil
+					}
+					return []byte(detailLocalProbeARM64), nil
+				case stepIndex:
+					return index, nil
+				case stepRaw:
+					return raw, nil
+				default:
+					return config, nil
+				}
+			})
+
+			out, err := scanUpdateDetails(context.Background(), map[string]string{"web": "nginx:1.27"}, f)
+			if err != nil {
+				t.Fatalf("scanUpdateDetails() error = %v, want nil — a per-image failure is absorbed", err)
+			}
+			if len(out) != 0 {
+				t.Errorf("scanUpdateDetails() = %v, want no entries", out)
+			}
+			if len(f.runCalls) != tt.wantCalls {
+				t.Errorf("made %d docker calls, want %d — the sequence must stop at the first failure",
+					len(f.runCalls), tt.wantCalls)
+			}
+		})
+	}
+}
+
+func TestScanUpdateDetails_PartialResultIsValid(t *testing.T) {
+	// One image failing must not drop the services whose image resolved.
+	index := readFixture(t, "imagetools_manifest_index_nginx.json")
+	raw := readFixture(t, "imagetools_raw_manifest.json")
+	config := readFixture(t, "imagetools_image_config_object.json")
+
+	f := detailRunner(t, func(step detailStep, ref string) ([]byte, error) {
+		if strings.HasPrefix(ref, "broken") && step == stepRaw {
+			return nil, fmt.Errorf("docker: manifest unknown")
+		}
+		switch step {
+		case stepLocal:
+			return []byte(detailLocalProbeARM64), nil
+		case stepIndex:
+			return index, nil
+		case stepRaw:
+			return raw, nil
+		default:
+			return config, nil
+		}
+	})
+
+	wanted := map[string]string{"web": "nginx:1.27", "api": "broken:1"}
+	out, err := scanUpdateDetails(context.Background(), wanted, f)
+	if err != nil {
+		t.Fatalf("scanUpdateDetails() error = %v, want nil", err)
+	}
+	if _, ok := out["api"]; ok {
+		t.Errorf("scanUpdateDetails() = %v, want api absent", out)
+	}
+	if _, ok := out["web"]; !ok {
+		t.Errorf("scanUpdateDetails() = %v, want web present", out)
+	}
+}
+
+func TestScanUpdateDetails_AbsentFieldKeepsEntry(t *testing.T) {
+	// A step that SUCCEEDS but whose parser returns "absent" drops only its own
+	// row: the entry survives so the other rows still render.
+	index := readFixture(t, "imagetools_manifest_index_nginx.json")
+	raw := readFixture(t, "imagetools_raw_manifest.json")
+	config := readFixture(t, "imagetools_image_config_object.json")
+
+	tests := []struct {
+		name           string
+		garbleRaw      bool
+		garbleConfig   bool
+		wantNewID      string
+		wantNewCreated bool
+	}{
+		{name: "raw manifest unparseable", garbleRaw: true, wantNewCreated: true},
+		{name: "image config unparseable", garbleConfig: true, wantNewID: detailNewID},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			f := detailRunner(t, func(step detailStep, ref string) ([]byte, error) {
+				switch step {
+				case stepLocal:
+					return []byte(detailLocalProbeARM64), nil
+				case stepIndex:
+					return index, nil
+				case stepRaw:
+					if tt.garbleRaw {
+						return []byte("Name: docker.io/library/nginx:1.27\n"), nil
+					}
+					return raw, nil
+				default:
+					if tt.garbleConfig {
+						return []byte("Name: docker.io/library/nginx:1.27\n"), nil
+					}
+					return config, nil
+				}
+			})
+
+			out, err := scanUpdateDetails(context.Background(), map[string]string{"web": "nginx:1.27"}, f)
+			if err != nil {
+				t.Fatalf("scanUpdateDetails() error = %v, want nil", err)
+			}
+			det, ok := out["web"]
+			if !ok {
+				t.Fatalf("scanUpdateDetails() = %v, want an entry for web", out)
+			}
+			if !det.LocalCreated.Equal(detailWantLocalCreated) {
+				t.Errorf("LocalCreated = %v, want %v", det.LocalCreated, detailWantLocalCreated)
+			}
+			if det.NewID != tt.wantNewID {
+				t.Errorf("NewID = %q, want %q", det.NewID, tt.wantNewID)
+			}
+			if got := !det.NewCreated.IsZero(); got != tt.wantNewCreated {
+				t.Errorf("NewCreated set = %v, want %v (%v)", got, tt.wantNewCreated, det.NewCreated)
+			}
+		})
+	}
+}
+
+func TestScanUpdateDetails_TransportAbort(t *testing.T) {
+	// A dead SSH hop poisons every remaining image, so the scan returns at the
+	// first errSSHTransport with the partial map alongside the error — the same
+	// contract scanImageUpdates follows.
+	index := readFixture(t, "imagetools_manifest_index_nginx.json")
+	raw := readFixture(t, "imagetools_raw_manifest.json")
+	config := readFixture(t, "imagetools_image_config_object.json")
+
+	f := detailRunner(t, func(step detailStep, ref string) ([]byte, error) {
+		if strings.HasPrefix(ref, "dead") {
+			return nil, fmt.Errorf("%w: ssh: connect to host db1 port 22: no route to host", errSSHTransport)
+		}
+		switch step {
+		case stepLocal:
+			return []byte(detailLocalProbeARM64), nil
+		case stepIndex:
+			return index, nil
+		case stepRaw:
+			return raw, nil
+		default:
+			return config, nil
+		}
+	})
+
+	// Services are visited in sorted order, so "a-web" resolves, "b-api"
+	// aborts, and "c-cache" is never reached.
+	wanted := map[string]string{"a-web": "nginx:1.27", "b-api": "dead:1", "c-cache": "redis:7"}
+	out, err := scanUpdateDetails(context.Background(), wanted, f)
+	if !errors.Is(err, errSSHTransport) {
+		t.Fatalf("scanUpdateDetails() error = %v, want it to wrap errSSHTransport", err)
+	}
+	if _, ok := out["a-web"]; !ok {
+		t.Errorf("scanUpdateDetails() = %v, want the partial result to keep a-web", out)
+	}
+	if len(out) != 1 {
+		t.Errorf("scanUpdateDetails() = %v, want exactly the pre-abort entry", out)
+	}
+	for _, ref := range stepRefs(f) {
+		if strings.HasPrefix(ref, "redis") {
+			t.Errorf("reached %q after the transport abort: %v", ref, stepRefs(f))
+		}
+	}
+}
+
+func TestScanUpdateDetails_MemoizesByImage(t *testing.T) {
+	// Three services off one image cost one call set. Host containers repeat a
+	// single tag constantly, and every round-trip here is a registry request
+	// against an anonymous quota.
+	index := readFixture(t, "imagetools_manifest_index_nginx.json")
+	raw := readFixture(t, "imagetools_raw_manifest.json")
+	config := readFixture(t, "imagetools_image_config_object.json")
+
+	f := detailRunner(t, func(step detailStep, ref string) ([]byte, error) {
+		switch step {
+		case stepLocal:
+			return []byte(detailLocalProbeARM64), nil
+		case stepIndex:
+			return index, nil
+		case stepRaw:
+			return raw, nil
+		default:
+			return config, nil
+		}
+	})
+
+	wanted := map[string]string{"web": "nginx:1.27", "edge": "nginx:1.27", "proxy": "nginx:1.27"}
+	out, err := scanUpdateDetails(context.Background(), wanted, f)
+	if err != nil {
+		t.Fatalf("scanUpdateDetails() error = %v, want nil", err)
+	}
+	if len(out) != 3 {
+		t.Fatalf("scanUpdateDetails() = %v, want all three services", out)
+	}
+	for svc, det := range out {
+		if det.NewID != detailNewID {
+			t.Errorf("%s NewID = %q, want %q", svc, det.NewID, detailNewID)
+		}
+	}
+	if len(f.runCalls) != 4 {
+		t.Errorf("made %d docker calls, want 4 — one call set per distinct image", len(f.runCalls))
+	}
+}
+
+func TestScanUpdateDetails_MemoizesFailures(t *testing.T) {
+	// A failing image must not be retried per service either — the cost is the
+	// same whichever way it ends.
+	calls := 0
+	f := detailRunner(t, func(step detailStep, ref string) ([]byte, error) {
+		calls++
+		return nil, fmt.Errorf("docker: no such image")
+	})
+
+	wanted := map[string]string{"web": "nginx:1.27", "edge": "nginx:1.27"}
+	out, err := scanUpdateDetails(context.Background(), wanted, f)
+	if err != nil {
+		t.Fatalf("scanUpdateDetails() error = %v, want nil", err)
+	}
+	if len(out) != 0 {
+		t.Errorf("scanUpdateDetails() = %v, want no entries", out)
+	}
+	if calls != 1 {
+		t.Errorf("made %d docker calls, want 1 — the failure is memoized too", calls)
+	}
+}
+
+func TestScanUpdateDetails_EmptyInput(t *testing.T) {
+	f := detailRunner(t, func(step detailStep, ref string) ([]byte, error) {
+		t.Errorf("no docker call is allowed for an empty service set")
+		return nil, nil
+	})
+	out, err := scanUpdateDetails(context.Background(), nil, f)
+	if err != nil {
+		t.Fatalf("scanUpdateDetails() error = %v, want nil", err)
+	}
+	if len(out) != 0 {
+		t.Errorf("scanUpdateDetails() = %v, want an empty map", out)
+	}
+}
+
+func TestPinnedImageRef(t *testing.T) {
+	index := readFixture(t, "imagetools_manifest_index_nginx.json")
+	single := readFixture(t, "imagetools_raw_manifest.json")
+	probe := localProbe{os: "linux", arch: "arm64"}
+
+	tests := []struct {
+		name    string
+		image   string
+		data    []byte
+		probe   localProbe
+		want    string
+		wantErr bool
+	}{
+		{
+			name: "index pins by digest", image: "nginx:1.27", data: index, probe: probe,
+			want: "nginx@" + detailNginxARM64,
+		},
+		{
+			// StripTag keeps a registry port intact, which is why the repo
+			// portion is never re-derived here.
+			name: "registry port survives", image: "localhost:5000/nginx:1.27", data: index, probe: probe,
+			want: "localhost:5000/nginx@" + detailNginxARM64,
+		},
+		{
+			name: "single manifest keeps the original ref", image: "internal/app:v3", data: single, probe: probe,
+			want: "internal/app:v3",
+		},
+		{
+			name: "platform absent aborts", image: "nginx:1.27", data: index,
+			probe: localProbe{os: "windows", arch: "amd64"}, wantErr: true,
+		},
+		{
+			name: "malformed index aborts", image: "nginx:1.27", data: []byte("Name: nginx"), probe: probe,
+			wantErr: true,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := pinnedImageRef(tt.image, tt.data, tt.probe)
+			if tt.wantErr {
+				if err == nil {
+					t.Fatalf("pinnedImageRef() = %q, want an error", got)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("pinnedImageRef() error = %v, want nil", err)
+			}
+			if got != tt.want {
+				t.Errorf("pinnedImageRef() = %q, want %q", got, tt.want)
 			}
 		})
 	}

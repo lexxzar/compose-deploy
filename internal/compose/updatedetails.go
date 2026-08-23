@@ -1,7 +1,9 @@
 package compose
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"sort"
 	"strings"
@@ -377,4 +379,129 @@ func platformKeyMatches(key, os, arch string) (exact, match bool) {
 		return false, false
 	}
 	return len(parts) == 2, true
+}
+
+// updateDetailResult is one image's memoized detail outcome inside
+// scanUpdateDetails. A non-nil err means the image contributed no entry; the
+// error is kept rather than discarded so a transport failure can still abort
+// the batch when it arrives from the memo cache.
+type updateDetailResult struct {
+	detail UpdateDetail
+	err    error
+}
+
+// scanUpdateDetails resolves the extra IMAGE-section values for every service
+// in wanted, mirroring scanImageUpdates: distinct images are fetched ONCE, and
+// a service whose image could not be resolved stays ABSENT from the map so the
+// inspect screen omits the rows rather than drawing a guess.
+//
+// Unlike scanImageUpdates there are no systemic-failure cascades here. The
+// glyph is the load-bearing signal and these rows are a bonus, so a partial
+// result is a valid result and the caller discards the error entirely rather
+// than letting it reach updatesMsg.err — a registry 429 during this phase must
+// not blank the "⇧" column.
+//
+// The transport abort is the one early return: an errSSHTransport failure
+// poisons every remaining image, so the scan stops and returns the partial map
+// ALONGSIDE the error, matching the untrusted-partial-map contract
+// scanImageUpdates follows.
+//
+// Services are visited in sorted order. Each image costs four round-trips
+// (three of them to the registry), so which images are reached before a
+// transport abort must not depend on Go's map iteration order.
+func scanUpdateDetails(ctx context.Context, wanted map[string]string, d dockerRunner) (map[string]UpdateDetail, error) {
+	out := make(map[string]UpdateDetail, len(wanted))
+	svcs := make([]string, 0, len(wanted))
+	for svc := range wanted {
+		svcs = append(svcs, svc)
+	}
+	sort.Strings(svcs)
+	seen := make(map[string]updateDetailResult, len(wanted))
+	for _, svc := range svcs {
+		img := wanted[svc]
+		r, cached := seen[img]
+		if !cached {
+			det, err := fetchUpdateDetail(ctx, d, img)
+			r = updateDetailResult{detail: det, err: err}
+			seen[img] = r
+		}
+		if r.err != nil {
+			if errors.Is(r.err, errSSHTransport) {
+				return out, fmt.Errorf("update detail transport failure: %w", r.err)
+			}
+			continue
+		}
+		out[svc] = r.detail
+	}
+	return out, nil
+}
+
+// fetchUpdateDetail runs the four-step sequence for one image reference:
+//
+//	1  docker image inspect                  local build time + platform pair
+//	2  buildx imagetools inspect --format     the index; select the host platform
+//	3  buildx imagetools inspect --raw        config.digest → NewID
+//	4  buildx imagetools inspect --format     created → NewCreated
+//
+// Steps 2-4 are registry calls, so the sequence returns at the FIRST failure
+// rather than pressing on: the caller omits the whole entry either way, and a
+// wasted round-trip here is a step closer to the registry's anonymous rate
+// limit. Step 2's three-state answer decides which reference the last two steps
+// address — the pinned one when the index named the host's platform, the
+// original when there is no index at all, and none at all when an index exists
+// but the host's platform is missing from it.
+//
+// A step that SUCCEEDS but whose parser returns "absent" is not a failure: the
+// matching field stays zero and its row is omitted, while the rows the other
+// steps filled still render.
+func fetchUpdateDetail(ctx context.Context, d dockerRunner, image string) (UpdateDetail, error) {
+	localOut, err := d.run(ctx, localProbeArgs(image)...)
+	if err != nil {
+		return UpdateDetail{}, fmt.Errorf("inspecting local image %q: %w", image, err)
+	}
+	probe, err := parseLocalProbe(localOut)
+	if err != nil {
+		return UpdateDetail{}, fmt.Errorf("inspecting local image %q: %w", image, err)
+	}
+
+	indexOut, err := d.run(ctx, manifestIndexArgs(image)...)
+	if err != nil {
+		return UpdateDetail{}, fmt.Errorf("fetching manifest index for %q: %w", image, err)
+	}
+	ref, err := pinnedImageRef(image, indexOut, probe)
+	if err != nil {
+		return UpdateDetail{}, err
+	}
+
+	rawOut, err := d.run(ctx, rawManifestArgs(ref)...)
+	if err != nil {
+		return UpdateDetail{}, fmt.Errorf("fetching raw manifest for %q: %w", ref, err)
+	}
+	configOut, err := d.run(ctx, imageConfigArgs(ref)...)
+	if err != nil {
+		return UpdateDetail{}, fmt.Errorf("fetching image config for %q: %w", ref, err)
+	}
+
+	det := UpdateDetail{LocalCreated: probe.created, NewID: parseConfigDigest(rawOut)}
+	if created, ok := parseImageCreated(configOut, probe.os, probe.arch); ok {
+		det.NewCreated = created
+	}
+	return det, nil
+}
+
+// pinnedImageRef turns step 2's three-state answer into the reference steps 3
+// and 4 address. StripTag is reused rather than re-deriving the repo portion,
+// so a registry port (localhost:5000/foo:1) survives the rewrite.
+func pinnedImageRef(image string, indexOut []byte, probe localProbe) (string, error) {
+	digest, hasIndex, found := parseIndexPlatformDigest(indexOut, probe.os, probe.arch)
+	switch {
+	case !hasIndex:
+		// Single-manifest reference: there is nothing to pin to, and the
+		// original ref already addresses the only manifest there is.
+		return image, nil
+	case !found:
+		return "", fmt.Errorf("no %s/%s manifest in the index for %q", probe.os, probe.arch, image)
+	default:
+		return StripTag(image) + "@" + digest, nil
+	}
 }
