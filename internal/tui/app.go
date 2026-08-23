@@ -4264,9 +4264,11 @@ func (m Model) updatesCacheLookup() (updateEntry, bool) {
 // maybeRefreshUpdatesCmd returns refreshUpdates() and marks updateInFlight
 // when the cache is stale or missing; otherwise returns nil, or — on a fresh
 // SUCCESS entry that no detail batch has reported for — refillUpdateDetailsCmd()
-// (see there for why a missing detail set has to be a refetch trigger). The
-// caller is expected to compose this into the screen-entry batch alongside
-// refreshStatus / refreshStats / loadServices. Cache hits surface via the
+// (see there for why a missing detail set has to be a refetch trigger, and the
+// fresh-success branch below for why that refill is NOT gated on
+// autoUpdatesAllowed while the fetch is). The caller is expected to compose
+// this into the screen-entry batch alongside refreshStatus / refreshStats /
+// loadServices. Cache hits surface via the
 // post-overwrite hydration in servicesMsg/statusMsg handlers — no synthetic msg
 // needed.
 //
@@ -4313,15 +4315,21 @@ func (m *Model) maybeRefreshUpdatesCmd() tea.Cmd {
 			return nil
 		}
 		m.updatesErr = ""
-		if !m.autoUpdatesAllowed() {
-			return nil
-		}
 		// The verdicts are fresh, but the entry may still be missing the
 		// inspect screen's detail rows — a batch was refused while another was
 		// running, or one finished under a key the user had already left. This
 		// is the second half of that self-heal: refillUpdateDetailsCmd returns
 		// nil unless the entry genuinely has no reported batch, so on the
 		// ordinary cache hit this is one map read and no fetch.
+		//
+		// It is deliberately NOT behind autoUpdatesAllowed(), for the same
+		// reason the arrival tail is not: the refill can only fire for an entry
+		// that already exists under the CURRENT key, and on a read-only key no
+		// automatic path can create one — the stale branch below refuses, and
+		// so do the statusMsg self-heal and Init(). U is the only thing that
+		// can, so a refill here completes that U rather than starting a fetch
+		// of its own. Gating it would strand the rows U asked for for the whole
+		// 10-minute TTL whenever its batch lost the race with another one.
 		return m.refillUpdateDetailsCmd()
 	}
 	if !m.autoUpdatesAllowed() {

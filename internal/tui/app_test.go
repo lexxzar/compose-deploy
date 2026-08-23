@@ -12600,11 +12600,14 @@ func TestReadOnly_NoAutomaticDetailFetch(t *testing.T) {
 		}
 	})
 
-	t.Run("a fresh entry missing its details is not refilled either", func(t *testing.T) {
-		// The self-heal that refetches a lost detail batch reaches every other
-		// screen through maybeRefreshUpdatesCmd, so it needs the same opt-in
-		// gate as the verdicts — otherwise the read-only view fans out to the
-		// registry on entry after all, just one message later.
+	t.Run("a fresh entry missing its details is refilled on re-entry", func(t *testing.T) {
+		// NEITHER refill site is gated, and this one used to be. The entry can
+		// only exist because U created it (the subtest above pins that no
+		// automatic path makes one under a read-only key), so refilling it
+		// completes that U — restricted to the services it already reported
+		// true — rather than starting an automatic fan-out. Gating it stranded
+		// the rows for the whole 10-minute TTL whenever the batch was refused
+		// while another was running and the arrival landed under another key.
 		c := newComposer()
 		m := inspectTestModel(t, c, c.services)
 		m.updateCache = map[string]updateEntry{m.updatesCacheKey(): {
@@ -12612,25 +12615,30 @@ func TestReadOnly_NoAutomaticDetailFetch(t *testing.T) {
 			results:   map[string]bool{"watchtower": true},
 		}}
 
-		if cmd := m.maybeRefreshUpdatesCmd(); cmd != nil {
-			t.Errorf("the read-only screen refilled the detail rows automatically: %T", cmd())
+		cmd := m.maybeRefreshUpdatesCmd()
+		if cmd == nil {
+			t.Fatal("the entry U created was left without its detail rows for the whole TTL")
 		}
-		if c.detailsCalls != 0 {
-			t.Errorf("UpdateDetails calls = %d, want 0", c.detailsCalls)
+		if _, ok := cmd().(updateDetailsMsg); !ok {
+			t.Fatalf("the refill produced %T, want updateDetailsMsg", cmd())
+		}
+		if c.updatesCalls != 0 {
+			t.Errorf("CheckUpdates calls = %d, want 0 — the refill must not re-run the verdicts", c.updatesCalls)
+		}
+		if c.detailsCalls != 1 {
+			t.Fatalf("UpdateDetails calls = %d, want exactly 1", c.detailsCalls)
+		}
+		if got := c.detailsArgs[0]; len(got) != 1 || got[0] != "watchtower" {
+			t.Errorf("UpdateDetails services = %v, want [watchtower] — only U's own true verdicts", got)
 		}
 	})
 
-	t.Run("the arrival-path refill completes U rather than bypassing the gate", func(t *testing.T) {
-		// refillUpdateDetailsCmd is called from two sites and only the
-		// maybeRefreshUpdatesCmd one sits behind autoUpdatesAllowed(). The
-		// arrival site deliberately does NOT, and that is not a hole: the entry
+	t.Run("the arrival-path refill completes U as well", func(t *testing.T) {
+		// The second of the two refill sites, on the same reasoning: the entry
 		// it fires for must be fresh, non-errored and under the read-only key,
-		// and the subtests above pin that no automatic path can create one
-		// there — U is the only thing that can. So a refill here is the
-		// deferred completion of that same U, restricted to the services it
-		// already reported true, not a second automatic fan-out. Gating it
-		// would instead drop the rows U asked for whenever its batch lost the
-		// race with another one.
+		// and only U can produce one. So a refill here is the deferred
+		// completion of that same U, restricted to the services it already
+		// reported true, not a second automatic fan-out.
 		c := newComposer()
 		m := inspectTestModel(t, c, c.services)
 		m.updateCache = map[string]updateEntry{m.updatesCacheKey(): {

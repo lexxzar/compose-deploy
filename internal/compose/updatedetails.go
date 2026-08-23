@@ -34,58 +34,89 @@ type UpdateDetail struct {
 }
 
 // localProbe is the parsed result of step 1 of the detail fetch: the build time
-// of the local image plus the platform pair used to select the host's entry out
-// of a multi-arch index.
+// of the local image plus the platform triple used to select the host's entry
+// out of a multi-arch index.
 type localProbe struct {
 	created time.Time
 	os      string
 	arch    string
+	variant string // "" when the image config names none — unknown, never a requirement
+}
+
+// platform renders the probe's platform triple the way an index descriptor
+// spells it — linux/arm/v7, or linux/amd64 when the architecture carries no
+// variant. The variant is the NORMALISED one, so the "no ... manifest in the
+// index" error names the platform that was actually searched for: an arm image
+// config carrying no variant was looked up as linux/arm/v7.
+func (p localProbe) platform() string {
+	s := p.os + "/" + p.arch
+	if v := normalizePlatformVariant(p.arch, p.variant); v != "" {
+		s += "/" + v
+	}
+	return s
 }
 
 // localProbeFormat is the Go template step 1 hands `docker image inspect`.
 //
-// `.Variant` is DELIBERATELY absent. A template referencing a field the docker
-// struct lacks is a hard execution error, not an empty string (the same policy
-// hostPsArgs documents), so an older docker host would fail step 1 for every
-// image and silently disable the whole feature. Variant is only ever a
-// tie-breaker in the index match, so the local side treats it as always-empty.
-// `.Id` is absent for the same "only what a row draws" reason — the image ID
-// row already comes from the container's own inspect document.
-const localProbeFormat = "{{.Created}}|{{.Os}}|{{.Architecture}}"
+// The WHOLE DOCUMENT is requested rather than a pipe-joined list of NAMED
+// fields, and that is what makes the variant safe to read. Naming a field the
+// CLI's struct lacks is a hard execution error: the CLI retries such a template
+// against the raw JSON with missingkey=error, and `Variant` is omitempty, so an
+// image without one carries no such key and the retry fails too — one unknown
+// field would kill step 1 for EVERY image and silently disable the whole
+// feature. `{{json .}}` cannot fail that way: a field an older CLI does not
+// know simply never appears, and an absent variant parses as the empty string
+// the index match already treats as "unknown". hostPsArgs documents the same
+// rule for `docker ps`, and it is the reason the matcher can be strict.
+//
+// Nothing else the document carries is read — `Id` in particular, because the
+// `image id` row already comes from the container's own inspect document.
+const localProbeFormat = "{{json .}}"
 
-// localProbeArgs builds the step-1 argv: the build timestamp and platform pair
-// of the LOCAL image. This is the only step that does not touch the registry.
+// localProbeDoc decodes the four fields step 1 reads. Go matches JSON keys
+// case-insensitively, so this survives a CLI that lower-cases them.
+type localProbeDoc struct {
+	Created      string `json:"Created"`
+	OS           string `json:"Os"`
+	Architecture string `json:"Architecture"`
+	Variant      string `json:"Variant"`
+}
+
+// localProbeArgs builds the step-1 argv: the build timestamp and platform
+// triple of the LOCAL image. This is the only step that does not touch the
+// registry.
 func localProbeArgs(image string) []string {
 	return []string{"image", "inspect", "--format", localProbeFormat, image}
 }
 
-// parseLocalProbe parses the single line localProbeArgs produces.
+// parseLocalProbe parses the image document localProbeArgs asks for.
 //
 // An unparseable or epoch-sentinel timestamp yields a ZERO created time rather
 // than an error: reproducible builds (distroless, ko, Bazel, nix) legitimately
-// report 1970-01-01, and the platform pair beside it is still usable, so the
-// scan continues and only the `built` row drops.
+// report 1970-01-01, and the platform triple beside it is still usable, so the
+// scan continues and only the `built` row drops. An ABSENT variant is ordinary
+// data, not a failure — real arm64 images split both ways (library/nginx records
+// v8, qdrant/qdrant records none) — so it is never required;
+// normalizePlatformVariant resolves what it MEANS at match time, where an
+// absent arm variant is v7 and an absent arm64 one is v8.
 //
-// A wrong field count, or an empty os/arch, IS an error. Without a platform
-// pair the index match can only fail, and erroring here saves the three
-// registry round-trips that would follow.
+// Unparseable output, and an empty os or architecture, ARE errors. Without a
+// platform pair the index match can only fail, and erroring here saves the
+// three registry round-trips that would follow.
 func parseLocalProbe(out []byte) (localProbe, error) {
-	line := strings.TrimSpace(string(out))
-	if line == "" {
-		return localProbe{}, fmt.Errorf("empty local image probe output")
-	}
-	parts := strings.Split(line, "|")
-	if len(parts) != 3 {
-		return localProbe{}, fmt.Errorf("unexpected local image probe output: %q", line)
+	var doc localProbeDoc
+	if err := json.Unmarshal(out, &doc); err != nil {
+		return localProbe{}, fmt.Errorf("unexpected local image probe output: %w", err)
 	}
 	p := localProbe{
-		os:   strings.TrimSpace(parts[1]),
-		arch: strings.TrimSpace(parts[2]),
+		os:      strings.TrimSpace(doc.OS),
+		arch:    strings.TrimSpace(doc.Architecture),
+		variant: strings.TrimSpace(doc.Variant),
 	}
 	if p.os == "" || p.arch == "" {
-		return localProbe{}, fmt.Errorf("local image probe has no platform: %q", line)
+		return localProbe{}, fmt.Errorf("local image probe has no platform: %q", strings.TrimSpace(string(out)))
 	}
-	p.created = parseImageTimestamp(strings.TrimSpace(parts[0]))
+	p.created = parseImageTimestamp(strings.TrimSpace(doc.Created))
 	return p, nil
 }
 
@@ -148,6 +179,48 @@ type indexManifest struct {
 // provenance/SBOM blob, not a runnable image.
 const unknownPlatform = "unknown"
 
+// normalizePlatformVariant canonicalises a platform's CPU variant, so the two
+// spellings of one platform compare equal and two different platforms never do.
+//
+// The OCI image-spec makes `variant` an OPTIONAL descriptor property and
+// standardises only four values (image-index.md, "Platform Variants": arm/v6,
+// arm/v7, arm/v8, arm64/v8), so the spec itself never says what an ABSENT
+// variant means. containerd answers that, and docker and buildx inherit the
+// answer through it — platforms/database.go, normalizeArch:
+//
+//	arm    with ""  or "7"   =>  v7        an unqualified linux/arm IS ARMv7
+//	arm    with "5"/"6"/"8"  =>  v5/v6/v8
+//	arm64  with "8" or "v8"  =>  ""        arm64 and arm64/v8 are one platform
+//
+// The first line is the load-bearing one: an unqualified `linux/arm` descriptor
+// is not a wildcard over every 32-bit ARM host, so an ARMv5 or ARMv6 host must
+// not select it. The third makes library/nginx's single `arm64/v8` entry an
+// EXACT match for an arm64 image config that records no variant.
+//
+// Only that arm/arm64 pair is folded. The architecture ALIASES containerd also
+// normalises (aarch64, x86_64, i386) cannot appear on either side here: both
+// the descriptor and the local probe come from docker's own JSON, which spells
+// the architecture as a Go GOARCH value.
+func normalizePlatformVariant(arch, variant string) string {
+	arch = strings.ToLower(strings.TrimSpace(arch))
+	variant = strings.ToLower(strings.TrimSpace(variant))
+	switch arch {
+	case "arm":
+		switch variant {
+		case "", "7":
+			return "v7"
+		case "5", "6", "8":
+			return "v" + variant
+		}
+	case "arm64":
+		switch variant {
+		case "8", "v8":
+			return ""
+		}
+	}
+	return variant
+}
+
 // parseIndexPlatformDigest picks the manifest digest for one platform out of
 // the JSON manifestIndexArgs returns. The three-state return distinguishes two
 // failures a (string, bool) pair would conflate:
@@ -169,16 +242,34 @@ const unknownPlatform = "unknown"
 // into an empty one) return the abort state instead — every doubt fails closed,
 // and an empty document describes no manifest to fall through to.
 //
-// Variant is a tie-breaker, never a requirement: the local probe cannot report
-// one (localProbeFormat omits .Variant deliberately), so an unqualified entry
-// wins outright when one is present. When only variant-qualified entries match,
-// exactly one of them is unambiguous and MORE THAN ONE aborts: linux/arm ships
-// as v5+v7 (nginx) or v6+v7 (postgres), and picking either by index order would
-// draw a digest and a build date belonging to an image the host will never run
-// — the same silent-wrong-value the three-state return exists to prevent, one
-// level finer. arm64 and amd64 carry a single entry each and still resolve.
-func parseIndexPlatformDigest(data []byte, os, arch string) (digest string, hasIndex bool, found bool) {
-	if os == "" || arch == "" {
+// The variant is matched, not guessed — and both sides are CANONICALISED
+// first, through normalizePlatformVariant. Step 1 reports the local image's own
+// variant, so the entry whose normalised variant EQUALS the probe's normalised
+// one wins. That covers the ordinary case where both are empty, the arm host
+// whose image config names no variant (both sides normalise to v7), and
+// library/nginx's single linux/arm64/v8 entry read by a config that records
+// none (both sides normalise to the empty variant).
+//
+// ONE fallback survives that: a lone entry whose normalised variant is EMPTY
+// claims the whole architecture, so it is taken whatever the local image says
+// — portainer and qdrant publish linux/arm64 unqualified, and a host reporting
+// a newer variant still runs the baseline image. It can no longer fire for
+// linux/arm at all, where an unqualified entry normalises to v7 and is
+// therefore an exact match or a mismatch, never a wildcard.
+//
+// Everything else aborts, and the ABORT is the point: linux/arm ships as v5+v7
+// (nginx) or v6+v7 (postgres), so a KNOWN local variant with no entry of its own
+// — an ARMv6 host offered only v5 and v7 — must draw nothing rather than a
+// digest and a build date belonging to an image the host will never run. That is
+// the same silent-wrong-value the three-state return exists to prevent, one
+// level finer, and it is worse than a blank row because a blank row is honest.
+// The mirror rule went the same way: a lone VARIANT-QUALIFIED entry is no longer
+// accepted for a probe that names no variant, because after normalisation such
+// a probe is a concrete platform (arm ⇒ v7, arm64 ⇒ v8) rather than "unknown",
+// so taking an arm64/v9 or amd64/v3 entry for it would be this same bug one
+// variant further out.
+func parseIndexPlatformDigest(data []byte, probe localProbe) (digest string, hasIndex bool, found bool) {
+	if probe.os == "" || probe.arch == "" {
 		return "", true, false
 	}
 	var doc map[string]json.RawMessage
@@ -193,25 +284,34 @@ func parseIndexPlatformDigest(data []byte, os, arch string) (digest string, hasI
 	if err := json.Unmarshal(rawList, &entries); err != nil {
 		return "", true, false
 	}
-	var qualified []string
+	want := normalizePlatformVariant(probe.arch, probe.variant)
+	var unqualified []string
 	for _, e := range entries {
 		if e.Platform.OS == unknownPlatform || e.Platform.Arch == unknownPlatform {
 			continue
 		}
-		if !strings.EqualFold(e.Platform.OS, os) || !strings.EqualFold(e.Platform.Arch, arch) {
+		if !strings.EqualFold(e.Platform.OS, probe.os) || !strings.EqualFold(e.Platform.Arch, probe.arch) {
 			continue
 		}
 		dg := validImagetoolsDigest(e.Digest)
 		if dg == "" {
 			continue
 		}
-		if e.Platform.Variant == "" {
+		// Both sides go through the same fold, which is also what makes the
+		// comparison case-insensitive: normalizePlatformVariant lower-cases.
+		v := normalizePlatformVariant(e.Platform.Arch, e.Platform.Variant)
+		if v == want {
 			return dg, true, true
 		}
-		qualified = append(qualified, dg)
+		if v == "" {
+			unqualified = append(unqualified, dg)
+		}
 	}
-	if len(qualified) == 1 {
-		return qualified[0], true, true
+	// Reached only when no entry named the host's platform exactly. A single
+	// architecture-wide entry still answers for it; two would describe one
+	// platform twice, which is a malformed index and a doubt like any other.
+	if len(unqualified) == 1 {
+		return unqualified[0], true, true
 	}
 	return "", true, false
 }
@@ -378,7 +478,7 @@ func scanUpdateDetails(ctx context.Context, wanted map[string]string, d dockerRu
 
 // fetchUpdateDetail runs the per-image sequence for one image reference:
 //
-//	1  docker image inspect                local build time + platform pair
+//	1  docker image inspect                local build time + platform triple
 //	2  buildx imagetools inspect --format  the index; select the host platform
 //	3  buildx imagetools inspect --raw     config.digest → NewID; SKIPPED when
 //	                                       step 2 already returned the manifest
@@ -448,14 +548,14 @@ func fetchUpdateDetail(ctx context.Context, d dockerRunner, image string) (Updat
 // false on the single-manifest path, which tells the caller step 2's own output
 // is the manifest and step 3 can be skipped.
 func pinnedImageRef(image string, indexOut []byte, probe localProbe) (ref string, pinned bool, err error) {
-	digest, hasIndex, found := parseIndexPlatformDigest(indexOut, probe.os, probe.arch)
+	digest, hasIndex, found := parseIndexPlatformDigest(indexOut, probe)
 	switch {
 	case !hasIndex:
 		// Single-manifest reference: there is nothing to pin to, and the
 		// original ref already addresses the only manifest there is.
 		return image, false, nil
 	case !found:
-		return "", false, fmt.Errorf("no %s/%s manifest in the index for %q", probe.os, probe.arch, image)
+		return "", false, fmt.Errorf("no %s manifest in the index for %q", probe.platform(), image)
 	default:
 		return stripTag(image) + "@" + digest, true, nil
 	}

@@ -15,7 +15,7 @@ import (
 
 func TestLocalProbeArgs(t *testing.T) {
 	args := localProbeArgs("nginx:1.27")
-	want := []string{"image", "inspect", "--format", "{{.Created}}|{{.Os}}|{{.Architecture}}", "nginx:1.27"}
+	want := []string{"image", "inspect", "--format", "{{json .}}", "nginx:1.27"}
 	if len(args) != len(want) {
 		t.Fatalf("localProbeArgs() = %v, want %v", args, want)
 	}
@@ -31,62 +31,86 @@ func TestLocalProbeArgs(t *testing.T) {
 			t.Fatalf("localProbeArgs() must carry no compose element: %v", args)
 		}
 	}
-	// A template field the docker struct lacks is a hard execution error, so
-	// .Variant must never appear here.
+	// The whole-document form is what makes the variant safe to read: naming a
+	// field the CLI struct lacks is a hard execution error (and the CLI's raw
+	// retry runs with missingkey=error, so an omitempty field with no value
+	// fails there too), while an unknown field simply never appears in
+	// `{{json .}}`. hostPsArgs carries the same rule.
 	if got := args[3]; got != localProbeFormat {
 		t.Errorf("format arg = %q, want %q", got, localProbeFormat)
 	}
-	if strings.Contains(localProbeFormat, "Variant") {
-		t.Errorf("localProbeFormat must not reference .Variant: %q", localProbeFormat)
+	if strings.Contains(localProbeFormat, ".Created") || strings.Contains(localProbeFormat, ".Variant") {
+		t.Errorf("localProbeFormat must not name individual fields: %q", localProbeFormat)
 	}
 }
 
 func TestParseLocalProbe(t *testing.T) {
+	doc := func(created, os, arch, variant string) string {
+		d := `{"Id":"sha256:abc","Created":"` + created + `","Os":"` + os + `","Architecture":"` + arch + `"`
+		if variant != "" {
+			d += `,"Variant":"` + variant + `"`
+		}
+		return d + `,"Config":{"Env":["PATH=/usr/bin"]}}`
+	}
+
 	tests := []struct {
 		name        string
 		in          string
 		wantErr     bool
 		wantOS      string
 		wantArch    string
+		wantVariant string
 		wantCreated time.Time
 	}{
 		{
-			name:        "full line",
-			in:          "2026-07-07T17:47:22.123456789Z|linux|arm64\n",
+			name:        "full document",
+			in:          doc("2026-07-07T17:47:22.123456789Z", "linux", "arm64", "v8") + "\n",
 			wantOS:      "linux",
 			wantArch:    "arm64",
+			wantVariant: "v8",
 			wantCreated: time.Date(2026, 7, 7, 17, 47, 22, 123456789, time.UTC),
 		},
 		{
-			name:        "no fractional seconds",
-			in:          "2026-07-07T17:47:22Z|linux|amd64",
+			// `Variant` is omitempty, so an image without one carries no key at
+			// all — real and ordinary: qdrant/qdrant records no arm64 variant
+			// while library/nginx records v8.
+			name:        "absent variant is unknown, not an error",
+			in:          doc("2026-07-07T17:47:22Z", "linux", "arm64", ""),
 			wantOS:      "linux",
-			wantArch:    "amd64",
+			wantArch:    "arm64",
 			wantCreated: time.Date(2026, 7, 7, 17, 47, 22, 0, time.UTC),
 		},
 		{
-			name:     "unparseable timestamp keeps platform",
-			in:       "not-a-time|linux|amd64",
+			name:     "unparseable timestamp keeps the platform",
+			in:       doc("not-a-time", "linux", "amd64", ""),
 			wantOS:   "linux",
 			wantArch: "amd64",
 		},
 		{
-			name:     "epoch sentinel keeps platform",
-			in:       "1970-01-01T00:00:00Z|linux|amd64",
+			name:     "epoch sentinel keeps the platform",
+			in:       doc("1970-01-01T00:00:00Z", "linux", "amd64", ""),
 			wantOS:   "linux",
 			wantArch: "amd64",
 		},
 		{
-			name:     "empty timestamp keeps platform",
-			in:       "|linux|amd64",
+			name:     "empty timestamp keeps the platform",
+			in:       doc("", "linux", "amd64", ""),
 			wantOS:   "linux",
 			wantArch: "amd64",
 		},
-		{name: "too few fields", in: "2026-07-07T17:47:22Z|linux", wantErr: true},
-		{name: "too many fields", in: "2026-07-07T17:47:22Z|linux|amd64|v8", wantErr: true},
+		{
+			name:        "arm variant survives",
+			in:          doc("2026-07-07T17:47:22Z", "linux", "arm", "v7"),
+			wantOS:      "linux",
+			wantArch:    "arm",
+			wantVariant: "v7",
+			wantCreated: time.Date(2026, 7, 7, 17, 47, 22, 0, time.UTC),
+		},
+		{name: "malformed json", in: `{"Os":"linux"`, wantErr: true},
+		{name: "not json at all", in: "2026-07-07T17:47:22Z|linux|arm64", wantErr: true},
 		{name: "empty output", in: "   \n", wantErr: true},
-		{name: "missing os", in: "2026-07-07T17:47:22Z||amd64", wantErr: true},
-		{name: "missing arch", in: "2026-07-07T17:47:22Z|linux|", wantErr: true},
+		{name: "missing os", in: doc("2026-07-07T17:47:22Z", "", "amd64", ""), wantErr: true},
+		{name: "missing arch", in: doc("2026-07-07T17:47:22Z", "linux", "", ""), wantErr: true},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -106,10 +130,58 @@ func TestParseLocalProbe(t *testing.T) {
 			if got.arch != tt.wantArch {
 				t.Errorf("arch = %q, want %q", got.arch, tt.wantArch)
 			}
+			if got.variant != tt.wantVariant {
+				t.Errorf("variant = %q, want %q", got.variant, tt.wantVariant)
+			}
 			if !got.created.Equal(tt.wantCreated) {
 				t.Errorf("created = %v, want %v", got.created, tt.wantCreated)
 			}
 		})
+	}
+}
+
+func TestParseLocalProbe_RealCapture(t *testing.T) {
+	// A real `docker image inspect --format '{{json .}}'` document (Docker
+	// 29.1.3, linux/arm64 nginx). Hand-authored fixtures cannot pin the KEY
+	// SPELLING, which is the one thing this parser depends on: docker
+	// capitalises Created/Os/Architecture/Variant, and Variant is omitempty.
+	got, err := parseLocalProbe(readFixture(t, "image_inspect_nginx.json"))
+	if err != nil {
+		t.Fatalf("parseLocalProbe() error: %v", err)
+	}
+	want := localProbe{
+		created: time.Date(2026, 5, 13, 19, 5, 45, 115991558, time.UTC),
+		os:      "linux",
+		arch:    "arm64",
+		variant: "v8",
+	}
+	if !got.created.Equal(want.created) {
+		t.Errorf("created = %v, want %v", got.created, want.created)
+	}
+	if got.os != want.os || got.arch != want.arch || got.variant != want.variant {
+		t.Errorf("platform = %q, want %q", got.platform(), want.platform())
+	}
+}
+
+func TestLocalProbePlatform(t *testing.T) {
+	tests := []struct {
+		probe localProbe
+		want  string
+	}{
+		{probe: localProbe{os: "linux", arch: "amd64"}, want: "linux/amd64"},
+		{probe: localProbe{os: "linux", arch: "arm", variant: "v7"}, want: "linux/arm/v7"},
+		{probe: localProbe{os: "linux", arch: "arm", variant: "v6"}, want: "linux/arm/v6"},
+		// The NORMALISED triple, so the "no ... manifest in the index" error
+		// names the platform that was actually searched for rather than the
+		// two spellings the probe happened to arrive in.
+		{probe: localProbe{os: "linux", arch: "arm"}, want: "linux/arm/v7"},
+		{probe: localProbe{os: "linux", arch: "arm64", variant: "v8"}, want: "linux/arm64"},
+		{probe: localProbe{os: "linux", arch: "arm64"}, want: "linux/arm64"},
+	}
+	for _, tt := range tests {
+		if got := tt.probe.platform(); got != tt.want {
+			t.Errorf("platform() = %q, want %q", got, tt.want)
+		}
 	}
 }
 
@@ -177,25 +249,52 @@ func TestParseIndexPlatformDigest_Fixtures(t *testing.T) {
 	tests := []struct {
 		name       string
 		data       []byte
-		os, arch   string
+		probe      localProbe
 		wantDigest string
 	}{
 		{
-			name: "nginx linux/arm64", data: nginx, os: "linux", arch: "arm64",
+			// Both captures spell arm64 as v8, and a real local arm64 image
+			// records that variant too (library/nginx does), so this is the
+			// exact-match path.
+			name: "nginx linux/arm64/v8", data: nginx,
+			probe:      localProbe{os: "linux", arch: "arm64", variant: "v8"},
 			wantDigest: "sha256:40ea9867eb2d91315bb6831f40286f77c086df2a132c36bce50019a54581aea7",
 		},
 		{
-			name: "nginx linux/amd64", data: nginx, os: "linux", arch: "amd64",
+			// The same index read by a local image whose config names no
+			// variant (qdrant/qdrant and portainer/portainer-ce are both like
+			// that): arm64 and arm64/v8 normalise to one platform, so this is
+			// the exact-match path too and the rows stay.
+			name: "nginx linux/arm64, local variant unknown", data: nginx,
+			probe:      localProbe{os: "linux", arch: "arm64"},
+			wantDigest: "sha256:40ea9867eb2d91315bb6831f40286f77c086df2a132c36bce50019a54581aea7",
+		},
+		{
+			name: "nginx linux/amd64", data: nginx,
+			probe:      localProbe{os: "linux", arch: "amd64"},
 			wantDigest: "sha256:c2e305ef468149bdc3297621cea453b47b095816fec4fc7be6ff837bce8deb7d",
 		},
 		{
-			name: "postgres linux/arm64", data: postgres, os: "linux", arch: "arm64",
+			name: "postgres linux/arm64/v8", data: postgres,
+			probe:      localProbe{os: "linux", arch: "arm64", variant: "v8"},
 			wantDigest: "sha256:7ae1143a9f249af815f056751a122a86d7e44ddce0926f2b227e3d5c434444f4",
+		},
+		{
+			// A 32-bit ARM host that DOES report its variant now picks its own
+			// entry out of the pair instead of aborting on the ambiguity.
+			name: "nginx linux/arm/v7", data: nginx,
+			probe:      localProbe{os: "linux", arch: "arm", variant: "v7"},
+			wantDigest: "sha256:49cae140454e5b0f498040765a37e193848ec69be9146a510edc0dd9ed491621",
+		},
+		{
+			name: "postgres linux/arm/v6", data: postgres,
+			probe:      localProbe{os: "linux", arch: "arm", variant: "v6"},
+			wantDigest: "sha256:6f9d8c4bbdc97889d16d6890a9b6b0d4454eae55155e02e03381c86cf75caefb",
 		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			dg, hasIndex, found := parseIndexPlatformDigest(tt.data, tt.os, tt.arch)
+			dg, hasIndex, found := parseIndexPlatformDigest(tt.data, tt.probe)
 			if !hasIndex || !found {
 				t.Fatalf("hasIndex=%v found=%v, want true/true", hasIndex, found)
 			}
@@ -215,11 +314,12 @@ func TestParseIndexPlatformDigest_NeverReturnsAttestation(t *testing.T) {
 		"sha256:792be14f71a03d7c73c4d7fb9c1f0d0b83dc294544ae1926db39b8ecaf414a1d": true,
 		"sha256:0dfea8046dfa75a40933444052a7a697d5a05387d6460cd3e33822d7aedd5fd5": true,
 	}
-	// "arm" is deliberately absent: the real index carries it twice (v5 and
-	// v7), which is the ambiguity TestParseIndexPlatformDigest_AmbiguousVariant
-	// pins as an abort.
-	for _, arch := range []string{"amd64", "arm64", "386", "ppc64le", "riscv64", "s390x"} {
-		dg, _, found := parseIndexPlatformDigest(nginx, "linux", arch)
+	// Bare "arm" is included: the real index carries it twice (v5 and v7), and
+	// an unqualified probe normalises to v7, so it resolves to the v7 entry
+	// rather than to a provenance blob.
+	attestArchVariant := map[string]string{"arm64": "v8"}
+	for _, arch := range []string{"amd64", "arm", "arm64", "386", "ppc64le", "riscv64", "s390x"} {
+		dg, _, found := parseIndexPlatformDigest(nginx, localProbe{os: "linux", arch: arch, variant: attestArchVariant[arch]})
 		if !found {
 			t.Errorf("linux/%s not found in the nginx index", arch)
 			continue
@@ -229,7 +329,7 @@ func TestParseIndexPlatformDigest_NeverReturnsAttestation(t *testing.T) {
 		}
 	}
 	// The "unknown" platform itself must never resolve.
-	if dg, hasIndex, found := parseIndexPlatformDigest(nginx, "unknown", "unknown"); found {
+	if dg, hasIndex, found := parseIndexPlatformDigest(nginx, localProbe{os: "unknown", arch: "unknown"}); found {
 		t.Errorf("unknown/unknown = %q hasIndex=%v found=%v, want abort", dg, hasIndex, found)
 	}
 }
@@ -246,7 +346,7 @@ func TestParseIndexPlatformDigest_PlatformAbsent(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.os+"/"+tt.arch, func(t *testing.T) {
-			dg, hasIndex, found := parseIndexPlatformDigest(nginx, tt.os, tt.arch)
+			dg, hasIndex, found := parseIndexPlatformDigest(nginx, localProbe{os: tt.os, arch: tt.arch})
 			if !hasIndex {
 				t.Errorf("hasIndex = false, want true (an index IS present)")
 			}
@@ -272,7 +372,7 @@ func TestParseIndexPlatformDigest_SingleManifest(t *testing.T) {
 	  },
 	  "layers": []
 	}`)
-	dg, hasIndex, found := parseIndexPlatformDigest(single, "linux", "arm64")
+	dg, hasIndex, found := parseIndexPlatformDigest(single, localProbe{os: "linux", arch: "arm64"})
 	if hasIndex {
 		t.Errorf("hasIndex = true, want false for a single-manifest document")
 	}
@@ -281,10 +381,51 @@ func TestParseIndexPlatformDigest_SingleManifest(t *testing.T) {
 	}
 }
 
-func TestParseIndexPlatformDigest_VariantTieBreaker(t *testing.T) {
+func TestNormalizePlatformVariant(t *testing.T) {
+	// containerd's platforms/database.go normalizeArch is the rule Docker and
+	// buildx inherit; the OCI image-spec only standardises the four ARM values
+	// and never says what an absent variant means. Both halves matter: an
+	// unqualified linux/arm IS v7, and arm64 with v8 IS unqualified.
+	tests := []struct {
+		arch, variant, want string
+	}{
+		{arch: "arm", variant: "", want: "v7"},
+		{arch: "arm", variant: "7", want: "v7"},
+		{arch: "arm", variant: "v7", want: "v7"},
+		{arch: "arm", variant: "5", want: "v5"},
+		{arch: "arm", variant: "v5", want: "v5"},
+		{arch: "arm", variant: "6", want: "v6"},
+		{arch: "arm", variant: "v6", want: "v6"},
+		{arch: "arm", variant: "8", want: "v8"},
+		{arch: "arm64", variant: "", want: ""},
+		{arch: "arm64", variant: "v8", want: ""},
+		{arch: "arm64", variant: "8", want: ""},
+		{arch: "arm64", variant: "v9", want: "v9"},
+		// Case and padding are folded here, which is what lets the index match
+		// compare the two normalised strings directly.
+		{arch: "ARM", variant: "V7", want: "v7"},
+		{arch: " arm64 ", variant: " V8 ", want: ""},
+		// Every other architecture passes through untouched: an absent variant
+		// stays absent and a named one is not invented or dropped.
+		{arch: "amd64", variant: "", want: ""},
+		{arch: "amd64", variant: "v3", want: "v3"},
+		{arch: "386", variant: "", want: ""},
+		{arch: "riscv64", variant: "", want: ""},
+	}
+	for _, tt := range tests {
+		if got := normalizePlatformVariant(tt.arch, tt.variant); got != tt.want {
+			t.Errorf("normalizePlatformVariant(%q, %q) = %q, want %q", tt.arch, tt.variant, got, tt.want)
+		}
+	}
+}
+
+func TestParseIndexPlatformDigest_VariantMatching(t *testing.T) {
 	unqualified := "sha256:" + strings.Repeat("1", 64)
 	v7 := "sha256:" + strings.Repeat("2", 64)
 	v6 := "sha256:" + strings.Repeat("3", 64)
+	v5 := "sha256:" + strings.Repeat("4", 64)
+	v8 := "sha256:" + strings.Repeat("5", 64)
+	v9 := "sha256:" + strings.Repeat("6", 64)
 
 	entry := func(dg, arch, variant string) string {
 		p := `{"os":"linux","architecture":"` + arch + `"`
@@ -300,72 +441,243 @@ func TestParseIndexPlatformDigest_VariantTieBreaker(t *testing.T) {
 	}
 
 	tests := []struct {
-		name string
-		data []byte
-		want string
+		name    string
+		data    []byte
+		arch    string // "" = arm
+		variant string
+		want    string // "" = abort
 	}{
 		{
-			// The local probe cannot report a variant, so an unqualified
-			// entry wins even when a qualified one comes first.
-			name: "unqualified entry wins over a variant",
-			data: index(entry(v7, "arm", "v7"), entry(unqualified, "arm", "")),
+			name:    "the local variant selects its own entry",
+			data:    index(entry(v6, "arm", "v6"), entry(v7, "arm", "v7")),
+			variant: "v7",
+			want:    v7,
+		},
+		{
+			name:    "index order does not decide it",
+			data:    index(entry(v7, "arm", "v7"), entry(v6, "arm", "v6")),
+			variant: "v6",
+			want:    v6,
+		},
+		{
+			name:    "the match is case-insensitive",
+			data:    index(entry(v7, "arm", "V7")),
+			variant: "v7",
+			want:    v7,
+		},
+		{
+			// containerd spells v6 as either "6" or "v6"; both name one
+			// platform, so both must match a v6 host.
+			name:    "a numeric variant spelling is the same platform",
+			data:    index(entry(v6, "arm", "6")),
+			variant: "v6",
+			want:    v6,
+		},
+		{
+			// The ARMv6 host codex's review names: the sole entry is v7, which
+			// this host cannot run. Drawing its config digest and build date
+			// under the image id row would invite exactly the comparison that
+			// is wrong.
+			name:    "a lone entry of another variant aborts",
+			data:    index(entry(v7, "arm", "v7")),
+			variant: "v6",
+			want:    "",
+		},
+		{
+			name:    "neither of two other variants is taken",
+			data:    index(entry(v6, "arm", "v6"), entry(v7, "arm", "v7")),
+			variant: "v5",
+			want:    "",
+		},
+		{
+			// The normalisation rule, on the side that motivated it: an
+			// unqualified linux/arm descriptor is ARMv7 by containerd's
+			// canonicalisation, NOT a wildcard over 32-bit ARM, so a v5 host
+			// must not take it.
+			name:    "an unqualified arm entry is v7, so a v5 host aborts",
+			data:    index(entry(unqualified, "arm", "")),
+			variant: "v5",
+			want:    "",
+		},
+		{
+			name:    "an unqualified arm entry is v7, so a v6 host aborts",
+			data:    index(entry(unqualified, "arm", "")),
+			variant: "v6",
+			want:    "",
+		},
+		{
+			name:    "an unqualified arm entry serves a v7 host",
+			data:    index(entry(unqualified, "arm", "")),
+			variant: "v7",
+			want:    unqualified,
+		},
+		{
+			// Both sides normalise to v7, so this is the EXACT-match path even
+			// though neither string names a variant.
+			name: "an unqualified arm entry serves a host that names no variant",
+			data: index(entry(unqualified, "arm", "")),
 			want: unqualified,
 		},
 		{
-			name: "unqualified entry wins when it comes first",
+			name:    "an unqualified entry wins over a mismatched one",
+			data:    index(entry(v6, "arm", "v6"), entry(unqualified, "arm", "")),
+			variant: "v7",
+			want:    unqualified,
+		},
+		{
+			// An index naming both `arm` and `arm/v7` describes ONE platform
+			// twice — malformed. The first match wins, exactly as containerd's
+			// matcher would take the first candidate it accepts.
+			name: "an index that names arm twice takes the first",
+			data: index(entry(v7, "arm", "v7"), entry(unqualified, "arm", "")),
+			want: v7,
+		},
+		{
+			name: "an unqualified entry wins when it comes first",
 			data: index(entry(unqualified, "arm", ""), entry(v7, "arm", "v7")),
 			want: unqualified,
 		},
 		{
-			// A single variant-qualified entry is unambiguous: it is the only
-			// thing the os+arch pair can mean.
-			name: "the only variant resolves",
-			data: index(entry(v7, "arm", "v7"), entry(unqualified, "amd64", "")),
+			// A host whose image config names no variant is canonically v7, so
+			// the v5+v7 and v6+v7 pairs the real captures carry now resolve
+			// instead of aborting on an ambiguity that was never one.
+			name: "a host that names no variant takes the v7 entry",
+			data: index(entry(v6, "arm", "v6"), entry(v7, "arm", "v7")),
 			want: v7,
+		},
+		{
+			name: "a host that names no variant still aborts with no v7 entry",
+			data: index(entry(v5, "arm", "v5"), entry(v6, "arm", "v6")),
+			want: "",
+		},
+		{
+			// The other half of the rule: arm64 and arm64/v8 are one platform,
+			// so library/nginx's single v8 entry is an exact match for an
+			// image config that records none.
+			name: "arm64/v8 serves a host that names no variant",
+			data: index(entry(v8, "arm64", "v8")),
+			arch: "arm64",
+			want: v8,
+		},
+		{
+			name:    "an unqualified arm64 entry serves a v8 host",
+			data:    index(entry(unqualified, "arm64", "")),
+			arch:    "arm64",
+			variant: "v8",
+			want:    unqualified,
+		},
+		{
+			// A probe that names no variant is a CONCRETE platform after
+			// normalisation, not "unknown", so a lone entry of a different
+			// variant is not taken for it — the same rule as the arm side, one
+			// variant further out.
+			name: "a lone arm64/v9 entry is not taken for a v8 host",
+			data: index(entry(v9, "arm64", "v9")),
+			arch: "arm64",
+			want: "",
+		},
+		{
+			// The surviving fallback: an entry that declares no variant on an
+			// architecture with no default claims the whole architecture, so a
+			// host reporting a variant of its own still runs it.
+			name:    "an unqualified entry serves a known variant elsewhere",
+			data:    index(entry(unqualified, "amd64", "")),
+			arch:    "amd64",
+			variant: "v3",
+			want:    unqualified,
 		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			dg, hasIndex, found := parseIndexPlatformDigest(tt.data, "linux", "arm")
-			if !hasIndex || !found {
-				t.Fatalf("hasIndex=%v found=%v, want true/true", hasIndex, found)
+			arch := tt.arch
+			if arch == "" {
+				arch = "arm"
+			}
+			probe := localProbe{os: "linux", arch: arch, variant: tt.variant}
+			dg, hasIndex, found := parseIndexPlatformDigest(tt.data, probe)
+			if !hasIndex {
+				t.Fatalf("hasIndex = false, want true (an index IS present)")
+			}
+			if tt.want == "" {
+				if found || dg != "" {
+					t.Fatalf("= %q/%v, want \"\"/false — a doubt must draw nothing", dg, found)
+				}
+				return
+			}
+			if !found {
+				t.Fatalf("found = false, want the %q entry", tt.want)
 			}
 			if dg != tt.want {
 				t.Errorf("digest = %q, want %q", dg, tt.want)
 			}
 		})
 	}
-
-	// Two variant-qualified entries and no unqualified one is a GUESS, and a
-	// guess draws another image's digest and build date under a row inviting
-	// comparison with the local one. Abort instead.
-	ambiguous := index(entry(v6, "arm", "v6"), entry(v7, "arm", "v7"))
-	dg, hasIndex, found := parseIndexPlatformDigest(ambiguous, "linux", "arm")
-	if !hasIndex {
-		t.Errorf("hasIndex = false, want true (an index IS present)")
-	}
-	if found || dg != "" {
-		t.Errorf("ambiguous variants = %q/%v, want \"\"/false", dg, found)
-	}
 }
 
-func TestParseIndexPlatformDigest_AmbiguousVariant(t *testing.T) {
-	// Both real captures carry linux/arm twice — nginx as v5+v7, postgres as
-	// v6+v7. A 32-bit ARM host (Raspberry Pi OS) reports architecture "arm"
-	// with no variant the local probe can see, so neither entry can be chosen
-	// without guessing. The rows drop; arm64 and amd64 are unaffected.
-	for _, name := range []string{"imagetools_manifest_index_nginx.json", "imagetools_manifest_index_postgres.json"} {
-		t.Run(name, func(t *testing.T) {
-			data := readFixture(t, name)
-			dg, hasIndex, found := parseIndexPlatformDigest(data, "linux", "arm")
-			if !hasIndex {
-				t.Errorf("hasIndex = false, want true")
+func TestParseIndexPlatformDigest_RealCaptureArmVariants(t *testing.T) {
+	// Both real captures carry linux/arm TWICE — nginx as v5+v7, postgres as
+	// v6+v7 — and both spell arm64 as v8. That is what makes them the evidence
+	// for the default-variant rule: an unqualified probe resolves to the v7
+	// entry (never to v5 or v6), a host that reports the variant the capture
+	// does not carry draws nothing, and arm64 resolves both spellings.
+	const (
+		nginxARMv5 = "sha256:442f3dd549c8750c2a7f1d4d9639f003b08a393d32ed13d02b7285176409b391"
+		nginxARMv7 = "sha256:49cae140454e5b0f498040765a37e193848ec69be9146a510edc0dd9ed491621"
+		pgARMv6    = "sha256:6f9d8c4bbdc97889d16d6890a9b6b0d4454eae55155e02e03381c86cf75caefb"
+		pgARMv7    = "sha256:7010e4dece8b70dcadb9236ed0f1d778c9da3371c7907a61421f561f261ea952"
+	)
+	tests := []struct {
+		file     string
+		arm5     string // "" = must abort
+		arm6     string
+		arm7     string
+		armPlain string
+		arm64    string
+	}{
+		{
+			file: "imagetools_manifest_index_nginx.json",
+			arm5: nginxARMv5, arm6: "", arm7: nginxARMv7, armPlain: nginxARMv7,
+			arm64: "sha256:40ea9867eb2d91315bb6831f40286f77c086df2a132c36bce50019a54581aea7",
+		},
+		{
+			file: "imagetools_manifest_index_postgres.json",
+			arm5: "", arm6: pgARMv6, arm7: pgARMv7, armPlain: pgARMv7,
+			arm64: "sha256:7ae1143a9f249af815f056751a122a86d7e44ddce0926f2b227e3d5c434444f4",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.file, func(t *testing.T) {
+			data := readFixture(t, tt.file)
+			cases := []struct {
+				arch, variant, want string
+			}{
+				{arch: "arm", variant: "v5", want: tt.arm5},
+				{arch: "arm", variant: "v6", want: tt.arm6},
+				{arch: "arm", variant: "v7", want: tt.arm7},
+				// An unqualified arm probe is v7, so it must land on the v7
+				// entry — never on the v5 or v6 one beside it.
+				{arch: "arm", variant: "", want: tt.armPlain},
+				{arch: "arm64", variant: "v8", want: tt.arm64},
+				{arch: "arm64", variant: "", want: tt.arm64},
 			}
-			if found || dg != "" {
-				t.Errorf("linux/arm = %q/%v, want \"\"/false", dg, found)
-			}
-			if _, _, ok := parseIndexPlatformDigest(data, "linux", "arm64"); !ok {
-				t.Errorf("linux/arm64 must still resolve")
+			for _, c := range cases {
+				dg, hasIndex, found := parseIndexPlatformDigest(data, localProbe{os: "linux", arch: c.arch, variant: c.variant})
+				if !hasIndex {
+					t.Fatalf("linux/%s/%s: hasIndex = false, want true", c.arch, c.variant)
+				}
+				if c.want == "" {
+					if found || dg != "" {
+						t.Errorf("linux/%s/%s = %q/%v, want \"\"/false — the capture carries no such entry", c.arch, c.variant, dg, found)
+					}
+					continue
+				}
+				if !found {
+					t.Errorf("linux/%s/%s not found, want %q", c.arch, c.variant, c.want)
+					continue
+				}
+				if dg != c.want {
+					t.Errorf("linux/%s/%s = %q, want %q", c.arch, c.variant, dg, c.want)
+				}
 			}
 		})
 	}
@@ -425,7 +737,7 @@ func TestParseIndexPlatformDigest_FailsClosed(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			dg, hasIndex, found := parseIndexPlatformDigest([]byte(tt.data), tt.os, tt.arch)
+			dg, hasIndex, found := parseIndexPlatformDigest([]byte(tt.data), localProbe{os: tt.os, arch: tt.arch})
 			if !hasIndex {
 				t.Errorf("hasIndex = false, want true — doubt must abort, not take the single-manifest path")
 			}
@@ -692,7 +1004,11 @@ func stepRefs(f *fakeDockerRunner) []string {
 }
 
 const (
-	detailLocalProbeARM64 = "2026-07-07T17:47:22Z|linux|arm64\n"
+	// The shape `docker image inspect --format '{{json .}}'` returns, trimmed to
+	// the four fields step 1 reads. v8 is what a real linux/arm64 image config
+	// records (library/nginx does), and it is the variant both committed index
+	// captures spell for arm64.
+	detailLocalProbeARM64 = `{"Id":"sha256:aaa","Created":"2026-07-07T17:47:22Z","Os":"linux","Architecture":"arm64","Variant":"v8"}` + "\n"
 	detailNginxARM64      = "sha256:40ea9867eb2d91315bb6831f40286f77c086df2a132c36bce50019a54581aea7"
 	detailNewID           = "sha256:c05eced01234567890abcdef1234567890abcdef1234567890abcdef12345678"
 )
@@ -844,7 +1160,7 @@ func TestScanUpdateDetails_PlatformAbsentAborts(t *testing.T) {
 	f := detailRunner(t, func(step detailStep, ref string) ([]byte, error) {
 		switch step {
 		case stepLocal:
-			return []byte("2026-07-07T17:47:22Z|windows|amd64"), nil
+			return []byte(`{"Created":"2026-07-07T17:47:22Z","Os":"windows","Architecture":"amd64"}`), nil
 		case stepIndex:
 			return index, nil
 		}
@@ -861,6 +1177,94 @@ func TestScanUpdateDetails_PlatformAbsentAborts(t *testing.T) {
 	}
 	if len(f.runCalls) != 2 {
 		t.Errorf("made %d docker calls, want 2 — the registry steps must be skipped", len(f.runCalls))
+	}
+}
+
+func TestScanUpdateDetails_HostVariantReachesTheMatch(t *testing.T) {
+	// The variant step 1 reports has to survive the whole way into the index
+	// match, or the parser's exact-match rule has nothing to match on. Driven
+	// against the real nginx capture, which carries linux/arm twice.
+	index := readFixture(t, "imagetools_manifest_index_nginx.json")
+	raw := readFixture(t, "imagetools_raw_manifest.json")
+	config := readFixture(t, "imagetools_image_config_object.json")
+	probe := func(arch, variant string) []byte {
+		return []byte(`{"Created":"2026-07-07T17:47:22Z","Os":"linux","Architecture":"` +
+			arch + `","Variant":"` + variant + `"}`)
+	}
+
+	tests := []struct {
+		name      string
+		variant   string
+		wantRef   string // "" = the image must be aborted
+		wantCalls int
+	}{
+		{
+			name:      "v7 pins its own entry",
+			variant:   "v7",
+			wantRef:   "nginx@sha256:49cae140454e5b0f498040765a37e193848ec69be9146a510edc0dd9ed491621",
+			wantCalls: 4,
+		},
+		{
+			name:      "v5 pins its own entry",
+			variant:   "v5",
+			wantRef:   "nginx@sha256:442f3dd549c8750c2a7f1d4d9639f003b08a393d32ed13d02b7285176409b391",
+			wantCalls: 4,
+		},
+		{
+			// An ARMv6 host: the index offers v5 and v7 and neither is what it
+			// runs, so the rows drop instead of describing another image.
+			name:      "v6 aborts rather than taking a neighbour",
+			variant:   "v6",
+			wantCalls: 2,
+		},
+		{
+			// An image config carrying no variant at all: canonically ARMv7,
+			// so the empty string has to survive step 1 AND be normalised
+			// before the match, or this lands on v5 or aborts.
+			name:      "an absent variant pins the v7 entry",
+			variant:   "",
+			wantRef:   "nginx@sha256:49cae140454e5b0f498040765a37e193848ec69be9146a510edc0dd9ed491621",
+			wantCalls: 4,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			f := detailRunner(t, func(step detailStep, ref string) ([]byte, error) {
+				switch step {
+				case stepLocal:
+					return probe("arm", tt.variant), nil
+				case stepIndex:
+					return index, nil
+				case stepRaw:
+					return raw, nil
+				default:
+					return config, nil
+				}
+			})
+
+			out, err := scanUpdateDetails(context.Background(), map[string]string{"web": "nginx:1.27"}, f)
+			if err != nil {
+				t.Fatalf("scanUpdateDetails() error = %v, want nil", err)
+			}
+			if len(f.runCalls) != tt.wantCalls {
+				t.Fatalf("made %d docker calls, want %d: %v", len(f.runCalls), tt.wantCalls, f.runCalls)
+			}
+			if tt.wantRef == "" {
+				if len(out) != 0 {
+					t.Fatalf("scanUpdateDetails() = %v, want no entry", out)
+				}
+				return
+			}
+			if _, ok := out["web"]; !ok {
+				t.Fatalf("scanUpdateDetails() = %v, want an entry for web", out)
+			}
+			refs := stepRefs(f)
+			for _, i := range []int{2, 3} {
+				if refs[i] != tt.wantRef {
+					t.Errorf("call %d addressed %q, want %q", i, refs[i], tt.wantRef)
+				}
+			}
+		})
 	}
 }
 
