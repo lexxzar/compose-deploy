@@ -5,7 +5,9 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -1213,5 +1215,259 @@ func TestPinnedImageRef(t *testing.T) {
 				t.Errorf("pinnedImageRef() = %q, want %q", got, tt.want)
 			}
 		})
+	}
+}
+
+// --- composer bindings -------------------------------------------------------
+
+// detailStepReply is the canned four-step reply set every composer-binding test
+// replays. It reads the same fixtures the parser tests do, so a fixture change
+// breaks both layers together rather than leaving the bindings green against
+// stale shapes.
+func detailStepReply(t *testing.T) func(step detailStep, ref string) ([]byte, error) {
+	t.Helper()
+	index := readFixture(t, "imagetools_manifest_index_nginx.json")
+	raw := readFixture(t, "imagetools_raw_manifest.json")
+	config := readFixture(t, "imagetools_image_config_object.json")
+	return func(step detailStep, ref string) ([]byte, error) {
+		switch step {
+		case stepLocal:
+			return []byte(detailLocalProbeARM64), nil
+		case stepIndex:
+			return index, nil
+		case stepRaw:
+			return raw, nil
+		case stepConfig:
+			return config, nil
+		}
+		return nil, fmt.Errorf("unexpected docker call for %q", ref)
+	}
+}
+
+// assertDetail checks the three UpdateDetail fields against the fixture values
+// the happy path produces, so every binding test proves it wired the parsers
+// through rather than merely returning a non-empty map.
+func assertDetail(t *testing.T, label string, det UpdateDetail) {
+	t.Helper()
+	if !det.LocalCreated.Equal(detailWantLocalCreated) {
+		t.Errorf("%s: LocalCreated = %v, want %v", label, det.LocalCreated, detailWantLocalCreated)
+	}
+	if det.NewID != detailNewID {
+		t.Errorf("%s: NewID = %q, want %q", label, det.NewID, detailNewID)
+	}
+	if !det.NewCreated.Equal(detailWantNewCreated) {
+		t.Errorf("%s: NewCreated = %v, want %v", label, det.NewCreated, detailWantNewCreated)
+	}
+}
+
+const detailComposeConfig = `{"services":{"web":{"image":"nginx:1.27"},"db":{"image":"postgres:16"}}}`
+
+// TestComposeUpdateDetails_SeamAndFilter pins the local binding: the four
+// detail steps must reach `docker <verb>` directly, and only the requested
+// service may be resolved. filterServices reads an empty slice as ALL services,
+// so an unfiltered call would spend three registry round-trips per service in
+// the project — the rate-limit failure the true-only gate exists to prevent.
+func TestComposeUpdateDetails_SeamAndFilter(t *testing.T) {
+	reply := detailStepReply(t)
+	var argv [][]string
+
+	c := New(t.TempDir())
+	c.SetTestHooks(nil, func(cmd *exec.Cmd) ([]byte, error) {
+		argv = append(argv, append([]string(nil), cmd.Args...))
+		if slices.Contains(cmd.Args, "compose") {
+			return []byte(detailComposeConfig), nil
+		}
+		return reply(classifyDetailCall(cmd.Args[1:]), cmd.Args[len(cmd.Args)-1])
+	})
+
+	out, err := c.UpdateDetails(context.Background(), []string{"web"})
+	if err != nil {
+		t.Fatalf("UpdateDetails() error = %v, want nil", err)
+	}
+	if len(out) != 1 {
+		t.Fatalf("UpdateDetails() = %v, want exactly the requested service", out)
+	}
+	det, ok := out["web"]
+	if !ok {
+		t.Fatalf("UpdateDetails() = %v, want an entry for web", out)
+	}
+	assertDetail(t, "web", det)
+
+	if len(argv) != 5 {
+		t.Fatalf("made %d docker calls, want 5 (config + 4 steps): %v", len(argv), argv)
+	}
+	// The discovery call IS a compose subcommand; the four detail steps are
+	// top-level docker commands and must never be routed through command().
+	if !slices.Contains(argv[0], "compose") {
+		t.Errorf("discovery call = %v, want the compose config subcommand", argv[0])
+	}
+	for _, args := range argv[1:] {
+		if slices.Contains(args, "compose") {
+			t.Errorf("detail argv %v must carry no compose element", args)
+		}
+		if args[0] != "docker" {
+			t.Errorf("detail argv %v must invoke docker directly", args)
+		}
+	}
+}
+
+// TestComposeUpdateDetails_DiscoveryErrorPropagates pins the one error the
+// binding does surface. A failed `docker compose config` yields no image map at
+// all, so there is nothing partial to return.
+func TestComposeUpdateDetails_DiscoveryErrorPropagates(t *testing.T) {
+	c := New(t.TempDir())
+	c.SetTestHooks(nil, func(cmd *exec.Cmd) ([]byte, error) {
+		return nil, errors.New("no configuration file provided")
+	})
+
+	out, err := c.UpdateDetails(context.Background(), nil)
+	if err == nil {
+		t.Fatalf("UpdateDetails() = %v, want an error", out)
+	}
+	if out != nil {
+		t.Errorf("UpdateDetails() = %v, want a nil map on discovery failure", out)
+	}
+}
+
+// classifyRemoteDetailCall classifies one remote docker command string by the
+// same markers classifyDetailCall reads. shellEscape only wraps each argument
+// in single quotes and none of the four argv shapes contains one, so matching
+// the escaped token is exact rather than a substring guess.
+func classifyRemoteDetailCall(remote string) detailStep {
+	if strings.Contains(remote, shellEscape("image")+" "+shellEscape("inspect")) {
+		return stepLocal
+	}
+	markers := []struct {
+		token string
+		step  detailStep
+	}{
+		{"--raw", stepRaw},
+		{manifestIndexFormat, stepIndex},
+		{imageConfigFormat, stepConfig},
+	}
+	for _, m := range markers {
+		if strings.Contains(remote, shellEscape(m.token)) {
+			return m.step
+		}
+	}
+	return stepUnknown
+}
+
+// TestRemoteUpdateDetails_SplicesSSHExtraArgsBeforeHost pins the remote binding
+// against the repo-wide convention: SSHExtraArgs land immediately before the
+// `--` separator that precedes the host argument, on EVERY call. Missing the
+// splice on one of the four steps would send that step to the default port or
+// without the CI identity file while the other three succeed.
+func TestRemoteUpdateDetails_SplicesSSHExtraArgsBeforeHost(t *testing.T) {
+	reply := detailStepReply(t)
+	extras := []string{"-p", "2222"}
+	host := "user@example.com"
+	var argv [][]string
+
+	r := &RemoteCompose{
+		Host:         host,
+		ProjectDir:   "/srv/app",
+		SocketPath:   "/tmp/cdeploy-ctrl-abc-99",
+		SSHExtraArgs: extras,
+	}
+	r.SetTestHooks(nil, func(cmd *exec.Cmd) ([]byte, error) {
+		argv = append(argv, append([]string(nil), cmd.Args...))
+		remote := cmd.Args[len(cmd.Args)-1]
+		if strings.Contains(remote, "compose") {
+			return []byte(detailComposeConfig), nil
+		}
+		return reply(classifyRemoteDetailCall(remote), remote)
+	})
+
+	out, err := r.UpdateDetails(context.Background(), []string{"web"})
+	if err != nil {
+		t.Fatalf("UpdateDetails() error = %v, want nil", err)
+	}
+	det, ok := out["web"]
+	if !ok {
+		t.Fatalf("UpdateDetails() = %v, want an entry for web", out)
+	}
+	assertDetail(t, "web", det)
+
+	if len(argv) != 5 {
+		t.Fatalf("made %d ssh calls, want 5 (config + 4 steps): %v", len(argv), argv)
+	}
+	for i, args := range argv {
+		assertExtraBeforeHost(t, fmt.Sprintf("RemoteCompose.UpdateDetails call %d", i), args, host, extras)
+	}
+	for i, args := range argv[1:] {
+		remote := args[len(args)-1]
+		if strings.Contains(remote, "compose") {
+			t.Errorf("detail call %d must NOT go through compose: %q", i+1, remote)
+		}
+		if !strings.HasPrefix(remote, "docker ") {
+			t.Errorf("detail call %d = %q, want a top-level docker command", i+1, remote)
+		}
+	}
+}
+
+// hostPsDetailMixed exercises every entry hostImageMap drops: a compose-managed
+// container, a bare image ID, and a container with no image reference at all.
+// Only watchtower survives.
+const hostPsDetailMixed = `{"ID":"aaa111222333","Names":"web","Image":"nginx:1.27","State":"running","Status":"Up 3 hours","Labels":"com.docker.compose.project=my-app"}
+{"ID":"bbb444555666","Names":"watchtower","Image":"nginx:1.27","State":"running","Status":"Up 2 days","Labels":"org.opencontainers.image.title=watchtower"}
+{"ID":"ccc777888999","Names":"scratch","Image":"9c7a54a9a43c","State":"running","Status":"Up 1 hour","Labels":""}
+{"ID":"ddd000111222","Names":"noimage","Image":"","State":"running","Status":"Up 1 hour","Labels":""}`
+
+// TestHostContainersUpdateDetails_DropsUnresolvableRefs pins the read-only
+// binding: the image map comes from the Image field `docker ps` already
+// returned, and the same two kinds of entry CheckUpdates drops are dropped here
+// — a bare image ID names no repository a registry can be asked about, and an
+// empty ref would make step 1 a malformed call.
+func TestHostContainersUpdateDetails_DropsUnresolvableRefs(t *testing.T) {
+	reply := detailStepReply(t)
+	f := &fakeDockerRunner{runFunc: func(args []string) ([]byte, error) {
+		if slices.Contains(args, "compose") {
+			return nil, fmt.Errorf("host argv must carry no compose element: %v", args)
+		}
+		if len(args) >= 1 && args[0] == "ps" {
+			return []byte(hostPsDetailMixed), nil
+		}
+		return reply(classifyDetailCall(args), args[len(args)-1])
+	}}
+
+	out, err := (&HostContainers{docker: f}).UpdateDetails(context.Background(), nil)
+	if err != nil {
+		t.Fatalf("UpdateDetails() error = %v, want nil", err)
+	}
+	if len(out) != 1 {
+		t.Fatalf("UpdateDetails() = %v, want only the resolvable unmanaged container", out)
+	}
+	det, ok := out["watchtower"]
+	if !ok {
+		t.Fatalf("UpdateDetails() = %v, want an entry for watchtower", out)
+	}
+	assertDetail(t, "watchtower", det)
+
+	if len(f.runCalls) != 5 {
+		t.Fatalf("made %d docker calls, want 5 (ps + 4 steps): %v", len(f.runCalls), f.runCalls)
+	}
+	for _, args := range f.runCalls {
+		if slices.Contains(args, "compose") {
+			t.Errorf("host argv %v must carry no compose element", args)
+		}
+	}
+}
+
+// TestHostContainersUpdateDetails_DiscoveryErrorPropagates mirrors the Compose
+// case: a failed `docker ps` yields no image map, so there is nothing partial
+// to return.
+func TestHostContainersUpdateDetails_DiscoveryErrorPropagates(t *testing.T) {
+	f := &fakeDockerRunner{runErr: errors.New("Cannot connect to the Docker daemon")}
+
+	out, err := (&HostContainers{docker: f}).UpdateDetails(context.Background(), nil)
+	if err == nil {
+		t.Fatalf("UpdateDetails() = %v, want an error", out)
+	}
+	if out != nil {
+		t.Errorf("UpdateDetails() = %v, want a nil map on discovery failure", out)
+	}
+	if len(f.runCalls) != 1 {
+		t.Errorf("made %d docker calls, want 1 — a failed discovery must not reach the registry", len(f.runCalls))
 	}
 }

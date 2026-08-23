@@ -14350,6 +14350,16 @@ var (
 	_ Inspector = (*compose.HostContainers)(nil)
 )
 
+// UpdateDetailer is reached the same way and needs the same protection, for a
+// worse failure mode: a drifted signature costs no key, so nothing looks broken
+// — the update-detail rows just silently stop appearing on a screen that still
+// draws the "⇧" glyph beside them.
+var (
+	_ UpdateDetailer = (*compose.Compose)(nil)
+	_ UpdateDetailer = (*compose.RemoteCompose)(nil)
+	_ UpdateDetailer = (*compose.HostContainers)(nil)
+)
+
 // TestHostContainers_CapabilityInterfaces pins both halves of the read-only
 // capability contract. The positive half is the compile-time assertion above;
 // the negative half must be a runtime check, because Go cannot express "does
@@ -14365,6 +14375,9 @@ func TestHostContainers_CapabilityInterfaces(t *testing.T) {
 	}
 	if _, ok := c.(Inspector); !ok {
 		t.Error("HostContainers must satisfy Inspector so the i key works on the unmanaged screen")
+	}
+	if _, ok := c.(UpdateDetailer); !ok {
+		t.Error("HostContainers must satisfy UpdateDetailer so U fills the inspect update rows")
 	}
 	if _, ok := c.(ConfigProvider); ok {
 		t.Error("HostContainers must NOT satisfy ConfigProvider; the c key has to gate itself")

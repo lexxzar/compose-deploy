@@ -356,6 +356,28 @@ func (c *Compose) CheckUpdates(ctx context.Context, services []string) (map[stri
 	return scanImageUpdates(ctx, filterServices(images, services), c.compareImageDigest)
 }
 
+// UpdateDetails resolves the extra IMAGE-section rows the inspect screen draws
+// once CheckUpdates has said an update exists: which image is waiting and when
+// each side was built. It satisfies the TUI-declared tui.UpdateDetailer, which
+// is type-asserted on the concrete composer — runner.Composer is deliberately
+// unchanged, so the CLI never pays for data it has no view to render.
+//
+// Callers pass ONLY the services whose verdict came back true. An empty slice
+// means "all services" to filterServices, so an unfiltered call would spend
+// four round-trips — three of them to the registry — on every service in the
+// project and walk straight into Docker Hub's anonymous rate limit.
+//
+// The error is advisory: scanUpdateDetails never cascades, and a partial map is
+// a valid result. The caller discards the error rather than letting it reach
+// the verdict path, so a 429 here cannot blank the "⇧" column.
+func (c *Compose) UpdateDetails(ctx context.Context, services []string) (map[string]UpdateDetail, error) {
+	images, err := c.fetchServiceImages(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return scanUpdateDetails(ctx, filterServices(images, services), localDockerRunner{c: c})
+}
+
 // imageComparer is the per-image verdict function scanImageUpdates folds into
 // its result map. The contract matches compareImageDigestVia: (updated, ok,
 // err) where ok=true and err=nil is the only definitive verdict.

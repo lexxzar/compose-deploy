@@ -76,6 +76,24 @@ type Inspector interface {
 	Inspect(ctx context.Context, service string) ([]byte, error)
 }
 
+// UpdateDetailer resolves the extra IMAGE-section rows the inspect screen draws
+// once the "⇧" verdict is true: which image is waiting and when each side was
+// built. Declared here beside Inspector and type-asserted on the concrete
+// composer, so runner.Composer and its five mocks stay untouched and the CLI
+// keeps `list --updates` at its current cost — it has no detail view to render.
+//
+// All three composers satisfy it (pinned in app_test.go). A composer that does
+// not simply produces verdicts with no detail rows, which is the same thing a
+// detail-fetch failure produces: the glyph is the load-bearing signal and these
+// rows are a bonus.
+//
+// Callers pass ONLY the services whose verdict is true. The compose layer reads
+// an empty slice as "all services", and each image costs three registry
+// round-trips, so the filter is a rate-limit guard rather than an optimisation.
+type UpdateDetailer interface {
+	UpdateDetails(ctx context.Context, services []string) (map[string]compose.UpdateDetail, error)
+}
+
 // Snapshotter records the currently-running image digests before a deploy so
 // that `cdeploy rollback` can later restore them. Defined in the tui package
 // (like ConfigProvider/ExecProvider) and type-asserted on the concrete composer

@@ -454,21 +454,32 @@ are told apart, and it is testable without driving all four steps.
 - Modify: `internal/compose/updatedetails_test.go`
 - Modify: `internal/tui/app_test.go`
 
-- [ ] add `Compose.UpdateDetails` using `fetchServiceImages` + `filterServices` + `localDockerRunner`
-- [ ] add `RemoteCompose.UpdateDetails` using the remote runner, so `SSHExtraArgs` splicing and
+- [x] add `Compose.UpdateDetails` using `fetchServiceImages` + `filterServices` + `localDockerRunner`
+- [x] add `RemoteCompose.UpdateDetails` using the remote runner, so `SSHExtraArgs` splicing and
       `classifySSHError` are inherited unchanged
-- [ ] add `HostContainers.UpdateDetails` using `hostImageMap`, dropping empty refs and bare
+- [x] add `HostContainers.UpdateDetails` using `hostImageMap`, dropping empty refs and bare
       image IDs exactly as `CheckUpdates` does
-- [ ] add the three compile-time pins beside the existing `Inspector` triple at
+- [x] add the three compile-time pins beside the existing `Inspector` triple at
       `internal/tui/app_test.go:14348` — `var _ UpdateDetailer = (*compose.Compose)(nil)` and
       the same for `*compose.RemoteCompose` and `*compose.HostContainers`. Without them a
       rename or signature drift leaves the suite green while the rows silently vanish, which is
       exactly what that comment block already warns about for `i`
-- [ ] extend `TestHostContainers_CapabilityInterfaces` (`app_test.go:14360`) with the runtime
+- [x] extend `TestHostContainers_CapabilityInterfaces` (`app_test.go:14360`) with the runtime
       assertion for `UpdateDetailer`
-- [ ] write tests asserting all three build argv with no `compose` element
-- [ ] write a test asserting the remote argv splices `SSHExtraArgs` immediately before the host arg
-- [ ] run `go test ./...` — must pass before task 7
+- [x] write tests asserting all three build argv with no `compose` element
+- [x] write a test asserting the remote argv splices `SSHExtraArgs` immediately before the host arg
+- [x] run `go test ./...` — must pass before task 7
+
+➕ `UpdateDetailer` is DECLARED in `internal/tui/app.go` here rather than in Task 7. The three
+compile-time pins this task requires cannot compile without it, and this task must leave
+`go test ./...` green. Task 7's first checkbox is therefore already satisfied when that task
+starts; everything else in Task 7 (the message, the cache field, `refreshUpdates`) is untouched.
+
+➕ The "no `compose` element" assertion is scoped to the four DETAIL calls on `Compose` and
+`RemoteCompose`. Their discovery call is `docker compose config --format json`, which is a real
+compose subcommand — a blanket assertion would either fail or force the test to skip the one
+call that legitimately carries it. `HostContainers` discovers with `docker ps`, so its whole
+argv set is asserted.
 
 ### Task 7: Thread details through the update cache
 
@@ -476,7 +487,8 @@ are told apart, and it is testable without driving all four steps.
 - Modify: `internal/tui/app.go`
 - Modify: `internal/tui/app_test.go`
 
-- [ ] declare the `UpdateDetailer` interface next to `Inspector` in `internal/tui/app.go`
+- [x] declare the `UpdateDetailer` interface next to `Inspector` in `internal/tui/app.go`
+      (done in Task 6 — the compile-time pins there need it; see that task's ➕ note)
 - [ ] add `details map[string]compose.UpdateDetail` to `updatesMsg` and to `updateEntry`
       (both are keyed struct literals in tests, so this costs no test churn)
 - [ ] extend `refreshUpdates()` to call `UpdateDetails` for the services whose verdict is

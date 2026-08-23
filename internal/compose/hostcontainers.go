@@ -245,6 +245,25 @@ func (h *HostContainers) CheckUpdates(ctx context.Context, services []string) (m
 	return scanImageUpdates(ctx, filterServices(hostImageMap(entries), services), h.compareImageDigest)
 }
 
+// UpdateDetails is HostContainers' binding of scanUpdateDetails. See
+// Compose.UpdateDetails for the contract.
+//
+// The name-to-image map comes from hostImageMap, exactly as CheckUpdates builds
+// it, so empty refs and bare image IDs are dropped here too: neither addresses
+// a repository a registry can be asked about, and including one would only buy
+// a wasted round-trip per hand-started container.
+//
+// Nothing calls this automatically. autoUpdatesAllowed() is false on the
+// read-only unmanaged screen, so the whole update phase — verdicts and details
+// alike — fires only on an explicit `U`.
+func (h *HostContainers) UpdateDetails(ctx context.Context, services []string) (map[string]UpdateDetail, error) {
+	entries, err := h.unmanagedEntries(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return scanUpdateDetails(ctx, filterServices(hostImageMap(entries), services), h.docker)
+}
+
 // bareImageIDRe matches the image-ID form `docker ps` reports for a container
 // whose image carries no repository tag — a 12-char short ID or the full
 // 64-char digest hex, with no registry, repository or tag.

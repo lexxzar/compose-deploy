@@ -715,6 +715,24 @@ func (r *RemoteCompose) CheckUpdates(ctx context.Context, services []string) (ma
 	return scanImageUpdates(ctx, filterServices(images, services), r.compareImageDigest)
 }
 
+// UpdateDetails is RemoteCompose's binding of scanUpdateDetails. See
+// Compose.UpdateDetails for the contract; the only difference is the seam.
+//
+// Going through remoteDockerRunner is what makes the remote form correct for
+// free: all four steps are TOP-LEVEL docker commands, so remoteCommand() would
+// build a malformed `docker compose image inspect` argv, while the seam gives
+// SSH argv construction with SSHExtraArgs spliced immediately before the host
+// argument, shell escaping, and classifySSHError — the last of which is what
+// lets scanUpdateDetails abort the batch on a dead hop instead of burning a
+// round-trip per remaining image.
+func (r *RemoteCompose) UpdateDetails(ctx context.Context, services []string) (map[string]UpdateDetail, error) {
+	images, err := r.fetchServiceImages(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return scanUpdateDetails(ctx, filterServices(images, services), remoteDockerRunner{r: r})
+}
+
 // fetchServiceImages runs `docker compose config --format json` on the
 // remote host and returns the service-name → image map. Build-only services
 // (no `image:`) are absent. Goes through remoteCommand() — regular compose
