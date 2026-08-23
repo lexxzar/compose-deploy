@@ -9,6 +9,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -93,13 +94,16 @@ type mockDetailComposer struct {
 	details    map[string]compose.UpdateDetail
 	detailsErr error
 
-	detailsCalls int
-	detailsArgs  [][]string // one entry per call, the services slice as received
+	detailsCalls     int
+	detailsArgs      [][]string  // one entry per call, the services slice as received
+	detailsDeadlines []time.Time // one entry per call, zero when the ctx carried none
 }
 
 func (m *mockDetailComposer) UpdateDetails(ctx context.Context, services []string) (map[string]compose.UpdateDetail, error) {
 	m.detailsCalls++
 	m.detailsArgs = append(m.detailsArgs, append([]string(nil), services...))
+	deadline, _ := ctx.Deadline()
+	m.detailsDeadlines = append(m.detailsDeadlines, deadline)
 	return m.details, m.detailsErr
 }
 
@@ -11139,48 +11143,108 @@ func TestUKeyPress_GuardsAgainstStacking(t *testing.T) {
 // it is the sole argument.
 func modelOf(teaModel tea.Model, _ tea.Cmd) Model { return teaModel.(Model) }
 
-// detailFixture is the UpdateDetail the detail-half tests hand back. The exact
-// values don't matter here — Task 10 owns the rendering — only that the map
-// survives the trip from the composer to the cache entry intact.
-var detailFixture = map[string]compose.UpdateDetail{
-	"web": {
-		LocalCreated: time.Date(2026, 7, 7, 17, 47, 22, 0, time.UTC),
-		NewID:        "sha256:c05eced0000000000000000000000000000000000000000000000000000000ff",
-		NewCreated:   time.Date(2026, 8, 19, 19, 14, 43, 0, time.UTC),
-	},
+// detailFixture is the UpdateDetail the detail-half tests hand back. It is a
+// FUNCTION rather than a package-level map so a test that mutates a cached
+// entry's details cannot corrupt the ~10 other tests that share it. The exact
+// values don't matter here — inspect_test.go owns the rendering — only that the
+// map survives the trip from the composer to the cache entry intact.
+func detailFixture() map[string]compose.UpdateDetail {
+	return map[string]compose.UpdateDetail{
+		"web": {
+			LocalCreated: time.Date(2026, 7, 7, 17, 47, 22, 0, time.UTC),
+			NewID:        "sha256:c05eced0000000000000000000000000000000000000000000000000000000ff",
+			NewCreated:   time.Date(2026, 8, 19, 19, 14, 43, 0, time.UTC),
+		},
+	}
+}
+
+// deliverUpdates feeds an updatesMsg through Update and then runs the follow-up
+// Cmd the handler enqueues, delivering the resulting updateDetailsMsg too. The
+// split is the point: the verdicts land on the first message and the details on
+// the second, so a test that wants both has to make both trips.
+func deliverUpdates(t *testing.T, m Model, msg updatesMsg) (Model, *updateDetailsMsg) {
+	t.Helper()
+	model, cmd := m.Update(msg)
+	if cmd == nil {
+		return model.(Model), nil
+	}
+	raw := cmd()
+	dm, ok := raw.(updateDetailsMsg)
+	if !ok {
+		t.Fatalf("the follow-up Cmd produced %T, want updateDetailsMsg", raw)
+	}
+	return modelOf(model.(Model).Update(dm)), &dm
+}
+
+// TestRefreshUpdates_VerdictsDoNotWaitOnDetails pins the message split. One
+// tea.Cmd returns one message, so folding the detail fetch into refreshUpdates'
+// own goroutine would hold the ⇧ verdicts behind three registry round-trips per
+// updated image — with updateInFlight pinned true, which makes U a no-op and
+// gates off the statusMsg self-heal for that whole window.
+func TestRefreshUpdates_VerdictsDoNotWaitOnDetails(t *testing.T) {
+	mc := &mockDetailComposer{details: detailFixture()}
+	mc.updates = map[string]bool{"web": true}
+	m := NewModel(mc, io.Discard, mockFactory(&mc.mockComposer), nil, nil)
+	m.composer = mc
+	m.screen = screenSelectContainers
+	m.svcStatus = map[string]runner.ServiceStatus{"web": {Running: true}}
+	m.updateInFlight = true
+
+	msg := m.refreshUpdates()().(updatesMsg)
+	if mc.detailsCalls != 0 {
+		t.Fatalf("the verdict fetch spent %d detail round-trips before returning", mc.detailsCalls)
+	}
+
+	model, cmd := m.Update(msg)
+	mo := model.(Model)
+	if mo.updateInFlight {
+		t.Error("the in-flight guard must clear with the verdicts — U stays dead until it does")
+	}
+	if st := mo.svcStatus["web"]; st.UpdateAvailable == nil || !*st.UpdateAvailable {
+		t.Error("the glyph must hydrate from the verdict message alone")
+	}
+	if cmd == nil {
+		t.Fatal("the handler must enqueue the detail fetch as a follow-up Cmd")
+	}
+	if _, ok := cmd().(updateDetailsMsg); !ok {
+		t.Error("the follow-up Cmd must produce an updateDetailsMsg")
+	}
 }
 
 // TestRefreshUpdates_PassesOnlyTrueVerdicts pins the rate-limit guard: the
 // compose layer reads an empty services slice as "ALL services", and each
 // image costs three registry round-trips, so handing it anything but the true
-// verdicts would walk straight into Docker Hub's anonymous quota. Sorted
-// because a transport abort truncates the batch — which images are reached
-// must not depend on Go's map iteration order.
+// verdicts would walk straight into Docker Hub's anonymous quota. Sorted so the
+// argument is deterministic.
 func TestRefreshUpdates_PassesOnlyTrueVerdicts(t *testing.T) {
-	mc := &mockDetailComposer{details: detailFixture}
-	mc.updates = map[string]bool{"web": true, "db": false, "api": true, "cache": false}
+	mc := &mockDetailComposer{details: detailFixture()}
+	mc.updates = map[string]bool{"web": true, "db": false, "api": true, "cache": false, "edge": true}
 	m := NewModel(mc, io.Discard, mockFactory(&mc.mockComposer), nil, nil)
 	m.composer = mc
+	m.screen = screenSelectContainers
 
 	msg, ok := m.refreshUpdates()().(updatesMsg)
 	if !ok {
 		t.Fatal("refreshUpdates should produce an updatesMsg")
 	}
+
+	model, dm := deliverUpdates(t, m, msg)
 	if mc.detailsCalls != 1 {
 		t.Fatalf("UpdateDetails calls = %d, want exactly 1", mc.detailsCalls)
 	}
 	got := mc.detailsArgs[0]
-	want := []string{"api", "web"}
-	if len(got) != len(want) {
-		t.Fatalf("UpdateDetails services = %v, want %v", got, want)
+	want := []string{"api", "edge", "web"}
+	if !slices.Equal(got, want) {
+		t.Fatalf("UpdateDetails services = %v, want %v (sorted, true verdicts only)", got, want)
 	}
-	for i := range want {
-		if got[i] != want[i] {
-			t.Fatalf("UpdateDetails services = %v, want %v (sorted, true verdicts only)", got, want)
-		}
+	if !slices.IsSorted(got) {
+		t.Errorf("UpdateDetails services = %v, want them sorted", got)
 	}
-	if msg.details == nil {
-		t.Error("the fetched details should ride the same message as the verdicts")
+	if dm == nil || dm.details == nil {
+		t.Fatal("the follow-up message should carry the fetched details")
+	}
+	if entry := model.updateCache[model.updatesCacheKey()]; entry.details == nil {
+		t.Error("the details should have merged onto the cache entry the verdicts wrote")
 	}
 }
 
@@ -11189,18 +11253,20 @@ func TestRefreshUpdates_PassesOnlyTrueVerdicts(t *testing.T) {
 // services", so a call with no true verdicts would fetch details for the
 // entire project.
 func TestRefreshUpdates_SkipsDetailsWhenNoVerdictIsTrue(t *testing.T) {
-	mc := &mockDetailComposer{details: detailFixture}
+	mc := &mockDetailComposer{details: detailFixture()}
 	mc.updates = map[string]bool{"web": false, "db": false}
 	m := NewModel(mc, io.Discard, mockFactory(&mc.mockComposer), nil, nil)
 	m.composer = mc
+	m.screen = screenSelectContainers
 
 	msg := m.refreshUpdates()().(updatesMsg)
+	_, cmd := m.Update(msg)
 
+	if cmd != nil {
+		t.Errorf("the handler enqueued a detail fetch (%T) with no true verdict", cmd())
+	}
 	if mc.detailsCalls != 0 {
 		t.Errorf("UpdateDetails calls = %d, want 0 when every verdict is false", mc.detailsCalls)
-	}
-	if msg.details != nil {
-		t.Errorf("details = %v, want nil when no verdict is true", msg.details)
 	}
 	if len(msg.results) != 2 {
 		t.Errorf("results = %v, want both verdicts through untouched", msg.results)
@@ -11212,19 +11278,23 @@ func TestRefreshUpdates_SkipsDetailsWhenNoVerdictIsTrue(t *testing.T) {
 // up — and the detail fetch would spend registry round-trips on a path that is
 // already broken.
 func TestRefreshUpdates_SkipsDetailsOnCheckError(t *testing.T) {
-	mc := &mockDetailComposer{details: detailFixture}
+	mc := &mockDetailComposer{details: detailFixture()}
 	mc.updates = map[string]bool{"web": true}
 	mc.updatesErr = errors.New("registry unreachable")
 	m := NewModel(mc, io.Discard, mockFactory(&mc.mockComposer), nil, nil)
 	m.composer = mc
+	m.screen = screenSelectContainers
 
 	msg := m.refreshUpdates()().(updatesMsg)
-
+	if msg.err == nil {
+		t.Fatal("the CheckUpdates error must still reach the handler")
+	}
+	_, cmd := m.Update(msg)
+	if cmd != nil {
+		t.Errorf("the handler enqueued a detail fetch (%T) after CheckUpdates errored", cmd())
+	}
 	if mc.detailsCalls != 0 {
 		t.Errorf("UpdateDetails calls = %d, want 0 when CheckUpdates errored", mc.detailsCalls)
-	}
-	if msg.err == nil {
-		t.Error("the CheckUpdates error must still reach the handler")
 	}
 }
 
@@ -11235,17 +11305,22 @@ func TestRefreshUpdates_ComposerWithoutDetailerStillProducesVerdicts(t *testing.
 	mc := &mockComposer{updates: map[string]bool{"web": true}}
 	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
 	m.composer = mc
+	m.screen = screenSelectContainers
 
 	msg := m.refreshUpdates()().(updatesMsg)
-
 	if msg.err != nil {
 		t.Errorf("err = %v, want nil", msg.err)
 	}
-	if msg.details != nil {
-		t.Errorf("details = %v, want nil from a composer without UpdateDetailer", msg.details)
-	}
 	if v, ok := msg.results["web"]; !ok || !v {
 		t.Errorf("results = %v, want the verdict through unchanged", msg.results)
+	}
+
+	model, cmd := m.Update(msg)
+	if cmd != nil {
+		t.Errorf("a composer without UpdateDetailer enqueued a detail fetch (%T)", cmd())
+	}
+	if entry := model.(Model).updateCache[model.(Model).updatesCacheKey()]; entry.details != nil {
+		t.Errorf("details = %v, want nil from a composer without UpdateDetailer", entry.details)
 	}
 }
 
@@ -11267,7 +11342,7 @@ func TestRefreshUpdates_DetailErrorKeepsVerdictsAndSuccessTTL(t *testing.T) {
 		t.Fatalf("err = %v; a detail-fetch failure must never reach updatesMsg.err", msg.err)
 	}
 
-	model := modelOf(m.Update(msg))
+	model, _ := deliverUpdates(t, m, msg)
 	if model.updatesErr != "" {
 		t.Errorf("updatesErr = %q, want empty — the verdicts are sound", model.updatesErr)
 	}
@@ -11291,53 +11366,872 @@ func TestRefreshUpdates_DetailErrorKeepsVerdictsAndSuccessTTL(t *testing.T) {
 	}
 }
 
-// TestUpdatesMsg_StoresDetailsOnTheCacheEntry: the details ride the same entry
+// TestRefreshUpdates_PartialDetailsSurviveTheirError: scanUpdateDetails returns
+// (partialMap, err) on a transport abort BY DESIGN — the rows resolved before
+// the abort are still correct. Discarding the map along with the error would
+// throw them away silently.
+func TestRefreshUpdates_PartialDetailsSurviveTheirError(t *testing.T) {
+	mc := &mockDetailComposer{details: detailFixture(), detailsErr: errors.New("update detail transport failure")}
+	mc.updates = map[string]bool{"web": true}
+	m := NewModel(mc, io.Discard, mockFactory(&mc.mockComposer), nil, nil)
+	m.composer = mc
+	m.screen = screenSelectContainers
+
+	model, dm := deliverUpdates(t, m, m.refreshUpdates()().(updatesMsg))
+	if dm == nil || dm.details == nil {
+		t.Fatal("the partial detail map must survive the error that accompanied it")
+	}
+	entry := model.updateCache[model.updatesCacheKey()]
+	if got := entry.details["web"].NewID; got != detailFixture()["web"].NewID {
+		t.Errorf("cached NewID = %q, want the partial map's %q", got, detailFixture()["web"].NewID)
+	}
+}
+
+// TestUpdateDetailsMsg_MergesOntoTheCacheEntry: the details ride the same entry
 // as the verdicts so they inherit its key, TTL, session gate and post-Deploy
 // invalidation.
-func TestUpdatesMsg_StoresDetailsOnTheCacheEntry(t *testing.T) {
+func TestUpdateDetailsMsg_MergesOntoTheCacheEntry(t *testing.T) {
 	mc := &mockComposer{}
 	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
 	m.screen = screenSelectContainers
 	m.svcStatus = map[string]runner.ServiceStatus{"web": {Running: true}}
 
-	model := modelOf(m.Update(updatesMsg{
-		results: map[string]bool{"web": true},
-		details: detailFixture,
-		session: m.updatesSession,
+	fetched := time.Now()
+	m.updateCache = map[string]updateEntry{m.updatesCacheKey(): {
+		fetchedAt: fetched,
+		results:   map[string]bool{"web": true},
+	}}
+	model := modelOf(m.Update(updateDetailsMsg{
+		details:  detailFixture(),
+		forKey:   m.updatesCacheKey(),
+		forEntry: fetched,
 	}))
 
 	entry := model.updateCache[model.updatesCacheKey()]
 	if entry.details == nil {
 		t.Fatal("details should be stored beside results on the cache entry")
 	}
-	if got := entry.details["web"].NewID; got != detailFixture["web"].NewID {
-		t.Errorf("cached NewID = %q, want %q", got, detailFixture["web"].NewID)
+	if got := entry.details["web"].NewID; got != detailFixture()["web"].NewID {
+		t.Errorf("cached NewID = %q, want %q", got, detailFixture()["web"].NewID)
 	}
-	// hydrateUpdates stays untouched: it writes verdicts into svcStatus only.
-	if st := model.svcStatus["web"]; st.UpdateAvailable == nil || !*st.UpdateAvailable {
-		t.Error("hydration should still write the verdict")
+	if entry.results["web"] != true {
+		t.Error("the merge must leave the verdicts alone")
 	}
 }
 
-// TestUpdatesMsg_StaleSessionDoesNotWriteDetails: the details are gated by the
-// same session check as the verdicts, so a response from a previous project or
-// server context cannot pollute the new context's cache entry.
-func TestUpdatesMsg_StaleSessionDoesNotWriteDetails(t *testing.T) {
+// TestUpdateDetailsMsg_LandsAfterASessionBump: the details must NOT carry a
+// session gate. updatesSession is bumped by ordinary navigation that leaves the
+// context (and therefore the cache key and the entry) untouched — esc back from
+// logs or progress, execDone — and those sites find the just-written entry
+// fresh, so they enqueue no replacement fetch. A session gate here would drop
+// the only message that could fill the entry, leaving the inspect screen
+// without `built` / `update id` / `update built` for the full 10-minute TTL,
+// recoverable only by a manual U.
+func TestUpdateDetailsMsg_LandsAfterASessionBump(t *testing.T) {
+	mc := &mockComposer{}
+	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
+	m.screen = screenSelectContainers
+	m.updatesSession = 6
+	fetched := time.Now()
+	m.updateCache = map[string]updateEntry{m.updatesCacheKey(): {fetchedAt: fetched, results: map[string]bool{"web": true}}}
+	// The user opened logs and pressed esc while the details were resolving.
+	m.updatesSession = 7
+
+	model := modelOf(m.Update(updateDetailsMsg{details: detailFixture(), forKey: m.updatesCacheKey(), forEntry: fetched}))
+
+	entry := model.updateCache[model.updatesCacheKey()]
+	if entry.details == nil {
+		t.Fatal("a session bump must not drop the details — the entry it annotates is still the current one")
+	}
+	if got := entry.details["web"].NewID; got != detailFixture()["web"].NewID {
+		t.Errorf("cached NewID = %q, want %q", got, detailFixture()["web"].NewID)
+	}
+}
+
+// TestUpdateDetailsMsg_ForeignMergeDoesNotRedrawTheScreen: the merge is keyed
+// by the batch's own context, but the redraw is a render path and must stay
+// keyed by the CURRENT one. refreshInspectFromCache ends in a SetContent that
+// does SetXOffset(0), so redrawing for an entry the screen is not showing would
+// snap a sideways-scrolled pane back to column 0 at an arbitrary moment, for
+// data that did not change.
+func TestUpdateDetailsMsg_ForeignMergeDoesNotRedrawTheScreen(t *testing.T) {
+	m := inspectScreenModel(t)
+	m.projDir = "/srv/app-b"
+	fetched := time.Now()
+	m.updateCache = map[string]updateEntry{"/srv/app-a|": {fetchedAt: fetched, results: map[string]bool{"web": true}}}
+	// A sentinel the rebuild would overwrite: rebuildInspectSummary re-parses
+	// m.inspectRaw, so any value surviving here proves it never ran.
+	m.inspectSummary = "STALE SUMMARY"
+
+	model := modelOf(m.Update(updateDetailsMsg{details: detailFixture(), forKey: "/srv/app-a|", forEntry: fetched}))
+
+	if model.updateCache["/srv/app-a|"].details == nil {
+		t.Fatal("precondition: the merge itself must still land on the batch's own entry")
+	}
+	if model.inspectSummary != "STALE SUMMARY" {
+		t.Error("a merge onto another context's entry redrew the screen")
+	}
+}
+
+// TestUpdateDetails_ColdCacheFillsEveryRow walks the whole lifecycle on a cold
+// cache, through the real Cmds rather than a hand-built cache entry: the
+// verdicts land and paint the ⇧ glyph, the follow-up batch resolves, and all
+// four IMAGE rows appear on a screenInspect that was already open. That last
+// part is the point — entering `i` while the first fetch is in flight is
+// exactly when a cold cache happens, and without the rebuild the rows would
+// stay absent until a back-out and re-entry.
+func TestUpdateDetails_ColdCacheFillsEveryRow(t *testing.T) {
+	mc := &mockDetailComposer{details: detailFixture()}
+	mc.updates = map[string]bool{"web": true}
+	m := inspectScreenModel(t)
+	m.composer = mc
+	m.svcStatus = map[string]runner.ServiceStatus{"web": {Running: true}}
+	if _, ok := m.updateCache[m.updatesCacheKey()]; ok {
+		t.Fatal("precondition: the cache must be cold")
+	}
+
+	verdicts, ok := m.refreshUpdates()().(updatesMsg)
+	if !ok {
+		t.Fatal("refreshUpdates must produce an updatesMsg")
+	}
+	model, detailsCmd := m.Update(verdicts)
+	mo := model.(Model)
+	if detailsCmd == nil {
+		t.Fatal("the verdicts must enqueue the detail batch")
+	}
+	if !strings.Contains(mo.inspectSummary, inspectRow("update", "available")) {
+		t.Fatalf("the verdict row must appear without waiting on the details:\n%s", mo.inspectSummary)
+	}
+
+	filled := modelOf(mo.Update(detailsCmd().(updateDetailsMsg)))
+	for _, want := range []string{
+		inspectRow("built", "2026-07-07 17:47:22"),
+		inspectRow("update", "available"),
+		inspectRow("update id", detailFixture()["web"].NewID),
+		inspectRow("update built", "2026-08-19 19:14:43"),
+	} {
+		if !strings.Contains(filled.inspectSummary, want) {
+			t.Errorf("summary missing %q:\n%s", want, filled.inspectSummary)
+		}
+	}
+	// The pane is rewritten too, not just the summary string. The IMAGE block
+	// sits below the fold at this height, so scroll to it rather than asserting
+	// against the first screenful.
+	filled.inspectViewport.GotoBottom()
+	if got := filled.inspectViewport.View(); !strings.Contains(got, "ENV") {
+		t.Errorf("the pane must be rewritten with the filled summary:\n%s", got)
+	}
+}
+
+// TestUpdateDetailsMsg_ForeignContextIsNotTouched: the batch's OWN key decides
+// which entry it annotates, so a batch fetched under project A can never write
+// project B's entry. Both entries carry the same fetchedAt on purpose — that is
+// the case a handler which re-derived the key from the CURRENT context would
+// get wrong, merging A's answers onto B's verdicts.
+func TestUpdateDetailsMsg_ForeignContextIsNotTouched(t *testing.T) {
+	mc := &mockComposer{}
+	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
+	m.screen = screenSelectContainers
+	fetched := time.Now()
+	m.projDir = "/srv/app-a"
+	keyA := m.updatesCacheKey()
+	m.projDir = "/srv/app-b"
+	keyB := m.updatesCacheKey()
+	m.updateCache = map[string]updateEntry{
+		keyA: {fetchedAt: fetched, results: map[string]bool{"web": true}},
+		keyB: {fetchedAt: fetched, results: map[string]bool{"web": true}},
+	}
+	// The user is now on project B; the batch below was fetched for A.
+	model := modelOf(m.Update(updateDetailsMsg{details: detailFixture(), forKey: keyA, forEntry: fetched}))
+
+	if entry := model.updateCache[keyB]; entry.details != nil {
+		t.Errorf("project A's details landed on project B's entry: %+v", entry.details)
+	}
+	if entry := model.updateCache[keyA]; entry.details == nil {
+		t.Error("the batch must still annotate the entry it was fetched for")
+	}
+}
+
+// TestUpdateDetailsMsg_NeverCreatesAnEntry: the details are an annotation on a
+// verdict set, so a message naming a key the cache does not hold (the entry was
+// invalidated by a deploy, or the fetch outlived it) must not conjure one —
+// there would be no verdicts to annotate and no fetchedAt to age it by.
+func TestUpdateDetailsMsg_NeverCreatesAnEntry(t *testing.T) {
+	mc := &mockComposer{}
+	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
+	m.screen = screenSelectContainers
+	m.updateCache = map[string]updateEntry{}
+
+	model := modelOf(m.Update(updateDetailsMsg{
+		details:  detailFixture(),
+		forKey:   "/srv/app-a|",
+		forEntry: time.Now(),
+	}))
+
+	if len(model.updateCache) != 0 {
+		t.Errorf("the handler created a cache entry from a detail message: %+v", model.updateCache)
+	}
+}
+
+// TestUpdateDetailsMsg_ErroredEntryIsNotMerged: a non-nil CheckUpdates error
+// makes the whole verdict map untrusted per the Composer contract, so an entry
+// that failed must not gain rows describing verdicts it does not hold. The
+// inspect screen reads the raw entry, so a merge here would draw update rows
+// beside a blanked glyph column.
+func TestUpdateDetailsMsg_ErroredEntryIsNotMerged(t *testing.T) {
+	mc := &mockComposer{}
+	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
+	m.screen = screenSelectContainers
+	fetched := time.Now()
+	key := m.updatesCacheKey()
+	m.updateCache = map[string]updateEntry{key: {
+		fetchedAt: fetched,
+		err:       true,
+		errMsg:    "registry unreachable",
+	}}
+
+	model := modelOf(m.Update(updateDetailsMsg{details: detailFixture(), forKey: key, forEntry: fetched}))
+
+	if entry := model.updateCache[key]; entry.details != nil {
+		t.Errorf("details merged onto an errored entry: %+v", entry.details)
+	}
+}
+
+// TestUpdateDetailsMsg_LandsAfterNavigatingAway pins the second half of the
+// identity rule. A detail scan is the long half — three registry round-trips
+// per updated image, tens of seconds over SSH — so an ordinary esc to the
+// project picker mid-scan is routine. Because the batch carries the key it was
+// fetched under, the merge still lands on that project's entry, and returning
+// inside the 10-minute TTL shows the rows. Looking the key up at MERGE time
+// instead dropped the message, and nothing refetched: the entry is a fresh
+// success, so maybeRefreshUpdatesCmd and the statusMsg self-heal both skip it.
+func TestUpdateDetailsMsg_LandsAfterNavigatingAway(t *testing.T) {
+	mc := &mockComposer{}
+	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
+	m.screen = screenSelectContainers
+	m.projDir = "/srv/app-a"
+	projectKey := m.updatesCacheKey()
+	fetched := time.Now()
+	m.updateCache = map[string]updateEntry{projectKey: {fetchedAt: fetched, results: map[string]bool{"web": true}}}
+
+	// esc to the project picker: projDir is cleared, so the current key is no
+	// longer the one the batch was fetched under.
+	m.projDir = ""
+	m.screen = screenSelectProject
+	if m.updatesCacheKey() == projectKey {
+		t.Fatal("precondition: leaving the project must change the cache key")
+	}
+
+	model := modelOf(m.Update(updateDetailsMsg{details: detailFixture(), forKey: projectKey, forEntry: fetched}))
+
+	entry := model.updateCache[projectKey]
+	if entry.details == nil {
+		t.Fatal("a batch that finished after the user navigated away lost its rows for the entry's whole TTL")
+	}
+	if got := entry.details["web"].NewID; got != detailFixture()["web"].NewID {
+		t.Errorf("cached NewID = %q, want %q", got, detailFixture()["web"].NewID)
+	}
+}
+
+// TestUpdateDetails_OneBatchAtATime pins the second in-flight guard. The
+// verdicts clear updateInFlight the moment they land (that is what keeps U
+// alive), so without a guard of its own the expensive half is unprotected: a U
+// press during the detail scan stacks a SECOND batch of three registry
+// round-trips per updated image on top of the running one, and repeated presses
+// stack without bound — the exact Docker Hub 429 the true-only filter and the
+// per-image memoisation exist to avoid (two concurrent batches memoise
+// separately, so the mitigation does not span them).
+//
+// The refusal must not cost the rows. The U press replaced the entry the
+// running batch names, so that batch's map is dropped on arrival — and the
+// replacement is a fresh SUCCESS entry, which maybeRefreshUpdatesCmd and the
+// statusMsg self-heal both skip. The arrival therefore refills from the entry's
+// own details == nil, with no further keystroke.
+func TestUpdateDetails_OneBatchAtATime(t *testing.T) {
+	mc := &mockDetailComposer{details: detailFixture()}
+	mc.updates = map[string]bool{"web": true}
+	m := NewModel(mc, io.Discard, mockFactory(&mc.mockComposer), nil, nil)
+	m.composer = mc
+	m.screen = screenSelectContainers
+	m.svcStatus = map[string]runner.ServiceStatus{"web": {Running: true}}
+
+	first, cmd := m.Update(updatesMsg{results: map[string]bool{"web": true}, session: m.updatesSession})
+	mo := first.(Model)
+	if cmd == nil {
+		t.Fatal("the first verdicts must enqueue a detail fetch")
+	}
+	if !mo.detailsInFlight {
+		t.Fatal("enqueuing the detail fetch must raise the in-flight guard")
+	}
+
+	// The user presses U while the details are still resolving: the verdicts
+	// refresh (that half is guarded by updateInFlight alone), but the handler
+	// must NOT enqueue a second detail batch.
+	second, cmd2 := mo.Update(updatesMsg{results: map[string]bool{"web": true}, session: mo.updatesSession})
+	so := second.(Model)
+	if cmd2 != nil {
+		t.Errorf("a second detail batch was enqueued while one was in flight: %T", cmd2())
+	}
+	if entry := so.updateCache[so.updatesCacheKey()]; entry.details != nil {
+		t.Fatal("precondition: the entry the U press wrote must carry no reported batch")
+	}
+
+	// Once the running batch reports, the guard clears and the refused batch is
+	// re-dispatched on the spot. The arriving message names the SUPERSEDED
+	// entry, so its own map is dropped; without the refill those rows would be
+	// gone for the replacement entry's full 10-minute TTL.
+	third, cmd3 := so.Update(updateDetailsMsg{
+		details:  detailFixture(),
+		forKey:   so.updatesCacheKey(),
+		forEntry: time.Now().Add(-time.Minute),
+	})
+	to := third.(Model)
+	if cmd3 == nil {
+		t.Fatal("the refused batch must be retried when the running one reports, with no further keystroke")
+	}
+	if !to.detailsInFlight {
+		t.Error("the retry must re-raise the guard so the phase stays one batch wide")
+	}
+	// The retry carries the CURRENT entry's identity and fills it.
+	dm, ok := cmd3().(updateDetailsMsg)
+	if !ok {
+		t.Fatalf("the retry produced %T, want updateDetailsMsg", cmd3())
+	}
+	filled := modelOf(to.Update(dm))
+	entry := filled.updateCache[filled.updatesCacheKey()]
+	if entry.details == nil {
+		t.Fatal("the entry the U press wrote never received its detail rows")
+	}
+	if got := entry.details["web"].NewID; got != detailFixture()["web"].NewID {
+		t.Errorf("cached NewID = %q, want %q", got, detailFixture()["web"].NewID)
+	}
+	if filled.detailsInFlight {
+		t.Error("the retry's own arrival must clear the guard again")
+	}
+	if _, extra := filled.Update(updateDetailsMsg{details: detailFixture(), forKey: filled.updatesCacheKey(), forEntry: entry.fetchedAt}); extra != nil {
+		t.Errorf("an entry a batch has already reported for was refetched: %T", extra())
+	}
+}
+
+// TestUpdateDetails_RefillTargetsTheNewestEntry: repeated U presses during one
+// detail scan must not queue one retry each. The retry is derived from the
+// CURRENT cache entry rather than from a record of the refusals, so three
+// refusals produce ONE batch — against the newest verdict set — however hard
+// the key is mashed.
+func TestUpdateDetails_RefillTargetsTheNewestEntry(t *testing.T) {
+	mc := &mockDetailComposer{details: detailFixture()}
+	mc.updates = map[string]bool{"web": true}
+	m := NewModel(mc, io.Discard, mockFactory(&mc.mockComposer), nil, nil)
+	m.composer = mc
+	m.screen = screenSelectContainers
+	m.svcStatus = map[string]runner.ServiceStatus{"web": {Running: true}}
+
+	model, cmd := m.Update(updatesMsg{results: map[string]bool{"web": true}, session: m.updatesSession})
+	if cmd == nil {
+		t.Fatal("the first verdicts must enqueue a detail fetch")
+	}
+	mo := model.(Model)
+	for range 3 {
+		next, c := mo.Update(updatesMsg{results: map[string]bool{"web": true}, session: mo.updatesSession})
+		if c != nil {
+			t.Fatalf("a second detail batch was enqueued while one was in flight: %T", c())
+		}
+		mo = next.(Model)
+	}
+	newest := mo.updateCache[mo.updatesCacheKey()].fetchedAt
+
+	// One arrival, one retry — not three, and it names the NEWEST entry.
+	after, retry := mo.Update(updateDetailsMsg{details: nil, forKey: mo.updatesCacheKey(), forEntry: time.Now().Add(-time.Hour)})
+	if retry == nil {
+		t.Fatal("the refused batch must be re-dispatched")
+	}
+	rm, ok := retry().(updateDetailsMsg)
+	if !ok {
+		t.Fatalf("the retry produced %T, want updateDetailsMsg", retry())
+	}
+	if !rm.forEntry.Equal(newest) {
+		t.Errorf("the retry names fetchedAt %v, want the newest entry's %v", rm.forEntry, newest)
+	}
+	done := modelOf(after.(Model).Update(rm))
+	if _, extra := done.Update(updateDetailsMsg{details: nil, forKey: done.updatesCacheKey(), forEntry: time.Now()}); extra != nil {
+		t.Errorf("a fourth batch was dispatched after the entry was filled: %T", extra())
+	}
+	if mc.detailsCalls != 1 {
+		t.Errorf("UpdateDetails calls = %d, want 1 (three refusals collapse into one retry)", mc.detailsCalls)
+	}
+}
+
+// TestUpdateDetails_EmptyResultIsNotRetried: a batch that reports NOTHING (a
+// 429, or a transport abort before the first row) still counts as reported. The
+// merge normalises its nil map to an empty one, because details == nil is the
+// refill trigger — leaving it nil would re-scan the registry on every screen
+// entry for the entry's whole 10-minute TTL, which is the amplification the
+// error-swallowing at the fetch site exists to prevent.
+func TestUpdateDetails_EmptyResultIsNotRetried(t *testing.T) {
+	mc := &mockDetailComposer{detailsErr: errors.New("429 Too Many Requests")}
+	mc.updates = map[string]bool{"web": true}
+	m := NewModel(mc, io.Discard, mockFactory(&mc.mockComposer), nil, nil)
+	m.composer = mc
+	m.screen = screenSelectContainers
+
+	model, dm := deliverUpdates(t, m, m.refreshUpdates()().(updatesMsg))
+	if dm == nil || dm.details != nil {
+		t.Fatalf("precondition: the batch must report a nil map, got %+v", dm)
+	}
+	entry := model.updateCache[model.updatesCacheKey()]
+	if entry.details == nil {
+		t.Fatal("a batch that reported nothing must still be RECORDED on the entry")
+	}
+	if len(entry.details) != 0 {
+		t.Errorf("details = %+v, want an empty map", entry.details)
+	}
+	if cmd := model.refillUpdateDetailsCmd(); cmd != nil {
+		t.Errorf("the failed batch was retried inside its own TTL: %T", cmd())
+	}
+}
+
+// TestRefillUpdateDetails_FailsClosed: the refill is the detail phase's only
+// retry path, so everything that is NOT "a fresh success entry with a true
+// verdict that no batch has reported for" must refuse — otherwise the trigger
+// that heals a lost batch becomes a registry loop.
+func TestRefillUpdateDetails_FailsClosed(t *testing.T) {
+	fetched := time.Now()
+	rewrite := func(m *Model, fn func(*updateEntry)) {
+		e := m.updateCache[m.updatesCacheKey()]
+		fn(&e)
+		m.updateCache[m.updatesCacheKey()] = e
+	}
+	tests := []struct {
+		name  string
+		build func(*Model)
+	}{
+		{
+			name:  "a batch has already reported",
+			build: func(m *Model) { rewrite(m, func(e *updateEntry) { e.details = map[string]compose.UpdateDetail{} }) },
+		},
+		{
+			name:  "entry was invalidated by a deploy",
+			build: func(m *Model) { delete(m.updateCache, m.updatesCacheKey()) },
+		},
+		{
+			// The verdicts are kept on purpose: a non-nil CheckUpdates error
+			// makes the whole map untrusted per the Composer contract, so the
+			// err flag alone must refuse — not the emptiness that happens to
+			// accompany it on the production write path.
+			name: "entry failed",
+			build: func(m *Model) {
+				rewrite(m, func(e *updateEntry) { e.err, e.errMsg = true, "registry unreachable" })
+			},
+		},
+		{
+			name: "entry aged past its TTL",
+			build: func(m *Model) {
+				rewrite(m, func(e *updateEntry) { e.fetchedAt = time.Now().Add(-2 * updatesCacheTTL) })
+			},
+		},
+		{
+			name:  "no verdict is true",
+			build: func(m *Model) { rewrite(m, func(e *updateEntry) { e.results = map[string]bool{"web": false} }) },
+		},
+		{
+			name:  "a batch is already in flight",
+			build: func(m *Model) { m.detailsInFlight = true },
+		},
+		{
+			// The entry lives under another context's key, so the current one
+			// has nothing to refill — the refill must never reach across.
+			name: "the entry belongs to another context",
+			build: func(m *Model) {
+				m.updateCache["/srv/other|"] = m.updateCache[m.updatesCacheKey()]
+				delete(m.updateCache, m.updatesCacheKey())
+			},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			mc := &mockDetailComposer{details: detailFixture()}
+			m := NewModel(mc, io.Discard, mockFactory(&mc.mockComposer), nil, nil)
+			m.composer = mc
+			m.screen = screenSelectContainers
+			m.updateCache = map[string]updateEntry{m.updatesCacheKey(): {fetchedAt: fetched, results: map[string]bool{"web": true}}}
+			tt.build(&m)
+
+			if cmd := m.refillUpdateDetailsCmd(); cmd != nil {
+				t.Errorf("the refill fired anyway: %T", cmd())
+			}
+			if mc.detailsCalls != 0 {
+				t.Errorf("UpdateDetails calls = %d, want 0", mc.detailsCalls)
+			}
+		})
+	}
+
+	// The control: without one case that DOES fire, every assertion above would
+	// pass on a refill that never works at all.
+	t.Run("a fresh entry with no reported batch", func(t *testing.T) {
+		mc := &mockDetailComposer{details: detailFixture()}
+		m := NewModel(mc, io.Discard, mockFactory(&mc.mockComposer), nil, nil)
+		m.composer = mc
+		m.screen = screenSelectContainers
+		m.updateCache = map[string]updateEntry{m.updatesCacheKey(): {fetchedAt: fetched, results: map[string]bool{"web": true}}}
+
+		cmd := m.refillUpdateDetailsCmd()
+		if cmd == nil {
+			t.Fatal("a fresh success entry with a true verdict and no reported batch must refill")
+		}
+		if !m.detailsInFlight {
+			t.Error("the refill must raise the in-flight guard like any other dispatch")
+		}
+		if _, ok := cmd().(updateDetailsMsg); !ok {
+			t.Errorf("the refill produced %T, want updateDetailsMsg", cmd())
+		}
+	})
+}
+
+// TestUpdateDetails_UStaysLiveDuringTheDetailScan: the fix for the stacking
+// above must NOT be a gate on the U key (or a delayed updateInFlight clear).
+// The detail scan is the long half — three registry round-trips per updated
+// image, tens of seconds over SSH — and refusing U for that window is exactly
+// the dead-U window the message split removed.
+func TestUpdateDetails_UStaysLiveDuringTheDetailScan(t *testing.T) {
+	mc := &mockDetailComposer{details: detailFixture()}
+	m := NewModel(mc, io.Discard, mockFactory(&mc.mockComposer), nil, nil)
+	m.composer = mc
+	m.screen = screenSelectContainers
+	m.services = []string{"web"}
+	m.svcStatus = map[string]runner.ServiceStatus{"web": {Running: true}}
+	m.detailsInFlight = true
+	m.updateInFlight = false
+
+	model, cmd := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("U")})
+	if cmd == nil {
+		t.Fatal("U must still force-refresh the verdicts while the details resolve")
+	}
+	if !model.(Model).updateInFlight {
+		t.Error("the U refresh must raise updateInFlight as usual")
+	}
+}
+
+// hasUpdateDetailsCmd runs a Cmd (a tea.Batch or a single one) and reports
+// whether any of it produced an updateDetailsMsg.
+func hasUpdateDetailsCmd(t *testing.T, cmd tea.Cmd) bool {
+	t.Helper()
+	msg := cmd()
+	batch, ok := msg.(tea.BatchMsg)
+	if !ok {
+		_, isDetails := msg.(updateDetailsMsg)
+		return isDetails
+	}
+	for _, child := range batch {
+		if child == nil {
+			continue
+		}
+		if _, isDetails := child().(updateDetailsMsg); isDetails {
+			return true
+		}
+	}
+	return false
+}
+
+// TestUpdateDetails_GuardIsNotClearedByNavigation pins the guard's scope. It is
+// a GLOBAL one-batch bound, not a per-context one: a navigation that clears it
+// while the batch is still running lets the next verdicts dispatch a second
+// scan on top of it (each memoises separately, so the per-image mitigation does
+// not span them), and it makes the unconditional clear on arrival a lie — the
+// refill would then see "nothing in flight" and dispatch a third for an entry
+// the second is already filling.
+//
+// The table names every site that used to reset it, including the three that
+// change neither the cache key nor the composer.
+func TestUpdateDetails_GuardIsNotClearedByNavigation(t *testing.T) {
+	servers := []config.Server{{Name: "s1", Host: "h1"}}
+	cases := []struct {
+		name  string
+		setup func(*Model)
+		msg   tea.Msg
+	}{
+		{
+			name:  "execDone",
+			setup: func(m *Model) { m.screen = screenSelectContainers },
+			msg:   execDoneMsg{},
+		},
+		{
+			name:  "esc from logs",
+			setup: func(m *Model) { m.screen = screenLogs },
+			msg:   tea.KeyMsg{Type: tea.KeyEsc},
+		},
+		{
+			name:  "esc from progress",
+			setup: func(m *Model) { m.screen = screenProgress; m.done = true },
+			msg:   tea.KeyMsg{Type: tea.KeyEsc},
+		},
+		{
+			name:  "esc container→project",
+			setup: func(m *Model) { m.screen = screenSelectContainers; m.showPicker = true },
+			msg:   tea.KeyMsg{Type: tea.KeyEsc},
+		},
+		{
+			name:  "esc project→server",
+			setup: func(m *Model) { m.screen = screenSelectProject; m.servers = servers },
+			msg:   tea.KeyMsg{Type: tea.KeyEsc},
+		},
+		{
+			name: "project pick",
+			setup: func(m *Model) {
+				m.screen = screenSelectProject
+				m.projects = []compose.Project{{Name: "p1", ConfigDir: "/p1"}}
+				m.projCursor = 0
+			},
+			msg: tea.KeyMsg{Type: tea.KeyEnter},
+		},
+		{
+			name:  "entryLocal fast-track",
+			setup: func(m *Model) { m.screen = screenSelectServer; m.serverCursor = 0 },
+			msg:   tea.KeyMsg{Type: tea.KeyEnter},
+		},
+		{
+			name:  "connectResultMsg error",
+			setup: func(m *Model) { m.screen = screenSelectServer },
+			msg:   connectResultMsg{err: errors.New("boom")},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			mc := &mockDetailComposer{details: detailFixture()}
+			mc.services = []string{"web"}
+			mc.updates = map[string]bool{"web": true}
+			m := NewModel(mc, io.Discard, func(compose.Project) runner.Composer { return mc }, servers, nil)
+			installFakeTick(&m)
+			tc.setup(&m)
+			m.composer = mc
+			m.detailsInFlight = true
+
+			model := modelOf(m.Update(tc.msg))
+			if !model.detailsInFlight {
+				t.Error("the navigation cleared the guard while the batch was still running")
+			}
+		})
+	}
+}
+
+// TestUpdateDetails_SelfHealsAtEveryScreenEntry covers the other half: an entry
+// that a lost batch left with no detail rows is refetched at the next screen
+// entry, at every site that consults maybeRefreshUpdatesCmd. Without it the
+// entry is a fresh SUCCESS, so the statusMsg self-heal skips it too and the
+// inspect screen — a pure consumer — shows `update available` with no `built`,
+// no `update id` and no `update built` for the full 10-minute TTL.
+func TestUpdateDetails_SelfHealsAtEveryScreenEntry(t *testing.T) {
+	servers := []config.Server{{Name: "s1", Host: "h1"}}
+	cases := []struct {
+		name  string
+		key   string // the updatesCacheKey the navigation lands on
+		setup func(*Model)
+		msg   tea.Msg
+	}{
+		{
+			name: "project pick",
+			key:  "/p1|",
+			setup: func(m *Model) {
+				m.screen = screenSelectProject
+				m.projects = []compose.Project{{Name: "p1", ConfigDir: "/p1"}}
+				m.projCursor = 0
+			},
+			msg: tea.KeyMsg{Type: tea.KeyEnter},
+		},
+		{
+			name:  "entryLocal fast-track",
+			key:   "|",
+			setup: func(m *Model) { m.screen = screenSelectServer; m.serverCursor = 0 },
+			msg:   tea.KeyMsg{Type: tea.KeyEnter},
+		},
+		{
+			name:  "execDone",
+			key:   "|",
+			setup: func(m *Model) { m.screen = screenSelectContainers },
+			msg:   execDoneMsg{},
+		},
+		{
+			name:  "esc from logs",
+			key:   "|",
+			setup: func(m *Model) { m.screen = screenLogs },
+			msg:   tea.KeyMsg{Type: tea.KeyEsc},
+		},
+		{
+			name: "esc from progress",
+			key:  "|",
+			setup: func(m *Model) {
+				m.screen = screenProgress
+				m.done = true
+				// StopOnly leaves the cache entry in place; a successful
+				// Deploy/Restart/Rollback deletes it, and then the site
+				// enqueues a full refresh rather than a refill.
+				m.pendingOp = runner.StopOnly
+			},
+			msg: tea.KeyMsg{Type: tea.KeyEsc},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			mc := &mockDetailComposer{details: detailFixture()}
+			mc.services = []string{"web"}
+			mc.updates = map[string]bool{"web": true}
+			m := NewModel(mc, io.Discard, func(compose.Project) runner.Composer { return mc }, servers, nil)
+			installFakeTick(&m)
+			tc.setup(&m)
+			m.composer = mc
+			// A fresh SUCCESS entry with a true verdict that no detail batch
+			// ever reported for — exactly what a lost batch leaves behind.
+			m.updateCache = map[string]updateEntry{tc.key: {fetchedAt: time.Now(), results: map[string]bool{"web": true}}}
+
+			_, cmd := m.Update(tc.msg)
+			if cmd == nil {
+				t.Fatal("the navigation returned no Cmd at all")
+			}
+			if !hasUpdateDetailsCmd(t, cmd) {
+				t.Error("the screen entry did not refill the entry's missing detail rows")
+			}
+			if mc.detailsCalls == 0 {
+				t.Error("the refill Cmd never reached UpdateDetails")
+			}
+		})
+	}
+}
+
+// TestUpdateDetails_LostBatchHealsAfterNavigating walks the whole reachable
+// sequence the previous three review rounds each rediscovered through a
+// different door: a batch is refused, an ordinary navigation happens while the
+// running one is still out, and the refused batch's entry must still end up
+// with its rows.
+func TestUpdateDetails_LostBatchHealsAfterNavigating(t *testing.T) {
+	mc := &mockDetailComposer{details: detailFixture()}
+	mc.services = []string{"web"}
+	mc.updates = map[string]bool{"web": true}
+	m := NewModel(mc, io.Discard, mockFactory(&mc.mockComposer), nil, nil)
+	installFakeTick(&m)
+	m.composer = mc
+	m.screen = screenSelectContainers
+	m.svcStatus = map[string]runner.ServiceStatus{"web": {Running: true}}
+
+	// Batch B1 goes out for entry E1.
+	first, b1 := m.Update(updatesMsg{results: map[string]bool{"web": true}, session: m.updatesSession})
+	mo := first.(Model)
+	if b1 == nil {
+		t.Fatal("the first verdicts must enqueue a detail fetch")
+	}
+	// U mid-scan: E2 replaces E1 and its own batch is refused.
+	second, refused := mo.Update(updatesMsg{results: map[string]bool{"web": true}, session: mo.updatesSession})
+	if refused != nil {
+		t.Fatalf("precondition: the second batch must be refused, got %T", refused())
+	}
+	so := second.(Model)
+
+	// The user opens the log viewer and comes straight back — same project,
+	// same host, same cache entry.
+	so.screen = screenLogs
+	back := modelOf(so.Update(tea.KeyMsg{Type: tea.KeyEsc}))
+	if !back.detailsInFlight {
+		t.Error("the navigation cleared the guard while B1 was still running")
+	}
+
+	// B1 reports at last, naming the superseded entry: its map is dropped and
+	// the refill goes out for E2 instead.
+	stale := b1().(updateDetailsMsg)
+	healed, retry := back.Update(stale)
+	if retry == nil {
+		t.Fatal("the entry left without details across the navigation was never refilled")
+	}
+	filled := modelOf(healed.(Model).Update(retry().(updateDetailsMsg)))
+	entry := filled.updateCache[filled.updatesCacheKey()]
+	if entry.details == nil {
+		t.Fatal("the entry ended the sequence with no detail rows — the ten-minute hole is back")
+	}
+	if got := entry.details["web"].NewID; got != detailFixture()["web"].NewID {
+		t.Errorf("cached NewID = %q, want %q", got, detailFixture()["web"].NewID)
+	}
+}
+
+// TestUpdateDetailsMsg_SupersededEntryIsDropped: a U press mid-fetch replaces
+// the cache entry under the SAME session, so neither the session nor the key
+// can tell the older fetch's (possibly truncated) map from the newer one. The
+// entry's own fetchedAt is the identity that can.
+func TestUpdateDetailsMsg_SupersededEntryIsDropped(t *testing.T) {
+	mc := &mockComposer{}
+	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
+	m.screen = screenSelectContainers
+	superseded := time.Now().Add(-time.Minute)
+	m.updateCache = map[string]updateEntry{m.updatesCacheKey(): {
+		fetchedAt: time.Now(),
+		results:   map[string]bool{"web": true},
+	}}
+
+	// forKey names the CURRENT context on purpose: with it omitted the key
+	// lookup refuses the message first and the fetchedAt conjunct this test is
+	// named for is never consulted. Only the identity mismatch may refuse it.
+	model := modelOf(m.Update(updateDetailsMsg{
+		details:  detailFixture(),
+		forKey:   m.updatesCacheKey(),
+		forEntry: superseded,
+	}))
+
+	if entry := model.updateCache[model.updatesCacheKey()]; entry.details != nil {
+		t.Errorf("details from a superseded fetch landed on the newer entry: %+v", entry.details)
+	}
+}
+
+// TestUpdateDetails_FetchCarriesADeadline: detailsInFlight is a GLOBAL
+// one-batch bound whose only clear is the message arrival, so the arrival has
+// to be guaranteed. m.ctx lives for the whole program and neither dockerRunner
+// adds a deadline, so without this bound one stalled registry call closes the
+// detail phase for the rest of the session — no departure site resets the flag
+// and U cannot force it.
+func TestUpdateDetails_FetchCarriesADeadline(t *testing.T) {
+	mc := &mockDetailComposer{details: detailFixture()}
+	mc.updates = map[string]bool{"web": true}
+	m := NewModel(mc, io.Discard, mockFactory(&mc.mockComposer), nil, nil)
+	m.composer = mc
+	m.screen = screenSelectContainers
+
+	_, cmd := m.Update(updatesMsg{results: map[string]bool{"web": true}, session: m.updatesSession})
+	if cmd == nil {
+		t.Fatal("the verdicts enqueued no detail fetch")
+	}
+	before := time.Now()
+	cmd()
+
+	if len(mc.detailsDeadlines) != 1 {
+		t.Fatalf("UpdateDetails calls = %d, want exactly 1", len(mc.detailsDeadlines))
+	}
+	deadline := mc.detailsDeadlines[0]
+	if deadline.IsZero() {
+		t.Fatal("the ctx handed to UpdateDetails carries no deadline — a stalled batch latches detailsInFlight for the rest of the session")
+	}
+	// Within a second of the constant, so a hand-rolled window that happens to
+	// be non-zero does not pass for the one the design bounds the phase with.
+	if got := deadline.Sub(before); got > updateDetailsTimeout+time.Second || got < updateDetailsTimeout-time.Second {
+		t.Errorf("deadline is %v out, want updateDetailsTimeout (%v)", got, updateDetailsTimeout)
+	}
+}
+
+// TestUpdatesMsg_StaleSessionDoesNotWriteTheEntry: the cache write is gated by
+// the session check, so a response from a previous project or server context
+// cannot pollute the new context's entry.
+func TestUpdatesMsg_StaleSessionDoesNotWriteTheEntry(t *testing.T) {
 	mc := &mockComposer{}
 	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
 	m.screen = screenSelectContainers
 	m.updatesSession = 7
 
-	model := modelOf(m.Update(updatesMsg{
+	model, cmd := m.Update(updatesMsg{
 		results: map[string]bool{"web": true},
-		details: detailFixture,
 		session: 6, // a fetch issued before the context changed
-	}))
+	})
 
-	if entry, ok := model.updateCache[model.updatesCacheKey()]; ok {
+	if entry, ok := model.(Model).updateCache[model.(Model).updatesCacheKey()]; ok {
 		t.Errorf("a stale updatesMsg wrote a cache entry: %+v", entry)
 	}
-	if model.updateInFlight {
+	if cmd != nil {
+		t.Errorf("a superseded scan must not spend the detail round-trips at all, got %T", cmd())
+	}
+	if model.(Model).updateInFlight {
 		t.Error("the in-flight guard must still clear on a stale arrival")
 	}
 }
@@ -11345,7 +12239,10 @@ func TestUpdatesMsg_StaleSessionDoesNotWriteDetails(t *testing.T) {
 // TestUpdatesMsg_RefreshesInspectSummary: the inspect screen is a consumer of
 // the update cache and never fetches details itself. Entering `i` on a cold
 // cache is exactly when the fetch is still in flight, so without this rebuild
-// the new IMAGE rows would stay absent until a back-out and re-entry.
+// the new IMAGE rows would stay absent until a back-out and re-entry. The
+// assertions read the MESSAGE's own data back out of the summary, so a rebuild
+// that ran before the cache write (and therefore rendered the previous entry)
+// fails here rather than passing on "the sentinel is gone".
 func TestUpdatesMsg_RefreshesInspectSummary(t *testing.T) {
 	m := inspectScreenModel(t)
 	m.svcStatus = map[string]runner.ServiceStatus{"web": {Running: true}}
@@ -11354,11 +12251,11 @@ func TestUpdatesMsg_RefreshesInspectSummary(t *testing.T) {
 	m.inspectSummary = "STALE SUMMARY"
 	m.setInspectContent()
 
-	model := modelOf(m.Update(updatesMsg{
+	mid, cmd := m.Update(updatesMsg{
 		results: map[string]bool{"web": true},
-		details: detailFixture,
 		session: m.updatesSession,
-	}))
+	})
+	model := mid.(Model)
 
 	if model.inspectSummary == "STALE SUMMARY" {
 		t.Fatal("an updatesMsg on screenInspect must rebuild the summary")
@@ -11366,11 +12263,80 @@ func TestUpdatesMsg_RefreshesInspectSummary(t *testing.T) {
 	if !strings.Contains(model.inspectSummary, "STATE") {
 		t.Errorf("the rebuilt summary should be the real one:\n%s", model.inspectSummary)
 	}
+	// The verdict from THIS message, not the previous entry's.
+	if !strings.Contains(model.inspectSummary, inspectRow("update", "available")) {
+		t.Errorf("the rebuild must render the verdict the message carried:\n%s", model.inspectSummary)
+	}
 	if got := model.inspectViewport.View(); strings.Contains(got, "STALE SUMMARY") {
 		t.Error("setInspectContent must follow the rebuild so the pane shows it")
 	}
 	if model.screen != screenInspect {
 		t.Errorf("screen = %d, want screenInspect", model.screen)
+	}
+
+	// The detail rows arrive on the follow-up message and rebuild again. The
+	// inspect double carries no UpdateDetailer, so the message is delivered
+	// directly rather than through a Cmd this composer would never produce.
+	_ = cmd
+	withDetails := modelOf(model.Update(updateDetailsMsg{
+		details:  detailFixture(),
+		forKey:   model.updatesCacheKey(),
+		forEntry: model.updateCache[model.updatesCacheKey()].fetchedAt,
+	}))
+	if !strings.Contains(withDetails.inspectSummary, inspectRow("update id", detailFixture()["web"].NewID)) {
+		t.Errorf("the detail rows must reach the summary without a re-entry:\n%s", withDetails.inspectSummary)
+	}
+}
+
+// TestUpdatesMsg_FailurePathClearsInspectRows: the rebuild runs on the FAILURE
+// path too. The entry that just landed carries no verdicts and no details, so a
+// summary drawn from a previous one must stop showing them — otherwise the
+// glyph column blanks while the inspect screen keeps contradicting it.
+func TestUpdatesMsg_FailurePathClearsInspectRows(t *testing.T) {
+	m := inspectScreenModel(t)
+	m.svcStatus = map[string]runner.ServiceStatus{"web": {Running: true}}
+	m.updateCache = map[string]updateEntry{m.updatesCacheKey(): {
+		fetchedAt: time.Now().Add(-3 * time.Minute),
+		results:   map[string]bool{"web": true},
+		details:   detailFixture(),
+	}}
+	m.rebuildInspectSummary()
+	for _, row := range []string{"update", "update id", "update built", "built"} {
+		if !strings.Contains(m.inspectSummary, inspectRow(row, "")) {
+			t.Fatalf("precondition: the summary should carry the %q row:\n%s", row, m.inspectSummary)
+		}
+	}
+
+	model := modelOf(m.Update(updatesMsg{
+		err:     errors.New("registry unreachable"),
+		session: m.updatesSession,
+	}))
+
+	for _, row := range []string{"update", "update id", "update built", "built"} {
+		if strings.Contains(model.inspectSummary, inspectRow(row, "")) {
+			t.Errorf("a failed check must drop the %q row:\n%s", row, model.inspectSummary)
+		}
+	}
+}
+
+// TestUpdatesMsg_RawModeKeepsHorizontalScroll: in raw mode the buffer is
+// untouched by update details, so writing it again would change nothing except
+// reset the horizontal offset — snapping a user who scrolled sideways through
+// the long JSON lines back to column 0 when a background refresh lands.
+func TestUpdatesMsg_RawModeKeepsHorizontalScroll(t *testing.T) {
+	raw := inspectScrolledRawModel(t)
+
+	model := modelOf(raw.Update(updatesMsg{
+		results: map[string]bool{"web": true},
+		session: raw.updatesSession,
+	}))
+
+	if strings.Contains(model.inspectViewport.View(), `"Name"`) {
+		t.Errorf("a background updatesMsg snapped the raw view back to column 0:\n%s", model.inspectViewport.View())
+	}
+	// The summary is still rebuilt, so a later `r` shows the new rows.
+	if !strings.Contains(model.inspectSummary, inspectRow("update", "available")) {
+		t.Errorf("the summary must still be rebuilt in raw mode:\n%s", model.inspectSummary)
 	}
 }
 
@@ -11386,7 +12352,6 @@ func TestUpdatesMsg_InspectRebuildIsScreenScoped(t *testing.T) {
 
 	model := modelOf(m.Update(updatesMsg{
 		results: map[string]bool{"web": true},
-		details: detailFixture,
 		session: m.updatesSession,
 	}))
 
@@ -11435,12 +12400,12 @@ func TestInspectScreen_UpdateRowsFollowTheVerdict(t *testing.T) {
 			entry: &updateEntry{
 				fetchedAt: fetched,
 				results:   map[string]bool{"web": true},
-				details:   detailFixture,
+				details:   detailFixture(),
 			},
 			wantRows: []string{
 				inspectRow("update", "available  (checked 3m ago)"),
 				inspectRow("built", "2026-07-07 17:47:22"),
-				inspectRow("update id", detailFixture["web"].NewID),
+				inspectRow("update id", detailFixture()["web"].NewID),
 				inspectRow("update built", "2026-08-19 19:14:43"),
 			},
 		},
@@ -11492,7 +12457,7 @@ func TestInspectScreen_UpdateRowsFollowTheVerdict(t *testing.T) {
 // detailFixture2 re-keys the shared detail fixture onto another service, so a
 // cross-service leak reads as a real map rather than an empty one.
 func detailFixture2(service string) map[string]compose.UpdateDetail {
-	return map[string]compose.UpdateDetail{service: detailFixture["web"]}
+	return map[string]compose.UpdateDetail{service: detailFixture()["web"]}
 }
 
 // TestUpdateDetails_FireOnTheGlyphTriggers pins the acceptance criterion that
@@ -11503,7 +12468,7 @@ func detailFixture2(service string) map[string]compose.UpdateDetail {
 // three; this is what keeps a future second mechanism from drifting away.
 func TestUpdateDetails_FireOnTheGlyphTriggers(t *testing.T) {
 	newComposer := func() *mockDetailComposer {
-		mc := &mockDetailComposer{details: detailFixture}
+		mc := &mockDetailComposer{details: detailFixture()}
 		mc.services = []string{"web"}
 		mc.status = map[string]runner.ServiceStatus{"web": {Running: true}}
 		mc.updates = map[string]bool{"web": true}
@@ -11513,16 +12478,22 @@ func TestUpdateDetails_FireOnTheGlyphTriggers(t *testing.T) {
 		return map[string]updateEntry{m.updatesCacheKey(): {
 			fetchedAt: time.Now(),
 			results:   map[string]bool{"web": true},
-			details:   detailFixture,
+			details:   detailFixture(),
 		}}
 	}
-	assertFetched := func(t *testing.T, mc *mockDetailComposer, msg updatesMsg) {
+	// The details ride the follow-up Cmd the updatesMsg handler enqueues, so
+	// "the trigger reached them" means that Cmd exists and produces them.
+	assertFetched := func(t *testing.T, m Model, mc *mockDetailComposer, msg updatesMsg) {
 		t.Helper()
+		if mc.detailsCalls != 0 {
+			t.Errorf("UpdateDetails calls = %d before the verdicts were delivered, want 0", mc.detailsCalls)
+		}
+		_, dm := deliverUpdates(t, m, msg)
 		if mc.detailsCalls != 1 {
 			t.Errorf("UpdateDetails calls = %d, want exactly 1", mc.detailsCalls)
 		}
-		if msg.details == nil {
-			t.Error("the details must ride the same message as the verdicts")
+		if dm == nil || dm.details == nil {
+			t.Error("the trigger must carry the details through to the follow-up message")
 		}
 	}
 
@@ -11539,7 +12510,7 @@ func TestUpdateDetails_FireOnTheGlyphTriggers(t *testing.T) {
 		if !ok {
 			t.Fatalf("expected an updatesMsg, got %T", raw)
 		}
-		assertFetched(t, mc, msg)
+		assertFetched(t, m, mc, msg)
 	})
 
 	t.Run("U bypasses a fresh cache entry", func(t *testing.T) {
@@ -11559,7 +12530,7 @@ func TestUpdateDetails_FireOnTheGlyphTriggers(t *testing.T) {
 		if !ok {
 			t.Fatalf("expected an updatesMsg, got %T", raw)
 		}
-		assertFetched(t, mc, msg)
+		assertFetched(t, m, mc, msg)
 	})
 
 	t.Run("post-Deploy invalidation", func(t *testing.T) {
@@ -11572,7 +12543,8 @@ func TestUpdateDetails_FireOnTheGlyphTriggers(t *testing.T) {
 		m.updateCache = primed(m)
 
 		result, cmd := m.Update(tea.KeyMsg{Type: tea.KeyEsc})
-		if _, present := result.(Model).updateCache[key]; present {
+		after := result.(Model)
+		if _, present := after.updateCache[key]; present {
 			t.Fatal("a successful Deploy should have invalidated the cache entry")
 		}
 		if cmd == nil {
@@ -11593,7 +12565,9 @@ func TestUpdateDetails_FireOnTheGlyphTriggers(t *testing.T) {
 		if !found {
 			t.Fatal("the post-Deploy batch carried no updates refresh")
 		}
-		assertFetched(t, mc, msg)
+		// Deliver into the post-esc model: the esc bumped updatesSession, so
+		// the pre-esc copy would drop the message as stale.
+		assertFetched(t, after, mc, msg)
 	})
 }
 
@@ -11627,6 +12601,65 @@ func TestReadOnly_NoAutomaticDetailFetch(t *testing.T) {
 		}
 	})
 
+	t.Run("a fresh entry missing its details is not refilled either", func(t *testing.T) {
+		// The self-heal that refetches a lost detail batch reaches every other
+		// screen through maybeRefreshUpdatesCmd, so it needs the same opt-in
+		// gate as the verdicts — otherwise the read-only view fans out to the
+		// registry on entry after all, just one message later.
+		c := newComposer()
+		m := inspectTestModel(t, c, c.services)
+		m.updateCache = map[string]updateEntry{m.updatesCacheKey(): {
+			fetchedAt: time.Now(),
+			results:   map[string]bool{"watchtower": true},
+		}}
+
+		if cmd := m.maybeRefreshUpdatesCmd(); cmd != nil {
+			t.Errorf("the read-only screen refilled the detail rows automatically: %T", cmd())
+		}
+		if c.detailsCalls != 0 {
+			t.Errorf("UpdateDetails calls = %d, want 0", c.detailsCalls)
+		}
+	})
+
+	t.Run("the arrival-path refill completes U rather than bypassing the gate", func(t *testing.T) {
+		// refillUpdateDetailsCmd is called from two sites and only the
+		// maybeRefreshUpdatesCmd one sits behind autoUpdatesAllowed(). The
+		// arrival site deliberately does NOT, and that is not a hole: the entry
+		// it fires for must be fresh, non-errored and under the read-only key,
+		// and the subtests above pin that no automatic path can create one
+		// there — U is the only thing that can. So a refill here is the
+		// deferred completion of that same U, restricted to the services it
+		// already reported true, not a second automatic fan-out. Gating it
+		// would instead drop the rows U asked for whenever its batch lost the
+		// race with another one.
+		c := newComposer()
+		m := inspectTestModel(t, c, c.services)
+		m.updateCache = map[string]updateEntry{m.updatesCacheKey(): {
+			fetchedAt: time.Now(),
+			results:   map[string]bool{"watchtower": true},
+		}}
+
+		// A batch that finished under a context the user has since left: it
+		// merges nowhere, and its arrival is the refill trigger.
+		_, cmd := m.Update(updateDetailsMsg{
+			details:  detailFixture2("watchtower"),
+			forKey:   "some-other-project|",
+			forEntry: time.Now().Add(-time.Minute),
+		})
+		if cmd == nil {
+			t.Fatal("the entry U created was left without its detail rows for the whole TTL")
+		}
+		if _, ok := cmd().(updateDetailsMsg); !ok {
+			t.Fatalf("the refill produced %T, want updateDetailsMsg", cmd())
+		}
+		if c.detailsCalls != 1 {
+			t.Errorf("UpdateDetails calls = %d, want exactly 1", c.detailsCalls)
+		}
+		if got := c.detailsArgs[0]; len(got) != 1 || got[0] != "watchtower" {
+			t.Errorf("UpdateDetails services = %v, want [watchtower] — only U's own true verdicts", got)
+		}
+	})
+
 	t.Run("U still fetches both halves", func(t *testing.T) {
 		c := newComposer()
 		m := inspectTestModel(t, c, c.services)
@@ -11640,14 +12673,15 @@ func TestReadOnly_NoAutomaticDetailFetch(t *testing.T) {
 		if !ok {
 			t.Fatalf("expected an updatesMsg, got %T", raw)
 		}
+		_, dm := deliverUpdates(t, m, msg)
 		if c.detailsCalls != 1 {
 			t.Fatalf("UpdateDetails calls = %d, want exactly 1", c.detailsCalls)
 		}
 		if got := c.detailsArgs[0]; len(got) != 1 || got[0] != "watchtower" {
 			t.Errorf("UpdateDetails services = %v, want [watchtower]", got)
 		}
-		if msg.details == nil {
-			t.Error("U must carry the details back with the verdicts")
+		if dm == nil || dm.details == nil {
+			t.Error("U must carry the details back on the follow-up message")
 		}
 	})
 }
@@ -11667,7 +12701,7 @@ func TestInspectScreen_RawModeIgnoresUpdateDetails(t *testing.T) {
 			m.updateCache = map[string]updateEntry{m.updatesCacheKey(): {
 				fetchedAt: time.Now().Add(-3 * time.Minute),
 				results:   map[string]bool{"web": true},
-				details:   detailFixture,
+				details:   detailFixture(),
 			}}
 		}
 		model := modelOf(m.Update(inspectDataMsg{data: []byte(inspectFixtureJSON), session: 1}))
@@ -16358,6 +17392,9 @@ func inspectScreenModel(t *testing.T) Model {
 	m := Model{screen: screenInspect, inspectSession: 1, inspectService: "web"}
 	m.width, m.height = 120, 24
 	m.inspectViewport = viewport.New(m.width-4, m.height-6)
+	// NewModel always assigns this; the literal above does not, and
+	// updateDetailsCmd derives its updateDetailsTimeout deadline from it.
+	m.ctx = context.Background()
 	result, _ := m.Update(inspectDataMsg{data: []byte(inspectFixtureJSON), session: 1})
 	got := result.(Model)
 	if got.inspectSummary == "" {
@@ -16503,6 +17540,30 @@ func TestInspectScreen_ResizeRebuildsAndKeepsRaw(t *testing.T) {
 	for _, line := range strings.Split(got.inspectSummary, "\n") {
 		if ansi.StringWidth(line) > 40 {
 			t.Errorf("rebuilt line exceeds the new width: %q", line)
+		}
+	}
+}
+
+// TestInspectScreen_ResizeKeepsUpdateRows: the resize path rebuilds through the
+// same rebuildInspectSummary, so the cache lookup travels with it. Without a
+// populated cache the resize test above never draws the update block at all.
+func TestInspectScreen_ResizeKeepsUpdateRows(t *testing.T) {
+	m := inspectScreenModel(t)
+	m.updateCache = map[string]updateEntry{m.updatesCacheKey(): {
+		fetchedAt: time.Now().Add(-3 * time.Minute),
+		results:   map[string]bool{"web": true},
+		details:   detailFixture(),
+	}}
+	m.rebuildInspectSummary()
+	if !strings.Contains(m.inspectSummary, inspectRow("update id", detailFixture()["web"].NewID)) {
+		t.Fatalf("precondition: the summary should carry the update rows:\n%s", m.inspectSummary)
+	}
+
+	got := modelOf(m.Update(tea.WindowSizeMsg{Width: 120, Height: 30}))
+
+	for _, row := range []string{"built", "update", "update id", "update built"} {
+		if !strings.Contains(got.inspectSummary, inspectRow(row, "")) {
+			t.Errorf("a resize dropped the %q row:\n%s", row, got.inspectSummary)
 		}
 	}
 }

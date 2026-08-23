@@ -163,19 +163,26 @@ const unknownPlatform = "unknown"
 // comes back empty) and the config step would return the platform-keyed map,
 // from which the code could pick a platform that is not the host's.
 //
-// hasIndex=false is returned ONLY for a well-formed document that has no
-// manifests key. Malformed JSON, or a manifests value that is not a list,
-// returns the abort state instead — every doubt fails closed.
+// hasIndex=false is returned ONLY for a well-formed document that carries keys
+// but no manifests key. Malformed JSON, a manifests value that is not a list,
+// and a document with no keys at all (`null` unmarshals into a nil map, `{}`
+// into an empty one) return the abort state instead — every doubt fails closed,
+// and an empty document describes no manifest to fall through to.
 //
 // Variant is a tie-breaker, never a requirement: the local probe cannot report
 // one (localProbeFormat omits .Variant deliberately), so an unqualified entry
-// wins when both forms are present and index order decides otherwise.
+// wins outright when one is present. When only variant-qualified entries match,
+// exactly one of them is unambiguous and MORE THAN ONE aborts: linux/arm ships
+// as v5+v7 (nginx) or v6+v7 (postgres), and picking either by index order would
+// draw a digest and a build date belonging to an image the host will never run
+// — the same silent-wrong-value the three-state return exists to prevent, one
+// level finer. arm64 and amd64 carry a single entry each and still resolve.
 func parseIndexPlatformDigest(data []byte, os, arch string) (digest string, hasIndex bool, found bool) {
 	if os == "" || arch == "" {
 		return "", true, false
 	}
 	var doc map[string]json.RawMessage
-	if err := json.Unmarshal(data, &doc); err != nil {
+	if err := json.Unmarshal(data, &doc); err != nil || len(doc) == 0 {
 		return "", true, false
 	}
 	rawList, ok := doc["manifests"]
@@ -186,7 +193,7 @@ func parseIndexPlatformDigest(data []byte, os, arch string) (digest string, hasI
 	if err := json.Unmarshal(rawList, &entries); err != nil {
 		return "", true, false
 	}
-	var fallback string
+	var qualified []string
 	for _, e := range entries {
 		if e.Platform.OS == unknownPlatform || e.Platform.Arch == unknownPlatform {
 			continue
@@ -201,12 +208,10 @@ func parseIndexPlatformDigest(data []byte, os, arch string) (digest string, hasI
 		if e.Platform.Variant == "" {
 			return dg, true, true
 		}
-		if fallback == "" {
-			fallback = dg
-		}
+		qualified = append(qualified, dg)
 	}
-	if fallback != "" {
-		return fallback, true, true
+	if len(qualified) == 1 {
+		return qualified[0], true, true
 	}
 	return "", true, false
 }
@@ -280,35 +285,26 @@ type imageConfigDoc struct {
 }
 
 // parseImageCreated reads the build timestamp out of the JSON imageConfigArgs
-// returns, accepting BOTH shapes that command produces:
+// returns.
 //
-//	bare object          a pinned ref returns the OCI image config directly
-//	platform-keyed map   a bare tag returns {"linux/amd64": {...}, ...}
+// Only the BARE OBJECT shape is read. Step 4 addresses either a
+// platform-pinned repo@digest ref or a ref the index step reported as
+// single-manifest, and both resolve to exactly one manifest, so buildx returns
+// the OCI image config directly. The platform-keyed map it returns for a bare
+// multi-platform tag cannot reach here: such a tag always has an index, so it
+// is pinned before step 4 or aborted at step 2.
 //
-// Both must be handled because a single-arch ref reaches step 4 unpinned — the
-// index step returns hasIndex=false for it, so there is no digest to pin with.
+// No platform cross-check is applied for the same reason: the config is the
+// only one the ref resolves to, and rejecting it on a mismatch would drop the
+// row for every legitimate single-arch image.
 //
-// The bare-object form is trusted without a platform cross-check: it is only
-// reached for a ref that resolves to exactly one manifest, so its config is the
-// only one there is. The map form IS matched on the requested platform, with
-// variant as a tie-breaker exactly as parseIndexPlatformDigest applies it —
-// an unqualified `os/arch` key wins, and among variant-qualified keys the
-// lexicographically first wins, since Go map iteration order is not stable.
-//
-// The false return covers every doubt: malformed JSON, a shape that is neither
-// form, an absent platform, and the 1970-01-01 reproducible-build sentinel that
+// The false return covers every doubt: malformed JSON, any other shape (a
+// platform-keyed map decodes cleanly with an empty created, so it takes this
+// path too), and the 1970-01-01 reproducible-build sentinel that
 // parseImageTimestamp rejects.
-func parseImageCreated(data []byte, os, arch string) (time.Time, bool) {
-	var doc map[string]json.RawMessage
-	if err := json.Unmarshal(data, &doc); err != nil || len(doc) == 0 {
-		return time.Time{}, false
-	}
-	raw, ok := pickImageConfig(doc, data, os, arch)
-	if !ok {
-		return time.Time{}, false
-	}
+func parseImageCreated(data []byte) (time.Time, bool) {
 	var cfg imageConfigDoc
-	if err := json.Unmarshal(raw, &cfg); err != nil {
+	if err := json.Unmarshal(data, &cfg); err != nil {
 		return time.Time{}, false
 	}
 	t := parseImageTimestamp(strings.TrimSpace(cfg.Created))
@@ -316,69 +312,6 @@ func parseImageCreated(data []byte, os, arch string) (time.Time, bool) {
 		return time.Time{}, false
 	}
 	return t, true
-}
-
-// imageConfigKeys are top-level fields only an OCI image config carries. A
-// platform-keyed map's keys always contain a "/" instead, which is the primary
-// discriminator; this set is the fail-closed second opinion, so a document that
-// is neither shape returns "absent" rather than being read as one of them.
-var imageConfigKeys = []string{"created", "architecture", "rootfs", "config", "history"}
-
-// pickImageConfig returns the raw config object for the requested platform out
-// of either shape parseImageCreated accepts, or ok=false when the document is
-// neither shape or the platform is absent.
-func pickImageConfig(doc map[string]json.RawMessage, data []byte, os, arch string) (json.RawMessage, bool) {
-	platformKeyed := false
-	for k := range doc {
-		if strings.Contains(k, "/") {
-			platformKeyed = true
-			break
-		}
-	}
-	if !platformKeyed {
-		for _, k := range imageConfigKeys {
-			if _, ok := doc[k]; ok {
-				return data, true
-			}
-		}
-		return nil, false
-	}
-	if os == "" || arch == "" {
-		return nil, false
-	}
-	var qualified []string
-	for k := range doc {
-		exact, match := platformKeyMatches(k, os, arch)
-		if !match {
-			continue
-		}
-		if exact {
-			return doc[k], true
-		}
-		qualified = append(qualified, k)
-	}
-	if len(qualified) == 0 {
-		return nil, false
-	}
-	sort.Strings(qualified)
-	return doc[qualified[0]], true
-}
-
-// platformKeyMatches reports whether a platform map key names the requested
-// os/arch, and whether it does so without a variant suffix. An entry whose os
-// or architecture is "unknown" is an attestation and never matches.
-func platformKeyMatches(key, os, arch string) (exact, match bool) {
-	parts := strings.Split(key, "/")
-	if len(parts) != 2 && len(parts) != 3 {
-		return false, false
-	}
-	if parts[0] == unknownPlatform || parts[1] == unknownPlatform {
-		return false, false
-	}
-	if !strings.EqualFold(parts[0], os) || !strings.EqualFold(parts[1], arch) {
-		return false, false
-	}
-	return len(parts) == 2, true
 }
 
 // updateDetailResult is one image's memoized detail outcome inside
@@ -418,6 +351,13 @@ func scanUpdateDetails(ctx context.Context, wanted map[string]string, d dockerRu
 	sort.Strings(svcs)
 	seen := make(map[string]updateDetailResult, len(wanted))
 	for _, svc := range svcs {
+		// A cancelled context makes every remaining d.run fail, and a per-image
+		// failure only continues the loop — so without this the scan would spawn
+		// a doomed process for every image left. A superseded refresh is the
+		// normal way this ends.
+		if err := ctx.Err(); err != nil {
+			return out, fmt.Errorf("update detail scan stopped: %w", err)
+		}
 		img := wanted[svc]
 		r, cached := seen[img]
 		if !cached {
@@ -468,22 +408,34 @@ func fetchUpdateDetail(ctx context.Context, d dockerRunner, image string) (Updat
 	if err != nil {
 		return UpdateDetail{}, fmt.Errorf("fetching manifest index for %q: %w", image, err)
 	}
-	ref, err := pinnedImageRef(image, indexOut, probe)
+	ref, pinned, err := pinnedImageRef(image, indexOut, probe)
 	if err != nil {
 		return UpdateDetail{}, err
 	}
 
-	rawOut, err := d.run(ctx, rawManifestArgs(ref)...)
-	if err != nil {
-		return UpdateDetail{}, fmt.Errorf("fetching raw manifest for %q: %w", ref, err)
+	// On the single-manifest path step 2 ALREADY returned the manifest, so its
+	// config.digest is in hand and step 3 would re-fetch it. Falling through to
+	// step 3 when that yields nothing keeps the row on a buildx whose
+	// {{json .Manifest}} does not carry the config descriptor.
+	newID := ""
+	if !pinned {
+		newID = parseConfigDigest(indexOut)
 	}
+	if newID == "" {
+		rawOut, err := d.run(ctx, rawManifestArgs(ref)...)
+		if err != nil {
+			return UpdateDetail{}, fmt.Errorf("fetching raw manifest for %q: %w", ref, err)
+		}
+		newID = parseConfigDigest(rawOut)
+	}
+
 	configOut, err := d.run(ctx, imageConfigArgs(ref)...)
 	if err != nil {
 		return UpdateDetail{}, fmt.Errorf("fetching image config for %q: %w", ref, err)
 	}
 
-	det := UpdateDetail{LocalCreated: probe.created, NewID: parseConfigDigest(rawOut)}
-	if created, ok := parseImageCreated(configOut, probe.os, probe.arch); ok {
+	det := UpdateDetail{LocalCreated: probe.created, NewID: newID}
+	if created, ok := parseImageCreated(configOut); ok {
 		det.NewCreated = created
 	}
 	return det, nil
@@ -491,17 +443,19 @@ func fetchUpdateDetail(ctx context.Context, d dockerRunner, image string) (Updat
 
 // pinnedImageRef turns step 2's three-state answer into the reference steps 3
 // and 4 address. StripTag is reused rather than re-deriving the repo portion,
-// so a registry port (localhost:5000/foo:1) survives the rewrite.
-func pinnedImageRef(image string, indexOut []byte, probe localProbe) (string, error) {
+// so a registry port (localhost:5000/foo:1) survives the rewrite. pinned is
+// false on the single-manifest path, which tells the caller step 2's own output
+// is the manifest and step 3 can be skipped.
+func pinnedImageRef(image string, indexOut []byte, probe localProbe) (ref string, pinned bool, err error) {
 	digest, hasIndex, found := parseIndexPlatformDigest(indexOut, probe.os, probe.arch)
 	switch {
 	case !hasIndex:
 		// Single-manifest reference: there is nothing to pin to, and the
 		// original ref already addresses the only manifest there is.
-		return image, nil
+		return image, false, nil
 	case !found:
-		return "", fmt.Errorf("no %s/%s manifest in the index for %q", probe.os, probe.arch, image)
+		return "", false, fmt.Errorf("no %s/%s manifest in the index for %q", probe.os, probe.arch, image)
 	default:
-		return StripTag(image) + "@" + digest, nil
+		return StripTag(image) + "@" + digest, true, nil
 	}
 }

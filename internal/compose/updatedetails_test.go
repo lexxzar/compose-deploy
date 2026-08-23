@@ -215,7 +215,10 @@ func TestParseIndexPlatformDigest_NeverReturnsAttestation(t *testing.T) {
 		"sha256:792be14f71a03d7c73c4d7fb9c1f0d0b83dc294544ae1926db39b8ecaf414a1d": true,
 		"sha256:0dfea8046dfa75a40933444052a7a697d5a05387d6460cd3e33822d7aedd5fd5": true,
 	}
-	for _, arch := range []string{"amd64", "arm64", "arm", "386", "ppc64le", "riscv64", "s390x"} {
+	// "arm" is deliberately absent: the real index carries it twice (v5 and
+	// v7), which is the ambiguity TestParseIndexPlatformDigest_AmbiguousVariant
+	// pins as an abort.
+	for _, arch := range []string{"amd64", "arm64", "386", "ppc64le", "riscv64", "s390x"} {
 		dg, _, found := parseIndexPlatformDigest(nginx, "linux", arch)
 		if !found {
 			t.Errorf("linux/%s not found in the nginx index", arch)
@@ -314,11 +317,11 @@ func TestParseIndexPlatformDigest_VariantTieBreaker(t *testing.T) {
 			want: unqualified,
 		},
 		{
-			// Variant is a tie-breaker, never a requirement: with only
-			// qualified entries, index order decides.
-			name: "first variant wins when no unqualified entry exists",
-			data: index(entry(v6, "arm", "v6"), entry(v7, "arm", "v7")),
-			want: v6,
+			// A single variant-qualified entry is unambiguous: it is the only
+			// thing the os+arch pair can mean.
+			name: "the only variant resolves",
+			data: index(entry(v7, "arm", "v7"), entry(unqualified, "amd64", "")),
+			want: v7,
 		},
 	}
 	for _, tt := range tests {
@@ -329,6 +332,40 @@ func TestParseIndexPlatformDigest_VariantTieBreaker(t *testing.T) {
 			}
 			if dg != tt.want {
 				t.Errorf("digest = %q, want %q", dg, tt.want)
+			}
+		})
+	}
+
+	// Two variant-qualified entries and no unqualified one is a GUESS, and a
+	// guess draws another image's digest and build date under a row inviting
+	// comparison with the local one. Abort instead.
+	ambiguous := index(entry(v6, "arm", "v6"), entry(v7, "arm", "v7"))
+	dg, hasIndex, found := parseIndexPlatformDigest(ambiguous, "linux", "arm")
+	if !hasIndex {
+		t.Errorf("hasIndex = false, want true (an index IS present)")
+	}
+	if found || dg != "" {
+		t.Errorf("ambiguous variants = %q/%v, want \"\"/false", dg, found)
+	}
+}
+
+func TestParseIndexPlatformDigest_AmbiguousVariant(t *testing.T) {
+	// Both real captures carry linux/arm twice — nginx as v5+v7, postgres as
+	// v6+v7. A 32-bit ARM host (Raspberry Pi OS) reports architecture "arm"
+	// with no variant the local probe can see, so neither entry can be chosen
+	// without guessing. The rows drop; arm64 and amd64 are unaffected.
+	for _, name := range []string{"imagetools_manifest_index_nginx.json", "imagetools_manifest_index_postgres.json"} {
+		t.Run(name, func(t *testing.T) {
+			data := readFixture(t, name)
+			dg, hasIndex, found := parseIndexPlatformDigest(data, "linux", "arm")
+			if !hasIndex {
+				t.Errorf("hasIndex = false, want true")
+			}
+			if found || dg != "" {
+				t.Errorf("linux/arm = %q/%v, want \"\"/false", dg, found)
+			}
+			if _, _, ok := parseIndexPlatformDigest(data, "linux", "arm64"); !ok {
+				t.Errorf("linux/arm64 must still resolve")
 			}
 		})
 	}
@@ -347,6 +384,11 @@ func TestParseIndexPlatformDigest_FailsClosed(t *testing.T) {
 		{name: "malformed json", data: `{"manifests":[`, os: "linux", arch: "arm64"},
 		{name: "not json at all", data: "Name: docker.io/library/nginx:latest", os: "linux", arch: "arm64"},
 		{name: "empty input", data: "", os: "linux", arch: "arm64"},
+		// A null document unmarshals into a NIL map without an error, so the
+		// manifests lookup misses and the parser would fall through to the
+		// single-manifest state — failing OPEN, against the rule above.
+		{name: "null document", data: "null", os: "linux", arch: "arm64"},
+		{name: "empty object", data: "{}", os: "linux", arch: "arm64"},
 		{name: "manifests is null", data: `{"manifests":null}`, os: "linux", arch: "arm64"},
 		{name: "manifests is an object", data: `{"manifests":{"a":1}}`, os: "linux", arch: "arm64"},
 		{name: "manifests is empty", data: `{"manifests":[]}`, os: "linux", arch: "arm64"},
@@ -521,169 +563,55 @@ func TestParseConfigDigest_NormalizesCase(t *testing.T) {
 }
 
 func TestParseImageCreated_ObjectForm(t *testing.T) {
-	// A PINNED ref returns the OCI image config directly.
+	// Step 4 only ever addresses a ref that resolves to exactly one manifest,
+	// so buildx returns the OCI image config directly.
 	data := readFixture(t, "imagetools_image_config_object.json")
 	want := time.Date(2026, 8, 19, 19, 14, 43, 123456789, time.UTC)
-	got, ok := parseImageCreated(data, "linux", "arm64")
+	got, ok := parseImageCreated(data)
 	if !ok {
 		t.Fatalf("parseImageCreated() ok = false, want true")
 	}
 	if !got.Equal(want) {
 		t.Errorf("created = %v, want %v", got, want)
 	}
-	// The bare object is the only config there is, so the requested platform
-	// does not gate it — a single-arch ref reaches step 4 unpinned.
-	got, ok = parseImageCreated(data, "linux", "amd64")
-	if !ok || !got.Equal(want) {
-		t.Errorf("parseImageCreated(mismatched platform) = %v/%v, want %v/true", got, ok, want)
-	}
-}
-
-func TestParseImageCreated_MapForm(t *testing.T) {
-	// A BARE tag returns a platform-keyed map.
-	data := readFixture(t, "imagetools_image_config_map.json")
-	tests := []struct {
-		name     string
-		os, arch string
-		want     time.Time
-	}{
-		{
-			name: "linux/arm64", os: "linux", arch: "arm64",
-			want: time.Date(2026, 8, 19, 19, 14, 43, 123456789, time.UTC),
-		},
-		{
-			name: "linux/amd64", os: "linux", arch: "amd64",
-			want: time.Date(2026, 8, 19, 19, 14, 40, 500000000, time.UTC),
-		},
-		{
-			// The variant-qualified key still matches on os+arch alone.
-			name: "linux/arm resolves the v7 key", os: "linux", arch: "arm",
-			want: time.Date(2026, 8, 19, 19, 14, 38, 250000000, time.UTC),
-		},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			got, ok := parseImageCreated(data, tt.os, tt.arch)
-			if !ok {
-				t.Fatalf("parseImageCreated() ok = false, want true")
-			}
-			if !got.Equal(tt.want) {
-				t.Errorf("created = %v, want %v", got, tt.want)
-			}
-		})
-	}
 }
 
 func TestParseImageCreated_EpochSentinel(t *testing.T) {
 	// Reproducible builds (distroless, ko, Bazel, nix) report 1970-01-01.
 	// That is a placeholder, not a build date, so the row must drop.
-	data := readFixture(t, "imagetools_image_config_map.json")
-	if got, ok := parseImageCreated(data, "linux", "386"); ok {
-		t.Errorf("parseImageCreated(linux/386) = %v/true, want zero/false", got)
-	}
 	obj := []byte(`{"created":"1970-01-01T00:00:00Z","architecture":"amd64","os":"linux"}`)
-	if got, ok := parseImageCreated(obj, "linux", "amd64"); ok {
+	if got, ok := parseImageCreated(obj); ok {
 		t.Errorf("parseImageCreated(epoch object) = %v/true, want zero/false", got)
 	}
 }
 
 func TestParseImageCreated_OmitsOnDoubt(t *testing.T) {
 	tests := []struct {
-		name     string
-		in       string
-		os, arch string
-	}{
-		{name: "malformed json", in: `{"created":`, os: "linux", arch: "amd64"},
-		{name: "not json at all", in: "Name: docker.io/library/nginx:latest", os: "linux", arch: "amd64"},
-		{name: "empty input", in: "", os: "linux", arch: "amd64"},
-		{name: "empty object", in: `{}`, os: "linux", arch: "amd64"},
-		{name: "json array", in: `[{"created":"2026-08-19T19:14:43Z"}]`, os: "linux", arch: "amd64"},
-		// Neither shape: no "/" in the keys and no image-config field either.
-		{name: "unrecognised shape", in: `{"foo":1,"bar":2}`, os: "linux", arch: "amd64"},
-		{name: "object with no created", in: `{"architecture":"amd64","os":"linux","rootfs":{}}`, os: "linux", arch: "amd64"},
-		{name: "object created is garbage", in: `{"created":"yesterday","rootfs":{}}`, os: "linux", arch: "amd64"},
-		{
-			name: "map platform absent",
-			in:   `{"linux/amd64":{"created":"2026-08-19T19:14:43Z"}}`,
-			os:   "windows", arch: "amd64",
-		},
-		{
-			name: "map arch absent",
-			in:   `{"linux/amd64":{"created":"2026-08-19T19:14:43Z"}}`,
-			os:   "linux", arch: "s390x",
-		},
-		{
-			// An attestation entry must never satisfy a platform request.
-			name: "map only unknown platform",
-			in:   `{"unknown/unknown":{"created":"2026-08-19T19:14:43Z"}}`,
-			os:   "unknown", arch: "unknown",
-		},
-		{
-			name: "map with empty os argument",
-			in:   `{"linux/amd64":{"created":"2026-08-19T19:14:43Z"}}`,
-			os:   "", arch: "amd64",
-		},
-		{
-			name: "map with empty arch argument",
-			in:   `{"linux/amd64":{"created":"2026-08-19T19:14:43Z"}}`,
-			os:   "linux", arch: "",
-		},
-		{
-			name: "map value is not an object",
-			in:   `{"linux/amd64":"2026-08-19T19:14:43Z"}`,
-			os:   "linux", arch: "amd64",
-		},
-		{
-			name: "map key has too many segments",
-			in:   `{"linux/arm/v7/extra":{"created":"2026-08-19T19:14:43Z"}}`,
-			os:   "linux", arch: "arm",
-		},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			got, ok := parseImageCreated([]byte(tt.in), tt.os, tt.arch)
-			if ok || !got.IsZero() {
-				t.Errorf("parseImageCreated(%q) = %v/%v, want zero/false", tt.in, got, ok)
-			}
-		})
-	}
-}
-
-func TestParseImageCreated_VariantTieBreaker(t *testing.T) {
-	// Go map iteration order is not stable, so the choice among matching keys
-	// must not depend on it: an unqualified key wins, and among qualified keys
-	// the lexicographically first wins.
-	unqualified := `"linux/arm":{"created":"2026-08-19T10:00:00Z"}`
-	v6 := `"linux/arm/v6":{"created":"2026-08-19T11:00:00Z"}`
-	v7 := `"linux/arm/v7":{"created":"2026-08-19T12:00:00Z"}`
-
-	tests := []struct {
 		name string
 		in   string
-		want time.Time
 	}{
+		{name: "malformed json", in: `{"created":`},
+		{name: "not json at all", in: "Name: docker.io/library/nginx:latest"},
+		{name: "empty input", in: ""},
+		{name: "empty object", in: `{}`},
+		{name: "json array", in: `[{"created":"2026-08-19T19:14:43Z"}]`},
+		{name: "unrecognised shape", in: `{"foo":1,"bar":2}`},
+		{name: "object with no created", in: `{"architecture":"amd64","os":"linux","rootfs":{}}`},
+		{name: "object created is garbage", in: `{"created":"yesterday","rootfs":{}}`},
 		{
-			name: "unqualified key wins",
-			in:   `{` + v7 + `,` + unqualified + `,` + v6 + `}`,
-			want: time.Date(2026, 8, 19, 10, 0, 0, 0, time.UTC),
-		},
-		{
-			name: "lowest variant key wins when no unqualified key exists",
-			in:   `{` + v7 + `,` + v6 + `}`,
-			want: time.Date(2026, 8, 19, 11, 0, 0, 0, time.UTC),
+			// The platform-keyed map a BARE multi-platform tag returns cannot
+			// reach step 4 — such a tag always carries an index, so it is
+			// pinned before step 4 or aborted at step 2. It decodes cleanly
+			// with no top-level "created", so it omits rather than guesses.
+			name: "platform-keyed map is not read",
+			in:   `{"linux/amd64":{"created":"2026-08-19T19:14:43Z"},"linux/arm/v7":{"created":"2026-08-19T19:14:38Z"}}`,
 		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			// Repeat so a map-order-dependent implementation cannot pass by luck.
-			for i := 0; i < 50; i++ {
-				got, ok := parseImageCreated([]byte(tt.in), "linux", "arm")
-				if !ok {
-					t.Fatalf("parseImageCreated() ok = false, want true")
-				}
-				if !got.Equal(tt.want) {
-					t.Fatalf("created = %v, want %v", got, tt.want)
-				}
+			got, ok := parseImageCreated([]byte(tt.in))
+			if ok || !got.IsZero() {
+				t.Errorf("parseImageCreated(%q) = %v/%v, want zero/false", tt.in, got, ok)
 			}
 		})
 	}
@@ -828,10 +756,12 @@ func TestScanUpdateDetails_HappyPath(t *testing.T) {
 
 func TestScanUpdateDetails_SingleManifest(t *testing.T) {
 	// A single-manifest ref has no manifests key, so there is nothing to pin
-	// to and the ORIGINAL ref must carry the last two steps. Step 4 then
-	// returns the platform-keyed map form rather than a bare object.
+	// to and the ORIGINAL ref must carry the remaining steps. Step 2's own
+	// output IS that manifest, so its config.digest is already in hand and
+	// step 3 must NOT run — every skipped registry call is one further from
+	// the anonymous rate limit.
 	raw := readFixture(t, "imagetools_raw_manifest.json")
-	config := readFixture(t, "imagetools_image_config_map.json")
+	config := readFixture(t, "imagetools_image_config_object.json")
 
 	f := detailRunner(t, func(step detailStep, ref string) ([]byte, error) {
 		switch step {
@@ -840,6 +770,7 @@ func TestScanUpdateDetails_SingleManifest(t *testing.T) {
 		case stepIndex:
 			return raw, nil // no manifests key
 		case stepRaw:
+			t.Errorf("step 3 must not run when step 2 already returned the manifest")
 			return raw, nil
 		default:
 			return config, nil
@@ -860,10 +791,47 @@ func TestScanUpdateDetails_SingleManifest(t *testing.T) {
 	if !det.NewCreated.Equal(detailWantNewCreated) {
 		t.Errorf("NewCreated = %v, want %v", det.NewCreated, detailWantNewCreated)
 	}
+	if len(f.runCalls) != 3 {
+		t.Errorf("made %d docker calls, want 3 (step 3 reuses step 2's output): %v", len(f.runCalls), f.runCalls)
+	}
 	for i, ref := range stepRefs(f) {
 		if ref != "internal/app:v3" {
 			t.Errorf("call %d addressed %q, want the original ref", i, ref)
 		}
+	}
+}
+
+func TestScanUpdateDetails_SingleManifestFallsBackToRaw(t *testing.T) {
+	// If step 2's {{json .Manifest}} does NOT carry a config descriptor (a
+	// buildx version whose template output differs), the --raw call still runs
+	// so the `update id` row survives.
+	raw := readFixture(t, "imagetools_raw_manifest.json")
+	config := readFixture(t, "imagetools_image_config_object.json")
+	rawSteps := 0
+
+	f := detailRunner(t, func(step detailStep, ref string) ([]byte, error) {
+		switch step {
+		case stepLocal:
+			return []byte(detailLocalProbeARM64), nil
+		case stepIndex:
+			return []byte(`{"schemaVersion":2,"mediaType":"application/vnd.oci.image.manifest.v1+json"}`), nil
+		case stepRaw:
+			rawSteps++
+			return raw, nil
+		default:
+			return config, nil
+		}
+	})
+
+	out, err := scanUpdateDetails(context.Background(), map[string]string{"web": "internal/app:v3"}, f)
+	if err != nil {
+		t.Fatalf("scanUpdateDetails() error = %v, want nil", err)
+	}
+	if rawSteps != 1 {
+		t.Errorf("step 3 ran %d times, want 1", rawSteps)
+	}
+	if out["web"].NewID != detailNewID {
+		t.Errorf("NewID = %q, want %q", out["web"].NewID, detailNewID)
 	}
 }
 
@@ -1169,22 +1137,23 @@ func TestPinnedImageRef(t *testing.T) {
 	probe := localProbe{os: "linux", arch: "arm64"}
 
 	tests := []struct {
-		name    string
-		image   string
-		data    []byte
-		probe   localProbe
-		want    string
-		wantErr bool
+		name       string
+		image      string
+		data       []byte
+		probe      localProbe
+		want       string
+		wantPinned bool
+		wantErr    bool
 	}{
 		{
 			name: "index pins by digest", image: "nginx:1.27", data: index, probe: probe,
-			want: "nginx@" + detailNginxARM64,
+			want: "nginx@" + detailNginxARM64, wantPinned: true,
 		},
 		{
 			// StripTag keeps a registry port intact, which is why the repo
 			// portion is never re-derived here.
 			name: "registry port survives", image: "localhost:5000/nginx:1.27", data: index, probe: probe,
-			want: "localhost:5000/nginx@" + detailNginxARM64,
+			want: "localhost:5000/nginx@" + detailNginxARM64, wantPinned: true,
 		},
 		{
 			name: "single manifest keeps the original ref", image: "internal/app:v3", data: single, probe: probe,
@@ -1201,7 +1170,7 @@ func TestPinnedImageRef(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got, err := pinnedImageRef(tt.image, tt.data, tt.probe)
+			got, pinned, err := pinnedImageRef(tt.image, tt.data, tt.probe)
 			if tt.wantErr {
 				if err == nil {
 					t.Fatalf("pinnedImageRef() = %q, want an error", got)
@@ -1213,6 +1182,11 @@ func TestPinnedImageRef(t *testing.T) {
 			}
 			if got != tt.want {
 				t.Errorf("pinnedImageRef() = %q, want %q", got, tt.want)
+			}
+			// pinned=false is what tells the caller step 2's output IS the
+			// manifest, so step 3 can be skipped.
+			if pinned != tt.wantPinned {
+				t.Errorf("pinnedImageRef() pinned = %v, want %v", pinned, tt.wantPinned)
 			}
 		})
 	}
@@ -1469,5 +1443,132 @@ func TestHostContainersUpdateDetails_DiscoveryErrorPropagates(t *testing.T) {
 	}
 	if len(f.runCalls) != 1 {
 		t.Errorf("made %d docker calls, want 1 — a failed discovery must not reach the registry", len(f.runCalls))
+	}
+}
+
+// TestScanUpdateDetails_VisitsInSortedOrder pins the ordering rule directly
+// rather than through the transport-abort test, which could pass on Go's map
+// iteration order alone. Every image costs three registry round-trips, so which
+// images are reached before an abort must be deterministic.
+func TestScanUpdateDetails_VisitsInSortedOrder(t *testing.T) {
+	wanted := map[string]string{"c-cache": "redis:7", "a-web": "nginx:1.27", "b-api": "alpine:3"}
+	want := []string{"nginx:1.27", "alpine:3", "redis:7"}
+
+	// Repeat so a map-order-dependent implementation cannot pass by luck.
+	for i := 0; i < 50; i++ {
+		f := detailRunner(t, func(step detailStep, ref string) ([]byte, error) {
+			// Fail at step 1 so each image costs exactly one recorded call.
+			return nil, fmt.Errorf("no such image: %s", ref)
+		})
+		if _, err := scanUpdateDetails(context.Background(), wanted, f); err != nil {
+			t.Fatalf("scanUpdateDetails() error = %v, want nil", err)
+		}
+		if got := stepRefs(f); !slices.Equal(got, want) {
+			t.Fatalf("visit order = %v, want %v", got, want)
+		}
+	}
+}
+
+// TestScanUpdateDetails_StopsOnCancelledContext pins the early return. Without
+// it a cancelled context turns every remaining d.run into a per-image failure,
+// which only continues the loop — so the scan would spawn a doomed process for
+// every image left. A superseded refresh is the normal way this ends.
+func TestScanUpdateDetails_StopsOnCancelledContext(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	f := detailRunner(t, func(step detailStep, ref string) ([]byte, error) {
+		t.Errorf("no docker call is allowed once the context is cancelled")
+		return nil, nil
+	})
+	out, err := scanUpdateDetails(ctx, map[string]string{"web": "nginx:1.27", "api": "redis:7"}, f)
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("scanUpdateDetails() error = %v, want it to wrap context.Canceled", err)
+	}
+	if len(out) != 0 {
+		t.Errorf("scanUpdateDetails() = %v, want no entries", out)
+	}
+}
+
+// TestComposeUpdateDetails_UnknownServiceCostsNothing pins the filter for a
+// verdict naming a service the compose file no longer carries: it resolves to
+// no image, so the scan must reach the registry zero times rather than reading
+// an empty filter result as "all services".
+func TestComposeUpdateDetails_UnknownServiceCostsNothing(t *testing.T) {
+	var argv [][]string
+	c := New("/srv/app")
+	c.SetStandalone(false)
+	c.SetTestHooks(nil, func(cmd *exec.Cmd) ([]byte, error) {
+		argv = append(argv, append([]string(nil), cmd.Args...))
+		return []byte(detailComposeConfig), nil
+	})
+
+	out, err := c.UpdateDetails(context.Background(), []string{"ghost"})
+	if err != nil {
+		t.Fatalf("UpdateDetails() error = %v, want nil", err)
+	}
+	if len(out) != 0 {
+		t.Errorf("UpdateDetails() = %v, want no entries", out)
+	}
+	if len(argv) != 1 {
+		t.Errorf("made %d docker calls, want 1 (the discovery call only): %v", len(argv), argv)
+	}
+}
+
+// TestRemoteUpdateDetails_DiscoveryErrorPropagates mirrors the Compose and
+// HostContainers cases: a failed `docker compose config` yields no image map,
+// so there is nothing partial to return and no registry call may follow.
+func TestRemoteUpdateDetails_DiscoveryErrorPropagates(t *testing.T) {
+	var calls int
+	r := &RemoteCompose{Host: "user@example.com", ProjectDir: "/srv/app"}
+	r.SetTestHooks(nil, func(cmd *exec.Cmd) ([]byte, error) {
+		calls++
+		return nil, errors.New("ssh: connect to host example.com port 22: Connection refused")
+	})
+
+	out, err := r.UpdateDetails(context.Background(), []string{"web"})
+	if err == nil {
+		t.Fatalf("UpdateDetails() = %v, want an error", out)
+	}
+	if out != nil {
+		t.Errorf("UpdateDetails() = %v, want a nil map on discovery failure", out)
+	}
+	if calls != 1 {
+		t.Errorf("made %d ssh calls, want 1 — a failed discovery must not reach the registry", calls)
+	}
+}
+
+// hostPsDetailTwo carries two resolvable unmanaged containers, so the services
+// argument is the only thing that can narrow the scan.
+const hostPsDetailTwo = `{"ID":"bbb444555666","Names":"watchtower","Image":"nginx:1.27","State":"running","Status":"Up 2 days","Labels":"org.opencontainers.image.title=watchtower"}
+{"ID":"eee333444555","Names":"portainer","Image":"redis:7","State":"running","Status":"Up 5 days","Labels":""}`
+
+// TestHostContainersUpdateDetails_HonoursServiceFilter pins the filter on the
+// read-only binding. The unmanaged screen is the worst case for the registry
+// quota — every `docker ps -a` container contributes an image, and each image
+// costs three registry calls — so the filter is the only guard.
+func TestHostContainersUpdateDetails_HonoursServiceFilter(t *testing.T) {
+	reply := detailStepReply(t)
+	f := &fakeDockerRunner{runFunc: func(args []string) ([]byte, error) {
+		if len(args) >= 1 && args[0] == "ps" {
+			return []byte(hostPsDetailTwo), nil
+		}
+		if strings.Contains(args[len(args)-1], "redis") {
+			t.Errorf("redis:7 must not be reached: UpdateDetails asked for watchtower only")
+		}
+		return reply(classifyDetailCall(args), args[len(args)-1])
+	}}
+
+	out, err := (&HostContainers{docker: f}).UpdateDetails(context.Background(), []string{"watchtower"})
+	if err != nil {
+		t.Fatalf("UpdateDetails() error = %v, want nil", err)
+	}
+	if len(out) != 1 {
+		t.Fatalf("UpdateDetails() = %v, want only the requested container", out)
+	}
+	if _, ok := out["watchtower"]; !ok {
+		t.Errorf("UpdateDetails() = %v, want an entry for watchtower", out)
+	}
+	if len(f.runCalls) != 5 {
+		t.Errorf("made %d docker calls, want 5 (ps + 4 steps): %v", len(f.runCalls), f.runCalls)
 	}
 }

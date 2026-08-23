@@ -179,7 +179,7 @@ func (b *inspectBuilder) String() string {
 // the update rows existed.
 type inspectUpdateInfo struct {
 	now       time.Time
-	detail    *compose.UpdateDetail
+	detail    compose.UpdateDetail
 	verdict   *bool
 	checkedAt time.Time
 }
@@ -312,21 +312,17 @@ func inspectImageSection(b *inspectBuilder, doc compose.InspectDoc, upd inspectU
 	if doc.Image != "" {
 		b.kv("image id", doc.Image)
 	}
-	if upd.detail != nil {
-		if built := formatTimeWithAge(upd.detail.LocalCreated, upd.now); built != "" {
-			b.kv("built", built)
-		}
+	if built := formatTimeWithAge(upd.detail.LocalCreated, upd.now); built != "" {
+		b.kv("built", built)
 	}
 	if upd.verdict != nil {
 		b.kv("update", formatUpdateVerdict(*upd.verdict, upd.checkedAt, upd.now))
 	}
-	if upd.detail != nil {
-		if upd.detail.NewID != "" {
-			b.kv("update id", upd.detail.NewID)
-		}
-		if built := formatTimeWithAge(upd.detail.NewCreated, upd.now); built != "" {
-			b.kv("update built", built)
-		}
+	if upd.detail.NewID != "" {
+		b.kv("update id", upd.detail.NewID)
+	}
+	if built := formatTimeWithAge(upd.detail.NewCreated, upd.now); built != "" {
+		b.kv("update built", built)
 	}
 	if cmd != "" {
 		b.kv("command", cmd)
@@ -471,12 +467,12 @@ func formatInspectTime(s string) string {
 }
 
 // formatInspectTimeValue renders an already-parsed timestamp in the same layout
-// as formatInspectTime. Both the docker zero time and the 1970 epoch are absent
-// values rather than data — the latter is what reproducible builders (distroless,
+// as formatInspectTime. One guard covers both the docker zero time (year 1, so
+// far below the epoch) and 1970 itself: each is an absent value rather than data — the latter is what reproducible builders (distroless,
 // ko, Bazel, nix) write into an image's Created field — so each yields "" and the
 // caller omits the row.
 func formatInspectTimeValue(t time.Time) string {
-	if t.Year() <= 1 || t.Unix() <= 0 {
+	if t.Unix() <= 0 {
 		return ""
 	}
 	return t.Format("2006-01-02 15:04:05")

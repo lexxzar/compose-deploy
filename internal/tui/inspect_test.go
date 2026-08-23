@@ -742,7 +742,7 @@ func TestBuildInspectSummary_UpdateRows(t *testing.T) {
 	localBuilt := time.Date(2026, 7, 7, 17, 47, 22, 0, time.UTC)
 	newBuilt := time.Date(2026, 8, 19, 19, 14, 43, 0, time.UTC)
 	newID := "sha256:" + strings.Repeat("c", 64)
-	fullDetail := &compose.UpdateDetail{LocalCreated: localBuilt, NewID: newID, NewCreated: newBuilt}
+	fullDetail := compose.UpdateDetail{LocalCreated: localBuilt, NewID: newID, NewCreated: newBuilt}
 
 	tests := []struct {
 		name     string
@@ -802,7 +802,7 @@ func TestBuildInspectSummary_UpdateRows(t *testing.T) {
 			upd: inspectUpdateInfo{
 				now:     now,
 				verdict: &yes,
-				detail:  &compose.UpdateDetail{LocalCreated: localBuilt, NewCreated: newBuilt},
+				detail:  compose.UpdateDetail{LocalCreated: localBuilt, NewCreated: newBuilt},
 			},
 			wantRows: []string{
 				inspectRow("built", "2026-07-07 17:47:22  (47d ago)"),
@@ -839,7 +839,7 @@ func TestBuildInspectSummary_UpdateRowOrder(t *testing.T) {
 		now:       now,
 		verdict:   &yes,
 		checkedAt: now.Add(-3 * time.Minute),
-		detail: &compose.UpdateDetail{
+		detail: compose.UpdateDetail{
 			LocalCreated: time.Date(2026, 7, 7, 17, 47, 22, 0, time.UTC),
 			NewID:        "sha256:" + strings.Repeat("c", 64),
 			NewCreated:   time.Date(2026, 8, 19, 19, 14, 43, 0, time.UTC),
@@ -900,7 +900,7 @@ func TestBuildInspectSummary_UpdateRowsEpochSentinel(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			detail := tt.detail
-			out := buildInspectSummary(updateRowsDoc(), 120, inspectUpdateInfo{now: now, verdict: &yes, detail: &detail})
+			out := buildInspectSummary(updateRowsDoc(), 120, inspectUpdateInfo{now: now, verdict: &yes, detail: detail})
 			if !strings.Contains(out, tt.wantRow) {
 				t.Errorf("summary missing %q:\n%s", tt.wantRow, out)
 			}
@@ -926,7 +926,7 @@ func TestBuildInspectSummary_UpdateRowsWrapNarrow(t *testing.T) {
 		now:       now,
 		verdict:   &yes,
 		checkedAt: now.Add(-3 * time.Minute),
-		detail: &compose.UpdateDetail{
+		detail: compose.UpdateDetail{
 			LocalCreated: time.Date(2026, 7, 7, 17, 47, 22, 0, time.UTC),
 			NewID:        newID,
 			NewCreated:   time.Date(2026, 8, 19, 19, 14, 43, 0, time.UTC),
@@ -1381,6 +1381,7 @@ func TestBuildInspectSummary_ZeroUpdateInfoIsByteIdentical(t *testing.T) {
 func TestInspectUpdateInfo_FromCache(t *testing.T) {
 	yes, no := true, false
 	fetched := time.Date(2026, 8, 23, 10, 0, 0, 0, time.UTC)
+	stale := time.Now().Add(-2 * updatesCacheTTL)
 	detail := compose.UpdateDetail{NewID: "sha256:" + strings.Repeat("c", 64)}
 
 	tests := []struct {
@@ -1429,16 +1430,19 @@ func TestInspectUpdateInfo_FromCache(t *testing.T) {
 			service: "web",
 		},
 		{
+			// Explicitly past the TTL against the REAL clock: inspectUpdateInfo
+			// reads the raw map rather than updatesCacheLookup, because the
+			// glyph itself survives its TTL until a refresh replaces it.
 			name: "stale entry still renders",
 			entry: updateEntry{
-				fetchedAt: fetched.Add(-time.Hour),
+				fetchedAt: stale,
 				results:   map[string]bool{"web": true},
 				details:   map[string]compose.UpdateDetail{"web": detail},
 			},
 			service:     "web",
 			wantVerdict: &yes,
 			wantDetail:  true,
-			wantChecked: fetched.Add(-time.Hour),
+			wantChecked: stale,
 		},
 	}
 
@@ -1464,10 +1468,12 @@ func TestInspectUpdateInfo_FromCache(t *testing.T) {
 			case tt.wantVerdict != nil && *got.verdict != *tt.wantVerdict:
 				t.Errorf("verdict = %v, want %v", *got.verdict, *tt.wantVerdict)
 			}
-			if tt.wantDetail != (got.detail != nil) {
-				t.Errorf("detail present = %v, want %v", got.detail != nil, tt.wantDetail)
+			// The zero UpdateDetail IS the "unknown" contract, so presence is
+			// read off the fields the renderer checks rather than a pointer.
+			if tt.wantDetail != (got.detail != compose.UpdateDetail{}) {
+				t.Errorf("detail = %+v, want present = %v", got.detail, tt.wantDetail)
 			}
-			if got.detail != nil && got.detail.NewID != detail.NewID {
+			if tt.wantDetail && got.detail.NewID != detail.NewID {
 				t.Errorf("detail.NewID = %q, want %q", got.detail.NewID, detail.NewID)
 			}
 		})
@@ -1479,7 +1485,7 @@ func TestInspectUpdateInfo_FromCache(t *testing.T) {
 func TestInspectUpdateInfo_NoCache(t *testing.T) {
 	t.Run("nil cache", func(t *testing.T) {
 		m := Model{inspectService: "web"}
-		if got := m.inspectUpdateInfo(); got.verdict != nil || got.detail != nil || !got.checkedAt.IsZero() {
+		if got := m.inspectUpdateInfo(); got.verdict != nil || got.detail != (compose.UpdateDetail{}) || !got.checkedAt.IsZero() {
 			t.Errorf("nil cache must draw nothing, got %+v", got)
 		}
 	})

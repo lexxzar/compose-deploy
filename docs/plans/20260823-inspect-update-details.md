@@ -370,7 +370,12 @@ caller down the exact silent-wrong-path the three-state return exists to prevent
 
 ➕ Variant tie-breaker rule, since the signature carries no wanted variant (the local probe cannot
 report one): among the entries matching os+arch, an entry with NO variant wins regardless of index
-order; with only variant-qualified entries, the first in index order wins. Deterministic either way.
+order; with only variant-qualified entries, exactly ONE resolves and TWO OR MORE abort.
+**Amended in review**: the original rule took the first in index order. Both real captures carry
+`linux/arm` twice (nginx v5+v7, postgres v6+v7), so a 32-bit ARM host would have been pinned to a
+variant it never runs and shown a confident `update id` / `update built` for another image. That is
+the silent-wrong-value the three-state return exists to prevent, one level finer, so ambiguity now
+aborts. `arm64`/`amd64` carry one entry each and are unaffected.
 
 ➕ `validImagetoolsDigest(s string) string` shares the strict WHOLE-STRING `imagetoolsDigestRE`
 check and the lower-case normalisation. Task 4's `parseConfigDigest` reuses it — a substring search
@@ -395,19 +400,20 @@ would accept a fallen-through `--format` line as a digest.
 - [x] write tests for `parseImageCreated`: map form, object form, epoch rejection, absent platform
 - [x] run `go test ./internal/compose/` — must pass before task 5
 
-➕ Shape discrimination in `parseImageCreated`: a top-level key CONTAINING `/` marks the
-platform-keyed map; otherwise a top-level key from `imageConfigKeys` (`created`,
-`architecture`, `rootfs`, `config`, `history`) marks the bare object. A document that is
-neither returns "absent" rather than being read as one of them.
+➕ **Removed in review**: `parseImageCreated` originally accepted BOTH the bare object and the
+platform-keyed map. The map branch is unreachable — step 4 only ever addresses a ref
+`pinnedImageRef` produced, which is either platform-pinned or reported single-manifest, and a
+multi-platform tag always carries an index so it is pinned or aborted at step 2. About 100
+production lines, ~150 test lines and one fixture were deleted; `parseImageCreated(data)` now
+decodes straight into `imageConfigDoc`, and a map document decodes with no top-level `created`, so
+it omits the row — the designed behaviour for doubt.
 
 ➕ The bare object is trusted WITHOUT a platform cross-check. It is only reached for a ref that
 resolves to exactly one manifest, so its config is the only one there is; rejecting it on a
 platform mismatch would drop the row for every legitimate single-arch image.
 
-➕ Map-key tie-breaker, mirroring `parseIndexPlatformDigest` but with an extra determinism rule:
-an unqualified `os/arch` key wins, and among variant-qualified keys the LEXICOGRAPHICALLY first
-wins — Go map iteration order is not stable, so "index order" does not exist here. A key whose os
-or arch segment is `unknown` is an attestation and never matches.
+➕ Removed in review together with the map branch above (`pickImageConfig`, `platformKeyMatches`
+and `imageConfigKeys` are gone).
 
 ### Task 5: Add the shared `scanUpdateDetails` loop
 
@@ -659,7 +665,51 @@ Deliberately out of scope; record rather than fix:
 - **One duplicated round-trip per refresh.** `Compose.UpdateDetails` calls `fetchServiceImages`
   (`docker compose config`), which `CheckUpdates` just ran in the same goroutine;
   `HostContainers.UpdateDetails` re-runs `docker ps` the same way. On the remote path both are
-  full SSH round-trips. Passing the image map down from `refreshUpdates` would remove it.
+  full SSH round-trips. Passing the image map down from `refreshUpdates` would remove it. It is a
+  LOCAL command, not a registry one, so it costs latency rather than quota. Now recorded in
+  `docs/architecture/update-detection.md` as well.
+- **A superseded update scan is not cancelled, only discarded.** `m.ctx` is assigned once in
+  `NewModel`, and every context-change site fires a replacement fetch without stopping the
+  previous one, so two `CheckUpdates` scans can overlap. Pre-existing. **Amended in review**: an
+  earlier draft of this residual claimed the detail phase costs nothing extra "because it sits
+  behind the session check". That holds only while the supersession beats the `updatesMsg`; once
+  the verdicts have been handled the detail Cmd is already dispatched and runs to completion. Its
+  result is no longer DROPPED — it carries its own `forKey`, so it merges onto the entry it was
+  fetched for — but the round-trips are spent regardless. **Amended again in review round 4**:
+  `m.detailsInFlight` now bounds the phase to one batch GLOBALLY — no context-change site resets
+  it, so two detail scans can no longer overlap at all. `scanUpdateDetails` already checks
+  `ctx.Err()` per image, so wiring a per-fetch `context.WithCancel` on the Model would complete the
+  fix — deferred because `Init()` has a value receiver and cannot store the cancel, which would
+  leave one of the four fetch sites outside the invariant. **Closed in review round 5**: the batch
+  now runs under `context.WithTimeout(m.ctx, updateDetailsTimeout)` (3 minutes), so the arrival — and
+  therefore the only clear — is guaranteed and a stalled registry call can no longer keep the phase
+  closed for the rest of the session. An expiry degrades to a partial map rather than an error,
+  because `scanUpdateDetails` checks `ctx.Err()` per image. Residual: the deadline bounds the stall
+  but does not stop a scan the user has already navigated away from — a per-fetch `WithCancel` would,
+  and stays deferred for the value-receiver reason above.
+- **A refused or lost detail batch heals from the entry's own state.** *(Rewritten in review round
+  4, replacing the `pendingDetails` park of round 3 and the message-identity fix of round 2. All
+  three rounds found the SAME user-visible failure — the entry keeps `details == nil` for its whole
+  10-minute TTL and nothing refetches — through three different mechanisms, so the park was removed
+  along with its field, its type, its dispatcher and its 16 departure-site resets, and replaced by
+  one rule.)* `refillUpdateDetailsCmd` re-dispatches whenever the CURRENT context's entry is fresh,
+  non-errored and has `details == nil`; it is called from the `updateDetailsMsg` handler's tail and
+  from `maybeRefreshUpdatesCmd`'s fresh-SUCCESS branch (the latter behind `autoUpdatesAllowed()`,
+  so the read-only unmanaged view keeps `U` as its only trigger). The arrival-tail half is NOT
+  gated, because it can only ever refill an entry a `U` already created — that is a continuation of
+  an authorised fetch, not a new automatic one. It cannot loop: a dispatch fills the entry it
+  names, and the merge normalises a nil map to an empty one so a batch that reported nothing still
+  counts as reported. Residual: on the read-only screen, a batch whose loss the arrival tail cannot
+  see (its entry was not the current one at arrival time) waits for another `U`, since the
+  screen-entry half is gated there by design. *(Round 5 pinned the ungated arrival tail rather than
+  changing it — `TestReadOnly_NoAutomaticDetailFetch/the_arrival-path_refill_completes_U…`.)*
+- **A detail-only failure is cached under the 10-minute success TTL.** The verdicts are sound, so
+  the entry is a success entry even when the details came back nil or partial from a 429. The rows
+  then stay absent for the full TTL with no automatic retry; `U` recovers them, and the README now
+  says so.
+- **The detail rows need the buildx plugin (Docker v23+).** `fetchUpdateDetail` has no
+  `docker manifest inspect` fallback, unlike the check itself, so on an older host the glyph works
+  and the rows never appear. Documented in the README rather than fixed.
 - **The relative age freezes.** The summary is rebuilt on fetch, on resize and now on
   `updatesMsg`, so `(checked 3m ago)` still drifts while the user sits on the screen. Tolerable
   against a 10-minute TTL; a ticker would be the fix.
