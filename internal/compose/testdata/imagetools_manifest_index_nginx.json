@@ -1,0 +1,275 @@
+{
+  "schemaVersion": 2,
+  "mediaType": "application/vnd.oci.image.index.v1+json",
+  "digest": "sha256:0d4374c710a9649200e84f8ef8dbdd4fa76c0c107839cd50f1e42a63916b0f2e",
+  "size": 10229,
+  "manifests": [
+    {
+      "mediaType": "application/vnd.oci.image.manifest.v1+json",
+      "digest": "sha256:c2e305ef468149bdc3297621cea453b47b095816fec4fc7be6ff837bce8deb7d",
+      "size": 2290,
+      "annotations": {
+        "com.docker.official-images.bashbrew.arch": "amd64",
+        "org.opencontainers.image.base.digest": "sha256:38a76d01668772e381ad2826d876627c89e7133e2f8a0f5d567306798b0f2a16",
+        "org.opencontainers.image.base.name": "debian:trixie-slim",
+        "org.opencontainers.image.created": "2026-08-19T19:08:00Z",
+        "org.opencontainers.image.revision": "b8590bd36b4504b9b847fcf2e98a9111dcae85fa",
+        "org.opencontainers.image.source": "https://github.com/nginx/docker-nginx.git#b8590bd36b4504b9b847fcf2e98a9111dcae85fa:mainline/debian",
+        "org.opencontainers.image.url": "https://hub.docker.com/_/nginx",
+        "org.opencontainers.image.version": "1.31.4"
+      },
+      "platform": {
+        "architecture": "amd64",
+        "os": "linux"
+      }
+    },
+    {
+      "mediaType": "application/vnd.oci.image.manifest.v1+json",
+      "digest": "sha256:792be14f71a03d7c73c4d7fb9c1f0d0b83dc294544ae1926db39b8ecaf414a1d",
+      "size": 841,
+      "annotations": {
+        "com.docker.official-images.bashbrew.arch": "amd64",
+        "vnd.docker.reference.digest": "sha256:c2e305ef468149bdc3297621cea453b47b095816fec4fc7be6ff837bce8deb7d",
+        "vnd.docker.reference.type": "attestation-manifest"
+      },
+      "platform": {
+        "architecture": "unknown",
+        "os": "unknown"
+      }
+    },
+    {
+      "mediaType": "application/vnd.oci.image.manifest.v1+json",
+      "digest": "sha256:442f3dd549c8750c2a7f1d4d9639f003b08a393d32ed13d02b7285176409b391",
+      "size": 2292,
+      "annotations": {
+        "com.docker.official-images.bashbrew.arch": "arm32v5",
+        "org.opencontainers.image.base.digest": "sha256:24bfbf923b10ba8cfcd22c2e4124e625b30133491891f288d92cefc8ce9f4d14",
+        "org.opencontainers.image.base.name": "debian:trixie-slim",
+        "org.opencontainers.image.created": "2026-08-19T19:07:41Z",
+        "org.opencontainers.image.revision": "b8590bd36b4504b9b847fcf2e98a9111dcae85fa",
+        "org.opencontainers.image.source": "https://github.com/nginx/docker-nginx.git#b8590bd36b4504b9b847fcf2e98a9111dcae85fa:mainline/debian",
+        "org.opencontainers.image.url": "https://hub.docker.com/_/nginx",
+        "org.opencontainers.image.version": "1.31.4"
+      },
+      "platform": {
+        "architecture": "arm",
+        "os": "linux",
+        "variant": "v5"
+      }
+    },
+    {
+      "mediaType": "application/vnd.oci.image.manifest.v1+json",
+      "digest": "sha256:0dfea8046dfa75a40933444052a7a697d5a05387d6460cd3e33822d7aedd5fd5",
+      "size": 841,
+      "annotations": {
+        "com.docker.official-images.bashbrew.arch": "arm32v5",
+        "vnd.docker.reference.digest": "sha256:442f3dd549c8750c2a7f1d4d9639f003b08a393d32ed13d02b7285176409b391",
+        "vnd.docker.reference.type": "attestation-manifest"
+      },
+      "platform": {
+        "architecture": "unknown",
+        "os": "unknown"
+      }
+    },
+    {
+      "mediaType": "application/vnd.oci.image.manifest.v1+json",
+      "digest": "sha256:49cae140454e5b0f498040765a37e193848ec69be9146a510edc0dd9ed491621",
+      "size": 2292,
+      "annotations": {
+        "com.docker.official-images.bashbrew.arch": "arm32v7",
+        "org.opencontainers.image.base.digest": "sha256:f445f0eca2d6fa4c1525039c38dbea85a8a4149a88e2714a96e1e127bbb036ae",
+        "org.opencontainers.image.base.name": "debian:trixie-slim",
+        "org.opencontainers.image.created": "2026-08-19T19:07:55Z",
+        "org.opencontainers.image.revision": "b8590bd36b4504b9b847fcf2e98a9111dcae85fa",
+        "org.opencontainers.image.source": "https://github.com/nginx/docker-nginx.git#b8590bd36b4504b9b847fcf2e98a9111dcae85fa:mainline/debian",
+        "org.opencontainers.image.url": "https://hub.docker.com/_/nginx",
+        "org.opencontainers.image.version": "1.31.4"
+      },
+      "platform": {
+        "architecture": "arm",
+        "os": "linux",
+        "variant": "v7"
+      }
+    },
+    {
+      "mediaType": "application/vnd.oci.image.manifest.v1+json",
+      "digest": "sha256:dade4f6e2bb4f93fe16f59e068d1fc6967800dfcd73973a41ea6c266563594b7",
+      "size": 841,
+      "annotations": {
+        "com.docker.official-images.bashbrew.arch": "arm32v7",
+        "vnd.docker.reference.digest": "sha256:49cae140454e5b0f498040765a37e193848ec69be9146a510edc0dd9ed491621",
+        "vnd.docker.reference.type": "attestation-manifest"
+      },
+      "platform": {
+        "architecture": "unknown",
+        "os": "unknown"
+      }
+    },
+    {
+      "mediaType": "application/vnd.oci.image.manifest.v1+json",
+      "digest": "sha256:40ea9867eb2d91315bb6831f40286f77c086df2a132c36bce50019a54581aea7",
+      "size": 2292,
+      "annotations": {
+        "com.docker.official-images.bashbrew.arch": "arm64v8",
+        "org.opencontainers.image.base.digest": "sha256:c94f5ddd41327aa2d4a7cfba7889056c02936182fd76a513fec6160c97181fc0",
+        "org.opencontainers.image.base.name": "debian:trixie-slim",
+        "org.opencontainers.image.created": "2026-08-19T19:07:43Z",
+        "org.opencontainers.image.revision": "b8590bd36b4504b9b847fcf2e98a9111dcae85fa",
+        "org.opencontainers.image.source": "https://github.com/nginx/docker-nginx.git#b8590bd36b4504b9b847fcf2e98a9111dcae85fa:mainline/debian",
+        "org.opencontainers.image.url": "https://hub.docker.com/_/nginx",
+        "org.opencontainers.image.version": "1.31.4"
+      },
+      "platform": {
+        "architecture": "arm64",
+        "os": "linux",
+        "variant": "v8"
+      }
+    },
+    {
+      "mediaType": "application/vnd.oci.image.manifest.v1+json",
+      "digest": "sha256:7a9521e91ddb42e5a8969ee63003fbc80e6bbe50a723e219ff92d4f262aa9306",
+      "size": 841,
+      "annotations": {
+        "com.docker.official-images.bashbrew.arch": "arm64v8",
+        "vnd.docker.reference.digest": "sha256:40ea9867eb2d91315bb6831f40286f77c086df2a132c36bce50019a54581aea7",
+        "vnd.docker.reference.type": "attestation-manifest"
+      },
+      "platform": {
+        "architecture": "unknown",
+        "os": "unknown"
+      }
+    },
+    {
+      "mediaType": "application/vnd.oci.image.manifest.v1+json",
+      "digest": "sha256:3205c8e47ec80357934b047db93af7ef86f95f9ae613a8f8d59de3c943821b73",
+      "size": 2289,
+      "annotations": {
+        "com.docker.official-images.bashbrew.arch": "i386",
+        "org.opencontainers.image.base.digest": "sha256:00a5cd538a5885efc648411ce55fc407cd467d8f008dc6e509c04b8cf4819f7f",
+        "org.opencontainers.image.base.name": "debian:trixie-slim",
+        "org.opencontainers.image.created": "2026-08-19T19:08:03Z",
+        "org.opencontainers.image.revision": "b8590bd36b4504b9b847fcf2e98a9111dcae85fa",
+        "org.opencontainers.image.source": "https://github.com/nginx/docker-nginx.git#b8590bd36b4504b9b847fcf2e98a9111dcae85fa:mainline/debian",
+        "org.opencontainers.image.url": "https://hub.docker.com/_/nginx",
+        "org.opencontainers.image.version": "1.31.4"
+      },
+      "platform": {
+        "architecture": "386",
+        "os": "linux"
+      }
+    },
+    {
+      "mediaType": "application/vnd.oci.image.manifest.v1+json",
+      "digest": "sha256:fd94091f774ff9385b0b5e1f810398c41072469c624ee7ce92b5dc09d878d19b",
+      "size": 841,
+      "annotations": {
+        "com.docker.official-images.bashbrew.arch": "i386",
+        "vnd.docker.reference.digest": "sha256:3205c8e47ec80357934b047db93af7ef86f95f9ae613a8f8d59de3c943821b73",
+        "vnd.docker.reference.type": "attestation-manifest"
+      },
+      "platform": {
+        "architecture": "unknown",
+        "os": "unknown"
+      }
+    },
+    {
+      "mediaType": "application/vnd.oci.image.manifest.v1+json",
+      "digest": "sha256:079b9e8ddbebf297286162f340ba73f41e2ce45e78df092c8312f1221248796a",
+      "size": 2292,
+      "annotations": {
+        "com.docker.official-images.bashbrew.arch": "ppc64le",
+        "org.opencontainers.image.base.digest": "sha256:deefc402f62ae71568c0d3716cb61c4896e8e95207290c1055628bd6d1b7bbb9",
+        "org.opencontainers.image.base.name": "debian:trixie-slim",
+        "org.opencontainers.image.created": "2026-08-19T20:59:11Z",
+        "org.opencontainers.image.revision": "b8590bd36b4504b9b847fcf2e98a9111dcae85fa",
+        "org.opencontainers.image.source": "https://github.com/nginx/docker-nginx.git#b8590bd36b4504b9b847fcf2e98a9111dcae85fa:mainline/debian",
+        "org.opencontainers.image.url": "https://hub.docker.com/_/nginx",
+        "org.opencontainers.image.version": "1.31.4"
+      },
+      "platform": {
+        "architecture": "ppc64le",
+        "os": "linux"
+      }
+    },
+    {
+      "mediaType": "application/vnd.oci.image.manifest.v1+json",
+      "digest": "sha256:32d727aea9a254599c2af5bcc8020d73f6c20bdc274898917df73c27083f1874",
+      "size": 841,
+      "annotations": {
+        "com.docker.official-images.bashbrew.arch": "ppc64le",
+        "vnd.docker.reference.digest": "sha256:079b9e8ddbebf297286162f340ba73f41e2ce45e78df092c8312f1221248796a",
+        "vnd.docker.reference.type": "attestation-manifest"
+      },
+      "platform": {
+        "architecture": "unknown",
+        "os": "unknown"
+      }
+    },
+    {
+      "mediaType": "application/vnd.oci.image.manifest.v1+json",
+      "digest": "sha256:3790b715efb7383168389bc071ca3b11fc31f44e1efc9e5350b0b2614c636dc9",
+      "size": 2292,
+      "annotations": {
+        "com.docker.official-images.bashbrew.arch": "riscv64",
+        "org.opencontainers.image.base.digest": "sha256:9b16a18281ae6a264442bb19211592013e202fc5037828635f75953e9e873766",
+        "org.opencontainers.image.base.name": "debian:trixie-slim",
+        "org.opencontainers.image.created": "2026-08-22T18:06:29Z",
+        "org.opencontainers.image.revision": "b8590bd36b4504b9b847fcf2e98a9111dcae85fa",
+        "org.opencontainers.image.source": "https://github.com/nginx/docker-nginx.git#b8590bd36b4504b9b847fcf2e98a9111dcae85fa:mainline/debian",
+        "org.opencontainers.image.url": "https://hub.docker.com/_/nginx",
+        "org.opencontainers.image.version": "1.31.4"
+      },
+      "platform": {
+        "architecture": "riscv64",
+        "os": "linux"
+      }
+    },
+    {
+      "mediaType": "application/vnd.oci.image.manifest.v1+json",
+      "digest": "sha256:8fb30758ff9ae1a9cc4b244331c1fa76aa7fc162494efc25743ab11a23e102b5",
+      "size": 841,
+      "annotations": {
+        "com.docker.official-images.bashbrew.arch": "riscv64",
+        "vnd.docker.reference.digest": "sha256:3790b715efb7383168389bc071ca3b11fc31f44e1efc9e5350b0b2614c636dc9",
+        "vnd.docker.reference.type": "attestation-manifest"
+      },
+      "platform": {
+        "architecture": "unknown",
+        "os": "unknown"
+      }
+    },
+    {
+      "mediaType": "application/vnd.oci.image.manifest.v1+json",
+      "digest": "sha256:5712f06c8f5a4332596ff30fa16ae6c2ab32fe057ac38105ed8884a12acb1c50",
+      "size": 2290,
+      "annotations": {
+        "com.docker.official-images.bashbrew.arch": "s390x",
+        "org.opencontainers.image.base.digest": "sha256:79f9102397454866572f1c264b6c8807ffeda8603c084e2e358674b00d1574ae",
+        "org.opencontainers.image.base.name": "debian:trixie-slim",
+        "org.opencontainers.image.created": "2026-08-19T19:10:06Z",
+        "org.opencontainers.image.revision": "b8590bd36b4504b9b847fcf2e98a9111dcae85fa",
+        "org.opencontainers.image.source": "https://github.com/nginx/docker-nginx.git#b8590bd36b4504b9b847fcf2e98a9111dcae85fa:mainline/debian",
+        "org.opencontainers.image.url": "https://hub.docker.com/_/nginx",
+        "org.opencontainers.image.version": "1.31.4"
+      },
+      "platform": {
+        "architecture": "s390x",
+        "os": "linux"
+      }
+    },
+    {
+      "mediaType": "application/vnd.oci.image.manifest.v1+json",
+      "digest": "sha256:dde054910b7a630be1ab8d84c2782d95e0eb7bb0a08a5fc44566290f11e0b7ce",
+      "size": 841,
+      "annotations": {
+        "com.docker.official-images.bashbrew.arch": "s390x",
+        "vnd.docker.reference.digest": "sha256:5712f06c8f5a4332596ff30fa16ae6c2ab32fe057ac38105ed8884a12acb1c50",
+        "vnd.docker.reference.type": "attestation-manifest"
+      },
+      "platform": {
+        "architecture": "unknown",
+        "os": "unknown"
+      }
+    }
+  ]
+}

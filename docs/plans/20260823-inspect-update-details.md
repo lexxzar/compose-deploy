@@ -348,20 +348,33 @@ so Task 4's `parseImageCreated` reuses the same epoch rule.
 - Create: `internal/compose/testdata/imagetools_manifest_index_nginx.json`
 - Create: `internal/compose/testdata/imagetools_manifest_index_postgres.json`
 
-- [ ] **first**, copy the two real captures from
+- [x] **first**, copy the two real captures from
       `/Users/zavulon/.claude/jobs/5f71c92b/tmp/fixtures/` into `internal/compose/testdata/`
       (scratch space — do this before anything else; if already removed, hand-author from
       "Shape forks the parsers must survive" rather than re-fetching)
-- [ ] add `manifestIndexArgs(image string) []string` → `buildx imagetools inspect --format
+- [x] add `manifestIndexArgs(image string) []string` → `buildx imagetools inspect --format
       '{{json .Manifest}}' <image>`
-- [ ] add `parseIndexPlatformDigest(data []byte, os, arch string) (digest string, hasIndex bool, found bool)`
+- [x] add `parseIndexPlatformDigest(data []byte, os, arch string) (digest string, hasIndex bool, found bool)`
       per the three-state table: skips `unknown` platform entries, matches os+arch with variant
       as a tie-breaker, and validates the digest against `imagetoolsDigestRE`
-- [ ] write tests against the nginx fixture: selects `linux/arm64` correctly, never returns an
+- [x] write tests against the nginx fixture: selects `linux/arm64` correctly, never returns an
       attestation digest, and returns `hasIndex=true, found=false` for an absent platform
-- [ ] write a test asserting the single-manifest shape yields `hasIndex=false`
-- [ ] write tests for the variant tie-breaker and for malformed JSON
-- [ ] run `go test ./internal/compose/` — must pass before task 4
+- [x] write a test asserting the single-manifest shape yields `hasIndex=false`
+- [x] write tests for the variant tie-breaker and for malformed JSON
+- [x] run `go test ./internal/compose/` — must pass before task 4
+
+➕ `hasIndex=false` is returned ONLY for a well-formed document with no `manifests` key. Malformed
+JSON, a non-list `manifests` value, and an empty os/arch argument all return the ABORT state
+(`hasIndex=true, found=false`) instead. Mapping doubt onto the single-manifest state would send the
+caller down the exact silent-wrong-path the three-state return exists to prevent.
+
+➕ Variant tie-breaker rule, since the signature carries no wanted variant (the local probe cannot
+report one): among the entries matching os+arch, an entry with NO variant wins regardless of index
+order; with only variant-qualified entries, the first in index order wins. Deterministic either way.
+
+➕ `validImagetoolsDigest(s string) string` shares the strict WHOLE-STRING `imagetoolsDigestRE`
+check and the lower-case normalisation. Task 4's `parseConfigDigest` reuses it — a substring search
+would accept a fallen-through `--format` line as a digest.
 
 ### Task 4: Add the config-digest and created-timestamp parsers
 
