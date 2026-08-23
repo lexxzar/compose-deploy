@@ -33,7 +33,7 @@ func loadInspectFixture(t *testing.T, name string) compose.InspectDoc {
 // must reach the summary verbatim.
 func TestBuildInspectSummary_UnhealthyProbeOutput(t *testing.T) {
 	doc := loadInspectFixture(t, "docker_inspect_unhealthy.json")
-	out := buildInspectSummary(doc, 120)
+	out := buildInspectSummary(doc, 120, inspectUpdateInfo{})
 
 	const probe = "curl: (7) Failed to connect to localhost port 9999 after 0 ms: Could not connect to server"
 	if !strings.Contains(out, probe) {
@@ -58,7 +58,7 @@ func TestBuildInspectSummary_UnhealthyProbeOutput(t *testing.T) {
 
 func TestBuildInspectSummary_HealthyFixture(t *testing.T) {
 	doc := loadInspectFixture(t, "docker_inspect_healthy.json")
-	out := buildInspectSummary(doc, 120)
+	out := buildInspectSummary(doc, 120, inspectUpdateInfo{})
 
 	for _, want := range []string{
 		"STATE",
@@ -91,7 +91,7 @@ func TestBuildInspectSummary_HealthyFixture(t *testing.T) {
 
 func TestBuildInspectSummary_StoppedFixture(t *testing.T) {
 	doc := loadInspectFixture(t, "docker_inspect_stopped.json")
-	out := buildInspectSummary(doc, 120)
+	out := buildInspectSummary(doc, 120, inspectUpdateInfo{})
 
 	for _, want := range []string{
 		"STATE",
@@ -117,7 +117,7 @@ func TestBuildInspectSummary_ProbeOutputWrapsNotTruncates(t *testing.T) {
 	const probe = "curl: (7) Failed to connect to localhost port 9999 after 0 ms: Could not connect to server"
 
 	for _, width := range []int{30, 40, 60} {
-		out := buildInspectSummary(doc, width)
+		out := buildInspectSummary(doc, width, inspectUpdateInfo{})
 		if strings.Contains(out, probe) {
 			t.Fatalf("width %d: probe unexpectedly fits on one line", width)
 		}
@@ -271,7 +271,7 @@ func TestBuildInspectSummary_NeverExceedsWidth(t *testing.T) {
 			if width < tc.minWidth {
 				continue
 			}
-			out := buildInspectSummary(tc.doc, width)
+			out := buildInspectSummary(tc.doc, width, inspectUpdateInfo{})
 			for i, line := range strings.Split(out, "\n") {
 				if w := ansi.StringWidth(line); w > width {
 					t.Errorf("%s at width %d: line %d is %d cells: %q", name, width, i, w, line)
@@ -282,7 +282,7 @@ func TestBuildInspectSummary_NeverExceedsWidth(t *testing.T) {
 }
 
 func TestBuildInspectSummary_StateAlwaysRenders(t *testing.T) {
-	out := buildInspectSummary(compose.InspectDoc{}, 80)
+	out := buildInspectSummary(compose.InspectDoc{}, 80, inspectUpdateInfo{})
 	for _, want := range []string{"STATE", "status          unknown", "exit code       0", "restart policy  no"} {
 		if !strings.Contains(out, want) {
 			t.Errorf("empty doc summary missing %q:\n%s", want, out)
@@ -315,7 +315,7 @@ func TestBuildInspectSummary_StateNamesTheContainerAndItsError(t *testing.T) {
 			Error:    `exec: "worker": executable file not found in $PATH`,
 		},
 	}
-	out := buildInspectSummary(doc, 100)
+	out := buildInspectSummary(doc, 100, inspectUpdateInfo{})
 	for _, want := range []string{
 		"container       shop-worker-2",
 		"status          created",
@@ -332,7 +332,7 @@ func TestBuildInspectSummary_StateNamesTheContainerAndItsError(t *testing.T) {
 // name or a blank error must not render a labelled row with nothing after it.
 func TestBuildInspectSummary_StateOmitsEmptyRows(t *testing.T) {
 	doc := compose.InspectDoc{State: compose.InspectState{Status: "running", Running: true, Error: "   "}}
-	out := buildInspectSummary(doc, 80)
+	out := buildInspectSummary(doc, 80, inspectUpdateInfo{})
 	for _, skip := range []string{"container", "error"} {
 		if strings.Contains(out, skip) {
 			t.Errorf("summary must not render an empty %q row:\n%s", skip, out)
@@ -353,7 +353,7 @@ func TestBuildInspectSummary_OOMKilledAndRestartPolicy(t *testing.T) {
 			RestartPolicy: compose.InspectRestartPolicy{Name: "on-failure", MaximumRetryCount: 5},
 		},
 	}
-	out := buildInspectSummary(doc, 80)
+	out := buildInspectSummary(doc, 80, inspectUpdateInfo{})
 	for _, want := range []string{
 		"status          exited",
 		"exit code       137",
@@ -447,7 +447,7 @@ func TestBuildInspectSummary_HealthSectionPresence(t *testing.T) {
 				State:  compose.InspectState{Status: "running", Running: true, Health: tt.state},
 				Config: compose.InspectConfig{Healthcheck: tt.hc},
 			}
-			out := buildInspectSummary(doc, 80)
+			out := buildInspectSummary(doc, 80, inspectUpdateInfo{})
 			if got := strings.Contains(out, "HEALTH"); got != tt.wantSection {
 				t.Fatalf("HEALTH present = %v, want %v:\n%s", got, tt.wantSection, out)
 			}
@@ -474,7 +474,7 @@ func TestBuildInspectSummary_MultiLineProbeOutput(t *testing.T) {
 			Log:    []compose.InspectHealthLog{{ExitCode: 1, Output: "line one\nline two\nline three\n"}},
 		}},
 	}
-	out := buildInspectSummary(doc, 80)
+	out := buildInspectSummary(doc, 80, inspectUpdateInfo{})
 	for _, want := range []string{"    line one", "    line two", "    line three"} {
 		if !strings.Contains(out, want) {
 			t.Errorf("summary missing %q:\n%s", want, out)
@@ -491,7 +491,7 @@ func TestBuildInspectSummary_MultiLineProbeOutput(t *testing.T) {
 
 func TestBuildInspectSummary_ZeroWidthFallsBackToDefault(t *testing.T) {
 	doc := loadInspectFixture(t, "docker_inspect_unhealthy.json")
-	out := buildInspectSummary(doc, 0)
+	out := buildInspectSummary(doc, 0, inspectUpdateInfo{})
 	for i, line := range strings.Split(out, "\n") {
 		if w := ansi.StringWidth(line); w > inspectDefaultWidth {
 			t.Errorf("line %d is %d cells with an unknown width: %q", i, w, line)
@@ -522,6 +522,72 @@ func TestFormatInspectTime(t *testing.T) {
 				t.Errorf("formatInspectTime(%q) = %q, want %q", tt.in, got, tt.want)
 			}
 		})
+	}
+}
+
+func TestFormatInspectTimeValue(t *testing.T) {
+	tests := []struct {
+		name string
+		in   time.Time
+		want string
+	}{
+		{name: "go zero time", in: time.Time{}, want: ""},
+		{name: "docker zero time", in: time.Date(1, 1, 1, 0, 0, 0, 0, time.UTC), want: ""},
+		{name: "unix epoch sentinel", in: time.Unix(0, 0).UTC(), want: ""},
+		{name: "before the epoch", in: time.Date(1969, 12, 31, 23, 59, 59, 0, time.UTC), want: ""},
+		{name: "normal timestamp", in: time.Date(2026, 7, 7, 17, 47, 22, 0, time.UTC), want: "2026-07-07 17:47:22"},
+		{
+			name: "keeps the offset zone",
+			in:   time.Date(2026, 7, 7, 17, 47, 22, 0, time.FixedZone("CEST", 2*60*60)),
+			want: "2026-07-07 17:47:22",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := formatInspectTimeValue(tt.in); got != tt.want {
+				t.Errorf("formatInspectTimeValue(%v) = %q, want %q", tt.in, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestFormatTimeWithAge(t *testing.T) {
+	now := time.Date(2026, 8, 23, 12, 0, 0, 0, time.UTC)
+	tests := []struct {
+		name string
+		in   time.Time
+		want string
+	}{
+		{name: "go zero time is absent", in: time.Time{}, want: ""},
+		{name: "epoch sentinel is absent", in: time.Unix(0, 0).UTC(), want: ""},
+		{name: "seconds", in: now.Add(-30 * time.Second), want: "2026-08-23 11:59:30  (moments ago)"},
+		{name: "minute boundary", in: now.Add(-time.Minute), want: "2026-08-23 11:59:00  (1m ago)"},
+		{name: "minutes", in: now.Add(-3 * time.Minute), want: "2026-08-23 11:57:00  (3m ago)"},
+		{name: "hour boundary", in: now.Add(-time.Hour), want: "2026-08-23 11:00:00  (1h ago)"},
+		{name: "day boundary", in: now.Add(-24 * time.Hour), want: "2026-08-22 12:00:00  (1d ago)"},
+		{name: "many days", in: now.Add(-47 * 24 * time.Hour), want: "2026-07-07 12:00:00  (47d ago)"},
+		{name: "future stamp reads as moments", in: now.Add(time.Hour), want: "2026-08-23 13:00:00  (moments ago)"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := formatTimeWithAge(tt.in, now); got != tt.want {
+				t.Errorf("formatTimeWithAge(%v) = %q, want %q", tt.in, got, tt.want)
+			}
+		})
+	}
+}
+
+// TestBuildInspectSummary_StartedRowUnchanged pins the STATE section's "started"
+// row against the formatInspectTime split: the wrapper still parses the docker
+// RFC3339 string and the row keeps its bare stamp, with no age suffix.
+func TestBuildInspectSummary_StartedRowUnchanged(t *testing.T) {
+	doc := loadInspectFixture(t, "docker_inspect_healthy.json")
+	out := buildInspectSummary(doc, 80, inspectUpdateInfo{})
+	if !strings.Contains(out, "started") || !strings.Contains(out, "2026-08-22 03:09:23") {
+		t.Errorf("summary lost the started row:\n%s", out)
+	}
+	if strings.Contains(out, "2026-08-22 03:09:23  (") {
+		t.Errorf("started row must not carry an age suffix:\n%s", out)
 	}
 }
 
@@ -570,12 +636,12 @@ func inspectRow(label, value string) string {
 
 func TestBuildInspectSummary_ImageSection(t *testing.T) {
 	doc := loadInspectFixture(t, "docker_inspect_healthy.json")
-	out := buildInspectSummary(doc, 200)
+	out := buildInspectSummary(doc, 200, inspectUpdateInfo{})
 
 	for _, want := range []string{
 		"IMAGE",
 		inspectRow("image", "nginx:latest"),
-		inspectRow("digest", "sha256:d090ef0c3fa38df49d89dfcca52ce77f71d88a8db6bd8388d78817cad20a0c1f"),
+		inspectRow("image id", "sha256:d090ef0c3fa38df49d89dfcca52ce77f71d88a8db6bd8388d78817cad20a0c1f"),
 		inspectRow("command", "nginx -g daemon off;"),
 		inspectRow("entrypoint", "/docker-entrypoint.sh"),
 	} {
@@ -590,7 +656,7 @@ func TestBuildInspectSummary_ImageSection(t *testing.T) {
 // the reason the stopped fixture exited 3.
 func TestBuildInspectSummary_ImageSectionShellCommand(t *testing.T) {
 	doc := loadInspectFixture(t, "docker_inspect_stopped.json")
-	out := buildInspectSummary(doc, 200)
+	out := buildInspectSummary(doc, 200, inspectUpdateInfo{})
 
 	const cmd = `echo 'migration failed: relation "users" does not exist' >&2; exit 3`
 	if !strings.Contains(out, inspectRow("command", cmd)) {
@@ -611,10 +677,10 @@ func TestBuildInspectSummary_ImageSectionPresence(t *testing.T) {
 	}{
 		{name: "nothing to say", want: false},
 		{
-			name:    "digest only",
+			name:    "image id only",
 			doc:     compose.InspectDoc{Image: "sha256:abc"},
 			want:    true,
-			wantRow: inspectRow("digest", "sha256:abc"),
+			wantRow: inspectRow("image id", "sha256:abc"),
 			skipRow: "image  ",
 		},
 		{
@@ -622,7 +688,7 @@ func TestBuildInspectSummary_ImageSectionPresence(t *testing.T) {
 			doc:     compose.InspectDoc{Config: compose.InspectConfig{Image: "redis:7"}},
 			want:    true,
 			wantRow: inspectRow("image", "redis:7"),
-			skipRow: "digest",
+			skipRow: "image id",
 		},
 		{
 			name:    "command only",
@@ -635,14 +701,14 @@ func TestBuildInspectSummary_ImageSectionPresence(t *testing.T) {
 			name:    "empty command slice is not a command",
 			doc:     compose.InspectDoc{Image: "sha256:abc", Config: compose.InspectConfig{Cmd: []string{}}},
 			want:    true,
-			wantRow: inspectRow("digest", "sha256:abc"),
+			wantRow: inspectRow("image id", "sha256:abc"),
 			skipRow: "command",
 		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			out := buildInspectSummary(tt.doc, 80)
+			out := buildInspectSummary(tt.doc, 80, inspectUpdateInfo{})
 			if got := strings.Contains(out, "IMAGE"); got != tt.want {
 				t.Fatalf("IMAGE present = %v, want %v:\n%s", got, tt.want, out)
 			}
@@ -656,12 +722,240 @@ func TestBuildInspectSummary_ImageSectionPresence(t *testing.T) {
 	}
 }
 
+// updateRowsDoc is the minimal doc the update-row tests render against: enough
+// to open the IMAGE section, and nothing that could be mistaken for one of the
+// rows under test.
+func updateRowsDoc() compose.InspectDoc {
+	return compose.InspectDoc{
+		Image:  "sha256:" + strings.Repeat("a", 64),
+		Config: compose.InspectConfig{Image: "postgres:16-alpine", Cmd: []string{"postgres"}},
+	}
+}
+
+// TestBuildInspectSummary_UpdateRows pins the Rendering rules table: each of the
+// four rows appears on its own condition and is omitted on its own. The clock is
+// a fixed parameter, so the relative ages are assertions rather than a snapshot
+// of whatever day the suite happened to run on.
+func TestBuildInspectSummary_UpdateRows(t *testing.T) {
+	now := time.Date(2026, 8, 23, 19, 0, 0, 0, time.UTC)
+	yes, no := true, false
+	localBuilt := time.Date(2026, 7, 7, 17, 47, 22, 0, time.UTC)
+	newBuilt := time.Date(2026, 8, 19, 19, 14, 43, 0, time.UTC)
+	newID := "sha256:" + strings.Repeat("c", 64)
+	fullDetail := compose.UpdateDetail{LocalCreated: localBuilt, NewID: newID, NewCreated: newBuilt}
+
+	tests := []struct {
+		name     string
+		upd      inspectUpdateInfo
+		wantRows []string
+		skipRows []string
+	}{
+		{
+			name: "update available draws every row",
+			upd: inspectUpdateInfo{
+				now:       now,
+				verdict:   &yes,
+				checkedAt: now.Add(-3 * time.Minute),
+				detail:    fullDetail,
+			},
+			wantRows: []string{
+				inspectRow("built", "2026-07-07 17:47:22  (47d ago)"),
+				inspectRow("update", "available  (checked 3m ago)"),
+				inspectRow("update id", newID),
+				inspectRow("update built", "2026-08-19 19:14:43  (3d ago)"),
+			},
+		},
+		{
+			name: "up to date draws the verdict alone",
+			upd: inspectUpdateInfo{
+				now:       now,
+				verdict:   &no,
+				checkedAt: now.Add(-90 * time.Minute),
+			},
+			wantRows: []string{inspectRow("update", "up to date  (checked 1h ago)")},
+			skipRows: []string{"built", "update id"},
+		},
+		{
+			name:     "no verdict draws nothing",
+			upd:      inspectUpdateInfo{now: now},
+			skipRows: []string{"built", "update", "update id", "update built"},
+		},
+		{
+			name: "a detail without a verdict still draws its own rows",
+			upd:  inspectUpdateInfo{now: now, detail: fullDetail},
+			wantRows: []string{
+				inspectRow("built", "2026-07-07 17:47:22  (47d ago)"),
+				inspectRow("update id", newID),
+				inspectRow("update built", "2026-08-19 19:14:43  (3d ago)"),
+			},
+			// The verdict row is the one thing a detail cannot imply.
+			skipRows: []string{inspectRow("update", "available"), inspectRow("update", "up to date")},
+		},
+		{
+			name:     "an unstamped check reports no age",
+			upd:      inspectUpdateInfo{now: now, verdict: &yes},
+			wantRows: []string{inspectRow("update", "available")},
+			skipRows: []string{"(checked"},
+		},
+		{
+			name: "an empty new id omits only its own row",
+			upd: inspectUpdateInfo{
+				now:     now,
+				verdict: &yes,
+				detail:  compose.UpdateDetail{LocalCreated: localBuilt, NewCreated: newBuilt},
+			},
+			wantRows: []string{
+				inspectRow("built", "2026-07-07 17:47:22  (47d ago)"),
+				inspectRow("update built", "2026-08-19 19:14:43  (3d ago)"),
+			},
+			skipRows: []string{"update id"},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			out := buildInspectSummary(updateRowsDoc(), 120, tt.upd)
+			for _, want := range tt.wantRows {
+				if !strings.Contains(out, want) {
+					t.Errorf("summary missing %q:\n%s", want, out)
+				}
+			}
+			for _, skip := range tt.skipRows {
+				if strings.Contains(out, skip) {
+					t.Errorf("summary must not contain %q:\n%s", skip, out)
+				}
+			}
+		})
+	}
+}
+
+// TestBuildInspectSummary_UpdateRowOrder pins where the block sits: the two ids
+// and the two build dates have to read as pairs, so "built" follows "image id"
+// and the command pair stays at the bottom of the section.
+func TestBuildInspectSummary_UpdateRowOrder(t *testing.T) {
+	yes := true
+	now := time.Date(2026, 8, 23, 19, 0, 0, 0, time.UTC)
+	out := buildInspectSummary(updateRowsDoc(), 120, inspectUpdateInfo{
+		now:       now,
+		verdict:   &yes,
+		checkedAt: now.Add(-3 * time.Minute),
+		detail: compose.UpdateDetail{
+			LocalCreated: time.Date(2026, 7, 7, 17, 47, 22, 0, time.UTC),
+			NewID:        "sha256:" + strings.Repeat("c", 64),
+			NewCreated:   time.Date(2026, 8, 19, 19, 14, 43, 0, time.UTC),
+		},
+	})
+
+	prev := -1
+	for _, label := range []string{"image ", "image id", "built ", "update ", "update id", "update built", "command"} {
+		at := strings.Index(out, "  "+label)
+		if at < 0 {
+			t.Fatalf("summary missing the %q row:\n%s", label, out)
+		}
+		if at <= prev {
+			t.Errorf("%q at %d is not after the previous row at %d:\n%s", label, at, prev, out)
+		}
+		prev = at
+	}
+}
+
+// TestBuildInspectSummary_UpdateRowsEpochSentinel pins the reproducible-build
+// guard on both date rows independently. distroless, ko, Bazel and nix images
+// report 1970-01-01, which is a sentinel rather than a build date, so the row is
+// dropped instead of claiming the image was built 56 years ago.
+func TestBuildInspectSummary_UpdateRowsEpochSentinel(t *testing.T) {
+	now := time.Date(2026, 8, 23, 19, 0, 0, 0, time.UTC)
+	epoch := time.Unix(0, 0).UTC()
+	real := time.Date(2026, 8, 19, 19, 14, 43, 0, time.UTC)
+	yes := true
+
+	tests := []struct {
+		name    string
+		detail  compose.UpdateDetail
+		wantRow string
+		skipRow string
+	}{
+		{
+			name:    "local epoch drops built only",
+			detail:  compose.UpdateDetail{LocalCreated: epoch, NewCreated: real},
+			wantRow: inspectRow("update built", "2026-08-19 19:14:43  (3d ago)"),
+			// The row prefix is part of the needle: "built" alone is a
+			// substring of the "update built" row this case must keep.
+			skipRow: "\n  built",
+		},
+		{
+			name:    "registry epoch drops update built only",
+			detail:  compose.UpdateDetail{LocalCreated: real, NewCreated: epoch},
+			wantRow: inspectRow("built", "2026-08-19 19:14:43  (3d ago)"),
+			skipRow: "update built",
+		},
+		{
+			name:    "both epoch drops both",
+			detail:  compose.UpdateDetail{LocalCreated: epoch, NewCreated: epoch, NewID: "sha256:" + strings.Repeat("c", 64)},
+			wantRow: inspectRow("update id", "sha256:"+strings.Repeat("c", 64)),
+			skipRow: "built",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			detail := tt.detail
+			out := buildInspectSummary(updateRowsDoc(), 120, inspectUpdateInfo{now: now, verdict: &yes, detail: detail})
+			if !strings.Contains(out, tt.wantRow) {
+				t.Errorf("summary missing %q:\n%s", tt.wantRow, out)
+			}
+			if strings.Contains(out, tt.skipRow) {
+				t.Errorf("summary must not contain %q:\n%s", tt.skipRow, out)
+			}
+			if strings.Contains(out, "1970") {
+				t.Errorf("the epoch sentinel must never be rendered:\n%s", out)
+			}
+		})
+	}
+}
+
+// TestBuildInspectSummary_UpdateRowsWrapNarrow pins that the new rows obey the
+// wrap-not-truncate promise the rest of the section already carries: a 64-hex
+// digest is far wider than a narrow pane, and losing its tail would make the
+// "image id" / "update id" comparison the rows exist for impossible.
+func TestBuildInspectSummary_UpdateRowsWrapNarrow(t *testing.T) {
+	yes := true
+	now := time.Date(2026, 8, 23, 19, 0, 0, 0, time.UTC)
+	newID := "sha256:" + strings.Repeat("c", 64)
+	upd := inspectUpdateInfo{
+		now:       now,
+		verdict:   &yes,
+		checkedAt: now.Add(-3 * time.Minute),
+		detail: compose.UpdateDetail{
+			LocalCreated: time.Date(2026, 7, 7, 17, 47, 22, 0, time.UTC),
+			NewID:        newID,
+			NewCreated:   time.Date(2026, 8, 19, 19, 14, 43, 0, time.UTC),
+		},
+	}
+
+	for _, width := range []int{1, 4, 10, 16, 20, 30, 40, 60, 80} {
+		out := buildInspectSummary(updateRowsDoc(), width, upd)
+		for i, line := range strings.Split(out, "\n") {
+			if w := ansi.StringWidth(line); w > width {
+				t.Errorf("width %d: line %d is %d cells: %q", width, i, w, line)
+			}
+		}
+		// squeeze drops the wrap, so a truncated tail is the only way to fail.
+		flat := squeeze(out)
+		for _, want := range []string{newID, "2026-07-0717:47:22(47dago)", "available(checked3mago)", "2026-08-1919:14:43(3dago)"} {
+			if !strings.Contains(flat, want) {
+				t.Errorf("width %d: %q was truncated:\n%s", width, want, out)
+			}
+		}
+	}
+}
+
 func TestBuildInspectSummary_MountsSection(t *testing.T) {
 	doc := loadInspectFixture(t, "docker_inspect_healthy.json")
 	if len(doc.Mounts) != 2 {
 		t.Fatalf("fixture mounts = %d, want 2", len(doc.Mounts))
 	}
-	out := buildInspectSummary(doc, 200)
+	out := buildInspectSummary(doc, 200, inspectUpdateInfo{})
 
 	if !strings.Contains(out, "MOUNTS") {
 		t.Fatalf("summary missing MOUNTS:\n%s", out)
@@ -702,10 +996,10 @@ func TestBuildInspectSummary_MountsWrapNotTruncate(t *testing.T) {
 		t.Fatalf("fixture mounts = %d, want %d", len(doc.Mounts), len(want))
 	}
 	for _, width := range []int{40, 60, 80} {
-		out := squeeze(buildInspectSummary(doc, width))
+		out := squeeze(buildInspectSummary(doc, width, inspectUpdateInfo{}))
 		for _, w := range want {
 			if !strings.Contains(out, squeeze(w)) {
-				t.Errorf("width %d: mount %q truncated:\n%s", width, w, buildInspectSummary(doc, width))
+				t.Errorf("width %d: mount %q truncated:\n%s", width, w, buildInspectSummary(doc, width, inspectUpdateInfo{}))
 			}
 		}
 	}
@@ -735,7 +1029,7 @@ func TestBuildInspectSummary_MountLabelEdges(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			out := buildInspectSummary(compose.InspectDoc{Mounts: []compose.InspectMount{tt.in}}, 80)
+			out := buildInspectSummary(compose.InspectDoc{Mounts: []compose.InspectMount{tt.in}}, 80, inspectUpdateInfo{})
 			if !strings.Contains(out, tt.want) {
 				t.Errorf("summary missing %q:\n%s", tt.want, out)
 			}
@@ -748,7 +1042,7 @@ func TestBuildInspectSummary_MountsAbsent(t *testing.T) {
 	if len(doc.Mounts) != 0 {
 		t.Fatalf("fixture mounts = %d, want 0", len(doc.Mounts))
 	}
-	if out := buildInspectSummary(doc, 120); strings.Contains(out, "MOUNTS") {
+	if out := buildInspectSummary(doc, 120, inspectUpdateInfo{}); strings.Contains(out, "MOUNTS") {
 		t.Errorf("container with no mounts must not render MOUNTS:\n%s", out)
 	}
 }
@@ -794,7 +1088,7 @@ func TestFormatInspectMount(t *testing.T) {
 // secrets included. Masking here without masking raw mode would protect nothing.
 func TestBuildInspectSummary_EnvVerbatim(t *testing.T) {
 	doc := loadInspectFixture(t, "docker_inspect_healthy.json")
-	out := buildInspectSummary(doc, 200)
+	out := buildInspectSummary(doc, 200, inspectUpdateInfo{})
 
 	if !strings.Contains(out, "ENV") {
 		t.Fatalf("summary missing ENV:\n%s", out)
@@ -846,7 +1140,7 @@ func TestBuildInspectSummary_EnvPresence(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			doc := compose.InspectDoc{Config: compose.InspectConfig{Env: tt.env}}
-			out := buildInspectSummary(doc, 80)
+			out := buildInspectSummary(doc, 80, inspectUpdateInfo{})
 			if got := strings.Contains(out, "ENV"); got != tt.want {
 				t.Fatalf("ENV present = %v, want %v:\n%s", got, tt.want, out)
 			}
@@ -867,7 +1161,7 @@ func TestBuildInspectSummary_EnvPresence(t *testing.T) {
 // it runs, then what it has attached.
 func TestBuildInspectSummary_SectionOrder(t *testing.T) {
 	doc := loadInspectFixture(t, "docker_inspect_healthy.json")
-	out := buildInspectSummary(doc, 200)
+	out := buildInspectSummary(doc, 200, inspectUpdateInfo{})
 
 	prev := -1
 	for _, section := range []string{"STATE", "HEALTH", "IMAGE", "MOUNTS", "ENV"} {
@@ -946,7 +1240,7 @@ func TestBuildInspectSummary_StripsTerminalEscapes(t *testing.T) {
 		}},
 	}
 
-	out := buildInspectSummary(doc, 120)
+	out := buildInspectSummary(doc, 120, inspectUpdateInfo{})
 	for _, banned := range []string{esc + "]", "\x07", "\r", "2J", "pwned", "cGF5bG9hZA==", "\x9b"} {
 		if strings.Contains(out, banned) {
 			t.Errorf("summary must not carry %q:\n%q", banned, out)
@@ -1014,7 +1308,7 @@ func TestBuildInspectSummary_ExpandsTabs(t *testing.T) {
 		},
 	}
 
-	out := buildInspectSummary(doc, 120)
+	out := buildInspectSummary(doc, 120, inspectUpdateInfo{})
 	if strings.Contains(out, "\t") {
 		t.Errorf("no tab may reach the pane:\n%q", out)
 	}
@@ -1027,4 +1321,185 @@ func TestBuildInspectSummary_ExpandsTabs(t *testing.T) {
 			t.Errorf("probe indentation lost, missing %q:\n%s", want, out)
 		}
 	}
+}
+
+// inspectSummaryHealthyGolden is the summary the healthy fixture rendered
+// BEFORE buildInspectSummary took an inspectUpdateInfo, captured verbatim. It
+// pins the migration promise: the zero value draws no extra row, so widening
+// the signature — and, in the task after it, adding the update rows — cannot
+// move a byte of the summary a caller with nothing to say gets.
+const inspectSummaryHealthyGolden = `  STATE
+  container       cdeployfixture-healthyweb-1
+  status          running
+  started         2026-08-22 03:09:23
+  restart policy  no
+  restarts        0
+
+  HEALTH
+  status          healthy
+  failing streak  0
+  test            CMD-SHELL curl -fsS http://localhost/ >/dev/null || exit 1
+  interval        5s
+  timeout         3s
+  start period    2s
+  retries         3
+  last probe      exit 0 at 2026-08-22 03:09:38
+
+  IMAGE
+  image           nginx:latest
+  image id        sha256:d090ef0c3fa38df49d89dfcca52ce77f71d88a8db6bd8388d78817cad20a0c1f
+  command         nginx -g daemon off;
+  entrypoint      /docker-entrypoint.sh
+
+  MOUNTS
+  bind            /srv/cdeployfixture/site → /usr/share/nginx/html  ro
+  volume          /var/lib/docker/volumes/cdeployfixture_webdata/_data → /var/cache/nginx  rw
+
+  ENV
+  POSTGRES_PASSWORD=s3cr3t-pw
+  DATABASE_URL=postgres://appuser:hunter2@db:5432/appdb
+  APP_ENV=production
+  PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+  NGINX_VERSION=1.31.0
+  NJS_VERSION=0.9.8
+  NJS_RELEASE=1~trixie
+  ACME_VERSION=0.4.1
+  PKG_RELEASE=1~trixie
+  DYNPKG_RELEASE=1~trixie`
+
+func TestBuildInspectSummary_ZeroUpdateInfoIsByteIdentical(t *testing.T) {
+	doc := loadInspectFixture(t, "docker_inspect_healthy.json")
+
+	if got := buildInspectSummary(doc, 120, inspectUpdateInfo{}); got != inspectSummaryHealthyGolden {
+		t.Errorf("zero inspectUpdateInfo changed the summary:\ngot:\n%s\nwant:\n%s", got, inspectSummaryHealthyGolden)
+	}
+}
+
+// TestInspectUpdateInfo_FromCache pins the one lookup rebuildInspectSummary
+// makes. Note the RAW map read: an entry past updatesCacheTTL still feeds the
+// rows, because the glyph it belongs to survives its TTL too.
+func TestInspectUpdateInfo_FromCache(t *testing.T) {
+	yes, no := true, false
+	fetched := time.Date(2026, 8, 23, 10, 0, 0, 0, time.UTC)
+	stale := time.Now().Add(-2 * updatesCacheTTL)
+	detail := compose.UpdateDetail{NewID: "sha256:" + strings.Repeat("c", 64)}
+
+	tests := []struct {
+		name        string
+		entry       updateEntry
+		service     string
+		wantVerdict *bool
+		wantDetail  bool
+		wantChecked time.Time
+	}{
+		{
+			name: "verdict and detail",
+			entry: updateEntry{
+				fetchedAt: fetched,
+				results:   map[string]bool{"web": true},
+				details:   map[string]compose.UpdateDetail{"web": detail},
+			},
+			service:     "web",
+			wantVerdict: &yes,
+			wantDetail:  true,
+			wantChecked: fetched,
+		},
+		{
+			name: "verdict without detail",
+			entry: updateEntry{
+				fetchedAt: fetched,
+				results:   map[string]bool{"web": false},
+			},
+			service:     "web",
+			wantVerdict: &no,
+			wantChecked: fetched,
+		},
+		{
+			name: "service absent from the entry",
+			entry: updateEntry{
+				fetchedAt: fetched,
+				results:   map[string]bool{"db": true},
+				details:   map[string]compose.UpdateDetail{"db": detail},
+			},
+			service:     "web",
+			wantChecked: fetched,
+		},
+		{
+			name:    "errored entry is untrusted",
+			entry:   updateEntry{fetchedAt: fetched, err: true, errMsg: "boom"},
+			service: "web",
+		},
+		{
+			// Explicitly past the TTL against the REAL clock: inspectUpdateInfo
+			// reads the raw map rather than updatesCacheLookup, because the
+			// glyph itself survives its TTL until a refresh replaces it.
+			name: "stale entry still renders",
+			entry: updateEntry{
+				fetchedAt: stale,
+				results:   map[string]bool{"web": true},
+				details:   map[string]compose.UpdateDetail{"web": detail},
+			},
+			service:     "web",
+			wantVerdict: &yes,
+			wantDetail:  true,
+			wantChecked: stale,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			m := Model{
+				inspectService: tt.service,
+				updateCache:    map[string]updateEntry{"|": tt.entry},
+			}
+			got := m.currentUpdateInfo()
+
+			if got.now.IsZero() {
+				t.Error("now must be stamped so the renderer stays pure")
+			}
+			if !got.checkedAt.Equal(tt.wantChecked) {
+				t.Errorf("checkedAt = %v, want %v", got.checkedAt, tt.wantChecked)
+			}
+			switch {
+			case tt.wantVerdict == nil && got.verdict != nil:
+				t.Errorf("verdict = %v, want nil", *got.verdict)
+			case tt.wantVerdict != nil && got.verdict == nil:
+				t.Errorf("verdict = nil, want %v", *tt.wantVerdict)
+			case tt.wantVerdict != nil && *got.verdict != *tt.wantVerdict:
+				t.Errorf("verdict = %v, want %v", *got.verdict, *tt.wantVerdict)
+			}
+			// The zero UpdateDetail IS the "unknown" contract, so presence is
+			// read off the fields the renderer checks rather than a pointer.
+			if tt.wantDetail != (got.detail != compose.UpdateDetail{}) {
+				t.Errorf("detail = %+v, want present = %v", got.detail, tt.wantDetail)
+			}
+			if tt.wantDetail && got.detail.NewID != detail.NewID {
+				t.Errorf("detail.NewID = %q, want %q", got.detail.NewID, detail.NewID)
+			}
+		})
+	}
+}
+
+// TestInspectUpdateInfo_NoCache covers the cold path: no cache at all, and the
+// wrong key. Both must yield the zero value, which draws nothing.
+func TestInspectUpdateInfo_NoCache(t *testing.T) {
+	t.Run("nil cache", func(t *testing.T) {
+		m := Model{inspectService: "web"}
+		if got := m.currentUpdateInfo(); got.verdict != nil || got.detail != (compose.UpdateDetail{}) || !got.checkedAt.IsZero() {
+			t.Errorf("nil cache must draw nothing, got %+v", got)
+		}
+	})
+
+	t.Run("another context's key", func(t *testing.T) {
+		m := Model{
+			inspectService: "web",
+			projDir:        "/srv/app",
+			updateCache: map[string]updateEntry{
+				"/other|": {fetchedAt: time.Now(), results: map[string]bool{"web": true}},
+			},
+		}
+		if got := m.currentUpdateInfo(); got.verdict != nil || !got.checkedAt.IsZero() {
+			t.Errorf("another context's entry must not be read, got %+v", got)
+		}
+	})
 }

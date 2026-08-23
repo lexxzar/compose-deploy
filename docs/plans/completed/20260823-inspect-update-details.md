@@ -1,0 +1,850 @@
+# Inspect screen: update details (`update id`, `update built`)
+
+## Overview
+
+The `i` inspect screen's IMAGE section currently shows `image`, `digest`, `command` and
+`entrypoint`. When the `⇧` glyph says an update exists, the screen cannot say **which**
+image is waiting or **when it was built**.
+
+This plan adds four rows to the IMAGE section and relabels the existing `digest` row to
+`image id`. The `update` row is drawn whenever the verdict is non-nil (`available` on `true`,
+`up to date` on `false`); `built`, `update id` and `update built` carry values the detail fetch
+returns, and that fetch runs only for a `true` verdict, so in practice the four appear
+together. *(The row count and the `false` case were amended in review round 1; the Rendering
+rules table below is the authority.)*
+
+```
+IMAGE
+  image         postgres:16-alpine
+  image id      sha256:7e7dbab8…
+  built         2026-07-07 17:47:22  (47d ago)
+  update        available  (checked 3m ago)
+  update id     sha256:c05eced0…
+  update built  2026-08-19 19:14:43  (4d ago)
+  command       postgres
+```
+
+The detail fetch rides the **existing `⇧` cache entry, TTL and trigger rules** — no new key,
+no separate schedule. It is a strict extension of the update-detection subsystem, and the
+`Composer` interface does not change. *(Amended in review rounds 1-5: the details are DELIVERED
+by a second message, `updateDetailsMsg`, so the verdicts never wait on the registry calls. That
+message carries its OWN identity — `forKey` + `forEntry`, captured at dispatch time — rather than
+the verdicts' session counter, and the phase is bounded by one new Model field,
+`m.detailsInFlight`. See the Solution Overview and the Residuals.)*
+
+### Verified feasibility
+
+Measured on this machine (Docker 29.1.3 / buildx v0.30.1-desktop.1) before the plan was
+written:
+
+- A registry **config digest equals the local docker image ID**. Resolving the config digest
+  at the local image's own RepoDigest returned `sha256:7e7dbab8…`, matching
+  `docker image inspect --format '{{.Id}}'` exactly. So `update id` is comparable with
+  `image id`.
+- `--format '{{json .Manifest}}'` and `--format '{{json .Image}}'` both work, even though
+  the documented `--format '{{.Manifest.Digest}}'` still silently falls through to the
+  human block. The format flag is selectively broken, not uniformly broken.
+- `{{json .Image}}` on a **bare tag** returns a platform-keyed map (8 entries for nginx) and
+  costs 4.3 s. On a **pinned platform ref** it returns a bare object and costs ~1.2 s.
+  Always pin.
+- A multi-arch index interleaves **attestation manifests** with `platform.architecture ==
+  "unknown"` — 8 of nginx's 16 entries. They must be filtered.
+- `created` is `1970-01-01T00:00:00Z` for reproducible builds (verified on
+  `gcr.io/distroless/static`). It is a sentinel, not data.
+
+### Cost, and the risk it carries
+
+The fetch adds **up to 3 registry round-trips per updated image** (steps 2, 3 and 4 below), on
+top of the 1 the check already makes — **up to 4 in total per updated image**. It is 2 rather
+than 3 when the reference resolves to a single manifest: step 2's own output IS the manifest
+then, so its `config.digest` is reused and step 3 is skipped *(amended in review round 1)*.
+During research this hit Docker Hub's anonymous quota:
+
+```
+ERROR: unexpected status from HEAD request to
+https://registry-1.docker.io/v2/library/postgres/manifests/16-alpine:
+429 Too Many Requests
+```
+
+~15 anonymous manifest requests in ten minutes was enough. Three mitigations are built into
+the design, and all three are load-bearing:
+
+1. Details are fetched **only for services whose verdict is `true`** — usually a small
+   minority.
+2. The fetch is memoised **by image reference**, mirroring `scanImageUpdates`.
+3. It inherits `autoUpdatesAllowed()`, so it never fires by itself on the read-only
+   unmanaged screen.
+
+A quota hit already matches `looksLikeNetworkErr` (`too many requests`), which would trip
+the registry cascade and blank the whole `⇧` column. **A detail-fetch failure must therefore
+never propagate into the verdict path** — see Task 7.
+
+**Considered and rejected — reusing the index `CheckUpdates` already fetched.**
+`fetchRemoteDigestVia` (`internal/compose/updates.go:697`) runs `imagetools inspect <ref>`
+moments earlier, and its human output carries a `Manifests:` block with a `Name:` and
+`Platform:` per entry. Reusing it would remove step 2 and cut the cost by a quarter. It is
+rejected because harvesting per-platform digests from the human block is exactly the fragile
+text parse that produced the `--format` regression this subsystem already carries a pin
+against, and because plumbing the raw bytes out of `scanImageUpdates` would change a loop
+shared by all three composers. Revisit only if the quota proves binding in practice.
+
+## Context (from discovery)
+
+- **Files involved**: `internal/compose/updates.go`, `internal/compose/remote.go`,
+  `internal/compose/hostcontainers.go`, `internal/compose/snapshot.go` (read-only, for
+  `stripTag` reuse), `internal/tui/app.go`, `internal/tui/inspect.go`, `README.md`.
+- **Patterns reused**:
+  - The `dockerRunner` three-method seam (`run` / `stream` / `tty`) — every top-level
+    `docker` call already routes through it, and it gives remote SSH escaping plus
+    `errSSHTransport` classification for free.
+  - `scanImageUpdates`'s memoise-by-image-ref loop shape (`updates.go:394`).
+  - The `Inspector` / `ConfigProvider` / `ExecProvider` precedent: a TUI-declared interface,
+    type-asserted on the concrete composer, with `var _ …` compile-time pins in
+    `internal/tui/app_test.go:14339-14351`.
+  - `stripTag` (`updates.go:248`), the single source of truth for building a
+    `repo@digest` ref — see `rollbackImageRef` (`snapshot.go:198`).
+  - `formatInspectTime` (`internal/tui/inspect.go:409`) already renders
+    `2006-01-02 15:04:05`; `humanizeAge` (`internal/tui/app.go:2893`) already renders
+    `47d ago`.
+- **Dependencies**: none new. No `Composer` change, so **no mock churn** in
+  `internal/runner/`, `internal/tui/app_test.go`, `cmd/deploy_test.go`, `cmd/list_test.go`.
+- **No help-table changes**: no new key is bound, so the `?` overlay drift pins, the
+  container footer and `TestHelpGroups_NamesEveryBoundKey` are all untouched.
+
+### Departure-site audit (done — no cleanup needed)
+
+The repo's most fragile invariant is back-navigation state cleanup, so this was checked
+explicitly rather than assumed. `details` lives only in two places, both already handled:
+
+- `updateCache`, which is context-keyed by `updatesCacheKey()` (`app.go:3869`, including the
+  `unmanaged|` prefix) and already invalidated after a successful Deploy (`app.go:2654`).
+- the transient message that delivers it.
+
+*(Amended in review rounds 1-4: ONE new Model field was added after all — `m.detailsInFlight`,
+the guard that bounds the detail phase to one batch. It is deliberately a GLOBAL bound with NO
+departure-site reset, and `details` itself still needs none, so the conclusion below is
+unchanged: no departure site moves.)*
+
+Therefore `clearInspect()` (`app.go:3185`), the `esc` chain, `entryLocal` and the
+`connectResultMsg` error path need **no** change, and `inspectViewportSize()`
+(`app.go:3068`) needs none either — the new rows live inside the viewport, not the chrome
+budget. The longest new label is `update built`: `"  update built"` is 14 cells against
+`inspectValueCol = 18`, so no layout constant moves.
+
+### Fixtures
+
+Two real `{{json .Manifest}}` captures were taken **before** the 429 and are preserved at:
+
+```
+/Users/zavulon/.claude/jobs/5f71c92b/tmp/fixtures/
+  imagetools_manifest_index_nginx.json      # 16 manifests: 8 real platforms + 8 attestation
+  imagetools_manifest_index_postgres.json   # same shape, different platform set
+```
+
+These are genuine registry output, which hand-authored fixtures cannot fully imitate — the
+attestation interleave and the variant fields are exactly the shapes the parser must
+survive. **Copy them in Task 3 before anything else**, because that directory is scratch
+space and is removed when the job is deleted. If they are already gone, hand-author both
+from the shapes recorded under "Shape forks the parsers must survive" rather than re-fetching
+from the registry.
+
+## Development Approach
+
+- **testing approach**: Regular (code first, then tests)
+- complete each task fully before moving to the next
+- make small, focused changes
+- **CRITICAL: every task MUST include new/updated tests** for code changes in that task
+  - write unit tests for new functions/methods
+  - write unit tests for modified functions/methods
+  - tests cover both success and error scenarios
+- **CRITICAL: all tests must pass before starting the next task** — no exceptions
+- **CRITICAL: update this plan file when scope changes during implementation**
+- run `go test ./...` after each change
+- maintain backward compatibility
+
+## Testing Strategy
+
+- **unit tests**: required for every task.
+- **no e2e tests**: this project has none. The TUI is tested by calling `Update()` with
+  `tea.KeyMsg` directly, and the compose layer by driving fake `dockerRunner`s — no TTY and
+  no Docker needed.
+- **no live registry calls in tests.** Every parser test reads a captured fixture from
+  `internal/compose/testdata/`. This is not only for speed: a test suite that hits Docker Hub
+  would reproduce the 429 in CI.
+
+## Progress Tracking
+
+- mark completed items with `[x]` immediately when done
+- add newly discovered tasks with ➕ prefix
+- document issues/blockers with ⚠️ prefix
+- update plan if implementation deviates from original scope
+
+## Solution Overview
+
+A new TUI-declared interface, implemented by all three composers over the shared
+`dockerRunner` seam:
+
+```go
+// internal/tui/app.go
+type UpdateDetailer interface {
+    UpdateDetails(ctx context.Context, services []string) (map[string]compose.UpdateDetail, error)
+}
+```
+
+`refreshUpdates()` — the Cmd that already owns the `⇧` schedule — drives it for the services
+that came back `true`. Both halves share the schedule, the cache key, the cache entry, the TTL,
+the trigger set and the post-Deploy invalidation, so the "same timings" requirement is satisfied
+by construction rather than by a parallel mechanism that could drift.
+
+*(Amended in review rounds 1-5. The original design ran both calls in ONE goroutine and returned
+ONE message. That held the verdicts — already in hand — behind the registry round-trips: the
+whole `⇧` column stayed blank for that window and `U` was dead. As built, `refreshUpdates`
+returns the moment `CheckUpdates` does, and the `updatesMsg` handler enqueues
+`m.updateDetailsCmd(entry, key)` AFTER the cache write; the resulting `updateDetailsMsg` merges
+`details` onto the entry the verdicts created. It carries its OWN identity — `forKey` +
+`forEntry` — instead of a session counter, `m.detailsInFlight` bounds the phase to one batch
+globally under an `updateDetailsTimeout` deadline, and a batch that was refused or lost heals
+from the entry's own state through `refillUpdateDetailsCmd`. Two Cmds and two messages, still
+one cache entry under one key.)*
+
+The inspect screen is a **consumer** of that cache: it never fetches. When either message lands
+while the user is already on `screenInspect`, the handler calls `redrawInspectFromCache()` so the
+rows appear without a re-entry (Task 7).
+
+### Key design decisions
+
+1. **TUI-only interface, not a `Composer` change.** Keeps `runner.Composer` and its five
+   mocks untouched, and keeps `cdeploy list --updates` at its current cost. The CLI has no
+   detail view to render, so it would pay for data it cannot show.
+2. **Details ride `refreshUpdates`, not a lazy key press.** Per the explicit requirement
+   that the update info use the same rules and timings as the `⇧` glyph. *(Amended in review
+   round 1: they ride its SCHEDULE, not its message — see the amendment above.)*
+3. **A detail failure is non-fatal and never reaches `updatesMsg.err`.** The glyph is the
+   load-bearing signal; the detail rows are a bonus. This mirrors the existing
+   `svcErr > statsErr > updatesErr` soft-failure priority.
+4. **The detail rows appear together, only on `true`.** `built` is fetched by the same call,
+   so it appears alongside the update rows rather than always. See Residuals. *(Amended in
+   review round 1: the `update` row is NOT one of them — it is drawn from the verdict alone,
+   so it also renders `up to date` for a `false` verdict.)*
+5. **Strict validation, omit on doubt.** Every parser returns "absent" rather than a guess,
+   the same discipline `parseImagetoolsDigest` follows after the `--format` regression.
+6. **Only fields a row draws.** `UpdateDetail` carries exactly three values. An earlier
+   draft also carried `Platform` and `LocalID`; both were dropped because nothing renders
+   them, and `docs/architecture/tui-inspect-screen.md` states the rule directly — "a
+   parsed-but-unrendered field is a promise the screen does not keep".
+
+## Technical Details
+
+### The new type
+
+```go
+// internal/compose/updatedetails.go
+type UpdateDetail struct {
+    LocalCreated time.Time // build time of the running image; zero = unknown/sentinel
+    NewID        string    // config digest of the registry image = its docker image ID
+    NewCreated   time.Time // build time of the registry image; zero = unknown/sentinel
+}
+```
+
+### Per-image fetch sequence
+
+| # | Command | Yields |
+|---|---|---|
+| 1 | `docker image inspect --format '{{json .}}' <ref>` | `LocalCreated` + the platform triple (os / arch / variant). **Local only.** |
+| 2 | `docker buildx imagetools inspect --format '{{json .Manifest}}' <ref>` | the index; select the entry matching the normalised platform triple |
+| 3 | `docker buildx imagetools inspect --raw <pinnedRef>` | `config.digest` → `NewID` |
+| 4 | `docker buildx imagetools inspect --format '{{json .Image}}' <pinnedRef>` | `created` → `NewCreated` |
+
+`<pinnedRef>` is built with `stripTag(ref) + "@" + platformDigest`, reusing the in-package
+helper rather than re-deriving the repo portion.
+
+Steps 2–4 are registry calls. Step 1 is local. *(Amended in review round 1: step 3 is SKIPPED
+on the single-manifest path — step 2's output IS the manifest there, so `parseConfigDigest`
+already has `config.digest` and the `--raw` call is kept only as the fallback for a buildx whose
+`{{json .Manifest}}` omits the config descriptor. An updated image therefore costs 2 or 3
+registry calls, not always 3.)* All four bypass `command()` /
+`remoteCommand()` — they are top-level docker commands, so they go through the
+`dockerRunner` seam, exactly as `compareImageDigestVia` does.
+
+**Step 1 NAMES no field — it asks for `{{json .}}`.** *(Amended in review round 7; the original
+rule below was half right and its conclusion was wrong.)* A Go template referencing a field the
+docker struct lacks is a hard execution error, not an empty string — the policy documented at
+`internal/compose/hostcontainers.go:284-295` — and the CLI's raw-JSON retry runs with
+`missingkey=error`, so an `omitempty` field carrying no value fails there too. That ruled out
+naming `{{.Variant}}`. It did NOT rule out READING the variant: the whole-document form cannot
+fail that way (an unknown field simply never appears, and an absent variant parses as the empty
+string the matcher reads as "unknown"), which is the rule `hostPsArgs` already carries.
+Discarding the variant was not free — it forced the index match to guess, and the guess drew
+another image's digest on 32-bit ARM. `parseLocalProbe` decodes four keys out of the ~2 KB
+document and ignores the rest; `Id` stays among the ignored, because the `image id` row comes
+from the container's own inspect document.
+
+### Shape forks the parsers must survive
+
+- **Step 2, index vs single manifest.** A multi-arch tag returns `{"manifests": [...]}`. A
+  single-arch tag returns a manifest with no `manifests` key — in that case use the original
+  ref for steps 3–4. **This must be distinguishable from "platform not found in the index"**;
+  see the three-state return below.
+- **Step 2, attestation entries.** Skip any entry with `platform.architecture == "unknown"`
+  or `platform.os == "unknown"`.
+- **Step 2, variant matching.** Match on `os` + `architecture` + `variant`. *(Amended in review
+  rounds 7 and 8.)* Both sides are canonicalised first (`normalizePlatformVariant`, containerd's
+  rule: unqualified `arm` IS `v7`; `arm64` and `arm64/v8` are one platform), then the entry whose
+  NORMALISED variant equals step 1's wins. With no exact match, a lone entry whose normalised
+  variant is EMPTY wins (it serves the whole arch). Everything else aborts — including a lone
+  variant-qualified entry offered to a probe that names no variant, which round 8 removed once
+  normalisation made such a probe a concrete platform. Failing closed on the arm64 spelling is
+  NOT an option: both committed captures spell `linux/arm64` as `arm64/v8`, and the fold is what
+  makes those hosts match exactly.
+- **Step 4, map vs object.** A pinned ref returns a bare config object. A bare tag returns a
+  platform-keyed map. The parser must accept both, since a single-arch ref reaches step 4
+  unpinned.
+- **Epoch sentinel.** Any `created` with `Unix() <= 0` is treated as unknown and the row is
+  omitted.
+
+### The three-state index result
+
+`parseIndexPlatformDigest` must distinguish two failures that a `(string, bool)` return
+conflates:
+
+| Result | Meaning | Caller action |
+|---|---|---|
+| `hasIndex=false` | no `manifests` array — a single-manifest ref | use the original ref, and skip step 3 — step 2's output is already the manifest *(round 1)* |
+| `hasIndex=true, found=false` | an index exists but the host's platform is absent | **abort this image**; omit the rows |
+| `hasIndex=true, found=true` | matched | pin and continue |
+
+Conflating the middle row with the first is the silent failure mode: step 3 would run
+`--raw` against the index (no `config.digest`, so `NewID` is empty) and step 4 would return
+the platform-keyed map, from which the code could pick a platform that is not the host's.
+
+### Rendering rules
+
+| Row | Shown when |
+|---|---|
+| `image`, `image id`, `command`, `entrypoint` | unchanged from today |
+| `built` | detail present and `LocalCreated` non-zero |
+| `update` | verdict is non-nil. `available` on `true`, `up to date` on `false`. Omitted on `nil`. |
+| `update` age suffix | cache entry `fetchedAt` is non-zero → `(checked 3m ago)` |
+| `update id` | detail present and `NewID` non-empty |
+| `update built` | detail present and `NewCreated` non-zero |
+
+Raw mode (`r`) stays byte-identical — `m.inspectRaw` is untouched, and these rows exist only
+in the summary.
+
+## What Goes Where
+
+- **Implementation Steps**: all code, tests and documentation changes in this repo.
+- **Post-Completion**: manual verification against a real remote host and a rate-limit
+  observation that cannot be automated.
+
+## Implementation Steps
+
+### Task 1: Split the time formatter and add the epoch guard
+
+Independent of the compose work — sequenced first so the two halves can proceed in parallel.
+
+**Files:**
+- Modify: `internal/tui/inspect.go`
+- Modify: `internal/tui/inspect_test.go`
+
+- [x] split `formatInspectTime(s string)` into `formatInspectTimeValue(t time.Time) string`
+      plus the existing string wrapper that parses then delegates — `UpdateDetail` carries
+      `time.Time`, so without the split the new rows would round-trip through RFC3339
+- [x] add the epoch guard to `formatInspectTimeValue`: treat `t.Unix() <= 0` as absent,
+      covering the 1970 reproducible-build sentinel alongside the existing `Year() <= 1` check
+- [x] add `formatTimeWithAge(t, now time.Time) string` producing
+      `2026-07-07 17:47:22  (47d ago)`, reusing `formatInspectTimeValue` and `humanizeAge`,
+      and returning `""` whenever `formatInspectTimeValue` does
+- [x] **do not** extend `humanizeAge` with week/month tiers — `rollbackAgeSuffix` is its other
+      caller, the change is unrelated to this feature, and `47d ago` carries more information
+      than `1mo ago` when choosing a rollback target
+- [x] write tests asserting `formatInspectTimeValue` returns `""` for `1970-01-01T00:00:00Z`
+      and for the Go zero time, and a real value for a normal timestamp
+- [x] write tests for `formatTimeWithAge` across the minute/hour/day boundaries with a fixed `now`
+- [x] write a test asserting the existing `started` row is unchanged for a real timestamp
+- [x] run `go test ./internal/tui/` — must pass before task 2
+
+### Task 2: Add `UpdateDetail` and the local image probe
+
+**Files:**
+- Create: `internal/compose/updatedetails.go`
+- Create: `internal/compose/updatedetails_test.go`
+
+- [x] create `internal/compose/updatedetails.go` with the three-field `UpdateDetail` struct
+- [x] add `localProbeArgs(image string) []string` producing
+      `image inspect --format '{{json .}}' <image>` — NAMES no field
+      *(amended in review round 7; it was the pipe-joined `.Created|.Os|.Architecture` form)*
+- [x] add `parseLocalProbe(out []byte) (localProbe, error)` — decodes `Created`, `Os`,
+      `Architecture` and `Variant` out of the document, parses `Created` as RFC3339Nano and
+      returns a zero time for an unparseable or `Unix() <= 0` value
+- [x] write tests for `parseLocalProbe`: full line, malformed field count, unparseable
+      timestamp, epoch timestamp
+- [x] write a test for `localProbeArgs` asserting the argv carries no `compose` element
+- [x] run `go test ./internal/compose/` — must pass before task 3
+
+➕ `parseLocalProbe` also errors on an EMPTY os/arch, not only on a wrong field count: without
+a platform pair the Task 3 index match can only fail, so erroring here saves the two or three
+registry round-trips that would follow. The timestamp guard lives in a small `parseImageTimestamp` helper
+so Task 4's `parseImageCreated` reuses the same epoch rule.
+
+### Task 3: Add the index platform-selection parser
+
+**Files:**
+- Modify: `internal/compose/updatedetails.go`
+- Modify: `internal/compose/updatedetails_test.go`
+- Create: `internal/compose/testdata/imagetools_manifest_index_nginx.json`
+- Create: `internal/compose/testdata/imagetools_manifest_index_postgres.json`
+
+- [x] **first**, copy the two real captures from
+      `/Users/zavulon/.claude/jobs/5f71c92b/tmp/fixtures/` into `internal/compose/testdata/`
+      (scratch space — do this before anything else; if already removed, hand-author from
+      "Shape forks the parsers must survive" rather than re-fetching)
+- [x] add `manifestIndexArgs(image string) []string` → `buildx imagetools inspect --format
+      '{{json .Manifest}}' <image>`
+- [x] add `parseIndexPlatformDigest(data []byte, probe localProbe) (digest string, hasIndex bool, found bool)`
+      per the three-state table: skips `unknown` platform entries, matches os+arch+variant
+      *(amended in review round 7; the signature took bare `os, arch` strings and treated
+      variant as a tie-breaker)* with BOTH variants canonicalised through
+      `normalizePlatformVariant` *(added in review round 8)*, and validates the digest against
+      `imagetoolsDigestRE`
+- [x] write tests against the nginx fixture: selects `linux/arm64` correctly, never returns an
+      attestation digest, and returns `hasIndex=true, found=false` for an absent platform
+- [x] write a test asserting the single-manifest shape yields `hasIndex=false`
+- [x] write tests for the variant matching rule and for malformed JSON *(round 8 added
+      `TestNormalizePlatformVariant` and `_RealCaptureArmVariants`, and the v5/v6-versus-
+      unqualified rows in `_VariantMatching`)*
+- [x] run `go test ./internal/compose/` — must pass before task 4
+
+➕ `hasIndex=false` is returned ONLY for a well-formed document with no `manifests` key. Malformed
+JSON, a non-list `manifests` value, and an empty os/arch argument all return the ABORT state
+(`hasIndex=true, found=false`) instead. Mapping doubt onto the single-manifest state would send the
+caller down the exact silent-wrong-path the three-state return exists to prevent.
+
+➕ Variant matching rule. **Amended three times in review; the second amendment changed step 1 and
+the third added platform normalisation.** The original rule took the first entry in index order.
+Both real captures carry `linux/arm` twice (nginx v5+v7, postgres v6+v7), so a 32-bit ARM host was
+pinned to a variant it never runs and shown a confident `update id` / `update built` for another
+image — the silent-wrong-value the three-state return exists to prevent, one level finer. Round 6
+therefore aborted on TWO OR MORE qualified entries. Round 7 (codex) showed that stopped one case
+short: a LONE qualified entry was still accepted, so an image published for `linux/arm/v7` alone
+was handed to an ARMv6 host; the fix captured the variant (see the step-1 amendment above) and
+matched on it. Round 8 (codex) found the remaining case in the other direction: an UNQUALIFIED
+`linux/arm` descriptor was read as architecture-wide, but docker and containerd canonicalise it as
+ARMv7, so an ARMv5 or ARMv6 host still selected a v7 manifest. **Verified before implementing**:
+the OCI image-spec (`image-index.md`, "Platform Variants") makes `variant` OPTIONAL and standardises
+only `arm`/`v6`, `arm`/`v7`, `arm`/`v8` and `arm64`/`v8`, saying nothing about an absent one;
+containerd's `platforms/database.go` `normalizeArch` supplies the default — `arm` with `""` or `"7"`
+⇒ `v7`, `arm` with `5`/`6`/`8` ⇒ `v5`/`v6`/`v8`, `arm64` with `8`/`v8` ⇒ unqualified — and that
+function is unchanged from containerd 1.4 (in this repo's module cache) to the current
+`containerd/platforms` module, which docker and buildx use. `normalizePlatformVariant` applies it to
+BOTH sides before comparison; only the arm/arm64 variants are folded, since the architecture aliases
+containerd also normalises (`aarch64`, `x86_64`, `i386`) cannot reach either side — both come from
+docker's own JSON, which spells the architecture as a Go GOARCH value. Two consequences fell out:
+the `arm64`/`arm64/v8` pair now matches EXACTLY, so the lone-qualified-entry fallback that existed
+only for it was removed (keeping it would have handed an `arm64/v9` or `amd64/v3` entry to a
+baseline host — the same bug one variant further out), and a `linux/arm` probe that names no variant
+now resolves to the v7 entry instead of aborting on an ambiguity that was never one. Failing closed
+on the arm64 spelling was considered and rejected on the fixture evidence — both captures spell
+`linux/arm64` as `arm64/v8` (`TestPinnedImageRef` fails under that mutation).
+
+➕ `validImagetoolsDigest(s string) string` shares the strict WHOLE-STRING `imagetoolsDigestRE`
+check and the lower-case normalisation. Task 4's `parseConfigDigest` reuses it — a substring search
+would accept a fallen-through `--format` line as a digest.
+
+### Task 4: Add the config-digest and created-timestamp parsers
+
+**Files:**
+- Modify: `internal/compose/updatedetails.go`
+- Modify: `internal/compose/updatedetails_test.go`
+- Create: `internal/compose/testdata/imagetools_raw_manifest.json`
+- Create: `internal/compose/testdata/imagetools_image_config_map.json`
+- Create: `internal/compose/testdata/imagetools_image_config_object.json`
+
+- [x] add `rawManifestArgs` and `imageConfigArgs` for steps 3 and 4
+- [x] add `parseConfigDigest(raw []byte) string` reading `config.digest`, validated against
+      `imagetoolsDigestRE`, returning `""` on anything else
+- [x] add `parseImageCreated(data []byte, os, arch string) (time.Time, bool)` accepting BOTH
+      the platform-keyed map and the bare object, and rejecting `Unix() <= 0`
+- [x] hand-author the three fixtures from the shapes in Technical Details
+- [x] write tests for `parseConfigDigest`: valid, missing `config`, non-sha256 value, malformed JSON
+- [x] write tests for `parseImageCreated`: map form, object form, epoch rejection, absent platform
+- [x] run `go test ./internal/compose/` — must pass before task 5
+
+➕ **Removed in review**: `parseImageCreated` originally accepted BOTH the bare object and the
+platform-keyed map. The map branch is unreachable — step 4 only ever addresses a ref
+`pinnedImageRef` produced, which is either platform-pinned or reported single-manifest, and a
+multi-platform tag always carries an index so it is pinned or aborted at step 2. About 100
+production lines, ~150 test lines and one fixture were deleted; `parseImageCreated(data)` now
+decodes straight into `imageConfigDoc`, and a map document decodes with no top-level `created`, so
+it omits the row — the designed behaviour for doubt.
+
+➕ The bare object is trusted WITHOUT a platform cross-check. It is only reached for a ref that
+resolves to exactly one manifest, so its config is the only one there is; rejecting it on a
+platform mismatch would drop the row for every legitimate single-arch image.
+
+➕ Removed in review together with the map branch above (`pickImageConfig`, `platformKeyMatches`
+and `imageConfigKeys` are gone).
+
+### Task 5: Add the shared `scanUpdateDetails` loop
+
+**Files:**
+- Modify: `internal/compose/updatedetails.go`
+- Modify: `internal/compose/updatedetails_test.go`
+
+- [x] add `scanUpdateDetails(ctx, wanted map[string]string, d dockerRunner) (map[string]UpdateDetail, error)`
+      mirroring `scanImageUpdates`: memoise by image ref, one entry per distinct image
+- [x] chain steps 1→4; build the pinned ref with `stripTag(ref) + "@" + digest`
+- [x] branch on the three-state index result: `hasIndex=false` → use the original ref;
+      `hasIndex=true, found=false` → **abort this image**
+- [x] on any per-image failure, omit that service and continue — a partial result is valid
+- [x] short-circuit the whole scan on `errSSHTransport`, matching `scanImageUpdates`, and
+      return the partial map alongside the error per the untrusted-partial-map contract
+- [x] write tests with a fake `dockerRunner`: happy path, single-manifest path, platform-absent
+      abort, step-3 failure, step-4 failure, transport abort
+- [x] write a memoisation test — one image across three services issues one call set
+- [x] run `go test ./internal/compose/` — must pass before task 6
+
+➕ Services are visited in SORTED order. Each image costs up to four round-trips, up to three of
+them to the registry, so which images are reached before a transport abort must not depend on Go's map
+iteration order — otherwise the abort test is flaky and the quota cost is nondeterministic.
+
+➕ A per-image FAILURE (a command error, or a `parseLocalProbe` error) omits the whole entry and
+stops the sequence at that step, so a wasted registry round-trip is never spent on an image that
+is already lost. A step that SUCCEEDS but whose parser returns "absent" is NOT a failure: only its
+own field stays zero, and the rows the other steps filled still render.
+
+➕ Failures are memoised alongside successes, so a repeated image that cannot resolve costs one
+call set rather than one per service. The memoised error is kept rather than discarded, so an
+`errSSHTransport` still aborts the batch when it arrives from the cache.
+
+➕ The three-state branch lives in a named `pinnedImageRef(image, indexOut, probe)` helper rather
+than inline in the step chain: it is the one place the abort and the single-manifest fall-through
+are told apart, and it is testable without driving all four steps.
+
+### Task 6: Bind `UpdateDetails` on all three composers
+
+**Files:**
+- Modify: `internal/compose/updates.go`
+- Modify: `internal/compose/remote.go`
+- Modify: `internal/compose/hostcontainers.go`
+- Modify: `internal/compose/updatedetails_test.go`
+- Modify: `internal/tui/app_test.go`
+
+- [x] add `Compose.UpdateDetails` using `fetchServiceImages` + `filterServices` + `localDockerRunner`
+- [x] add `RemoteCompose.UpdateDetails` using the remote runner, so `SSHExtraArgs` splicing and
+      `classifySSHError` are inherited unchanged
+- [x] add `HostContainers.UpdateDetails` using `hostImageMap`, dropping empty refs and bare
+      image IDs exactly as `CheckUpdates` does
+- [x] add the three compile-time pins beside the existing `Inspector` triple at
+      `internal/tui/app_test.go:14348` — `var _ UpdateDetailer = (*compose.Compose)(nil)` and
+      the same for `*compose.RemoteCompose` and `*compose.HostContainers`. Without them a
+      rename or signature drift leaves the suite green while the rows silently vanish, which is
+      exactly what that comment block already warns about for `i`
+- [x] extend `TestHostContainers_CapabilityInterfaces` (`app_test.go:14360`) with the runtime
+      assertion for `UpdateDetailer`
+- [x] write tests asserting all three build argv with no `compose` element
+- [x] write a test asserting the remote argv splices `SSHExtraArgs` immediately before the host arg
+- [x] run `go test ./...` — must pass before task 7
+
+➕ `UpdateDetailer` is DECLARED in `internal/tui/app.go` here rather than in Task 7. The three
+compile-time pins this task requires cannot compile without it, and this task must leave
+`go test ./...` green. Task 7's first checkbox is therefore already satisfied when that task
+starts; everything else in Task 7 (the message, the cache field, `refreshUpdates`) is untouched.
+
+➕ The "no `compose` element" assertion is scoped to the four DETAIL calls on `Compose` and
+`RemoteCompose`. Their discovery call is `docker compose config --format json`, which is a real
+compose subcommand — a blanket assertion would either fail or force the test to skip the one
+call that legitimately carries it. `HostContainers` discovers with `docker ps`, so its whole
+argv set is asserted.
+
+### Task 7: Thread details through the update cache
+
+**Files:**
+- Modify: `internal/tui/app.go`
+- Modify: `internal/tui/app_test.go`
+
+- [x] declare the `UpdateDetailer` interface next to `Inspector` in `internal/tui/app.go`
+      (done in Task 6 — the compile-time pins there need it; see that task's ➕ note)
+- [x] add `details map[string]compose.UpdateDetail` to `updatesMsg` and to `updateEntry`
+      (both are keyed struct literals in tests, so this costs no test churn)
+- [x] extend `refreshUpdates()` to call `UpdateDetails` for the services whose verdict is
+      `true`, guarded by the type assertion and skipped entirely when no verdict is `true` —
+      note `filterServices` (`updates.go:612`) treats an empty slice as **all** services, so
+      the skip is load-bearing, not an optimisation
+- [x] **discard a detail-fetch error**: never assign it to `updatesMsg.err`, so a 429 during the
+      detail phase cannot blank the `⇧` column or shorten the cache entry to the error TTL
+- [x] store `details` on the cache entry beside `results`, under the same TTL and the same
+      session gate; leave `hydrateUpdates` untouched
+- [x] add a `screenInspect` branch to the `updatesMsg` handler that calls
+      `rebuildInspectSummary()` then `setInspectContent()` — without it, entering `i` on a cold
+      cache leaves the rows permanently absent until the user backs out and re-enters
+- [x] write a test asserting a detail-fetch error still yields verdicts and the 10 m success TTL
+- [x] write a test asserting `UpdateDetails` is NOT called when every verdict is `false`
+- [x] write a test asserting a composer without the interface still produces verdicts
+- [x] write a test asserting a stale-session `updatesMsg` does not write details to the cache
+- [x] write a test asserting an `updatesMsg` arriving on `screenInspect` refreshes the summary
+- [x] run `go test ./internal/tui/` — must pass before task 8
+
+➕ **Amended in review rounds 1-5: the delivery was SPLIT off the verdict message.** Three
+checkboxes above describe the first implementation — the `refreshUpdates` extension, the "same
+session gate" storage and the `screenInspect` branch. In it `refreshUpdates` fetched the details in
+its own goroutine and returned them on `updatesMsg`, which made the `⇧` verdicts wait on the
+registry calls with `updateInFlight` pinned true (a dead `U`). As built: `refreshUpdates` returns
+with the verdicts, the `updatesMsg` handler enqueues `m.updateDetailsCmd(entry, key)` after the
+cache write, and a second message — `updateDetailsMsg{details, forKey, forEntry}` — merges
+`details` onto the entry it was fetched for, under that entry's own identity rather than a session
+counter. `m.detailsInFlight` (the ONE new Model field) bounds the phase to one batch globally,
+`updateDetailsTimeout` guarantees the arrival that clears it, and `refillUpdateDetailsCmd`
+re-dispatches a batch that was refused or lost. The `screenInspect` rebuild moved into
+`redrawInspectFromCache()`, called from BOTH handlers. Everything else the checkboxes state — the
+discarded detail error, the one shared cache entry, the TTL and the trigger set — is unchanged.
+Rationale and failure modes: the Residuals, and `docs/architecture/update-detection.md`.
+
+➕ The detail fetch is ALSO skipped when `CheckUpdates` itself errored. A non-nil error makes
+the whole verdict map untrusted per the `Composer` contract, so no verdict is worth following
+up, and the two or three registry round-trips per image would be spent on a path that is already
+broken.
+
+➕ `servicesWithUpdate` returns the true verdicts SORTED, matching Task 5's sorted-visit rule:
+`scanUpdateDetails` walks the slice in order and a transport abort truncates the batch, so
+which images are reached must not depend on Go's map iteration order.
+
+➕ The `screenInspect` rebuild sits directly after the cache write, so it runs on the FAILURE
+path too — the entry that just landed carries no details, so a summary drawn from a previous
+one must stop showing them. It is the one screen-coupled mutation in the handler, pinned in
+both directions by `TestUpdatesMsg_RefreshesInspectSummary` and
+`TestUpdatesMsg_InspectRebuildIsScreenScoped`.
+
+### Task 8: Relabel `digest` → `image id`
+
+Isolated because it is a user-visible rename with its own broken assertions.
+
+**Files:**
+- Modify: `internal/tui/inspect.go`
+- Modify: `internal/tui/inspect_test.go`
+
+- [x] relabel the `digest` row in `inspectImageSection` (`inspect.go:292`) to `image id` — it is
+      the local image ID, and an `update id` row beside a row labelled `digest` invites exactly
+      the false comparison this feature must avoid
+- [x] update the four assertions that pin the old label (`inspect_test.go:578, 617, 625, 638`)
+- [x] run `go test ./internal/tui/` — must pass before task 9
+
+### Task 9: Widen the `buildInspectSummary` signature
+
+**Files:**
+- Modify: `internal/tui/inspect.go`
+- Modify: `internal/tui/app.go`
+- Modify: `internal/tui/inspect_test.go`
+
+- [x] add an `inspectUpdateInfo` struct carrying `now time.Time`, `detail *compose.UpdateDetail`,
+      `verdict *bool` and `checkedAt time.Time`, and change the signature to
+      `buildInspectSummary(doc, width int, upd inspectUpdateInfo)`. **Its zero value must draw
+      no new rows**, so the migration below is mechanical and every existing assertion holds
+- [x] keep the function pure — the clock arrives inside `upd`, never via `time.Now()` internally
+- [x] update the **single** production call site: `app.go:3178`, inside `rebuildInspectSummary()`.
+      `app.go:730` (the `WindowSizeMsg` branch) and `app.go:1240` (`inspectDataMsg`) both call
+      `rebuildInspectSummary()`, so they inherit the change untouched
+- [x] have `rebuildInspectSummary` build `inspectUpdateInfo` itself by reading
+      `m.updateCache[m.updatesCacheKey()]` and `m.inspectService` — one lookup, one site, no
+      chance of three copies drifting
+- [x] migrate the 25 existing calls in `inspect_test.go` by appending `inspectUpdateInfo{}`
+- [x] write a test asserting the zero value renders a byte-identical summary to before
+- [x] run `go test ./internal/tui/` — must pass before task 10
+
+### Task 10: Render the four new rows
+
+**Files:**
+- Modify: `internal/tui/inspect.go`
+- Modify: `internal/tui/inspect_test.go`
+
+- [x] extend `inspectImageSection` with the `built`, `update`, `update id` and `update built`
+      rows per the Rendering rules table, each omitted independently
+- [x] render the `update` row's `(checked 3m ago)` suffix from `upd.checkedAt`, omitting the
+      suffix when that is zero
+- [x] verify every new line goes through `inspectBuilder.push` so the sanitiser and `wrapCells`
+      soft-wrap apply, and that `viewInspect()` still does not end in a newline
+- [x] write table tests with a fixed `now`: update available (all rows), up to date (one
+      `update` line, no detail rows), verdict nil (no rows at all)
+- [x] write tests for the epoch sentinel omitting `built` and `update built` independently
+- [x] write a narrow-width test asserting the new rows wrap rather than truncate
+- [x] run `go test ./internal/tui/` — must pass before task 11
+
+➕ The IMAGE section's presence gate is UNCHANGED: a doc with no image, no command and no
+entrypoint stays silent even when a verdict is in hand. An update verdict describes the image,
+so a section opened by the verdict alone would carry one row and nothing to compare it against.
+
+➕ The four rows sit BETWEEN `image id` and `command`, so the two ids and the two build dates
+read as pairs. `TestBuildInspectSummary_UpdateRowOrder` pins that order.
+
+➕ Each row keys off its OWN input, per the rendering table: a detail with no verdict still
+draws `built` / `update id` / `update built`, and a verdict with no detail still draws `update`.
+The renderer never infers one from the other, so a future caller that fills only half the struct
+cannot make it claim something it was not told.
+
+### Task 11: Verify acceptance criteria
+
+- [x] verify the rows appear only when the verdict is `true`, and that `nil` renders nothing
+- [x] verify the detail fetch fires on the same triggers as `⇧`: screen entry on cache miss,
+      `U` force refresh, and post-Deploy cache invalidation
+- [x] verify no automatic fetch occurs on the read-only unmanaged screen, and that `U` still works there
+- [x] verify raw mode (`r`) output is byte-identical to before this change
+- [x] verify no help-table or footer drift: `go test ./internal/tui/ -run TestHelp` passes untouched
+- [x] run the full suite uncached: `go test ./... -count=1`
+- [x] run `go build -o cdeploy .` and confirm the binary builds
+
+➕ Every criterion held; nothing needed fixing. Four criteria were only implied by existing
+tests rather than pinned end to end, so each got its own test in `internal/tui/app_test.go`:
+`TestInspectScreen_UpdateRowsFollowTheVerdict` (cache entry → summary, including the
+cross-service leak case), `TestUpdateDetails_FireOnTheGlyphTriggers` (the three triggers, each
+driving the real Cmd), `TestReadOnly_NoAutomaticDetailFetch` (a NEW `readOnlyDetailComposer`
+double that carries the capability, so the gate is what the test measures) and
+`TestInspectScreen_RawModeIgnoresUpdateDetails` (raw output equal with and without a populated
+cache, with the differing summary as the control).
+
+➕ The help/footer criterion is verified structurally as well as by the run:
+`git diff --name-only` across the nine feature commits touches no `help*`/`footer*` file, so the
+`?` overlay drift pins and the container footer are provably untouched rather than merely green.
+
+### Task 12: Update documentation
+
+- [x] add the rule digest to `CLAUDE.md` under the update-detection paragraphs — the fetch
+      sequence, the three-state index result, the `.Variant` prohibition, the non-fatal-detail
+      rule and the epoch sentinel
+- [x] add the full rationale to `docs/architecture/update-detection.md`, including the measured
+      429, the three mitigations, and the rejected index-reuse option
+- [x] add the new IMAGE rows and the `buildInspectSummary` signature change to
+      `docs/architecture/tui-inspect-screen.md`
+- [x] update `README.md` in four places: line 67 and line 110 (both say "image digest"), line
+      440 (the IMAGE section description) and line 195 (which enumerates the exact docker
+      commands the update check runs and would otherwise undercount them)
+- [x] confirm `skills/cdeploy/SKILL.md` needs no edit — no CLI behaviour changed — and that its
+      content pins still pass
+- [x] move this plan to `docs/plans/completed/` (deferred — the exec run moves it in its final step, after the review phases)
+
+➕ The README's update-check enumeration (line ~195) was left describing the CHECK alone and the three
+extra calls got their own paragraph, "Detail rows on the inspect screen (TUI only)", after the TUI-cache
+paragraph. Folding four more commands into the one sentence that explains the verdict would have made a
+reader believe every service pays them; they are only spent on a service whose verdict is already `true`,
+and that gate is the rate-limit mitigation, so it needed the room to be stated.
+
+➕ A FIFTH README edit beyond the four named: the inspect screen's "The screen is a snapshot" paragraph now
+names the update rows as its one exception. The `updatesMsg` handler's `screenInspect` rebuild is exactly a
+self-refresh, so leaving that sentence absolute would have documented the opposite of Task 7's behaviour.
+
+➕ No new `docs/architecture/` file was created — the rationale extends the two existing subsystem files, so
+the "Six subsystems" sentence at the top of `CLAUDE.md` still counts correctly.
+
+## Residuals
+
+Deliberately out of scope; record rather than fix:
+
+- **`built` describes the local tag, not strictly the running container.** Step 1 inspects the
+  compose image reference, while the `image id` row above it comes from the container's
+  `doc.Image`. If a `docker pull` moved the tag without a redeploy, the two describe different
+  images. Narrow in practice — a fully-pulled tag makes the verdict `false`, so the rows do not
+  render at all — but real. Deriving step 1 from `doc.Image` would fix it and requires passing
+  the container's image ID down into the compose layer.
+- **`built` only shows when an update exists.** It arrives from the same call as the update
+  rows. Showing it for every service needs one local `docker image inspect` per service, which
+  is cheap (no registry) but changes the fetch shape.
+- **One duplicated round-trip per refresh — and the two calls can disagree (TOCTOU).**
+  `Compose.UpdateDetails` calls `fetchServiceImages` (`docker compose config`), which
+  `CheckUpdates` already ran; `HostContainers.UpdateDetails` re-runs `docker ps` the same way. On
+  the remote path both are full SSH round-trips. **Amended in review round 7**: this was recorded
+  as a COST deferral only, which did not cover the correctness half codex raised. Since the
+  message split the two calls no longer share a goroutine, so the window between them is a Bubble
+  Tea round trip rather than two statements: a compose file edited inside it attaches image B's
+  details to a verdict computed for image A. Judged acceptable, deliberately:
+  - the entry is displayed from cache for up to `updatesCacheTTL` (10 minutes), so any compose
+    edit inside THAT window already makes the shown verdict describe an image the file no longer
+    names — closing the seconds-wide gap shrinks a hole inside an already-accepted one rather than
+    removing the class;
+  - the common trigger is self-limiting: an edit naming an image the host has not pulled fails
+    step 1 (`docker image inspect`) and the whole entry is omitted rather than drawn wrong, and a
+    service that disappeared from the file is dropped by `filterServices`;
+  - the fix (passing the resolved image map down) widens the interface this design deliberately
+    kept narrow, and it would pin the rows to the verdict's map rather than to the truth — trading
+    a stale-verdict mismatch for a stale-image one.
+  It is a LOCAL command, not a registry one, so the cost half is latency rather than quota. Both
+  halves are recorded in `docs/architecture/update-detection.md` as well.
+- **A superseded update scan is not cancelled, only discarded.** `m.ctx` is assigned once in
+  `NewModel`, and every context-change site fires a replacement fetch without stopping the
+  previous one, so two `CheckUpdates` scans can overlap. Pre-existing. **Amended in review**: an
+  earlier draft of this residual claimed the detail phase costs nothing extra "because it sits
+  behind the session check". That holds only while the supersession beats the `updatesMsg`; once
+  the verdicts have been handled the detail Cmd is already dispatched and runs to completion. Its
+  result is no longer DROPPED — it carries its own `forKey`, so it merges onto the entry it was
+  fetched for — but the round-trips are spent regardless. **Amended again in review round 4**:
+  `m.detailsInFlight` now bounds the phase to one batch GLOBALLY — no context-change site resets
+  it, so two detail scans can no longer overlap at all. `scanUpdateDetails` already checks
+  `ctx.Err()` per image, so wiring a per-fetch `context.WithCancel` on the Model would complete the
+  fix — deferred because `Init()` has a value receiver and cannot store the cancel, which would
+  leave one of the four fetch sites outside the invariant. **Closed in review round 5**: the batch
+  now runs under `context.WithTimeout(m.ctx, updateDetailsTimeout)` (3 minutes), so the arrival — and
+  therefore the only clear — is guaranteed and a stalled registry call can no longer keep the phase
+  closed for the rest of the session. An expiry degrades to a partial map rather than an error,
+  because `scanUpdateDetails` checks `ctx.Err()` per image. Residual: the deadline bounds the stall
+  but does not stop a scan the user has already navigated away from — a per-fetch `WithCancel` would,
+  and stays deferred for the value-receiver reason above.
+- **A refused or lost detail batch heals from the entry's own state.** *(Rewritten in review round
+  4, replacing the `pendingDetails` park of round 3 and the message-identity fix of round 2. All
+  three rounds found the SAME user-visible failure — the entry keeps `details == nil` for its whole
+  10-minute TTL and nothing refetches — through three different mechanisms, so the park was removed
+  along with its field, its type, its dispatcher and its 16 departure-site resets, and replaced by
+  one rule.)* `refillUpdateDetailsCmd` re-dispatches whenever the CURRENT context's entry is fresh,
+  non-errored and has `details == nil`; it is called from the `updateDetailsMsg` handler's tail and
+  from `maybeRefreshUpdatesCmd`'s fresh-SUCCESS branch. **Amended in review round 7** (commit
+  `bf24a9b`): NEITHER site is behind `autoUpdatesAllowed()` any more. A refill can only fire for an
+  entry that ALREADY exists under the current key, and on a read-only key no automatic path can
+  create one — the stale branch, the `statusMsg` self-heal and `Init()` all refuse — so a refill
+  there is the continuation of the `U` that created the entry, not a new automatic fetch; gating
+  the screen-entry half stranded the rows `U` had asked for for the whole 10-minute TTL whenever
+  that batch lost the race with another one. It cannot loop: a dispatch fills the entry it
+  names, and the merge normalises a nil map to an empty one so a batch that reported nothing still
+  counts as reported. *(Both ungated sites are pinned by the two refill subtests of
+  `TestReadOnly_NoAutomaticDetailFetch`, which measure the gate rather than the missing
+  interface.)*
+- **A detail-only failure is cached under the 10-minute success TTL.** The verdicts are sound, so
+  the entry is a success entry even when the details came back nil or partial from a 429. The rows
+  then stay absent for the full TTL with no automatic retry; `U` recovers them, and the README now
+  says so.
+- **The detail rows need the buildx plugin (Docker v23+).** `fetchUpdateDetail` has no
+  `docker manifest inspect` fallback, unlike the check itself, so on an older host the glyph works
+  and the rows never appear. Documented in the README rather than fixed.
+- **The relative age freezes.** The summary is rebuilt on fetch, on resize and now on
+  `updatesMsg`, so `(checked 3m ago)` still drifts while the user sits on the screen. Tolerable
+  against a 10-minute TTL; a ticker would be the fix.
+- **`created` is unreliable for reproducible builds.** distroless, ko, Bazel and nix images
+  report `1970-01-01`. The epoch guard omits the row, so those images show no build date at
+  all. There is no upstream fix.
+- **The `--format` flag is not trustworthy across buildx versions.** `{{json .Manifest}}` and
+  `{{json .Image}}` work on 0.30.1 and `{{.Manifest.Digest}}` does not. Strict validation plus
+  row omission is the only defence; a future buildx could break the working forms too.
+- **`update id` costs a whole round-trip on its own.** Step 3 exists only to draw that one row,
+  and only on the pinned path — a single-manifest reference already carries the config digest in
+  step 2's output. If the 429 proves binding, dropping `update id` and keeping `update built`
+  removes up to 25% of the registry cost and one fixture.
+
+## Post-Completion
+
+*Items requiring manual intervention or external systems — no checkboxes, informational only*
+
+**Manual verification:**
+
+- Run against a **real remote arm64 host from an amd64 machine** and confirm the resolved
+  platform is the host's, not the laptop's. This is the failure mode unit tests cannot catch,
+  because both sides are faked. The `hasIndex=true, found=false` abort is what should fire if
+  the match is wrong — verify it does rather than silently pinning the wrong platform. Check the
+  VARIANT too: an arm64 image whose config records `v8` and one that records none must both
+  still draw the rows (library/nginx and qdrant/qdrant are one of each), and a 32-bit ARM host
+  must draw its own variant's entry or nothing at all — an ARMv5 or ARMv6 host in particular must
+  never draw the rows for an unqualified `linux/arm` entry, which is ARMv7.
+- Watch for HTTP 429 on a project with many updated services. If it appears, the per-image
+  memoisation or the `true`-only gate is not working as designed.
+- Confirm `docker login` on the docker host raises the quota enough for routine use, and
+  document that as the recommended mitigation for teams.
+
+**External system updates:**
+
+- None. No CLI flag, no JSON wire-shape change, no config-file change, and no `Composer`
+  contract change, so nothing downstream needs updating.

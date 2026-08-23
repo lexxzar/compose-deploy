@@ -1,0 +1,65 @@
+{
+  "Id": "sha256:d090ef0c3fa38df49d89dfcca52ce77f71d88a8db6bd8388d78817cad20a0c1f",
+  "RepoTags": [
+    "nginx:latest"
+  ],
+  "RepoDigests": [
+    "nginx@sha256:06aa3d7be10bc6307990c81bdca075793132e9163391abc370c015e344e23128"
+  ],
+  "Comment": "buildkit.dockerfile.v0",
+  "Created": "2026-05-13T19:05:45.115991558Z",
+  "Config": {
+    "ExposedPorts": {
+      "80/tcp": {}
+    },
+    "Env": [
+      "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+      "NGINX_VERSION=1.31.0",
+      "NJS_VERSION=0.9.8",
+      "NJS_RELEASE=1~trixie",
+      "ACME_VERSION=0.4.1",
+      "PKG_RELEASE=1~trixie",
+      "DYNPKG_RELEASE=1~trixie"
+    ],
+    "Entrypoint": [
+      "/docker-entrypoint.sh"
+    ],
+    "Cmd": [
+      "nginx",
+      "-g",
+      "daemon off;"
+    ],
+    "Labels": {
+      "maintainer": "NGINX Docker Maintainers <docker-maint@nginx.com>"
+    },
+    "StopSignal": "SIGQUIT"
+  },
+  "Architecture": "arm64",
+  "Variant": "v8",
+  "Os": "linux",
+  "Size": 180816826,
+  "GraphDriver": {
+    "Data": {
+      "LowerDir": "/var/lib/docker/overlay2/366c0bdfce693277e0f5bb1112dae61c60e6d9edd35f2c443baed2dcb35d2a79/diff:/var/lib/docker/overlay2/43751efd0a469a2521badede43182c35548e3c7cd096b99fb5ee1b6840da74b0/diff:/var/lib/docker/overlay2/40b79e2748fa0864569b8e75e757d45f934534884c4886d1d9b7843e1ea3bdee/diff:/var/lib/docker/overlay2/ed282b3b111937b8f72755decd120c9ef77461fe79dcc173b4452de665371195/diff:/var/lib/docker/overlay2/dd9c8d342462dc6343b8e522c7c7fddc5481217311ac056eef99ecf334985812/diff:/var/lib/docker/overlay2/ddbe6bb6391c775ef12b39d7d24bebf43d7082a6a8a03d55251af6cbfcbcfafd/diff",
+      "MergedDir": "/var/lib/docker/overlay2/0706f6638ad30fcfa320d90551d504677672419dfccadc7ba376d6ab0ab2575b/merged",
+      "UpperDir": "/var/lib/docker/overlay2/0706f6638ad30fcfa320d90551d504677672419dfccadc7ba376d6ab0ab2575b/diff",
+      "WorkDir": "/var/lib/docker/overlay2/0706f6638ad30fcfa320d90551d504677672419dfccadc7ba376d6ab0ab2575b/work"
+    },
+    "Name": "overlay2"
+  },
+  "RootFS": {
+    "Type": "layers",
+    "Layers": [
+      "sha256:3be22cd0fa54745db14ce1e1deb645d45e7b3e81fee5bc65421c2e64282266dd",
+      "sha256:ade579aa5220e46be0081ca176a84626ddf1a76b02893dca7ab40ef4e25db53a",
+      "sha256:60b51121b320fb96531f00db1a8b7a94edd033228ea1de3f2abe55ed66e20344",
+      "sha256:05e020a1cc86efdf6bf0ec0d2797beff2cf71e202536591b265d966e3c9128af",
+      "sha256:614ca0ae96a18046d889507a9fa471a86dcf5919877a87e533df3c7046b1bfad",
+      "sha256:b86184dd8e64f4a6f751843bf718a26c54d88991e5f409d89306e7a87c298761",
+      "sha256:bb8316a851b8438672367c6715af14287d0d4f0d40b986a3bbab198aa2203897"
+    ]
+  },
+  "Metadata": {
+    "LastTagTime": "0001-01-01T00:00:00Z"
+  }
+}

@@ -48,6 +48,26 @@ const updatesCacheTTL = 10 * time.Minute
 // session resets and U keypress just like success entries.
 const updatesErrorTTL = 30 * time.Second
 
+// updateDetailsTimeout bounds ONE inspect-detail batch.
+//
+// m.detailsInFlight is a GLOBAL one-batch guard whose only clear is the
+// updateDetailsMsg arrival, so the arrival has to be guaranteed. m.ctx lives
+// for the whole program and neither dockerRunner adds a deadline of its own,
+// so without this bound a single stalled registry call would close the detail
+// phase for the rest of the session — U cannot force it and no departure site
+// resets it, leaving restarting cdeploy as the only escape.
+//
+// An expiry DEGRADES rather than errors: scanUpdateDetails checks ctx.Err() at
+// the top of each image and returns the partial map, so the rows resolved
+// before the deadline still land. The value therefore trades two failure modes
+// against each other — too short records a partial set on an entry that then
+// keeps it for the whole 10-minute success TTL (the merge normalises a partial
+// map to "reported", so refillUpdateDetailsCmd will not retry it), too long
+// re-opens the stall. 3 minutes clears a dozen updated images at four
+// round-trips each over a slow SSH hop while keeping the worst-case stall well
+// under updatesCacheTTL.
+const updateDetailsTimeout = 3 * time.Minute
+
 // ConfigProvider provides access to docker-compose configuration files.
 // Defined in the tui package (not runner) because it returns *exec.Cmd and
 // is TUI-only. Both Compose and RemoteCompose implement it.
@@ -74,6 +94,24 @@ type ExecProvider interface {
 // gated on m.readOnly().
 type Inspector interface {
 	Inspect(ctx context.Context, service string) ([]byte, error)
+}
+
+// UpdateDetailer resolves the extra IMAGE-section rows the inspect screen draws
+// once the "⇧" verdict is true: which image is waiting and when each side was
+// built. Declared here beside Inspector and type-asserted on the concrete
+// composer, so runner.Composer and its five mocks stay untouched and the CLI
+// keeps `list --updates` at its current cost — it has no detail view to render.
+//
+// All three composers satisfy it (pinned in app_test.go). A composer that does
+// not simply produces verdicts with no detail rows, which is the same thing a
+// detail-fetch failure produces: the glyph is the load-bearing signal and these
+// rows are a bonus.
+//
+// Callers pass ONLY the services whose verdict is true. The compose layer reads
+// an empty slice as "all services", and each image costs three registry
+// round-trips, so the filter is a rate-limit guard rather than an optimisation.
+type UpdateDetailer interface {
+	UpdateDetails(ctx context.Context, services []string) (map[string]compose.UpdateDetail, error)
 }
 
 // Snapshotter records the currently-running image digests before a deploy so
@@ -274,15 +312,16 @@ type Model struct {
 	// runs. updateCache key is projectDir + "|" + serverName (empty serverName
 	// = local). projDir is empty for the local-fast-track entry (no project
 	// picker), giving the local-no-picker context a single cache slot of "".
-	updateCache    map[string]updateEntry
-	updatesSession uint64 // mirror of statsSession — bumped at the 7 context-change sites so a stale CheckUpdates response can't hydrate UpdateAvailable into a different project's svcStatus map
-	updateInFlight bool   // mirror of refreshInFlight for refreshUpdates — prevents a slow CheckUpdates from stacking on the next screen entry / `U` press
-	updatesErr     string // last error from CheckUpdates; rendered as soft warning below statsErr (priority: svcErr > statsErr > updatesErr)
-	projDir        string // active project's config dir; used for the updateCache key
-	selected       map[int]bool
-	svcCursor      int
-	svcOffset      int // index of first visible service in scroll window
-	svcErr         error
+	updateCache     map[string]updateEntry
+	updatesSession  uint64 // mirror of statsSession — bumped at the 7 context-change sites so a stale CheckUpdates response can't hydrate UpdateAvailable into a different project's svcStatus map
+	updateInFlight  bool   // mirror of refreshInFlight for refreshUpdates — prevents a slow CheckUpdates from stacking on the next screen entry / `U` press
+	detailsInFlight bool   // updateInFlight's twin for the detail phase; a GLOBAL one-batch bound — no context-change site resets it, and its only clear is the unconditional one on every updateDetailsMsg arrival
+	updatesErr      string // last error from CheckUpdates; rendered as soft warning below statsErr (priority: svcErr > statsErr > updatesErr)
+	projDir         string // active project's config dir; used for the updateCache key
+	selected        map[int]bool
+	svcCursor       int
+	svcOffset       int // index of first visible service in scroll window
+	svcErr          error
 
 	// Confirmation state (within container screen)
 	confirming  bool
@@ -476,7 +515,23 @@ type statsMsg struct {
 type updateEntry struct {
 	fetchedAt time.Time
 	results   map[string]bool
-	err       bool
+	// details carries the inspect screen's extra IMAGE rows for the services
+	// whose verdict came back true. It rides this entry rather than a cache of
+	// its own so it inherits the key, the TTL and the post-Deploy invalidation
+	// the "⇧" glyph already owns — the requirement is that the two use the same
+	// rules and timings, and sharing one entry satisfies it by construction
+	// rather than through a parallel mechanism that could drift.
+	//
+	// nil versus empty is LOAD-BEARING. nil means no detail batch has ever
+	// REPORTED for this entry, and it is the sole trigger refillUpdateDetailsCmd
+	// keys off, so the merge normalises a nil map to an empty one: a batch that
+	// came back with nothing (a 429, a transport abort before the first row) is
+	// recorded as reported and is NOT retried for the rest of the TTL. An entry
+	// can also stay nil forever without being a fault — no verdict was true, or
+	// the composer does not implement UpdateDetailer — because both make
+	// updateDetailsCmd return nil, so the refill is a no-op rather than a loop.
+	details map[string]compose.UpdateDetail
+	err     bool
 	// errMsg is the original error text from CheckUpdates. It's only set when
 	// err == true. Stored alongside the failure flag so cache-hit paths
 	// (maybeRefreshUpdatesCmd, servicesMsg/statusMsg cache replays) can
@@ -494,6 +549,34 @@ type updatesMsg struct {
 	results map[string]bool
 	err     error
 	session uint64
+}
+
+// updateDetailsMsg carries the inspect screen's extra IMAGE rows, fetched by a
+// follow-up Cmd the updatesMsg handler enqueues once the verdicts are already
+// stored. It is deliberately a second message rather than a field on
+// updatesMsg: the verdicts drive the "⇧" glyph and must not wait on three
+// registry round-trips per updated image.
+//
+// It carries no error of its own — a detail-fetch failure is discarded at the
+// fetch site, so a registry 429 during this phase cannot blank the glyph
+// column or shorten the entry to the error TTL.
+//
+// forKey and forEntry are the batch's identity, and both are captured at
+// DISPATCH time and travel WITH the message. forKey is the updatesCacheKey()
+// the batch was fetched under and forEntry the fetchedAt of the entry it
+// annotates; together they name exactly one verdict set. It carries NO session:
+// the counter is bumped by ordinary navigation that does NOT change the context
+// (esc back from logs or progress, execDone), and because those sites find the
+// just-written entry fresh they enqueue no replacement, so a session gate here
+// dropped the only message that could fill the entry, for its whole 10-minute
+// TTL. Re-deriving the key in the handler instead had the same shape of bug one
+// step further out: a scan runs for tens of seconds, so an ordinary navigation
+// away and back left the merge looking up a key the batch was never fetched
+// for.
+type updateDetailsMsg struct {
+	details  map[string]compose.UpdateDetail
+	forKey   string
+	forEntry time.Time
 }
 
 // refreshTickMsg fires every statsRefreshInterval to drive periodic
@@ -955,11 +1038,26 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if m.updateCache == nil {
 			m.updateCache = make(map[string]updateEntry)
 		}
+		var detailsCmd tea.Cmd
 		if msg.err == nil {
-			m.updateCache[key] = updateEntry{
-				fetchedAt: time.Now(),
-				results:   msg.results,
-			}
+			entry := updateEntry{fetchedAt: time.Now(), results: msg.results}
+			m.updateCache[key] = entry
+			// The inspect screen's detail rows are fetched as a SECOND Cmd,
+			// not inside refreshUpdates' own goroutine. One Cmd returns one
+			// message, so folding them together would hold the verdicts —
+			// the load-bearing "⇧" signal — behind three registry
+			// round-trips per updated image, with updateInFlight pinned true
+			// (a dead U key) for that whole window. Enqueuing here keeps
+			// every trigger, key and TTL rule identical and moves only the
+			// message boundary. It sits AFTER the session check, so a scan
+			// already superseded when its verdicts arrive spends no detail
+			// calls at all; one superseded LATER cannot be stopped (m.ctx is
+			// never cancelled per fetch), which is why updateDetailsCmd
+			// carries an in-flight guard of its own. A refusal there is not a
+			// loss: the entry written just above keeps details == nil, and
+			// refillUpdateDetailsCmd re-dispatches it at the next arrival or
+			// screen entry.
+			detailsCmd = m.updateDetailsCmd(entry, key)
 		} else {
 			m.updateCache[key] = updateEntry{
 				fetchedAt: time.Now(),
@@ -968,6 +1066,15 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				errMsg:    msg.err.Error(),
 			}
 		}
+		// The inspect screen is a pure CONSUMER of this cache — it never fetches
+		// details of its own. Without this rebuild, pressing `i` while the first
+		// fetch is still in flight (a cold cache is exactly when that happens)
+		// would leave the new IMAGE rows permanently absent until the user backs
+		// out and re-enters. Runs on the failure path too: the entry that just
+		// landed carries no details, so a summary drawn from a previous one must
+		// stop showing them. rebuildInspectSummary early-returns when no raw
+		// bytes are in hand, so this is a no-op before the inspect fetch lands.
+		m.redrawInspectFromCache()
 		// State mutations below happen regardless of which screen the user is
 		// on: m.svcStatus is the source of truth that the next entry to
 		// screenSelectContainers (re-)renders from, so leaving stale
@@ -1020,7 +1127,67 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// — also covers the symmetric off-screen success case, and the
 		// helper is a cheap clamp when nothing actually changed.
 		m.fixSvcOffset()
-		return m, nil
+		return m, detailsCmd
+
+	case updateDetailsMsg:
+		// Clear the in-flight guard on EVERY arrival, before the identity
+		// gates below — the same clear-before-check discipline updateInFlight
+		// follows. A message that is dropped as superseded still means the
+		// batch that produced it has finished, so leaving the flag set would
+		// silently refuse every later detail fetch for the rest of the session.
+		// Nothing else clears it, which is what keeps the phase bounded to one
+		// batch globally: one raise, one arrival, one clear.
+		m.detailsInFlight = false
+		// The details are a bonus annotation on an entry the verdicts already
+		// wrote, so this handler only ever merges into an existing entry and
+		// never creates one. The identity is the message's OWN forKey plus the
+		// entry's own fetchedAt, and NOT the session counter: forKey is the
+		// context the batch was fetched under and fetchedAt names the exact
+		// verdict set it annotates, so a U press mid-fetch (which replaces the
+		// entry under the SAME session) is refused while a benign session bump
+		// that left the entry untouched still merges. Both identities must
+		// travel WITH the message: a session gate, or a key re-derived here,
+		// made the rows unrecoverable for the entry's full 10-minute TTL after
+		// an ordinary navigation — see the updateDetailsMsg doc comment.
+		//
+		// forKey rather than the CURRENT key is also what lets a scan that
+		// finishes after the user has navigated away still land on the entry it
+		// was fetched for, so returning to that project inside the TTL shows the
+		// rows instead of an entry that can never fill.
+		if entry, ok := m.updateCache[msg.forKey]; ok && !entry.err && entry.fetchedAt.Equal(msg.forEntry) {
+			entry.details = msg.details
+			if entry.details == nil {
+				// Normalise so the entry RECORDS that a batch reported, even
+				// though it reported nothing. details == nil is the refill
+				// trigger, so leaving it nil here would re-scan the registry on
+				// every screen entry for the full 10-minute success TTL each
+				// time the detail fetch failed — the exact amplification the
+				// error-swallowing at the fetch site exists to avoid.
+				entry.details = map[string]compose.UpdateDetail{}
+			}
+			m.updateCache[msg.forKey] = entry
+			// Render only when the merge landed on the context currently on
+			// screen. redrawInspectFromCache reads the CURRENT key (it is a
+			// render path), and its setInspectContent does SetXOffset(0), so
+			// calling it for a foreign entry would reset the pane's horizontal
+			// scroll to show data that did not change.
+			if msg.forKey == m.updatesCacheKey() {
+				m.redrawInspectFromCache()
+			}
+		}
+		// A batch this one's guard refused waits here, not on the next keystroke:
+		// the guard bounds the phase to one batch, it does not cancel the work.
+		// The refill reads the CURRENT entry, so it also covers the batch that
+		// was refused while the user was somewhere else — the entry it would
+		// have filled is the one still carrying details == nil.
+		//
+		// The call is hoisted out of the return on purpose. It has a pointer
+		// receiver and mutates the same m the return carries; Go leaves the
+		// evaluation order of a bare operand against a call operand
+		// unspecified, and the mutation it would lose (detailsInFlight) is the
+		// one that keeps this from becoming an unbounded registry loop.
+		cmd := m.refillUpdateDetailsCmd()
+		return m, cmd
 
 	case refreshTickMsg:
 		// Always reschedule the next tick to keep this a singleton background
@@ -2084,6 +2251,10 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			// flight (e.g. the user mashes U or a previous request hasn't
 			// completed), the previous response will hydrate the same
 			// session. Firing another fetch would only burn registry calls.
+			// The detail phase is deliberately NOT gated here — it has its
+			// own m.detailsInFlight guard inside updateDetailsCmd, so the
+			// verdicts stay force-refreshable while the (much longer) detail
+			// batch resolves.
 			if m.updateInFlight {
 				return m, nil
 			}
@@ -2889,7 +3060,11 @@ func (m Model) rollbackAgeSuffix(targets []string) string {
 }
 
 // humanizeAge renders a duration as a compact relative age (e.g. "3h ago",
-// "2d ago", "moments ago") for the rollback confirm prompt.
+// "2d ago", "moments ago"). Three callers share it: rollbackAgeSuffix, the
+// inspect screen's (checked Nm ago) suffix (formatUpdateVerdict) and its build
+// dates (formatTimeWithAge). Week and month tiers are deliberately absent —
+// "47d ago" carries more information than "1mo ago" when the reader is choosing
+// a rollback target.
 func humanizeAge(d time.Duration) string {
 	switch {
 	case d < time.Minute:
@@ -3175,7 +3350,55 @@ func (m *Model) rebuildInspectSummary() {
 		return
 	}
 	m.inspectErr = nil
-	m.inspectSummary = buildInspectSummary(doc, m.inspectViewport.Width)
+	m.inspectSummary = buildInspectSummary(doc, m.inspectViewport.Width, m.currentUpdateInfo())
+}
+
+// currentUpdateInfo reads the update rows' inputs out of the "⇧" cache for the
+// service the inspect screen is showing. It is the SINGLE place that lookup
+// happens: every render path (the fetch, a resize, an updatesMsg landing on the
+// screen) goes through rebuildInspectSummary, so three copies cannot drift.
+//
+// The raw map read is deliberate, not the TTL-checked updatesCacheLookup: the
+// glyph itself is drawn from m.svcStatus, which keeps the last verdict until a
+// refresh replaces it, so an entry aging past its TTL must not blank these rows
+// either. The (checked Nm ago) suffix is what tells the user how old it is.
+//
+// An errored entry yields the zero value — a non-nil CheckUpdates error makes
+// the whole verdict map untrusted, so there is nothing here worth drawing.
+func (m Model) currentUpdateInfo() inspectUpdateInfo {
+	upd := inspectUpdateInfo{now: time.Now()}
+	entry, ok := m.updateCache[m.updatesCacheKey()]
+	if !ok || entry.err {
+		return upd
+	}
+	upd.checkedAt = entry.fetchedAt
+	if verdict, ok := entry.results[m.inspectService]; ok {
+		upd.verdict = &verdict
+	}
+	// An absent key gives the zero UpdateDetail, which is the "unknown"
+	// contract that type already documents — every field is checked on its own
+	// by the renderer, so absent and zero draw the same nothing.
+	upd.detail = entry.details[m.inspectService]
+	return upd
+}
+
+// redrawInspectFromCache redraws the inspect summary from the "⇧" cache when
+// that screen is up, so the IMAGE update rows can arrive (or leave) without a
+// re-entry. A no-op on every other screen, and before the inspect fetch lands.
+//
+// The viewport write is skipped in RAW mode: the raw buffer is untouched by
+// update details, so setInspectContent would change nothing except reset the
+// horizontal offset — snapping a user who scrolled sideways through the long
+// JSON lines back to column 0 at an arbitrary moment. The summary is still
+// rebuilt, so a later `r` back to it shows the new rows.
+func (m *Model) redrawInspectFromCache() {
+	if m.screen != screenInspect {
+		return
+	}
+	m.rebuildInspectSummary()
+	if !m.inspectShowRaw {
+		m.setInspectContent()
+	}
 }
 
 // clearInspect resets every inspect field on departure. The session is NOT
@@ -3839,6 +4062,12 @@ func (m Model) refreshStats() tea.Cmd {
 // services slice (= "all services"). The returned updatesMsg carries the
 // current updatesSession so a stale response from a previous project/server
 // context is dropped by the handler.
+//
+// It returns as soon as the verdicts are in hand. The inspect screen's detail
+// rows are fetched by updateDetailsCmd, which the handler enqueues after the
+// cache write — same trigger, same key, same TTL, one message later. The
+// enqueue itself sits behind THIS message's session check; the detail message
+// carries no session of its own (see updateDetailsMsg).
 func (m Model) refreshUpdates() tea.Cmd {
 	ctx := m.ctx
 	c := m.composer
@@ -3847,6 +4076,113 @@ func (m Model) refreshUpdates() tea.Cmd {
 		results, err := c.CheckUpdates(ctx, nil)
 		return updatesMsg{results: results, err: err, session: session}
 	}
+}
+
+// updateDetailsCmd resolves the inspect screen's extra IMAGE rows for the
+// services whose verdict came back true, and reports them against the cache
+// entry those verdicts just wrote. It returns nil when there is nothing to
+// fetch, so the handler enqueues no Cmd at all in the common case.
+//
+// It is only ever built on the SUCCESS path: a non-nil CheckUpdates error makes
+// the whole verdict map untrusted per the Composer contract, so no verdict is
+// worth following up and the three registry round-trips per image would be
+// spent on a path that is already broken.
+//
+// The m.detailsInFlight guard bounds the phase to ONE batch at a time, and it
+// has to live here rather than on the U key: U must stay live while the details
+// resolve, but its refresh would otherwise enqueue a second batch on top of the
+// running one, and repeated presses would stack without bound at three registry
+// round-trips per updated image.
+//
+// A refusal here is a DEFERRAL, not a loss, and nothing is queued to make it
+// one: the entry the verdicts just wrote keeps details == nil, and
+// refillUpdateDetailsCmd re-dispatches from that fact alone.
+//
+// The fetch runs under updateDetailsTimeout rather than the bare m.ctx. The
+// guard's only clear is the arrival, so the arrival must be guaranteed — see
+// the constant for why an expiry is a degraded result rather than an error.
+//
+// The whole entry is taken rather than its parts, so results and fetchedAt can
+// never come from two different entries — that pairing is exactly what the
+// forKey/forEntry identity guards against.
+func (m *Model) updateDetailsCmd(entry updateEntry, key string) tea.Cmd {
+	d, ok := m.composer.(UpdateDetailer)
+	if !ok {
+		return nil
+	}
+	svcs := servicesWithUpdate(entry.results)
+	if len(svcs) == 0 {
+		return nil
+	}
+	if m.detailsInFlight {
+		return nil
+	}
+	ctx := m.ctx
+	forEntry := entry.fetchedAt
+	m.detailsInFlight = true
+	return func() tea.Msg {
+		fetchCtx, cancel := context.WithTimeout(ctx, updateDetailsTimeout)
+		defer cancel()
+		// The error is DISCARDED, and that is load-bearing rather than lazy.
+		// Each updated image costs three registry round-trips, and a Docker Hub
+		// 429 reads as "too many requests" — which looksLikeNetworkErr matches.
+		// Letting it reach updatesMsg.err would trip the registry cascade,
+		// blank the whole "⇧" column and shorten the cache entry to the
+		// 30-second error TTL, so a detail-phase rate limit would degrade the
+		// very signal it was meant to annotate. A PARTIAL map (what
+		// scanUpdateDetails returns alongside a transport abort) is kept for
+		// the same reason: the rows resolved before the abort are correct.
+		details, _ := d.UpdateDetails(fetchCtx, svcs)
+		return updateDetailsMsg{details: details, forKey: key, forEntry: forEntry}
+	}
+}
+
+// refillUpdateDetailsCmd re-dispatches the detail batch for the CURRENT
+// context's cache entry when no batch has ever reported for it. It is the detail
+// phase's ONE self-healing path.
+//
+// Losing a batch is otherwise PERMANENT. The entry the verdicts wrote is a fresh
+// SUCCESS, so maybeRefreshUpdatesCmd and the statusMsg self-heal both skip it,
+// and the inspect screen is a pure consumer that never fetches — the rows are
+// then absent for the full 10-minute TTL with nothing on screen explaining why.
+// The retry therefore keys off the ENTRY'S OWN STATE, not off any mechanism:
+// however a batch goes missing, the entry still says "no batch reported" and the
+// next trigger refills it.
+//
+// It cannot loop. A dispatch fills the entry it names (details becomes non-nil
+// even when the batch resolved nothing — see updateEntry.details), so the same
+// entry is never fetched twice; a mismatched arrival only re-dispatches for an
+// entry a KEYSTROKE created in the meantime. Every other refusal — no true
+// verdict, a composer without UpdateDetailer, a batch already in flight — makes
+// updateDetailsCmd return nil without touching anything.
+func (m *Model) refillUpdateDetailsCmd() tea.Cmd {
+	entry, fresh := m.updatesCacheLookup()
+	if !fresh || entry.err || entry.details != nil {
+		return nil
+	}
+	return m.updateDetailsCmd(entry, m.updatesCacheKey())
+}
+
+// servicesWithUpdate returns the names of the services whose verdict is true.
+//
+// The empty return is load-bearing, not an optimisation: filterServices reads
+// an empty services slice as "ALL services", so calling through with no true
+// verdicts would spend four round-trips on every service in the project.
+//
+// The order is sorted so the argument is deterministic and the mock-driven
+// tests can assert it. The visit-order guarantee a transport abort depends on
+// belongs to scanUpdateDetails, which sorts the image map's keys itself — this
+// sort cannot provide it, because filterServices turns the slice back into a
+// map on the way down.
+func servicesWithUpdate(results map[string]bool) []string {
+	var svcs []string
+	for svc, avail := range results {
+		if avail {
+			svcs = append(svcs, svc)
+		}
+	}
+	slices.Sort(svcs)
+	return svcs
 }
 
 // updatesCacheKey returns the cache key for the current context. The format
@@ -3926,10 +4262,15 @@ func (m Model) updatesCacheLookup() (updateEntry, bool) {
 }
 
 // maybeRefreshUpdatesCmd returns refreshUpdates() and marks updateInFlight
-// when the cache is stale or missing; otherwise returns nil. The caller is
-// expected to compose this into the screen-entry batch alongside refreshStatus
-// / refreshStats / loadServices. Cache hits surface via the post-overwrite
-// hydration in servicesMsg/statusMsg handlers — no synthetic msg needed.
+// when the cache is stale or missing; otherwise returns nil, or — on a fresh
+// SUCCESS entry that no detail batch has reported for — refillUpdateDetailsCmd()
+// (see there for why a missing detail set has to be a refetch trigger, and the
+// fresh-success branch below for why that refill is NOT gated on
+// autoUpdatesAllowed while the fetch is). The caller is expected to compose
+// this into the screen-entry batch alongside refreshStatus / refreshStats /
+// loadServices. Cache hits surface via the
+// post-overwrite hydration in servicesMsg/statusMsg handlers — no synthetic msg
+// needed.
 //
 // Cache hits on SUCCESS entries clear updatesErr (the stored success is the
 // latest ground truth, so any stale warning from before is no longer valid).
@@ -3971,10 +4312,25 @@ func (m *Model) maybeRefreshUpdatesCmd() tea.Cmd {
 			// surface the same warning rather than showing blank glyphs
 			// with no explanation.
 			m.updatesErr = entry.errMsg
-		} else {
-			m.updatesErr = ""
+			return nil
 		}
-		return nil
+		m.updatesErr = ""
+		// The verdicts are fresh, but the entry may still be missing the
+		// inspect screen's detail rows — a batch was refused while another was
+		// running, or one finished under a key the user had already left. This
+		// is the second half of that self-heal: refillUpdateDetailsCmd returns
+		// nil unless the entry genuinely has no reported batch, so on the
+		// ordinary cache hit this is one map read and no fetch.
+		//
+		// It is deliberately NOT behind autoUpdatesAllowed(), for the same
+		// reason the arrival tail is not: the refill can only fire for an entry
+		// that already exists under the CURRENT key, and on a read-only key no
+		// automatic path can create one — the stale branch below refuses, and
+		// so do the statusMsg self-heal and Init(). U is the only thing that
+		// can, so a refill here completes that U rather than starting a fetch
+		// of its own. Gating it would strand the rows U asked for for the whole
+		// 10-minute TTL whenever its batch lost the race with another one.
+		return m.refillUpdateDetailsCmd()
 	}
 	if !m.autoUpdatesAllowed() {
 		// Same reasoning as the statusMsg branch: the cached failure has

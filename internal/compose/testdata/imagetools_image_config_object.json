@@ -1,0 +1,36 @@
+{
+  "created": "2026-08-19T19:14:43.123456789Z",
+  "architecture": "arm64",
+  "os": "linux",
+  "config": {
+    "Env": [
+      "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+      "PG_MAJOR=16"
+    ],
+    "Entrypoint": [
+      "docker-entrypoint.sh"
+    ],
+    "Cmd": [
+      "postgres"
+    ],
+    "WorkingDir": "/"
+  },
+  "rootfs": {
+    "type": "layers",
+    "diff_ids": [
+      "sha256:1a0b2c3d4e5f60718293a4b5c6d7e8f90a1b2c3d4e5f60718293a4b5c6d7e8f9",
+      "sha256:2b1c0d3e4f5061728394a5b6c7d8e9f01a2b3c4d5e6f70819a2b3c4d5e6f7081"
+    ]
+  },
+  "history": [
+    {
+      "created": "2026-08-19T19:14:41.000000000Z",
+      "created_by": "/bin/sh -c #(nop) ADD file:... in / "
+    },
+    {
+      "created": "2026-08-19T19:14:43.123456789Z",
+      "created_by": "/bin/sh -c #(nop)  CMD [\"postgres\"]",
+      "empty_layer": true
+    }
+  ]
+}

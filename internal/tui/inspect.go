@@ -169,19 +169,34 @@ func (b *inspectBuilder) String() string {
 	return strings.Join(b.lines, "\n")
 }
 
+// inspectUpdateInfo carries the update-detection half of the IMAGE section into
+// the builder. The clock arrives as a field rather than a time.Now() call inside
+// the renderer, so buildInspectSummary stays pure and the relative ages are
+// testable against a fixed now.
+//
+// The ZERO VALUE draws no extra row: a caller with no cache entry in hand passes
+// inspectUpdateInfo{} and gets exactly the summary this screen rendered before
+// the update rows existed.
+type inspectUpdateInfo struct {
+	now       time.Time
+	detail    compose.UpdateDetail
+	verdict   *bool
+	checkedAt time.Time
+}
+
 // buildInspectSummary renders the curated summary of one container's
 // `docker inspect` output. Pure — no Model state, no TTY and no Docker — so it
 // is golden-testable against the real fixtures in internal/compose/testdata.
 //
 // A section with nothing to say is omitted; STATE always renders.
-func buildInspectSummary(doc compose.InspectDoc, width int) string {
+func buildInspectSummary(doc compose.InspectDoc, width int, upd inspectUpdateInfo) string {
 	if width <= 0 {
 		width = inspectDefaultWidth
 	}
 	b := &inspectBuilder{width: width}
 	inspectStateSection(b, doc)
 	inspectHealthSection(b, doc)
-	inspectImageSection(b, doc)
+	inspectImageSection(b, doc, upd)
 	inspectMountsSection(b, doc)
 	inspectEnvSection(b, doc)
 	return b.String()
@@ -274,10 +289,16 @@ func inspectHealthSection(b *inspectBuilder, doc compose.InspectDoc) {
 }
 
 // inspectImageSection renders what the container actually runs: the ref the
-// compose file asked for, the digest docker resolved it to, and the command
-// pair. The digest is the row that answers "did my deploy take?" — a stale
-// container keeps the old digest under an unchanged tag.
-func inspectImageSection(b *inspectBuilder, doc compose.InspectDoc) {
+// compose file asked for, the local image ID docker resolved it to, and the
+// command pair. The image ID is the row that answers "did my deploy take?" — a
+// stale container keeps the old image ID under an unchanged tag.
+//
+// The four update rows sit BETWEEN the image ID and the command pair, so the
+// two ids and the two build dates read as one block: "image id" against
+// "update id", "built" against "update built". Each row is omitted on its own,
+// and the section's presence gate is unchanged — an update verdict describes
+// the image, so a doc with no image at all still has nothing to say.
+func inspectImageSection(b *inspectBuilder, doc compose.InspectDoc, upd inspectUpdateInfo) {
 	cmd := strings.Join(doc.Config.Cmd, " ")
 	entrypoint := strings.Join(doc.Config.Entrypoint, " ")
 	if doc.Config.Image == "" && doc.Image == "" && cmd == "" && entrypoint == "" {
@@ -289,7 +310,19 @@ func inspectImageSection(b *inspectBuilder, doc compose.InspectDoc) {
 		b.kv("image", doc.Config.Image)
 	}
 	if doc.Image != "" {
-		b.kv("digest", doc.Image)
+		b.kv("image id", doc.Image)
+	}
+	if built := formatTimeWithAge(upd.detail.LocalCreated, upd.now); built != "" {
+		b.kv("built", built)
+	}
+	if upd.verdict != nil {
+		b.kv("update", formatUpdateVerdict(*upd.verdict, upd.checkedAt, upd.now))
+	}
+	if upd.detail.NewID != "" {
+		b.kv("update id", upd.detail.NewID)
+	}
+	if built := formatTimeWithAge(upd.detail.NewCreated, upd.now); built != "" {
+		b.kv("update built", built)
 	}
 	if cmd != "" {
 		b.kv("command", cmd)
@@ -297,6 +330,21 @@ func inspectImageSection(b *inspectBuilder, doc compose.InspectDoc) {
 	if entrypoint != "" {
 		b.kv("entrypoint", entrypoint)
 	}
+}
+
+// formatUpdateVerdict renders the "update" row's value: the verdict, plus how
+// old the check behind it is. The age suffix is dropped when the entry carries
+// no fetch time, rather than reported as "moments ago" — a missing timestamp is
+// not a fresh one.
+func formatUpdateVerdict(available bool, checkedAt, now time.Time) string {
+	value := "up to date"
+	if available {
+		value = "available"
+	}
+	if checkedAt.IsZero() {
+		return value
+	}
+	return value + "  (checked " + humanizeAge(now.Sub(checkedAt)) + ")"
 }
 
 func inspectMountsSection(b *inspectBuilder, doc compose.InspectDoc) {
@@ -415,8 +463,28 @@ func formatInspectTime(s string) string {
 	if err != nil {
 		return s
 	}
-	if t.Year() <= 1 {
+	return formatInspectTimeValue(t)
+}
+
+// formatInspectTimeValue renders an already-parsed timestamp in the same layout
+// as formatInspectTime. One guard covers both the docker zero time (year 1, so
+// far below the epoch) and 1970 itself: each is an absent value rather than
+// data — the latter is what reproducible builders (distroless, ko, Bazel, nix)
+// write into an image's Created field — so each yields "" and the caller omits
+// the row.
+func formatInspectTimeValue(t time.Time) string {
+	if t.Unix() <= 0 {
 		return ""
 	}
 	return t.Format("2006-01-02 15:04:05")
+}
+
+// formatTimeWithAge renders "2026-07-07 17:47:22  (47d ago)" relative to now.
+// The clock is a parameter so the caller stays pure and testable.
+func formatTimeWithAge(t, now time.Time) string {
+	stamp := formatInspectTimeValue(t)
+	if stamp == "" {
+		return ""
+	}
+	return stamp + "  (" + humanizeAge(now.Sub(t)) + ")"
 }
