@@ -376,12 +376,13 @@ func scanUpdateDetails(ctx context.Context, wanted map[string]string, d dockerRu
 	return out, nil
 }
 
-// fetchUpdateDetail runs the four-step sequence for one image reference:
+// fetchUpdateDetail runs the per-image sequence for one image reference:
 //
-//	1  docker image inspect                  local build time + platform pair
-//	2  buildx imagetools inspect --format     the index; select the host platform
-//	3  buildx imagetools inspect --raw        config.digest → NewID
-//	4  buildx imagetools inspect --format     created → NewCreated
+//	1  docker image inspect                local build time + platform pair
+//	2  buildx imagetools inspect --format  the index; select the host platform
+//	3  buildx imagetools inspect --raw     config.digest → NewID; SKIPPED when
+//	                                       step 2 already returned the manifest
+//	4  buildx imagetools inspect --format  created → NewCreated
 //
 // Steps 2-4 are registry calls, so the sequence returns at the FIRST failure
 // rather than pressing on: the caller omits the whole entry either way, and a
@@ -442,7 +443,7 @@ func fetchUpdateDetail(ctx context.Context, d dockerRunner, image string) (Updat
 }
 
 // pinnedImageRef turns step 2's three-state answer into the reference steps 3
-// and 4 address. StripTag is reused rather than re-deriving the repo portion,
+// and 4 address. stripTag is reused rather than re-deriving the repo portion,
 // so a registry port (localhost:5000/foo:1) survives the rewrite. pinned is
 // false on the single-manifest path, which tells the caller step 2's own output
 // is the manifest and step 3 can be skipped.
@@ -456,6 +457,6 @@ func pinnedImageRef(image string, indexOut []byte, probe localProbe) (ref string
 	case !found:
 		return "", false, fmt.Errorf("no %s/%s manifest in the index for %q", probe.os, probe.arch, image)
 	default:
-		return StripTag(image) + "@" + digest, true, nil
+		return stripTag(image) + "@" + digest, true, nil
 	}
 }

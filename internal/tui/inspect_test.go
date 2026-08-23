@@ -1452,7 +1452,7 @@ func TestInspectUpdateInfo_FromCache(t *testing.T) {
 				inspectService: tt.service,
 				updateCache:    map[string]updateEntry{"|": tt.entry},
 			}
-			got := m.inspectUpdateInfo()
+			got := m.currentUpdateInfo()
 
 			if got.now.IsZero() {
 				t.Error("now must be stamped so the renderer stays pure")
@@ -1485,7 +1485,7 @@ func TestInspectUpdateInfo_FromCache(t *testing.T) {
 func TestInspectUpdateInfo_NoCache(t *testing.T) {
 	t.Run("nil cache", func(t *testing.T) {
 		m := Model{inspectService: "web"}
-		if got := m.inspectUpdateInfo(); got.verdict != nil || got.detail != (compose.UpdateDetail{}) || !got.checkedAt.IsZero() {
+		if got := m.currentUpdateInfo(); got.verdict != nil || got.detail != (compose.UpdateDetail{}) || !got.checkedAt.IsZero() {
 			t.Errorf("nil cache must draw nothing, got %+v", got)
 		}
 	})
@@ -1498,7 +1498,7 @@ func TestInspectUpdateInfo_NoCache(t *testing.T) {
 				"/other|": {fetchedAt: time.Now(), results: map[string]bool{"web": true}},
 			},
 		}
-		if got := m.inspectUpdateInfo(); got.verdict != nil || !got.checkedAt.IsZero() {
+		if got := m.currentUpdateInfo(); got.verdict != nil || !got.checkedAt.IsZero() {
 			t.Errorf("another context's entry must not be read, got %+v", got)
 		}
 	})

@@ -1131,6 +1131,49 @@ func TestScanUpdateDetails_EmptyInput(t *testing.T) {
 	}
 }
 
+// TestScanUpdateDetails_VisitsInSortedOrder pins the ordering rule directly
+// rather than through the transport-abort test, which could pass on Go's map
+// iteration order alone. Every image costs three registry round-trips, so which
+// images are reached before an abort must be deterministic.
+func TestScanUpdateDetails_VisitsInSortedOrder(t *testing.T) {
+	wanted := map[string]string{"c-cache": "redis:7", "a-web": "nginx:1.27", "b-api": "alpine:3"}
+	want := []string{"nginx:1.27", "alpine:3", "redis:7"}
+
+	// Repeat so a map-order-dependent implementation cannot pass by luck.
+	for i := 0; i < 50; i++ {
+		f := detailRunner(t, func(step detailStep, ref string) ([]byte, error) {
+			// Fail at step 1 so each image costs exactly one recorded call.
+			return nil, fmt.Errorf("no such image: %s", ref)
+		})
+		if _, err := scanUpdateDetails(context.Background(), wanted, f); err != nil {
+			t.Fatalf("scanUpdateDetails() error = %v, want nil", err)
+		}
+		if got := stepRefs(f); !slices.Equal(got, want) {
+			t.Fatalf("visit order = %v, want %v", got, want)
+		}
+	}
+}
+
+// TestScanUpdateDetails_StopsOnCancelledContext pins the early return. Without
+// it a cancelled context turns every remaining d.run into a per-image failure,
+// which only continues the loop — so the scan would spawn a doomed process for
+// every image left. A superseded refresh is the normal way this ends.
+func TestScanUpdateDetails_StopsOnCancelledContext(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	f := detailRunner(t, func(step detailStep, ref string) ([]byte, error) {
+		t.Errorf("no docker call is allowed once the context is cancelled")
+		return nil, nil
+	})
+	out, err := scanUpdateDetails(ctx, map[string]string{"web": "nginx:1.27", "api": "redis:7"}, f)
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("scanUpdateDetails() error = %v, want it to wrap context.Canceled", err)
+	}
+	if len(out) != 0 {
+		t.Errorf("scanUpdateDetails() = %v, want no entries", out)
+	}
+}
+
 func TestPinnedImageRef(t *testing.T) {
 	index := readFixture(t, "imagetools_manifest_index_nginx.json")
 	single := readFixture(t, "imagetools_raw_manifest.json")
@@ -1303,6 +1346,31 @@ func TestComposeUpdateDetails_DiscoveryErrorPropagates(t *testing.T) {
 	}
 }
 
+// TestComposeUpdateDetails_UnknownServiceCostsNothing pins the filter for a
+// verdict naming a service the compose file no longer carries: it resolves to
+// no image, so the scan must reach the registry zero times rather than reading
+// an empty filter result as "all services".
+func TestComposeUpdateDetails_UnknownServiceCostsNothing(t *testing.T) {
+	var argv [][]string
+	c := New("/srv/app")
+	c.SetStandalone(false)
+	c.SetTestHooks(nil, func(cmd *exec.Cmd) ([]byte, error) {
+		argv = append(argv, append([]string(nil), cmd.Args...))
+		return []byte(detailComposeConfig), nil
+	})
+
+	out, err := c.UpdateDetails(context.Background(), []string{"ghost"})
+	if err != nil {
+		t.Fatalf("UpdateDetails() error = %v, want nil", err)
+	}
+	if len(out) != 0 {
+		t.Errorf("UpdateDetails() = %v, want no entries", out)
+	}
+	if len(argv) != 1 {
+		t.Errorf("made %d docker calls, want 1 (the discovery call only): %v", len(argv), argv)
+	}
+}
+
 // classifyRemoteDetailCall classifies one remote docker command string by the
 // same markers classifyDetailCall reads. shellEscape only wraps each argument
 // in single quotes and none of the four argv shapes contains one, so matching
@@ -1380,6 +1448,29 @@ func TestRemoteUpdateDetails_SplicesSSHExtraArgsBeforeHost(t *testing.T) {
 	}
 }
 
+// TestRemoteUpdateDetails_DiscoveryErrorPropagates mirrors the Compose and
+// HostContainers cases: a failed `docker compose config` yields no image map,
+// so there is nothing partial to return and no registry call may follow.
+func TestRemoteUpdateDetails_DiscoveryErrorPropagates(t *testing.T) {
+	var calls int
+	r := &RemoteCompose{Host: "user@example.com", ProjectDir: "/srv/app"}
+	r.SetTestHooks(nil, func(cmd *exec.Cmd) ([]byte, error) {
+		calls++
+		return nil, errors.New("ssh: connect to host example.com port 22: Connection refused")
+	})
+
+	out, err := r.UpdateDetails(context.Background(), []string{"web"})
+	if err == nil {
+		t.Fatalf("UpdateDetails() = %v, want an error", out)
+	}
+	if out != nil {
+		t.Errorf("UpdateDetails() = %v, want a nil map on discovery failure", out)
+	}
+	if calls != 1 {
+		t.Errorf("made %d ssh calls, want 1 — a failed discovery must not reach the registry", calls)
+	}
+}
+
 // hostPsDetailMixed exercises every entry hostImageMap drops: a compose-managed
 // container, a bare image ID, and a container with no image reference at all.
 // Only watchtower survives.
@@ -1443,97 +1534,6 @@ func TestHostContainersUpdateDetails_DiscoveryErrorPropagates(t *testing.T) {
 	}
 	if len(f.runCalls) != 1 {
 		t.Errorf("made %d docker calls, want 1 — a failed discovery must not reach the registry", len(f.runCalls))
-	}
-}
-
-// TestScanUpdateDetails_VisitsInSortedOrder pins the ordering rule directly
-// rather than through the transport-abort test, which could pass on Go's map
-// iteration order alone. Every image costs three registry round-trips, so which
-// images are reached before an abort must be deterministic.
-func TestScanUpdateDetails_VisitsInSortedOrder(t *testing.T) {
-	wanted := map[string]string{"c-cache": "redis:7", "a-web": "nginx:1.27", "b-api": "alpine:3"}
-	want := []string{"nginx:1.27", "alpine:3", "redis:7"}
-
-	// Repeat so a map-order-dependent implementation cannot pass by luck.
-	for i := 0; i < 50; i++ {
-		f := detailRunner(t, func(step detailStep, ref string) ([]byte, error) {
-			// Fail at step 1 so each image costs exactly one recorded call.
-			return nil, fmt.Errorf("no such image: %s", ref)
-		})
-		if _, err := scanUpdateDetails(context.Background(), wanted, f); err != nil {
-			t.Fatalf("scanUpdateDetails() error = %v, want nil", err)
-		}
-		if got := stepRefs(f); !slices.Equal(got, want) {
-			t.Fatalf("visit order = %v, want %v", got, want)
-		}
-	}
-}
-
-// TestScanUpdateDetails_StopsOnCancelledContext pins the early return. Without
-// it a cancelled context turns every remaining d.run into a per-image failure,
-// which only continues the loop — so the scan would spawn a doomed process for
-// every image left. A superseded refresh is the normal way this ends.
-func TestScanUpdateDetails_StopsOnCancelledContext(t *testing.T) {
-	ctx, cancel := context.WithCancel(context.Background())
-	cancel()
-	f := detailRunner(t, func(step detailStep, ref string) ([]byte, error) {
-		t.Errorf("no docker call is allowed once the context is cancelled")
-		return nil, nil
-	})
-	out, err := scanUpdateDetails(ctx, map[string]string{"web": "nginx:1.27", "api": "redis:7"}, f)
-	if !errors.Is(err, context.Canceled) {
-		t.Fatalf("scanUpdateDetails() error = %v, want it to wrap context.Canceled", err)
-	}
-	if len(out) != 0 {
-		t.Errorf("scanUpdateDetails() = %v, want no entries", out)
-	}
-}
-
-// TestComposeUpdateDetails_UnknownServiceCostsNothing pins the filter for a
-// verdict naming a service the compose file no longer carries: it resolves to
-// no image, so the scan must reach the registry zero times rather than reading
-// an empty filter result as "all services".
-func TestComposeUpdateDetails_UnknownServiceCostsNothing(t *testing.T) {
-	var argv [][]string
-	c := New("/srv/app")
-	c.SetStandalone(false)
-	c.SetTestHooks(nil, func(cmd *exec.Cmd) ([]byte, error) {
-		argv = append(argv, append([]string(nil), cmd.Args...))
-		return []byte(detailComposeConfig), nil
-	})
-
-	out, err := c.UpdateDetails(context.Background(), []string{"ghost"})
-	if err != nil {
-		t.Fatalf("UpdateDetails() error = %v, want nil", err)
-	}
-	if len(out) != 0 {
-		t.Errorf("UpdateDetails() = %v, want no entries", out)
-	}
-	if len(argv) != 1 {
-		t.Errorf("made %d docker calls, want 1 (the discovery call only): %v", len(argv), argv)
-	}
-}
-
-// TestRemoteUpdateDetails_DiscoveryErrorPropagates mirrors the Compose and
-// HostContainers cases: a failed `docker compose config` yields no image map,
-// so there is nothing partial to return and no registry call may follow.
-func TestRemoteUpdateDetails_DiscoveryErrorPropagates(t *testing.T) {
-	var calls int
-	r := &RemoteCompose{Host: "user@example.com", ProjectDir: "/srv/app"}
-	r.SetTestHooks(nil, func(cmd *exec.Cmd) ([]byte, error) {
-		calls++
-		return nil, errors.New("ssh: connect to host example.com port 22: Connection refused")
-	})
-
-	out, err := r.UpdateDetails(context.Background(), []string{"web"})
-	if err == nil {
-		t.Fatalf("UpdateDetails() = %v, want an error", out)
-	}
-	if out != nil {
-		t.Errorf("UpdateDetails() = %v, want a nil map on discovery failure", out)
-	}
-	if calls != 1 {
-		t.Errorf("made %d ssh calls, want 1 — a failed discovery must not reach the registry", calls)
 	}
 }
 

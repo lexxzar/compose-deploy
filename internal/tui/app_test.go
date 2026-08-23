@@ -11450,7 +11450,7 @@ func TestUpdateDetailsMsg_LandsAfterASessionBump(t *testing.T) {
 
 // TestUpdateDetailsMsg_ForeignMergeDoesNotRedrawTheScreen: the merge is keyed
 // by the batch's own context, but the redraw is a render path and must stay
-// keyed by the CURRENT one. refreshInspectFromCache ends in a SetContent that
+// keyed by the CURRENT one. redrawInspectFromCache ends in a SetContent that
 // does SetXOffset(0), so redrawing for an entry the screen is not showing would
 // snap a sideways-scrolled pane back to column 0 at an arbitrary moment, for
 // data that did not change.
@@ -12097,10 +12097,9 @@ func TestUpdateDetails_SelfHealsAtEveryScreenEntry(t *testing.T) {
 }
 
 // TestUpdateDetails_LostBatchHealsAfterNavigating walks the whole reachable
-// sequence the previous three review rounds each rediscovered through a
-// different door: a batch is refused, an ordinary navigation happens while the
-// running one is still out, and the refused batch's entry must still end up
-// with its rows.
+// sequence a lost batch takes: a batch is refused, an ordinary navigation
+// happens while the running one is still out, and the refused batch's entry
+// must still end up with its rows.
 func TestUpdateDetails_LostBatchHealsAfterNavigating(t *testing.T) {
 	mc := &mockDetailComposer{details: detailFixture()}
 	mc.services = []string{"web"}
@@ -12421,7 +12420,7 @@ func TestInspectScreen_UpdateRowsFollowTheVerdict(t *testing.T) {
 		},
 		{
 			name:     "another service's verdict is not borrowed",
-			entry:    &updateEntry{fetchedAt: fetched, results: map[string]bool{"db": true}, details: detailFixture2("db")},
+			entry:    &updateEntry{fetchedAt: fetched, results: map[string]bool{"db": true}, details: detailFixtureFor("db")},
 			skipRows: append([]string{"update"}, detailRows...),
 		},
 	}
@@ -12454,9 +12453,9 @@ func TestInspectScreen_UpdateRowsFollowTheVerdict(t *testing.T) {
 	}
 }
 
-// detailFixture2 re-keys the shared detail fixture onto another service, so a
+// detailFixtureFor re-keys the shared detail fixture onto another service, so a
 // cross-service leak reads as a real map rather than an empty one.
-func detailFixture2(service string) map[string]compose.UpdateDetail {
+func detailFixtureFor(service string) map[string]compose.UpdateDetail {
 	return map[string]compose.UpdateDetail{service: detailFixture()["web"]}
 }
 
@@ -12578,7 +12577,7 @@ func TestUpdateDetails_FireOnTheGlyphTriggers(t *testing.T) {
 // opt-in exists to prevent. U must still reach both halves.
 func TestReadOnly_NoAutomaticDetailFetch(t *testing.T) {
 	newComposer := func() *readOnlyDetailComposer {
-		c := &readOnlyDetailComposer{details: detailFixture2("watchtower")}
+		c := &readOnlyDetailComposer{details: detailFixtureFor("watchtower")}
 		c.services = []string{"watchtower"}
 		c.status = map[string]runner.ServiceStatus{"watchtower": {Running: true}}
 		c.updates = map[string]bool{"watchtower": true}
@@ -12642,7 +12641,7 @@ func TestReadOnly_NoAutomaticDetailFetch(t *testing.T) {
 		// A batch that finished under a context the user has since left: it
 		// merges nowhere, and its arrival is the refill trigger.
 		_, cmd := m.Update(updateDetailsMsg{
-			details:  detailFixture2("watchtower"),
+			details:  detailFixtureFor("watchtower"),
 			forKey:   "some-other-project|",
 			forEntry: time.Now().Add(-time.Minute),
 		})

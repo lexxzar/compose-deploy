@@ -468,9 +468,10 @@ func formatInspectTime(s string) string {
 
 // formatInspectTimeValue renders an already-parsed timestamp in the same layout
 // as formatInspectTime. One guard covers both the docker zero time (year 1, so
-// far below the epoch) and 1970 itself: each is an absent value rather than data — the latter is what reproducible builders (distroless,
-// ko, Bazel, nix) write into an image's Created field — so each yields "" and the
-// caller omits the row.
+// far below the epoch) and 1970 itself: each is an absent value rather than
+// data — the latter is what reproducible builders (distroless, ko, Bazel, nix)
+// write into an image's Created field — so each yields "" and the caller omits
+// the row.
 func formatInspectTimeValue(t time.Time) string {
 	if t.Unix() <= 0 {
 		return ""

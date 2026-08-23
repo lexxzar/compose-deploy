@@ -188,9 +188,8 @@ func parseImagetoolsDigest(data []byte) string {
 		}
 		rest := strings.TrimSpace(strings.TrimPrefix(line, "Digest:"))
 		rest = strings.Trim(rest, "\"'")
-		if m := imagetoolsDigestRE.FindString(rest); m != "" {
-			// Normalize to lower-case algorithm/hex for stable comparison.
-			return "sha256:" + strings.ToLower(m[len("sha256:"):])
+		if dg := validImagetoolsDigest(imagetoolsDigestRE.FindString(rest)); dg != "" {
+			return dg
 		}
 	}
 	return ""

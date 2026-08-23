@@ -82,7 +82,7 @@ shared by all three composers. Revisit only if the quota proves binding in pract
 
 - **Files involved**: `internal/compose/updates.go`, `internal/compose/remote.go`,
   `internal/compose/hostcontainers.go`, `internal/compose/snapshot.go` (read-only, for
-  `StripTag` reuse), `internal/tui/app.go`, `internal/tui/inspect.go`, `README.md`.
+  `stripTag` reuse), `internal/tui/app.go`, `internal/tui/inspect.go`, `README.md`.
 - **Patterns reused**:
   - The `dockerRunner` three-method seam (`run` / `stream` / `tty`) — every top-level
     `docker` call already routes through it, and it gives remote SSH escaping plus
@@ -91,8 +91,8 @@ shared by all three composers. Revisit only if the quota proves binding in pract
   - The `Inspector` / `ConfigProvider` / `ExecProvider` precedent: a TUI-declared interface,
     type-asserted on the concrete composer, with `var _ …` compile-time pins in
     `internal/tui/app_test.go:14339-14351`.
-  - `StripTag` (`updates.go:241`), already exported as the single source of truth for
-    building a `repo@digest` ref — see `rollbackImageRef` (`snapshot.go:198`).
+  - `stripTag` (`updates.go:248`), the single source of truth for building a
+    `repo@digest` ref — see `rollbackImageRef` (`snapshot.go:198`).
   - `formatInspectTime` (`internal/tui/inspect.go:409`) already renders
     `2006-01-02 15:04:05`; `humanizeAge` (`internal/tui/app.go:2893`) already renders
     `47d ago`.
@@ -227,7 +227,7 @@ type UpdateDetail struct {
 | 3 | `docker buildx imagetools inspect --raw <pinnedRef>` | `config.digest` → `NewID` |
 | 4 | `docker buildx imagetools inspect --format '{{json .Image}}' <pinnedRef>` | `created` → `NewCreated` |
 
-`<pinnedRef>` is built with `StripTag(ref) + "@" + platformDigest`, reusing the exported
+`<pinnedRef>` is built with `stripTag(ref) + "@" + platformDigest`, reusing the in-package
 helper rather than re-deriving the repo portion.
 
 Steps 2–4 are registry calls. Step 1 is local. All four bypass `command()` /
@@ -423,7 +423,7 @@ and `imageConfigKeys` are gone).
 
 - [x] add `scanUpdateDetails(ctx, wanted map[string]string, d dockerRunner) (map[string]UpdateDetail, error)`
       mirroring `scanImageUpdates`: memoise by image ref, one entry per distinct image
-- [x] chain steps 1→4; build the pinned ref with `StripTag(ref) + "@" + digest`
+- [x] chain steps 1→4; build the pinned ref with `stripTag(ref) + "@" + digest`
 - [x] branch on the three-state index result: `hasIndex=false` → use the original ref;
       `hasIndex=true, found=false` → **abort this image**
 - [x] on any per-image failure, omit that service and continue — a partial result is valid
