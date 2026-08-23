@@ -566,17 +566,29 @@ Isolated because it is a user-visible rename with its own broken assertions.
 - Modify: `internal/tui/inspect.go`
 - Modify: `internal/tui/inspect_test.go`
 
-- [ ] extend `inspectImageSection` with the `built`, `update`, `update id` and `update built`
+- [x] extend `inspectImageSection` with the `built`, `update`, `update id` and `update built`
       rows per the Rendering rules table, each omitted independently
-- [ ] render the `update` row's `(checked 3m ago)` suffix from `upd.checkedAt`, omitting the
+- [x] render the `update` row's `(checked 3m ago)` suffix from `upd.checkedAt`, omitting the
       suffix when that is zero
-- [ ] verify every new line goes through `inspectBuilder.push` so the sanitiser and `wrapCells`
+- [x] verify every new line goes through `inspectBuilder.push` so the sanitiser and `wrapCells`
       soft-wrap apply, and that `viewInspect()` still does not end in a newline
-- [ ] write table tests with a fixed `now`: update available (all rows), up to date (one
+- [x] write table tests with a fixed `now`: update available (all rows), up to date (one
       `update` line, no detail rows), verdict nil (no rows at all)
-- [ ] write tests for the epoch sentinel omitting `built` and `update built` independently
-- [ ] write a narrow-width test asserting the new rows wrap rather than truncate
-- [ ] run `go test ./internal/tui/` — must pass before task 11
+- [x] write tests for the epoch sentinel omitting `built` and `update built` independently
+- [x] write a narrow-width test asserting the new rows wrap rather than truncate
+- [x] run `go test ./internal/tui/` — must pass before task 11
+
+➕ The IMAGE section's presence gate is UNCHANGED: a doc with no image, no command and no
+entrypoint stays silent even when a verdict is in hand. An update verdict describes the image,
+so a section opened by the verdict alone would carry one row and nothing to compare it against.
+
+➕ The four rows sit BETWEEN `image id` and `command`, so the two ids and the two build dates
+read as pairs. `TestBuildInspectSummary_UpdateRowOrder` pins that order.
+
+➕ Each row keys off its OWN input, per the rendering table: a detail with no verdict still
+draws `built` / `update id` / `update built`, and a verdict with no detail still draws `update`.
+The renderer never infers one from the other, so a future caller that fills only half the struct
+cannot make it claim something it was not told.
 
 ### Task 11: Verify acceptance criteria
 

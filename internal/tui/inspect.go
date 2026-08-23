@@ -292,6 +292,12 @@ func inspectHealthSection(b *inspectBuilder, doc compose.InspectDoc) {
 // compose file asked for, the local image ID docker resolved it to, and the
 // command pair. The image ID is the row that answers "did my deploy take?" — a
 // stale container keeps the old image ID under an unchanged tag.
+//
+// The four update rows sit BETWEEN the image ID and the command pair, so the
+// two ids and the two build dates read as one block: "image id" against
+// "update id", "built" against "update built". Each row is omitted on its own,
+// and the section's presence gate is unchanged — an update verdict describes
+// the image, so a doc with no image at all still has nothing to say.
 func inspectImageSection(b *inspectBuilder, doc compose.InspectDoc, upd inspectUpdateInfo) {
 	cmd := strings.Join(doc.Config.Cmd, " ")
 	entrypoint := strings.Join(doc.Config.Entrypoint, " ")
@@ -306,12 +312,43 @@ func inspectImageSection(b *inspectBuilder, doc compose.InspectDoc, upd inspectU
 	if doc.Image != "" {
 		b.kv("image id", doc.Image)
 	}
+	if upd.detail != nil {
+		if built := formatTimeWithAge(upd.detail.LocalCreated, upd.now); built != "" {
+			b.kv("built", built)
+		}
+	}
+	if upd.verdict != nil {
+		b.kv("update", formatUpdateVerdict(*upd.verdict, upd.checkedAt, upd.now))
+	}
+	if upd.detail != nil {
+		if upd.detail.NewID != "" {
+			b.kv("update id", upd.detail.NewID)
+		}
+		if built := formatTimeWithAge(upd.detail.NewCreated, upd.now); built != "" {
+			b.kv("update built", built)
+		}
+	}
 	if cmd != "" {
 		b.kv("command", cmd)
 	}
 	if entrypoint != "" {
 		b.kv("entrypoint", entrypoint)
 	}
+}
+
+// formatUpdateVerdict renders the "update" row's value: the verdict, plus how
+// old the check behind it is. The age suffix is dropped when the entry carries
+// no fetch time, rather than reported as "moments ago" — a missing timestamp is
+// not a fresh one.
+func formatUpdateVerdict(available bool, checkedAt, now time.Time) string {
+	value := "up to date"
+	if available {
+		value = "available"
+	}
+	if checkedAt.IsZero() {
+		return value
+	}
+	return value + "  (checked " + humanizeAge(now.Sub(checkedAt)) + ")"
 }
 
 func inspectMountsSection(b *inspectBuilder, doc compose.InspectDoc) {

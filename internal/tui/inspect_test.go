@@ -722,6 +722,234 @@ func TestBuildInspectSummary_ImageSectionPresence(t *testing.T) {
 	}
 }
 
+// updateRowsDoc is the minimal doc the update-row tests render against: enough
+// to open the IMAGE section, and nothing that could be mistaken for one of the
+// rows under test.
+func updateRowsDoc() compose.InspectDoc {
+	return compose.InspectDoc{
+		Image:  "sha256:" + strings.Repeat("a", 64),
+		Config: compose.InspectConfig{Image: "postgres:16-alpine", Cmd: []string{"postgres"}},
+	}
+}
+
+// TestBuildInspectSummary_UpdateRows pins the Rendering rules table: each of the
+// four rows appears on its own condition and is omitted on its own. The clock is
+// a fixed parameter, so the relative ages are assertions rather than a snapshot
+// of whatever day the suite happened to run on.
+func TestBuildInspectSummary_UpdateRows(t *testing.T) {
+	now := time.Date(2026, 8, 23, 19, 0, 0, 0, time.UTC)
+	yes, no := true, false
+	localBuilt := time.Date(2026, 7, 7, 17, 47, 22, 0, time.UTC)
+	newBuilt := time.Date(2026, 8, 19, 19, 14, 43, 0, time.UTC)
+	newID := "sha256:" + strings.Repeat("c", 64)
+	fullDetail := &compose.UpdateDetail{LocalCreated: localBuilt, NewID: newID, NewCreated: newBuilt}
+
+	tests := []struct {
+		name     string
+		upd      inspectUpdateInfo
+		wantRows []string
+		skipRows []string
+	}{
+		{
+			name: "update available draws every row",
+			upd: inspectUpdateInfo{
+				now:       now,
+				verdict:   &yes,
+				checkedAt: now.Add(-3 * time.Minute),
+				detail:    fullDetail,
+			},
+			wantRows: []string{
+				inspectRow("built", "2026-07-07 17:47:22  (47d ago)"),
+				inspectRow("update", "available  (checked 3m ago)"),
+				inspectRow("update id", newID),
+				inspectRow("update built", "2026-08-19 19:14:43  (3d ago)"),
+			},
+		},
+		{
+			name: "up to date draws the verdict alone",
+			upd: inspectUpdateInfo{
+				now:       now,
+				verdict:   &no,
+				checkedAt: now.Add(-90 * time.Minute),
+			},
+			wantRows: []string{inspectRow("update", "up to date  (checked 1h ago)")},
+			skipRows: []string{"built", "update id"},
+		},
+		{
+			name:     "no verdict draws nothing",
+			upd:      inspectUpdateInfo{now: now},
+			skipRows: []string{"built", "update", "update id", "update built"},
+		},
+		{
+			name: "a detail without a verdict still draws its own rows",
+			upd:  inspectUpdateInfo{now: now, detail: fullDetail},
+			wantRows: []string{
+				inspectRow("built", "2026-07-07 17:47:22  (47d ago)"),
+				inspectRow("update id", newID),
+				inspectRow("update built", "2026-08-19 19:14:43  (3d ago)"),
+			},
+			// The verdict row is the one thing a detail cannot imply.
+			skipRows: []string{inspectRow("update", "available"), inspectRow("update", "up to date")},
+		},
+		{
+			name:     "an unstamped check reports no age",
+			upd:      inspectUpdateInfo{now: now, verdict: &yes},
+			wantRows: []string{inspectRow("update", "available")},
+			skipRows: []string{"(checked"},
+		},
+		{
+			name: "an empty new id omits only its own row",
+			upd: inspectUpdateInfo{
+				now:     now,
+				verdict: &yes,
+				detail:  &compose.UpdateDetail{LocalCreated: localBuilt, NewCreated: newBuilt},
+			},
+			wantRows: []string{
+				inspectRow("built", "2026-07-07 17:47:22  (47d ago)"),
+				inspectRow("update built", "2026-08-19 19:14:43  (3d ago)"),
+			},
+			skipRows: []string{"update id"},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			out := buildInspectSummary(updateRowsDoc(), 120, tt.upd)
+			for _, want := range tt.wantRows {
+				if !strings.Contains(out, want) {
+					t.Errorf("summary missing %q:\n%s", want, out)
+				}
+			}
+			for _, skip := range tt.skipRows {
+				if strings.Contains(out, skip) {
+					t.Errorf("summary must not contain %q:\n%s", skip, out)
+				}
+			}
+		})
+	}
+}
+
+// TestBuildInspectSummary_UpdateRowOrder pins where the block sits: the two ids
+// and the two build dates have to read as pairs, so "built" follows "image id"
+// and the command pair stays at the bottom of the section.
+func TestBuildInspectSummary_UpdateRowOrder(t *testing.T) {
+	yes := true
+	now := time.Date(2026, 8, 23, 19, 0, 0, 0, time.UTC)
+	out := buildInspectSummary(updateRowsDoc(), 120, inspectUpdateInfo{
+		now:       now,
+		verdict:   &yes,
+		checkedAt: now.Add(-3 * time.Minute),
+		detail: &compose.UpdateDetail{
+			LocalCreated: time.Date(2026, 7, 7, 17, 47, 22, 0, time.UTC),
+			NewID:        "sha256:" + strings.Repeat("c", 64),
+			NewCreated:   time.Date(2026, 8, 19, 19, 14, 43, 0, time.UTC),
+		},
+	})
+
+	prev := -1
+	for _, label := range []string{"image ", "image id", "built ", "update ", "update id", "update built", "command"} {
+		at := strings.Index(out, "  "+label)
+		if at < 0 {
+			t.Fatalf("summary missing the %q row:\n%s", label, out)
+		}
+		if at <= prev {
+			t.Errorf("%q at %d is not after the previous row at %d:\n%s", label, at, prev, out)
+		}
+		prev = at
+	}
+}
+
+// TestBuildInspectSummary_UpdateRowsEpochSentinel pins the reproducible-build
+// guard on both date rows independently. distroless, ko, Bazel and nix images
+// report 1970-01-01, which is a sentinel rather than a build date, so the row is
+// dropped instead of claiming the image was built 56 years ago.
+func TestBuildInspectSummary_UpdateRowsEpochSentinel(t *testing.T) {
+	now := time.Date(2026, 8, 23, 19, 0, 0, 0, time.UTC)
+	epoch := time.Unix(0, 0).UTC()
+	real := time.Date(2026, 8, 19, 19, 14, 43, 0, time.UTC)
+	yes := true
+
+	tests := []struct {
+		name    string
+		detail  compose.UpdateDetail
+		wantRow string
+		skipRow string
+	}{
+		{
+			name:    "local epoch drops built only",
+			detail:  compose.UpdateDetail{LocalCreated: epoch, NewCreated: real},
+			wantRow: inspectRow("update built", "2026-08-19 19:14:43  (3d ago)"),
+			// The row prefix is part of the needle: "built" alone is a
+			// substring of the "update built" row this case must keep.
+			skipRow: "\n  built",
+		},
+		{
+			name:    "registry epoch drops update built only",
+			detail:  compose.UpdateDetail{LocalCreated: real, NewCreated: epoch},
+			wantRow: inspectRow("built", "2026-08-19 19:14:43  (3d ago)"),
+			skipRow: "update built",
+		},
+		{
+			name:    "both epoch drops both",
+			detail:  compose.UpdateDetail{LocalCreated: epoch, NewCreated: epoch, NewID: "sha256:" + strings.Repeat("c", 64)},
+			wantRow: inspectRow("update id", "sha256:"+strings.Repeat("c", 64)),
+			skipRow: "built",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			detail := tt.detail
+			out := buildInspectSummary(updateRowsDoc(), 120, inspectUpdateInfo{now: now, verdict: &yes, detail: &detail})
+			if !strings.Contains(out, tt.wantRow) {
+				t.Errorf("summary missing %q:\n%s", tt.wantRow, out)
+			}
+			if strings.Contains(out, tt.skipRow) {
+				t.Errorf("summary must not contain %q:\n%s", tt.skipRow, out)
+			}
+			if strings.Contains(out, "1970") {
+				t.Errorf("the epoch sentinel must never be rendered:\n%s", out)
+			}
+		})
+	}
+}
+
+// TestBuildInspectSummary_UpdateRowsWrapNarrow pins that the new rows obey the
+// wrap-not-truncate promise the rest of the section already carries: a 64-hex
+// digest is far wider than a narrow pane, and losing its tail would make the
+// "image id" / "update id" comparison the rows exist for impossible.
+func TestBuildInspectSummary_UpdateRowsWrapNarrow(t *testing.T) {
+	yes := true
+	now := time.Date(2026, 8, 23, 19, 0, 0, 0, time.UTC)
+	newID := "sha256:" + strings.Repeat("c", 64)
+	upd := inspectUpdateInfo{
+		now:       now,
+		verdict:   &yes,
+		checkedAt: now.Add(-3 * time.Minute),
+		detail: &compose.UpdateDetail{
+			LocalCreated: time.Date(2026, 7, 7, 17, 47, 22, 0, time.UTC),
+			NewID:        newID,
+			NewCreated:   time.Date(2026, 8, 19, 19, 14, 43, 0, time.UTC),
+		},
+	}
+
+	for _, width := range []int{1, 4, 10, 16, 20, 30, 40, 60, 80} {
+		out := buildInspectSummary(updateRowsDoc(), width, upd)
+		for i, line := range strings.Split(out, "\n") {
+			if w := ansi.StringWidth(line); w > width {
+				t.Errorf("width %d: line %d is %d cells: %q", width, i, w, line)
+			}
+		}
+		// squeeze drops the wrap, so a truncated tail is the only way to fail.
+		flat := squeeze(out)
+		for _, want := range []string{newID, "2026-07-0717:47:22(47dago)", "available(checked3mago)", "2026-08-1919:14:43(3dago)"} {
+			if !strings.Contains(flat, want) {
+				t.Errorf("width %d: %q was truncated:\n%s", width, want, out)
+			}
+		}
+	}
+}
+
 func TestBuildInspectSummary_MountsSection(t *testing.T) {
 	doc := loadInspectFixture(t, "docker_inspect_healthy.json")
 	if len(doc.Mounts) != 2 {
