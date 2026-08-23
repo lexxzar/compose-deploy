@@ -525,6 +525,72 @@ func TestFormatInspectTime(t *testing.T) {
 	}
 }
 
+func TestFormatInspectTimeValue(t *testing.T) {
+	tests := []struct {
+		name string
+		in   time.Time
+		want string
+	}{
+		{name: "go zero time", in: time.Time{}, want: ""},
+		{name: "docker zero time", in: time.Date(1, 1, 1, 0, 0, 0, 0, time.UTC), want: ""},
+		{name: "unix epoch sentinel", in: time.Unix(0, 0).UTC(), want: ""},
+		{name: "before the epoch", in: time.Date(1969, 12, 31, 23, 59, 59, 0, time.UTC), want: ""},
+		{name: "normal timestamp", in: time.Date(2026, 7, 7, 17, 47, 22, 0, time.UTC), want: "2026-07-07 17:47:22"},
+		{
+			name: "keeps the offset zone",
+			in:   time.Date(2026, 7, 7, 17, 47, 22, 0, time.FixedZone("CEST", 2*60*60)),
+			want: "2026-07-07 17:47:22",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := formatInspectTimeValue(tt.in); got != tt.want {
+				t.Errorf("formatInspectTimeValue(%v) = %q, want %q", tt.in, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestFormatTimeWithAge(t *testing.T) {
+	now := time.Date(2026, 8, 23, 12, 0, 0, 0, time.UTC)
+	tests := []struct {
+		name string
+		in   time.Time
+		want string
+	}{
+		{name: "go zero time is absent", in: time.Time{}, want: ""},
+		{name: "epoch sentinel is absent", in: time.Unix(0, 0).UTC(), want: ""},
+		{name: "seconds", in: now.Add(-30 * time.Second), want: "2026-08-23 11:59:30  (moments ago)"},
+		{name: "minute boundary", in: now.Add(-time.Minute), want: "2026-08-23 11:59:00  (1m ago)"},
+		{name: "minutes", in: now.Add(-3 * time.Minute), want: "2026-08-23 11:57:00  (3m ago)"},
+		{name: "hour boundary", in: now.Add(-time.Hour), want: "2026-08-23 11:00:00  (1h ago)"},
+		{name: "day boundary", in: now.Add(-24 * time.Hour), want: "2026-08-22 12:00:00  (1d ago)"},
+		{name: "many days", in: now.Add(-47 * 24 * time.Hour), want: "2026-07-07 12:00:00  (47d ago)"},
+		{name: "future stamp reads as moments", in: now.Add(time.Hour), want: "2026-08-23 13:00:00  (moments ago)"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := formatTimeWithAge(tt.in, now); got != tt.want {
+				t.Errorf("formatTimeWithAge(%v) = %q, want %q", tt.in, got, tt.want)
+			}
+		})
+	}
+}
+
+// TestBuildInspectSummary_StartedRowUnchanged pins the STATE section's "started"
+// row against the formatInspectTime split: the wrapper still parses the docker
+// RFC3339 string and the row keeps its bare stamp, with no age suffix.
+func TestBuildInspectSummary_StartedRowUnchanged(t *testing.T) {
+	doc := loadInspectFixture(t, "docker_inspect_healthy.json")
+	out := buildInspectSummary(doc, 80)
+	if !strings.Contains(out, "started") || !strings.Contains(out, "2026-08-22 03:09:23") {
+		t.Errorf("summary lost the started row:\n%s", out)
+	}
+	if strings.Contains(out, "2026-08-22 03:09:23  (") {
+		t.Errorf("started row must not carry an age suffix:\n%s", out)
+	}
+}
+
 func TestFormatRestartPolicy(t *testing.T) {
 	tests := []struct {
 		name string

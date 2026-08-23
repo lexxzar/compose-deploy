@@ -301,22 +301,22 @@ Independent of the compose work — sequenced first so the two halves can procee
 - Modify: `internal/tui/inspect.go`
 - Modify: `internal/tui/inspect_test.go`
 
-- [ ] split `formatInspectTime(s string)` into `formatInspectTimeValue(t time.Time) string`
+- [x] split `formatInspectTime(s string)` into `formatInspectTimeValue(t time.Time) string`
       plus the existing string wrapper that parses then delegates — `UpdateDetail` carries
       `time.Time`, so without the split the new rows would round-trip through RFC3339
-- [ ] add the epoch guard to `formatInspectTimeValue`: treat `t.Unix() <= 0` as absent,
+- [x] add the epoch guard to `formatInspectTimeValue`: treat `t.Unix() <= 0` as absent,
       covering the 1970 reproducible-build sentinel alongside the existing `Year() <= 1` check
-- [ ] add `formatTimeWithAge(t, now time.Time) string` producing
+- [x] add `formatTimeWithAge(t, now time.Time) string` producing
       `2026-07-07 17:47:22  (47d ago)`, reusing `formatInspectTimeValue` and `humanizeAge`,
       and returning `""` whenever `formatInspectTimeValue` does
-- [ ] **do not** extend `humanizeAge` with week/month tiers — `rollbackAgeSuffix` is its other
+- [x] **do not** extend `humanizeAge` with week/month tiers — `rollbackAgeSuffix` is its other
       caller, the change is unrelated to this feature, and `47d ago` carries more information
       than `1mo ago` when choosing a rollback target
-- [ ] write tests asserting `formatInspectTimeValue` returns `""` for `1970-01-01T00:00:00Z`
+- [x] write tests asserting `formatInspectTimeValue` returns `""` for `1970-01-01T00:00:00Z`
       and for the Go zero time, and a real value for a normal timestamp
-- [ ] write tests for `formatTimeWithAge` across the minute/hour/day boundaries with a fixed `now`
-- [ ] write a test asserting the existing `started` row is unchanged for a real timestamp
-- [ ] run `go test ./internal/tui/` — must pass before task 2
+- [x] write tests for `formatTimeWithAge` across the minute/hour/day boundaries with a fixed `now`
+- [x] write a test asserting the existing `started` row is unchanged for a real timestamp
+- [x] run `go test ./internal/tui/` — must pass before task 2
 
 ### Task 2: Add `UpdateDetail` and the local image probe
 

@@ -415,8 +415,27 @@ func formatInspectTime(s string) string {
 	if err != nil {
 		return s
 	}
-	if t.Year() <= 1 {
+	return formatInspectTimeValue(t)
+}
+
+// formatInspectTimeValue renders an already-parsed timestamp in the same layout
+// as formatInspectTime. Both the docker zero time and the 1970 epoch are absent
+// values rather than data — the latter is what reproducible builders (distroless,
+// ko, Bazel, nix) write into an image's Created field — so each yields "" and the
+// caller omits the row.
+func formatInspectTimeValue(t time.Time) string {
+	if t.Year() <= 1 || t.Unix() <= 0 {
 		return ""
 	}
 	return t.Format("2006-01-02 15:04:05")
+}
+
+// formatTimeWithAge renders "2026-07-07 17:47:22  (47d ago)" relative to now.
+// The clock is a parameter so the caller stays pure and testable.
+func formatTimeWithAge(t, now time.Time) string {
+	stamp := formatInspectTimeValue(t)
+	if stamp == "" {
+		return ""
+	}
+	return stamp + "  (" + humanizeAge(now.Sub(t)) + ")"
 }
