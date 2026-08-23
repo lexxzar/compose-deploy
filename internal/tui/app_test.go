@@ -11395,6 +11395,311 @@ func TestUpdatesMsg_InspectRebuildIsScreenScoped(t *testing.T) {
 	}
 }
 
+// readOnlyDetailComposer is a read-only composer that ALSO satisfies
+// UpdateDetailer — the shape *compose.HostContainers really has. The plain
+// readOnlyMockComposer does not implement it, so a read-only test built on that
+// double would pass on the missing capability rather than on the
+// autoUpdatesAllowed() gate under test (the capableReadOnlyComposer precedent).
+type readOnlyDetailComposer struct {
+	readOnlyMockComposer
+	details      map[string]compose.UpdateDetail
+	detailsCalls int
+	detailsArgs  [][]string
+}
+
+func (c *readOnlyDetailComposer) UpdateDetails(ctx context.Context, services []string) (map[string]compose.UpdateDetail, error) {
+	c.detailsCalls++
+	c.detailsArgs = append(c.detailsArgs, append([]string(nil), services...))
+	return c.details, nil
+}
+
+// TestInspectScreen_UpdateRowsFollowTheVerdict is the end-to-end half of the
+// "rows appear only when the verdict is true, and nil renders nothing"
+// criterion: buildInspectSummary is pinned per row in inspect_test.go, and
+// refreshUpdates is pinned to ask for details only on a true verdict, so what
+// is left is the path between them — the cache entry the inspect screen reads.
+// The false-verdict entry deliberately carries NO details, because that is the
+// shape refreshUpdates really writes.
+func TestInspectScreen_UpdateRowsFollowTheVerdict(t *testing.T) {
+	fetched := time.Now().Add(-3 * time.Minute)
+	detailRows := []string{"built", "update id", "update built"}
+
+	tests := []struct {
+		name     string
+		entry    *updateEntry
+		wantRows []string
+		skipRows []string
+	}{
+		{
+			name: "true verdict draws the whole block",
+			entry: &updateEntry{
+				fetchedAt: fetched,
+				results:   map[string]bool{"web": true},
+				details:   detailFixture,
+			},
+			wantRows: []string{
+				inspectRow("update", "available  (checked 3m ago)"),
+				inspectRow("built", "2026-07-07 17:47:22"),
+				inspectRow("update id", detailFixture["web"].NewID),
+				inspectRow("update built", "2026-08-19 19:14:43"),
+			},
+		},
+		{
+			name:     "false verdict draws the verdict alone",
+			entry:    &updateEntry{fetchedAt: fetched, results: map[string]bool{"web": false}},
+			wantRows: []string{inspectRow("update", "up to date  (checked 3m ago)")},
+			skipRows: detailRows,
+		},
+		{
+			name:     "no entry draws nothing",
+			skipRows: append([]string{"update"}, detailRows...),
+		},
+		{
+			name:     "another service's verdict is not borrowed",
+			entry:    &updateEntry{fetchedAt: fetched, results: map[string]bool{"db": true}, details: detailFixture2("db")},
+			skipRows: append([]string{"update"}, detailRows...),
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			m := Model{screen: screenInspect, inspectSession: 1, inspectService: "web"}
+			m.width, m.height = 120, 24
+			m.inspectViewport = viewport.New(m.width-4, m.height-6)
+			if tt.entry != nil {
+				m.updateCache = map[string]updateEntry{m.updatesCacheKey(): *tt.entry}
+			}
+
+			model := modelOf(m.Update(inspectDataMsg{data: []byte(inspectFixtureJSON), session: 1}))
+			out := model.inspectSummary
+			if out == "" {
+				t.Fatal("precondition: the summary should be rendered")
+			}
+			for _, want := range tt.wantRows {
+				if !strings.Contains(out, want) {
+					t.Errorf("summary missing %q:\n%s", want, out)
+				}
+			}
+			for _, skip := range tt.skipRows {
+				if strings.Contains(out, skip) {
+					t.Errorf("summary must not contain %q:\n%s", skip, out)
+				}
+			}
+		})
+	}
+}
+
+// detailFixture2 re-keys the shared detail fixture onto another service, so a
+// cross-service leak reads as a real map rather than an empty one.
+func detailFixture2(service string) map[string]compose.UpdateDetail {
+	return map[string]compose.UpdateDetail{service: detailFixture["web"]}
+}
+
+// TestUpdateDetails_FireOnTheGlyphTriggers pins the acceptance criterion that
+// the detail fetch rides the "⇧" schedule rather than one of its own: the three
+// triggers that refresh the glyph — a cache-miss screen entry, the U force
+// refresh and the post-Deploy invalidation — each carry the details with them.
+// They do by construction, because refreshUpdates is the single Cmd behind all
+// three; this is what keeps a future second mechanism from drifting away.
+func TestUpdateDetails_FireOnTheGlyphTriggers(t *testing.T) {
+	newComposer := func() *mockDetailComposer {
+		mc := &mockDetailComposer{details: detailFixture}
+		mc.services = []string{"web"}
+		mc.status = map[string]runner.ServiceStatus{"web": {Running: true}}
+		mc.updates = map[string]bool{"web": true}
+		return mc
+	}
+	primed := func(m Model) map[string]updateEntry {
+		return map[string]updateEntry{m.updatesCacheKey(): {
+			fetchedAt: time.Now(),
+			results:   map[string]bool{"web": true},
+			details:   detailFixture,
+		}}
+	}
+	assertFetched := func(t *testing.T, mc *mockDetailComposer, msg updatesMsg) {
+		t.Helper()
+		if mc.detailsCalls != 1 {
+			t.Errorf("UpdateDetails calls = %d, want exactly 1", mc.detailsCalls)
+		}
+		if msg.details == nil {
+			t.Error("the details must ride the same message as the verdicts")
+		}
+	}
+
+	t.Run("screen entry on a cache miss", func(t *testing.T) {
+		mc := newComposer()
+		m := inspectTestModel(t, mc, mc.services)
+
+		cmd := m.maybeRefreshUpdatesCmd()
+		if cmd == nil {
+			t.Fatal("a cache miss must fire a refresh")
+		}
+		raw := cmd()
+		msg, ok := raw.(updatesMsg)
+		if !ok {
+			t.Fatalf("expected an updatesMsg, got %T", raw)
+		}
+		assertFetched(t, mc, msg)
+	})
+
+	t.Run("U bypasses a fresh cache entry", func(t *testing.T) {
+		mc := newComposer()
+		m := inspectTestModel(t, mc, mc.services)
+		m.updateCache = primed(m)
+		if _, fresh := m.updatesCacheLookup(); !fresh {
+			t.Fatal("precondition: the primed entry should be fresh")
+		}
+
+		_, cmd := m.Update(keyMsgFor("U"))
+		if cmd == nil {
+			t.Fatal("U must force a refresh straight through a fresh entry")
+		}
+		raw := cmd()
+		msg, ok := raw.(updatesMsg)
+		if !ok {
+			t.Fatalf("expected an updatesMsg, got %T", raw)
+		}
+		assertFetched(t, mc, msg)
+	})
+
+	t.Run("post-Deploy invalidation", func(t *testing.T) {
+		mc := newComposer()
+		m := inspectTestModel(t, mc, mc.services)
+		m.screen = screenProgress
+		m.done = true
+		m.pendingOp = runner.Deploy
+		key := m.updatesCacheKey()
+		m.updateCache = primed(m)
+
+		result, cmd := m.Update(tea.KeyMsg{Type: tea.KeyEsc})
+		if _, present := result.(Model).updateCache[key]; present {
+			t.Fatal("a successful Deploy should have invalidated the cache entry")
+		}
+		if cmd == nil {
+			t.Fatal("leaving the progress screen must fan out a refresh batch")
+		}
+		raw := cmd()
+		batch, ok := raw.(tea.BatchMsg)
+		if !ok {
+			t.Fatalf("expected a tea.BatchMsg, got %T", raw)
+		}
+		var msg updatesMsg
+		found := false
+		for _, c := range batch {
+			if got, isUpdates := c().(updatesMsg); isUpdates {
+				msg, found = got, true
+			}
+		}
+		if !found {
+			t.Fatal("the post-Deploy batch carried no updates refresh")
+		}
+		assertFetched(t, mc, msg)
+	})
+}
+
+// TestReadOnly_NoAutomaticDetailFetch is the read-only half of the same
+// criterion. The unmanaged view is derived from `docker ps -a`, so every
+// leftover container contributes an image; adding three registry round-trips
+// per updated one to an automatic check is exactly the quota burn the U-only
+// opt-in exists to prevent. U must still reach both halves.
+func TestReadOnly_NoAutomaticDetailFetch(t *testing.T) {
+	newComposer := func() *readOnlyDetailComposer {
+		c := &readOnlyDetailComposer{details: detailFixture2("watchtower")}
+		c.services = []string{"watchtower"}
+		c.status = map[string]runner.ServiceStatus{"watchtower": {Running: true}}
+		c.updates = map[string]bool{"watchtower": true}
+		return c
+	}
+
+	t.Run("screen entry fetches neither half", func(t *testing.T) {
+		c := newComposer()
+		m := inspectTestModel(t, c, c.services)
+		if !m.readOnly() {
+			t.Fatal("precondition: the composer should be read-only")
+		}
+
+		if cmd := m.maybeRefreshUpdatesCmd(); cmd != nil {
+			t.Error("the read-only screen fired an automatic refresh; U must be the only trigger")
+		}
+		if c.updatesCalls != 0 || c.detailsCalls != 0 {
+			t.Errorf("CheckUpdates calls = %d, UpdateDetails calls = %d, want 0 and 0",
+				c.updatesCalls, c.detailsCalls)
+		}
+	})
+
+	t.Run("U still fetches both halves", func(t *testing.T) {
+		c := newComposer()
+		m := inspectTestModel(t, c, c.services)
+
+		_, cmd := m.Update(keyMsgFor("U"))
+		if cmd == nil {
+			t.Fatal("U must still force a refresh on the read-only screen")
+		}
+		raw := cmd()
+		msg, ok := raw.(updatesMsg)
+		if !ok {
+			t.Fatalf("expected an updatesMsg, got %T", raw)
+		}
+		if c.detailsCalls != 1 {
+			t.Fatalf("UpdateDetails calls = %d, want exactly 1", c.detailsCalls)
+		}
+		if got := c.detailsArgs[0]; len(got) != 1 || got[0] != "watchtower" {
+			t.Errorf("UpdateDetails services = %v, want [watchtower]", got)
+		}
+		if msg.details == nil {
+			t.Error("U must carry the details back with the verdicts")
+		}
+	})
+}
+
+// TestInspectScreen_RawModeIgnoresUpdateDetails pins the acceptance criterion
+// that `r` output is byte-identical to what it was before this feature: the new
+// rows exist only in the summary, and m.inspectRaw is never rewritten. The
+// summary comparison is the control — without it the raw equality could pass
+// on an empty cache on both sides.
+func TestInspectScreen_RawModeIgnoresUpdateDetails(t *testing.T) {
+	build := func(t *testing.T, withCache bool) Model {
+		t.Helper()
+		m := Model{screen: screenInspect, inspectSession: 1, inspectService: "web"}
+		m.width, m.height = 120, 24
+		m.inspectViewport = viewport.New(m.width-4, m.height-6)
+		if withCache {
+			m.updateCache = map[string]updateEntry{m.updatesCacheKey(): {
+				fetchedAt: time.Now().Add(-3 * time.Minute),
+				results:   map[string]bool{"web": true},
+				details:   detailFixture,
+			}}
+		}
+		model := modelOf(m.Update(inspectDataMsg{data: []byte(inspectFixtureJSON), session: 1}))
+		if model.inspectSummary == "" {
+			t.Fatal("precondition: the summary should be rendered")
+		}
+		return model
+	}
+
+	hot, cold := build(t, true), build(t, false)
+	if hot.inspectSummary == cold.inspectSummary {
+		t.Fatal("precondition: the cache entry should change the SUMMARY")
+	}
+
+	hotRaw := modelOf(hot.Update(keyMsgFor("r")))
+	coldRaw := modelOf(cold.Update(keyMsgFor("r")))
+	if !hotRaw.inspectShowRaw || !coldRaw.inspectShowRaw {
+		t.Fatal("r should have switched both models to raw mode")
+	}
+	if got, want := hotRaw.inspectViewport.View(), coldRaw.inspectViewport.View(); got != want {
+		t.Errorf("the update cache changed raw mode:\nwith:\n%s\nwithout:\n%s", got, want)
+	}
+	for _, m := range []Model{hotRaw, coldRaw} {
+		if string(m.inspectRaw) != inspectFixtureJSON {
+			t.Error("inspectRaw must stay verbatim in raw mode")
+		}
+	}
+	if strings.Contains(hotRaw.inspectViewport.View(), "update id") {
+		t.Error("the update rows must not leak into the raw buffer")
+	}
+}
+
 // TestUpdateInFlight_ResetOnLeaveScreen_ContainerToProj verifies that
 // updateInFlight is explicitly reset to false when navigating back from the
 // container screen (mirrors refreshInFlight cleanup at the same site).

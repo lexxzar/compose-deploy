@@ -592,14 +592,27 @@ cannot make it claim something it was not told.
 
 ### Task 11: Verify acceptance criteria
 
-- [ ] verify the rows appear only when the verdict is `true`, and that `nil` renders nothing
-- [ ] verify the detail fetch fires on the same triggers as `⇧`: screen entry on cache miss,
+- [x] verify the rows appear only when the verdict is `true`, and that `nil` renders nothing
+- [x] verify the detail fetch fires on the same triggers as `⇧`: screen entry on cache miss,
       `U` force refresh, and post-Deploy cache invalidation
-- [ ] verify no automatic fetch occurs on the read-only unmanaged screen, and that `U` still works there
-- [ ] verify raw mode (`r`) output is byte-identical to before this change
-- [ ] verify no help-table or footer drift: `go test ./internal/tui/ -run TestHelp` passes untouched
-- [ ] run the full suite uncached: `go test ./... -count=1`
-- [ ] run `go build -o cdeploy .` and confirm the binary builds
+- [x] verify no automatic fetch occurs on the read-only unmanaged screen, and that `U` still works there
+- [x] verify raw mode (`r`) output is byte-identical to before this change
+- [x] verify no help-table or footer drift: `go test ./internal/tui/ -run TestHelp` passes untouched
+- [x] run the full suite uncached: `go test ./... -count=1`
+- [x] run `go build -o cdeploy .` and confirm the binary builds
+
+➕ Every criterion held; nothing needed fixing. Four criteria were only implied by existing
+tests rather than pinned end to end, so each got its own test in `internal/tui/app_test.go`:
+`TestInspectScreen_UpdateRowsFollowTheVerdict` (cache entry → summary, including the
+cross-service leak case), `TestUpdateDetails_FireOnTheGlyphTriggers` (the three triggers, each
+driving the real Cmd), `TestReadOnly_NoAutomaticDetailFetch` (a NEW `readOnlyDetailComposer`
+double that carries the capability, so the gate is what the test measures) and
+`TestInspectScreen_RawModeIgnoresUpdateDetails` (raw output equal with and without a populated
+cache, with the differing summary as the control).
+
+➕ The help/footer criterion is verified structurally as well as by the run:
+`git diff --name-only` across the nine feature commits touches no `help*`/`footer*` file, so the
+`?` overlay drift pins and the container footer are provably untouched rather than merely green.
 
 ### Task 12: Update documentation
 
