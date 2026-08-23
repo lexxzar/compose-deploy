@@ -324,16 +324,21 @@ Independent of the compose work — sequenced first so the two halves can procee
 - Create: `internal/compose/updatedetails.go`
 - Create: `internal/compose/updatedetails_test.go`
 
-- [ ] create `internal/compose/updatedetails.go` with the three-field `UpdateDetail` struct
-- [ ] add `localProbeArgs(image string) []string` producing
+- [x] create `internal/compose/updatedetails.go` with the three-field `UpdateDetail` struct
+- [x] add `localProbeArgs(image string) []string` producing
       `image inspect --format '{{.Created}}|{{.Os}}|{{.Architecture}}' <image>` — no `.Variant`,
       no `.Id`
-- [ ] add `parseLocalProbe(out []byte) (localProbe, error)` — splits on `|`, parses `Created`
+- [x] add `parseLocalProbe(out []byte) (localProbe, error)` — splits on `|`, parses `Created`
       as RFC3339Nano, returns a zero time for an unparseable or `Unix() <= 0` value
-- [ ] write tests for `parseLocalProbe`: full line, malformed field count, unparseable
+- [x] write tests for `parseLocalProbe`: full line, malformed field count, unparseable
       timestamp, epoch timestamp
-- [ ] write a test for `localProbeArgs` asserting the argv carries no `compose` element
-- [ ] run `go test ./internal/compose/` — must pass before task 3
+- [x] write a test for `localProbeArgs` asserting the argv carries no `compose` element
+- [x] run `go test ./internal/compose/` — must pass before task 3
+
+➕ `parseLocalProbe` also errors on an EMPTY os/arch, not only on a wrong field count: without
+a platform pair the Task 3 index match can only fail, so erroring here saves the three registry
+round-trips that would follow. The timestamp guard lives in a small `parseImageTimestamp` helper
+so Task 4's `parseImageCreated` reuses the same epoch rule.
 
 ### Task 3: Add the index platform-selection parser
 
