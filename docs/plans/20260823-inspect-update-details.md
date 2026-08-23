@@ -489,25 +489,40 @@ argv set is asserted.
 
 - [x] declare the `UpdateDetailer` interface next to `Inspector` in `internal/tui/app.go`
       (done in Task 6 — the compile-time pins there need it; see that task's ➕ note)
-- [ ] add `details map[string]compose.UpdateDetail` to `updatesMsg` and to `updateEntry`
+- [x] add `details map[string]compose.UpdateDetail` to `updatesMsg` and to `updateEntry`
       (both are keyed struct literals in tests, so this costs no test churn)
-- [ ] extend `refreshUpdates()` to call `UpdateDetails` for the services whose verdict is
+- [x] extend `refreshUpdates()` to call `UpdateDetails` for the services whose verdict is
       `true`, guarded by the type assertion and skipped entirely when no verdict is `true` —
       note `filterServices` (`updates.go:612`) treats an empty slice as **all** services, so
       the skip is load-bearing, not an optimisation
-- [ ] **discard a detail-fetch error**: never assign it to `updatesMsg.err`, so a 429 during the
+- [x] **discard a detail-fetch error**: never assign it to `updatesMsg.err`, so a 429 during the
       detail phase cannot blank the `⇧` column or shorten the cache entry to the error TTL
-- [ ] store `details` on the cache entry beside `results`, under the same TTL and the same
+- [x] store `details` on the cache entry beside `results`, under the same TTL and the same
       session gate; leave `hydrateUpdates` untouched
-- [ ] add a `screenInspect` branch to the `updatesMsg` handler that calls
+- [x] add a `screenInspect` branch to the `updatesMsg` handler that calls
       `rebuildInspectSummary()` then `setInspectContent()` — without it, entering `i` on a cold
       cache leaves the rows permanently absent until the user backs out and re-enters
-- [ ] write a test asserting a detail-fetch error still yields verdicts and the 10 m success TTL
-- [ ] write a test asserting `UpdateDetails` is NOT called when every verdict is `false`
-- [ ] write a test asserting a composer without the interface still produces verdicts
-- [ ] write a test asserting a stale-session `updatesMsg` does not write details to the cache
-- [ ] write a test asserting an `updatesMsg` arriving on `screenInspect` refreshes the summary
-- [ ] run `go test ./internal/tui/` — must pass before task 8
+- [x] write a test asserting a detail-fetch error still yields verdicts and the 10 m success TTL
+- [x] write a test asserting `UpdateDetails` is NOT called when every verdict is `false`
+- [x] write a test asserting a composer without the interface still produces verdicts
+- [x] write a test asserting a stale-session `updatesMsg` does not write details to the cache
+- [x] write a test asserting an `updatesMsg` arriving on `screenInspect` refreshes the summary
+- [x] run `go test ./internal/tui/` — must pass before task 8
+
+➕ The detail fetch is ALSO skipped when `CheckUpdates` itself errored. A non-nil error makes
+the whole verdict map untrusted per the `Composer` contract, so no verdict is worth following
+up, and the three registry round-trips per image would be spent on a path that is already
+broken.
+
+➕ `servicesWithUpdate` returns the true verdicts SORTED, matching Task 5's sorted-visit rule:
+`scanUpdateDetails` walks the slice in order and a transport abort truncates the batch, so
+which images are reached must not depend on Go's map iteration order.
+
+➕ The `screenInspect` rebuild sits directly after the cache write, so it runs on the FAILURE
+path too — the entry that just landed carries no details, so a summary drawn from a previous
+one must stop showing them. It is the one screen-coupled mutation in the handler, pinned in
+both directions by `TestUpdatesMsg_RefreshesInspectSummary` and
+`TestUpdatesMsg_InspectRebuildIsScreenScoped`.
 
 ### Task 8: Relabel `digest` → `image id`
 

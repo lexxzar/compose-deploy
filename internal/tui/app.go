@@ -494,7 +494,17 @@ type statsMsg struct {
 type updateEntry struct {
 	fetchedAt time.Time
 	results   map[string]bool
-	err       bool
+	// details carries the inspect screen's extra IMAGE rows for the services
+	// whose verdict came back true. It rides this entry rather than a cache of
+	// its own so it inherits the key, the TTL, the session gate and the
+	// post-Deploy invalidation the "⇧" glyph already owns — the requirement is
+	// that the two use the same rules and timings, and sharing one entry
+	// satisfies it by construction rather than through a parallel mechanism
+	// that could drift. A nil map is normal and not an error state: no verdict
+	// was true, the composer does not implement UpdateDetailer, or the detail
+	// fetch failed and was discarded.
+	details map[string]compose.UpdateDetail
+	err     bool
 	// errMsg is the original error text from CheckUpdates. It's only set when
 	// err == true. Stored alongside the failure flag so cache-hit paths
 	// (maybeRefreshUpdatesCmd, servicesMsg/statusMsg cache replays) can
@@ -508,8 +518,14 @@ type updateEntry struct {
 // updatesMsg carries the result of a refreshUpdates fetch. session is
 // captured at fetch time and compared against m.updatesSession in the
 // handler to drop stale responses from a previous project/server context.
+//
+// details rides the same message as results for the same reason it rides the
+// same cache entry: one Cmd, one message, one session counter. It is never
+// accompanied by an error of its own — a detail-fetch failure is discarded at
+// the fetch site, so err always describes CheckUpdates alone.
 type updatesMsg struct {
 	results map[string]bool
+	details map[string]compose.UpdateDetail
 	err     error
 	session uint64
 }
@@ -977,6 +993,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.updateCache[key] = updateEntry{
 				fetchedAt: time.Now(),
 				results:   msg.results,
+				details:   msg.details,
 			}
 		} else {
 			m.updateCache[key] = updateEntry{
@@ -985,6 +1002,18 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				err:       true,
 				errMsg:    msg.err.Error(),
 			}
+		}
+		// The inspect screen is a pure CONSUMER of this cache — it never fetches
+		// details of its own. Without this rebuild, pressing `i` while the first
+		// fetch is still in flight (a cold cache is exactly when that happens)
+		// would leave the new IMAGE rows permanently absent until the user backs
+		// out and re-enters. Runs on the failure path too: the entry that just
+		// landed carries no details, so a summary drawn from a previous one must
+		// stop showing them. rebuildInspectSummary early-returns when no raw
+		// bytes are in hand, so this is a no-op before the inspect fetch lands.
+		if m.screen == screenInspect {
+			m.rebuildInspectSummary()
+			m.setInspectContent()
 		}
 		// State mutations below happen regardless of which screen the user is
 		// on: m.svcStatus is the source of truth that the next entry to
@@ -3857,14 +3886,67 @@ func (m Model) refreshStats() tea.Cmd {
 // services slice (= "all services"). The returned updatesMsg carries the
 // current updatesSession so a stale response from a previous project/server
 // context is dropped by the handler.
+//
+// The inspect screen's detail rows are fetched in the SAME goroutine, right
+// after the verdicts, so they inherit every trigger, TTL and session rule the
+// "⇧" glyph already has. They are skipped when CheckUpdates errored (a non-nil
+// error makes the whole verdict map untrusted, so no verdict is worth
+// following up).
 func (m Model) refreshUpdates() tea.Cmd {
 	ctx := m.ctx
 	c := m.composer
 	session := m.updatesSession
 	return func() tea.Msg {
 		results, err := c.CheckUpdates(ctx, nil)
-		return updatesMsg{results: results, err: err, session: session}
+		msg := updatesMsg{results: results, err: err, session: session}
+		if err == nil {
+			msg.details = fetchUpdateDetails(ctx, c, results)
+		}
+		return msg
 	}
+}
+
+// fetchUpdateDetails resolves the inspect screen's extra IMAGE rows for the
+// services whose verdict came back true. It is deliberately total: every
+// failure mode returns nil (or a partial map) rather than an error, because
+// the glyph is the load-bearing signal and these rows are a bonus.
+//
+// Discarding the error is load-bearing, not laziness. Each updated image costs
+// three registry round-trips, and a Docker Hub 429 reads as "too many
+// requests" — which looksLikeNetworkErr matches. Letting it reach
+// updatesMsg.err would trip the registry cascade, blank the whole "⇧" column
+// and shorten the cache entry to the 30-second error TTL, so a detail-phase
+// rate limit would degrade the very signal it was meant to annotate.
+//
+// The empty-slice guard is equally load-bearing: filterServices reads an empty
+// services slice as "ALL services", so calling through with no true verdicts
+// would spend four round-trips on every service in the project.
+func fetchUpdateDetails(ctx context.Context, c runner.Composer, results map[string]bool) map[string]compose.UpdateDetail {
+	d, ok := c.(UpdateDetailer)
+	if !ok {
+		return nil
+	}
+	svcs := servicesWithUpdate(results)
+	if len(svcs) == 0 {
+		return nil
+	}
+	details, _ := d.UpdateDetails(ctx, svcs)
+	return details
+}
+
+// servicesWithUpdate returns the sorted names of the services whose verdict is
+// true. Sorted because the compose layer visits images in the order it is
+// given and a transport abort truncates the batch — which images get reached
+// must not depend on Go's map iteration order.
+func servicesWithUpdate(results map[string]bool) []string {
+	var svcs []string
+	for svc, avail := range results {
+		if avail {
+			svcs = append(svcs, svc)
+		}
+	}
+	slices.Sort(svcs)
+	return svcs
 }
 
 // updatesCacheKey returns the cache key for the current context. The format

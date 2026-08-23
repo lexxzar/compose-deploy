@@ -84,6 +84,25 @@ func (m *mockComposer) Logs(ctx context.Context, service string, follow bool, ta
 	return nil
 }
 
+// mockDetailComposer implements runner.Composer AND UpdateDetailer, so the
+// detail half of refreshUpdates can be driven without Docker. The plain
+// mockComposer deliberately does NOT implement the interface — that is the
+// "composer without the capability" case, which must still produce verdicts.
+type mockDetailComposer struct {
+	mockComposer
+	details    map[string]compose.UpdateDetail
+	detailsErr error
+
+	detailsCalls int
+	detailsArgs  [][]string // one entry per call, the services slice as received
+}
+
+func (m *mockDetailComposer) UpdateDetails(ctx context.Context, services []string) (map[string]compose.UpdateDetail, error) {
+	m.detailsCalls++
+	m.detailsArgs = append(m.detailsArgs, append([]string(nil), services...))
+	return m.details, m.detailsErr
+}
+
 // mockConfigComposer implements both runner.Composer and ConfigProvider.
 type mockConfigComposer struct {
 	mockComposer
@@ -11112,6 +11131,267 @@ func TestUKeyPress_GuardsAgainstStacking(t *testing.T) {
 	}
 	if mc.updatesCalls != 0 {
 		t.Errorf("U with in-flight fetch should not call CheckUpdates (got %d calls)", mc.updatesCalls)
+	}
+}
+
+// modelOf unwraps an Update result. It takes the tea.Cmd so a bare
+// `modelOf(m.Update(msg))` compiles — Go only expands a multi-valued call when
+// it is the sole argument.
+func modelOf(teaModel tea.Model, _ tea.Cmd) Model { return teaModel.(Model) }
+
+// detailFixture is the UpdateDetail the detail-half tests hand back. The exact
+// values don't matter here — Task 10 owns the rendering — only that the map
+// survives the trip from the composer to the cache entry intact.
+var detailFixture = map[string]compose.UpdateDetail{
+	"web": {
+		LocalCreated: time.Date(2026, 7, 7, 17, 47, 22, 0, time.UTC),
+		NewID:        "sha256:c05eced0000000000000000000000000000000000000000000000000000000ff",
+		NewCreated:   time.Date(2026, 8, 19, 19, 14, 43, 0, time.UTC),
+	},
+}
+
+// TestRefreshUpdates_PassesOnlyTrueVerdicts pins the rate-limit guard: the
+// compose layer reads an empty services slice as "ALL services", and each
+// image costs three registry round-trips, so handing it anything but the true
+// verdicts would walk straight into Docker Hub's anonymous quota. Sorted
+// because a transport abort truncates the batch — which images are reached
+// must not depend on Go's map iteration order.
+func TestRefreshUpdates_PassesOnlyTrueVerdicts(t *testing.T) {
+	mc := &mockDetailComposer{details: detailFixture}
+	mc.updates = map[string]bool{"web": true, "db": false, "api": true, "cache": false}
+	m := NewModel(mc, io.Discard, mockFactory(&mc.mockComposer), nil, nil)
+	m.composer = mc
+
+	msg, ok := m.refreshUpdates()().(updatesMsg)
+	if !ok {
+		t.Fatal("refreshUpdates should produce an updatesMsg")
+	}
+	if mc.detailsCalls != 1 {
+		t.Fatalf("UpdateDetails calls = %d, want exactly 1", mc.detailsCalls)
+	}
+	got := mc.detailsArgs[0]
+	want := []string{"api", "web"}
+	if len(got) != len(want) {
+		t.Fatalf("UpdateDetails services = %v, want %v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("UpdateDetails services = %v, want %v (sorted, true verdicts only)", got, want)
+		}
+	}
+	if msg.details == nil {
+		t.Error("the fetched details should ride the same message as the verdicts")
+	}
+}
+
+// TestRefreshUpdates_SkipsDetailsWhenNoVerdictIsTrue: the skip is load-bearing,
+// not an optimisation — filterServices treats an empty slice as "all
+// services", so a call with no true verdicts would fetch details for the
+// entire project.
+func TestRefreshUpdates_SkipsDetailsWhenNoVerdictIsTrue(t *testing.T) {
+	mc := &mockDetailComposer{details: detailFixture}
+	mc.updates = map[string]bool{"web": false, "db": false}
+	m := NewModel(mc, io.Discard, mockFactory(&mc.mockComposer), nil, nil)
+	m.composer = mc
+
+	msg := m.refreshUpdates()().(updatesMsg)
+
+	if mc.detailsCalls != 0 {
+		t.Errorf("UpdateDetails calls = %d, want 0 when every verdict is false", mc.detailsCalls)
+	}
+	if msg.details != nil {
+		t.Errorf("details = %v, want nil when no verdict is true", msg.details)
+	}
+	if len(msg.results) != 2 {
+		t.Errorf("results = %v, want both verdicts through untouched", msg.results)
+	}
+}
+
+// TestRefreshUpdates_SkipsDetailsOnCheckError: a non-nil CheckUpdates error
+// makes the whole verdict map untrusted, so there is nothing worth following
+// up — and the detail fetch would spend registry round-trips on a path that is
+// already broken.
+func TestRefreshUpdates_SkipsDetailsOnCheckError(t *testing.T) {
+	mc := &mockDetailComposer{details: detailFixture}
+	mc.updates = map[string]bool{"web": true}
+	mc.updatesErr = errors.New("registry unreachable")
+	m := NewModel(mc, io.Discard, mockFactory(&mc.mockComposer), nil, nil)
+	m.composer = mc
+
+	msg := m.refreshUpdates()().(updatesMsg)
+
+	if mc.detailsCalls != 0 {
+		t.Errorf("UpdateDetails calls = %d, want 0 when CheckUpdates errored", mc.detailsCalls)
+	}
+	if msg.err == nil {
+		t.Error("the CheckUpdates error must still reach the handler")
+	}
+}
+
+// TestRefreshUpdates_ComposerWithoutDetailerStillProducesVerdicts: the
+// capability is type-asserted, so a composer that lacks it (every test mock,
+// and any future composer) simply draws no detail rows.
+func TestRefreshUpdates_ComposerWithoutDetailerStillProducesVerdicts(t *testing.T) {
+	mc := &mockComposer{updates: map[string]bool{"web": true}}
+	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
+	m.composer = mc
+
+	msg := m.refreshUpdates()().(updatesMsg)
+
+	if msg.err != nil {
+		t.Errorf("err = %v, want nil", msg.err)
+	}
+	if msg.details != nil {
+		t.Errorf("details = %v, want nil from a composer without UpdateDetailer", msg.details)
+	}
+	if v, ok := msg.results["web"]; !ok || !v {
+		t.Errorf("results = %v, want the verdict through unchanged", msg.results)
+	}
+}
+
+// TestRefreshUpdates_DetailErrorKeepsVerdictsAndSuccessTTL is the whole reason
+// the detail error is discarded: a 429 during the detail phase reads as "too
+// many requests", which looksLikeNetworkErr matches. Letting it reach
+// updatesMsg.err would blank the ⇧ column and cut the cache entry down to the
+// 30-second error TTL — the detail rows would degrade the signal they annotate.
+func TestRefreshUpdates_DetailErrorKeepsVerdictsAndSuccessTTL(t *testing.T) {
+	mc := &mockDetailComposer{detailsErr: errors.New("429 Too Many Requests")}
+	mc.updates = map[string]bool{"web": true}
+	m := NewModel(mc, io.Discard, mockFactory(&mc.mockComposer), nil, nil)
+	m.composer = mc
+	m.screen = screenSelectContainers
+	m.svcStatus = map[string]runner.ServiceStatus{"web": {Running: true}}
+
+	msg := m.refreshUpdates()().(updatesMsg)
+	if msg.err != nil {
+		t.Fatalf("err = %v; a detail-fetch failure must never reach updatesMsg.err", msg.err)
+	}
+
+	model := modelOf(m.Update(msg))
+	if model.updatesErr != "" {
+		t.Errorf("updatesErr = %q, want empty — the verdicts are sound", model.updatesErr)
+	}
+	if st := model.svcStatus["web"]; st.UpdateAvailable == nil || !*st.UpdateAvailable {
+		t.Error("the ⇧ verdict must survive a detail-fetch failure")
+	}
+	entry, ok := model.updateCache[model.updatesCacheKey()]
+	if !ok {
+		t.Fatal("the fetch should still have written a cache entry")
+	}
+	if entry.err {
+		t.Error("the cache entry must be a SUCCESS entry, not the short error-TTL one")
+	}
+	// The TTL is chosen from entry.err, so age the entry past the error window
+	// and confirm the lookup still calls it fresh: this is the 10-minute
+	// success TTL in effect, not the 30-second error one.
+	entry.fetchedAt = time.Now().Add(-2 * updatesErrorTTL)
+	model.updateCache[model.updatesCacheKey()] = entry
+	if _, fresh := model.updatesCacheLookup(); !fresh {
+		t.Error("entry aged past updatesErrorTTL should still be fresh under the success TTL")
+	}
+}
+
+// TestUpdatesMsg_StoresDetailsOnTheCacheEntry: the details ride the same entry
+// as the verdicts so they inherit its key, TTL, session gate and post-Deploy
+// invalidation.
+func TestUpdatesMsg_StoresDetailsOnTheCacheEntry(t *testing.T) {
+	mc := &mockComposer{}
+	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
+	m.screen = screenSelectContainers
+	m.svcStatus = map[string]runner.ServiceStatus{"web": {Running: true}}
+
+	model := modelOf(m.Update(updatesMsg{
+		results: map[string]bool{"web": true},
+		details: detailFixture,
+		session: m.updatesSession,
+	}))
+
+	entry := model.updateCache[model.updatesCacheKey()]
+	if entry.details == nil {
+		t.Fatal("details should be stored beside results on the cache entry")
+	}
+	if got := entry.details["web"].NewID; got != detailFixture["web"].NewID {
+		t.Errorf("cached NewID = %q, want %q", got, detailFixture["web"].NewID)
+	}
+	// hydrateUpdates stays untouched: it writes verdicts into svcStatus only.
+	if st := model.svcStatus["web"]; st.UpdateAvailable == nil || !*st.UpdateAvailable {
+		t.Error("hydration should still write the verdict")
+	}
+}
+
+// TestUpdatesMsg_StaleSessionDoesNotWriteDetails: the details are gated by the
+// same session check as the verdicts, so a response from a previous project or
+// server context cannot pollute the new context's cache entry.
+func TestUpdatesMsg_StaleSessionDoesNotWriteDetails(t *testing.T) {
+	mc := &mockComposer{}
+	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
+	m.screen = screenSelectContainers
+	m.updatesSession = 7
+
+	model := modelOf(m.Update(updatesMsg{
+		results: map[string]bool{"web": true},
+		details: detailFixture,
+		session: 6, // a fetch issued before the context changed
+	}))
+
+	if entry, ok := model.updateCache[model.updatesCacheKey()]; ok {
+		t.Errorf("a stale updatesMsg wrote a cache entry: %+v", entry)
+	}
+	if model.updateInFlight {
+		t.Error("the in-flight guard must still clear on a stale arrival")
+	}
+}
+
+// TestUpdatesMsg_RefreshesInspectSummary: the inspect screen is a consumer of
+// the update cache and never fetches details itself. Entering `i` on a cold
+// cache is exactly when the fetch is still in flight, so without this rebuild
+// the new IMAGE rows would stay absent until a back-out and re-entry.
+func TestUpdatesMsg_RefreshesInspectSummary(t *testing.T) {
+	m := inspectScreenModel(t)
+	m.svcStatus = map[string]runner.ServiceStatus{"web": {Running: true}}
+	// A sentinel the rebuild has to overwrite: rebuildInspectSummary re-parses
+	// m.inspectRaw, so any value here that survives proves it never ran.
+	m.inspectSummary = "STALE SUMMARY"
+	m.setInspectContent()
+
+	model := modelOf(m.Update(updatesMsg{
+		results: map[string]bool{"web": true},
+		details: detailFixture,
+		session: m.updatesSession,
+	}))
+
+	if model.inspectSummary == "STALE SUMMARY" {
+		t.Fatal("an updatesMsg on screenInspect must rebuild the summary")
+	}
+	if !strings.Contains(model.inspectSummary, "STATE") {
+		t.Errorf("the rebuilt summary should be the real one:\n%s", model.inspectSummary)
+	}
+	if got := model.inspectViewport.View(); strings.Contains(got, "STALE SUMMARY") {
+		t.Error("setInspectContent must follow the rebuild so the pane shows it")
+	}
+	if model.screen != screenInspect {
+		t.Errorf("screen = %d, want screenInspect", model.screen)
+	}
+}
+
+// TestUpdatesMsg_InspectRebuildIsScreenScoped: the rebuild is the ONE
+// screen-coupled mutation in this handler. Off-screen it must not run — the
+// inspect fields are cleared on departure, and a rebuild there would write a
+// summary for a screen the user already left.
+func TestUpdatesMsg_InspectRebuildIsScreenScoped(t *testing.T) {
+	mc := &mockComposer{}
+	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
+	m.screen = screenSelectContainers
+	m.inspectSummary = "STALE SUMMARY"
+
+	model := modelOf(m.Update(updatesMsg{
+		results: map[string]bool{"web": true},
+		details: detailFixture,
+		session: m.updatesSession,
+	}))
+
+	if model.inspectSummary != "STALE SUMMARY" {
+		t.Error("the rebuild must not run while the user is off screenInspect")
 	}
 }
 
