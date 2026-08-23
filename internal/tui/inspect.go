@@ -169,19 +169,34 @@ func (b *inspectBuilder) String() string {
 	return strings.Join(b.lines, "\n")
 }
 
+// inspectUpdateInfo carries the update-detection half of the IMAGE section into
+// the builder. The clock arrives as a field rather than a time.Now() call inside
+// the renderer, so buildInspectSummary stays pure and the relative ages are
+// testable against a fixed now.
+//
+// The ZERO VALUE draws no extra row: a caller with no cache entry in hand passes
+// inspectUpdateInfo{} and gets exactly the summary this screen rendered before
+// the update rows existed.
+type inspectUpdateInfo struct {
+	now       time.Time
+	detail    *compose.UpdateDetail
+	verdict   *bool
+	checkedAt time.Time
+}
+
 // buildInspectSummary renders the curated summary of one container's
 // `docker inspect` output. Pure — no Model state, no TTY and no Docker — so it
 // is golden-testable against the real fixtures in internal/compose/testdata.
 //
 // A section with nothing to say is omitted; STATE always renders.
-func buildInspectSummary(doc compose.InspectDoc, width int) string {
+func buildInspectSummary(doc compose.InspectDoc, width int, upd inspectUpdateInfo) string {
 	if width <= 0 {
 		width = inspectDefaultWidth
 	}
 	b := &inspectBuilder{width: width}
 	inspectStateSection(b, doc)
 	inspectHealthSection(b, doc)
-	inspectImageSection(b, doc)
+	inspectImageSection(b, doc, upd)
 	inspectMountsSection(b, doc)
 	inspectEnvSection(b, doc)
 	return b.String()
@@ -277,7 +292,7 @@ func inspectHealthSection(b *inspectBuilder, doc compose.InspectDoc) {
 // compose file asked for, the local image ID docker resolved it to, and the
 // command pair. The image ID is the row that answers "did my deploy take?" — a
 // stale container keeps the old image ID under an unchanged tag.
-func inspectImageSection(b *inspectBuilder, doc compose.InspectDoc) {
+func inspectImageSection(b *inspectBuilder, doc compose.InspectDoc, upd inspectUpdateInfo) {
 	cmd := strings.Join(doc.Config.Cmd, " ")
 	entrypoint := strings.Join(doc.Config.Entrypoint, " ")
 	if doc.Config.Image == "" && doc.Image == "" && cmd == "" && entrypoint == "" {

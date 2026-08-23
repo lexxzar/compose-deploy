@@ -545,20 +545,20 @@ Isolated because it is a user-visible rename with its own broken assertions.
 - Modify: `internal/tui/app.go`
 - Modify: `internal/tui/inspect_test.go`
 
-- [ ] add an `inspectUpdateInfo` struct carrying `now time.Time`, `detail *compose.UpdateDetail`,
+- [x] add an `inspectUpdateInfo` struct carrying `now time.Time`, `detail *compose.UpdateDetail`,
       `verdict *bool` and `checkedAt time.Time`, and change the signature to
       `buildInspectSummary(doc, width int, upd inspectUpdateInfo)`. **Its zero value must draw
       no new rows**, so the migration below is mechanical and every existing assertion holds
-- [ ] keep the function pure — the clock arrives inside `upd`, never via `time.Now()` internally
-- [ ] update the **single** production call site: `app.go:3178`, inside `rebuildInspectSummary()`.
+- [x] keep the function pure — the clock arrives inside `upd`, never via `time.Now()` internally
+- [x] update the **single** production call site: `app.go:3178`, inside `rebuildInspectSummary()`.
       `app.go:730` (the `WindowSizeMsg` branch) and `app.go:1240` (`inspectDataMsg`) both call
       `rebuildInspectSummary()`, so they inherit the change untouched
-- [ ] have `rebuildInspectSummary` build `inspectUpdateInfo` itself by reading
+- [x] have `rebuildInspectSummary` build `inspectUpdateInfo` itself by reading
       `m.updateCache[m.updatesCacheKey()]` and `m.inspectService` — one lookup, one site, no
       chance of three copies drifting
-- [ ] migrate the 25 existing calls in `inspect_test.go` by appending `inspectUpdateInfo{}`
-- [ ] write a test asserting the zero value renders a byte-identical summary to before
-- [ ] run `go test ./internal/tui/` — must pass before task 10
+- [x] migrate the 25 existing calls in `inspect_test.go` by appending `inspectUpdateInfo{}`
+- [x] write a test asserting the zero value renders a byte-identical summary to before
+- [x] run `go test ./internal/tui/` — must pass before task 10
 
 ### Task 10: Render the four new rows
 

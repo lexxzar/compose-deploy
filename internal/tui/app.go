@@ -3222,7 +3222,35 @@ func (m *Model) rebuildInspectSummary() {
 		return
 	}
 	m.inspectErr = nil
-	m.inspectSummary = buildInspectSummary(doc, m.inspectViewport.Width)
+	m.inspectSummary = buildInspectSummary(doc, m.inspectViewport.Width, m.inspectUpdateInfo())
+}
+
+// inspectUpdateInfo reads the update rows' inputs out of the "⇧" cache for the
+// service the inspect screen is showing. It is the SINGLE place that lookup
+// happens: every render path (the fetch, a resize, an updatesMsg landing on the
+// screen) goes through rebuildInspectSummary, so three copies cannot drift.
+//
+// The raw map read is deliberate, not the TTL-checked updatesCacheLookup: the
+// glyph itself is drawn from m.svcStatus, which keeps the last verdict until a
+// refresh replaces it, so an entry aging past its TTL must not blank these rows
+// either. The (checked Nm ago) suffix is what tells the user how old it is.
+//
+// An errored entry yields the zero value — a non-nil CheckUpdates error makes
+// the whole verdict map untrusted, so there is nothing here worth drawing.
+func (m Model) inspectUpdateInfo() inspectUpdateInfo {
+	upd := inspectUpdateInfo{now: time.Now()}
+	entry, ok := m.updateCache[m.updatesCacheKey()]
+	if !ok || entry.err {
+		return upd
+	}
+	upd.checkedAt = entry.fetchedAt
+	if verdict, ok := entry.results[m.inspectService]; ok {
+		upd.verdict = &verdict
+	}
+	if detail, ok := entry.details[m.inspectService]; ok {
+		upd.detail = &detail
+	}
+	return upd
 }
 
 // clearInspect resets every inspect field on departure. The session is NOT
