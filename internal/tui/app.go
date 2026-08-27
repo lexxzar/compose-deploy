@@ -397,6 +397,10 @@ type Model struct {
 	// reload, which must preserve the folds the user opened, so a flat "fold
 	// on a grouped payload" would re-fold the screen every tick. Drill-out
 	// lands through enterGroupedContainers and re-folds on purpose.
+	//
+	// Disarming rides with the rows the flag names: clearContainerScreen
+	// clears it, and drillIntoGroup — the one departure site that does not
+	// call that helper — clears it by hand.
 	groupFoldPending bool
 
 	// svcStatus and stats are keyed by the QUALIFIED key svcKey produces, not
@@ -1003,11 +1007,8 @@ func NewModel(composer runner.Composer, logWriter io.Writer, factory ComposerFac
 		// screen.
 		m.screen = screenSelectContainers
 		m.grouped = true
-		// The second arming site for the landing fold. This branch is NOT
-		// enterGroupedContainers — NewModel is not a transition and must not
-		// clear composers, bump sessions or return a Cmd — so the flag is set
-		// here by hand. Init() dispatches loadGroups and the payload consumes
-		// it. See groupFoldPending.
+		// The second arming site; NewModel is not a transition, so it cannot
+		// go through enterGroupedContainers. See groupFoldPending.
 		m.groupFoldPending = true
 		m.statsRequested = true
 		// Init() will fire loadGroups; its servicesMsg either clears the flag or
@@ -1657,7 +1658,6 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			// The failed connect leaves the user on the server screen, so the
 			// grouped host view a previous server populated must go with it.
 			m.grouped = false
-			m.groupFoldPending = false
 			m.clearContainerScreen()
 			m.clearSearch()
 			m.clearWaitState()
@@ -2300,11 +2300,6 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 				m.rollbackTargets = nil
 				m.rollbackProj = compose.Project{}
 				m.rollbackCleanup = nil
-				// Cleared here, in the common block, for the same reason
-				// updatesErr is: the drilled fast track below must not carry an
-				// armed landing fold, and the grouped branch after it re-arms
-				// through enterGroupedContainers.
-				m.groupFoldPending = false
 				m.clearSearch()
 				m.clearWaitState()
 				if m.localComposer != nil {
@@ -2576,7 +2571,7 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 				return m, nil
 			}
 			if entry.kind == entrySvcGroupHeader {
-				m.foldGroupAt(entry.groupIdx, !m.svcGroups[entry.groupIdx].folded)
+				m.toggleGroupFold(entry.groupIdx)
 				return m, nil
 			}
 			// An unmanaged container has no compose project to operate on, so
@@ -2608,6 +2603,8 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.foldGroupAt(gi, key == "left")
 			return m, nil
 		case "Z":
+			// One key with the shape `a` already uses for the selection: any
+			// group still open means fold everything, otherwise unfold.
 			if m.readOnly() || !m.grouped {
 				m.fixSvcOffset()
 				return m, nil
@@ -6146,11 +6143,8 @@ func (m *Model) enterGroupedContainers() tea.Cmd {
 	m.projDir = ""
 	m.drilledFromHost = false
 	m.clearContainerScreen()
-	// Land folded. The header aggregates ARE the host summary, and on a host
-	// running ten projects an unfolded landing buries them under ninety rows.
-	// Set here rather than applied here because clearContainerScreen just
-	// nilled the rows: the first grouped payload folds and clears the flag.
-	// Drill-out lands through this body too, and re-folding there is intended.
+	// AFTER the clear above, which drops the flag with the rows it names.
+	// See groupFoldPending.
 	m.groupFoldPending = true
 	m.confirming = false
 	m.pendingExec = false
@@ -6276,10 +6270,7 @@ func (m *Model) drillIntoGroup(gi int) tea.Cmd {
 		return nil
 	}
 	m.grouped = false
-	// Disarm the landing fold: the drilled screen has no group to fold, and a
-	// flag left armed here would be spent by whichever grouped payload arrived
-	// next instead of by the drill-out that re-arms it. Every departure site
-	// clears it; enterGroupedContainers is the one that sets it.
+	// This site does not call clearContainerScreen, so it disarms by hand.
 	m.groupFoldPending = false
 	// The grouped view is the parent screen from here on: canGoBack and the
 	// footer's back label both read drilledFromHost on the drilled screen.
@@ -6324,7 +6315,6 @@ func (m *Model) backToServerScreen() tea.Cmd {
 	disconnectFn := m.disconnectFunc
 	m.screen = screenSelectServer
 	m.grouped = false
-	m.groupFoldPending = false
 	m.serverName = ""
 	m.serverHost = ""
 	m.serverColor = ""
@@ -6397,14 +6387,20 @@ func (m *Model) bumpFetchSessions() {
 // the groups and entries, the status/stats maps keyed off them, the soft stats
 // error, the primary error, the selection and the cursor/window position.
 //
-// It is ONE helper because four departure sites owe exactly these eight lines,
-// and CLAUDE.md names departure-site cleanup as the repo's most fragile
-// invariant — four hand-maintained copies is precisely how a new field ends up
-// cleared at three of them. Site-specific state (project identity, sessions,
-// callbacks, search, wait) stays at the site.
+// It is ONE helper because four departure sites owe exactly these lines, and
+// CLAUDE.md names departure-site cleanup as the repo's most fragile invariant —
+// four hand-maintained copies is precisely how a new field ends up cleared at
+// three of them. Site-specific state (project identity, sessions, callbacks,
+// search, wait) stays at the site.
+//
+// The two one-shots it carries, svcReloadPending and groupFoldPending, are
+// row-derived like the rest: both name a payload for rows this call just
+// dropped. enterGroupedContainers re-arms groupFoldPending AFTER calling this,
+// which is what makes the landing fold survive its own cleanup.
 func (m *Model) clearContainerScreen() {
 	m.clearSvcGroups()
 	m.svcReloadPending = false
+	m.groupFoldPending = false
 	m.svcStatus = nil
 	m.stats = nil
 	m.statsErr = nil
@@ -6493,13 +6489,19 @@ func (m *Model) applyPendingGroupFold() {
 		return
 	}
 	m.groupFoldPending = false
-	if len(m.svcGroups) < 2 {
+	if len(m.svcGroups) == 1 {
 		return
 	}
-	for i := range m.svcGroups {
-		m.svcGroups[i].folded = true
-	}
+	m.setAllFolded(true)
 	m.svcEntries = rebuildSvcEntries(m.svcGroups)
+}
+
+// setAllFolded writes one fold state across every group. It rebuilds nothing:
+// both callers settle the row list themselves, and they settle it differently.
+func (m *Model) setAllFolded(folded bool) {
+	for i := range m.svcGroups {
+		m.svcGroups[i].folded = folded
+	}
 }
 
 // foldGroupAt sets one group's fold state and settles what the rebuild
@@ -6519,20 +6521,29 @@ func (m *Model) foldGroupAt(gi int, folded bool) {
 	m.settleFold(gi)
 }
 
-// foldAllGroups is Z: one key with the shape `a` already uses for the
-// selection — any group open means fold, otherwise unfold.
+// toggleGroupFold flips one group's fold state. It exists so no caller has to
+// index svcGroups to read the current state and hand back its negation, which
+// would put an unguarded lookup in front of foldGroupAt's own bounds check.
+func (m *Model) toggleGroupFold(gi int) {
+	if gi < 0 || gi >= len(m.svcGroups) {
+		m.fixSvcOffset()
+		return
+	}
+	m.foldGroupAt(gi, !m.svcGroups[gi].folded)
+}
+
+// foldAllGroups writes one fold state across every group and settles the rows,
+// aiming the cursor at the group it was already in.
 func (m *Model) foldAllGroups(folded bool) {
 	aim := -1
 	if gi, ok := m.cursorGroupIdx(); ok {
 		aim = gi
 	}
-	for i := range m.svcGroups {
-		m.svcGroups[i].folded = folded
-	}
+	m.setAllFolded(folded)
 	m.settleFold(aim)
 }
 
-// anyGroupUnfolded is the predicate behind Z's single meaning.
+// anyGroupUnfolded reports whether any group is currently open.
 func (m Model) anyGroupUnfolded() bool {
 	for _, g := range m.svcGroups {
 		if !g.folded {

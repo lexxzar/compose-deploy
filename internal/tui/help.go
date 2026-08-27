@@ -476,9 +476,11 @@ func helpStackedRows(groups []helpGroup) []string {
 // with the descriptions aligned on the widest key across ALL the groups passed
 // in. separate adds a blank line BETWEEN groups — the two-column layout keeps
 // it, the single-column fallback drops it because that is where the height
-// budget bites. Those five blanks are the container table's 29-versus-24 rows,
-// and 24 is what makes its 18 action rows fit the 19 a 24-line pane keeps.
-// Every other row-count claim in this file refers back to those numbers.
+// budget bites. Those five blanks are the drilled container table's
+// 30-versus-25 rows, and 25 is what makes its 19 action rows fit the 19 a
+// 24-line pane keeps. The grouped variant runs 32/27 with 21 action rows, so
+// the two rows past that budget (x, U) fall off a narrow 24-line pane. Every
+// other row-count claim in this file refers back to those numbers.
 func helpRows(groups []helpGroup, separate bool) []string {
 	keyw := 0
 	for _, g := range groups {

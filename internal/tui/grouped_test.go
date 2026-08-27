@@ -1381,18 +1381,10 @@ func groupedScreenModel(groups ...svcGroup) Model {
 }
 
 // pressGroupKey drives one key through Update. It is the string-keyed sibling
-// of pressKey (help_test.go), because space arrives as its own tea.KeyType.
+// of pressKey (help_test.go) and delegates to keyMsgFor, so the package keeps
+// ONE table mapping a key name to the tea.KeyMsg a terminal would send.
 func pressGroupKey(m Model, key string) Model {
-	msg := tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune(key)}
-	switch key {
-	case " ":
-		msg = tea.KeyMsg{Type: tea.KeySpace}
-	case "left":
-		msg = tea.KeyMsg{Type: tea.KeyLeft}
-	case "right":
-		msg = tea.KeyMsg{Type: tea.KeyRight}
-	}
-	updated, _ := m.Update(msg)
+	updated, _ := m.Update(keyMsgFor(key))
 	return updated.(Model)
 }
 
@@ -1489,6 +1481,17 @@ func foldedCount(m Model) int {
 		}
 	}
 	return n
+}
+
+// foldStates snapshots every group's fold flag. An inertness pin asserts the
+// whole list rather than a count, which a compensating pair of folds would
+// satisfy.
+func foldStates(m Model) []bool {
+	out := make([]bool, len(m.svcGroups))
+	for i, g := range m.svcGroups {
+		out[i] = g.folded
+	}
+	return out
 }
 
 // groupedLanding drives a real landing: enterGroupedContainers arms the
@@ -1875,11 +1878,11 @@ func TestGroupedFold_ArrowsAreDirectional(t *testing.T) {
 	}
 }
 
-// z was the toggle the arrows replaced. It must now reach the row list as an
-// ordinary unbound rune — the `?` overlay names it nowhere, and a key that
-// reshapes the list while being advertised nowhere is the no-op rule in
-// reverse.
-func TestGroupedFold_ZIsNoLongerBound(t *testing.T) {
+// Lowercase z was the toggle the arrows replaced; uppercase Z is the fold-all
+// key that stayed. z must now reach the row list as an ordinary unbound rune —
+// the `?` overlay names it nowhere, and a key that reshapes the list while
+// being advertised nowhere is the no-op rule in reverse.
+func TestGroupedFold_LowercaseZIsNotBound(t *testing.T) {
 	// Both directions: a z re-added to the arrow case label inherits whichever
 	// branch the directional expression falls into, so only asserting one of
 	// them leaves the other rebindable in silence.
@@ -1905,17 +1908,33 @@ func TestGroupedFold_ZIsNoLongerBound(t *testing.T) {
 
 // The fold keys are grouped-only and write-only: the drilled screen has one
 // group and no header to fold, and a read-only host must advertise no no-op.
+//
+// Each key is driven against the state it would actually change — right only
+// ever unfolds, so it needs a FOLDED group, while left and Z need an open one.
+// A fixture already in the state the key moves it to cannot fail, gate or no
+// gate.
 func TestGroupedFold_KeysAreInertDrilledAndReadOnly(t *testing.T) {
 	keys := []string{"Z", "left", "right"}
+
+	// foldForKey puts the group the key addresses in the state that makes the
+	// keypress a real change, and returns the fold flags it must still hold.
+	foldForKey := func(m *Model, key string) []bool {
+		m.svcGroups[0].folded = key == "right"
+		m.setGroups(m.svcGroups)
+		return foldStates(*m)
+	}
 
 	for _, key := range keys {
 		m := singleGroupModel([]string{"api", "web"})
 		m.screen = screenSelectContainers
 		m.width, m.height = 100, 30
+		want := foldForKey(&m, key)
+		rows := len(m.svcEntries)
 
 		m = pressGroupKey(m, key)
-		if m.svcGroups[0].folded || len(m.svcEntries) != 2 {
-			t.Errorf("drilled %q: folded=%v rows=%d, want false/2", key, m.svcGroups[0].folded, len(m.svcEntries))
+		if !slices.Equal(foldStates(m), want) || len(m.svcEntries) != rows {
+			t.Errorf("drilled %q: folded=%v rows=%d, want %v/%d",
+				key, foldStates(m), len(m.svcEntries), want, rows)
 		}
 	}
 
@@ -1924,10 +1943,13 @@ func TestGroupedFold_KeysAreInertDrilledAndReadOnly(t *testing.T) {
 		if !m.readOnly() {
 			t.Fatal("precondition: an unmanaged-only host reads as read-only")
 		}
+		want := foldForKey(&m, key)
+		rows := len(m.svcEntries)
 
 		m = pressGroupKey(m, key)
-		if m.svcGroups[0].folded {
-			t.Errorf("read-only %q folded the unmanaged bucket", key)
+		if !slices.Equal(foldStates(m), want) || len(m.svcEntries) != rows {
+			t.Errorf("read-only %q: folded=%v rows=%d, want %v/%d",
+				key, foldStates(m), len(m.svcEntries), want, rows)
 		}
 	}
 }
@@ -2070,19 +2092,31 @@ func TestGroupedFold_KeysAreLiteralWhileSearching(t *testing.T) {
 // An svcErr replaces the whole list with the error screen, so every row key
 // goes inert — the fold keys included, or the user reshapes a list that is not
 // on screen and cannot see what changed.
+//
+// web stays open and db stays folded, and the cursor moves per key so each one
+// addresses a group it would really change: left from inside the open web
+// group, right from the folded db header, Z from anywhere (web is open, so it
+// folds).
 func TestGroupedFold_KeysInertOnTheErrorScreen(t *testing.T) {
-	for _, key := range []string{"Z", "left", "right"} {
+	for _, tc := range []struct {
+		key    string
+		cursor int
+	}{
+		{"Z", 1},     // "api", inside the open web group
+		{"left", 1},  // same row: left folds web
+		{"right", 3}, // the folded db header: right opens it
+	} {
 		m := groupedScreenModel(svcGroupOf("web", "api", "nginx"), svcGroupOf("db", "postgres"))
 		m.svcGroups[1].folded = true
 		m.setGroups(m.svcGroups)
 		m.svcErr = errors.New("docker daemon gone")
-		m.svcCursor = 3 // the folded db header: right would open it, Z would close web
+		m.svcCursor = tc.cursor
 
-		m = pressGroupKey(m, key)
+		m = pressGroupKey(m, tc.key)
 
 		if m.svcGroups[0].folded || !m.svcGroups[1].folded {
 			t.Errorf("%q changed the fold state behind the error screen (web folded=%v, db folded=%v)",
-				key, m.svcGroups[0].folded, m.svcGroups[1].folded)
+				tc.key, m.svcGroups[0].folded, m.svcGroups[1].folded)
 		}
 	}
 }
@@ -2090,11 +2124,23 @@ func TestGroupedFold_KeysInertOnTheErrorScreen(t *testing.T) {
 // The confirmation intercept swallows the fold keys too. The armed prompt names
 // a batch that enter resolves AGAIN from the cursor, and a fold re-aims the
 // cursor at a group header — so folding behind the prompt edits its target.
+//
+// Each key arms over the state it would really change: left and Z from an
+// open shop with the cursor inside it, right from a folded shop with the
+// cursor on its header — the row that survives that fold and still arms the
+// same batch.
 func TestGroupedFold_KeysInertWhileAConfirmationIsArmed(t *testing.T) {
 	for _, key := range []string{"Z", "left", "right"} {
 		m := groupedOpModel(t)
 		m.width, m.height = 100, 24
 		m.svcCursor = 3 // shop/api, a service row inside the second group
+		if key == "right" {
+			m.svcGroups[1].folded = true
+			m.setGroups(m.svcGroups)
+			m.svcCursor = 2 // the folded shop header
+		}
+		want := foldStates(m)
+		cursor := m.svcCursor
 		armed, _ := m.Update(keyMsgFor("d"))
 		m = armed.(Model)
 		if !m.confirming {
@@ -2106,11 +2152,13 @@ func TestGroupedFold_KeysInertWhileAConfirmationIsArmed(t *testing.T) {
 		if !m.confirming {
 			t.Errorf("%q dismissed the armed prompt", key)
 		}
-		if foldedCount(m) != 0 {
-			t.Errorf("%q folded a group behind the armed prompt", key)
+		if !slices.Equal(foldStates(m), want) {
+			t.Errorf("%q changed the fold state behind the armed prompt: %v, want %v",
+				key, foldStates(m), want)
 		}
-		if m.svcCursor != 3 {
-			t.Errorf("%q moved the cursor to row %d, retargeting the armed batch", key, m.svcCursor)
+		if m.svcCursor != cursor {
+			t.Errorf("%q moved the cursor to row %d, want %d — retargeting the armed batch",
+				key, m.svcCursor, cursor)
 		}
 	}
 }

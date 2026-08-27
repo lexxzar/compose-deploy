@@ -1551,10 +1551,10 @@ func TestHelpOverlay_YieldsToQuitPrompt(t *testing.T) {
 // from under the overlay (l/c/x/i), start work (U), open an input (/), or
 // mutate the selection (space/enter/a).
 //
-// The grouped variant carries the fold keys on top. They are inert on the
-// drilled fixture — one group draws no header — so only a grouped model can
-// pin them, and they are exactly the "state changed behind the overlay" this
-// test is about: a fold hides rows AND re-aims the cursor.
+// The grouped variant carries the fold keys on top. Their dispatch is gated on
+// !m.grouped, so only a grouped model can pin them, and they are exactly the
+// "state changed behind the overlay" this test is about: a fold hides rows AND
+// re-aims the cursor.
 func TestHelpOverlay_SwallowsEveryActionKey(t *testing.T) {
 	shared := []string{"l", "c", "x", "i", "/", "U", "r", "s", "R", "a", " ", "j", "k", "n", "N", "enter"}
 	for _, tc := range []struct {
@@ -1623,13 +1623,24 @@ func TestHelpOverlay_SwallowsEveryActionKey(t *testing.T) {
 	}
 }
 
-// keyMsgFor builds the tea.KeyMsg for a handleKey key string.
+// keyMsgFor builds the tea.KeyMsg for a handleKey key string. It is the
+// package's ONE key-construction table: a named key missing a case here still
+// stringifies back to its own name as a run of runes, so the dispatch matches
+// and the test passes against a fake the terminal can never produce.
 func keyMsgFor(key string) tea.KeyMsg {
 	switch key {
 	case "enter":
 		return tea.KeyMsg{Type: tea.KeyEnter}
 	case " ":
 		return tea.KeyMsg{Type: tea.KeySpace}
+	case "up":
+		return tea.KeyMsg{Type: tea.KeyUp}
+	case "down":
+		return tea.KeyMsg{Type: tea.KeyDown}
+	case "left":
+		return tea.KeyMsg{Type: tea.KeyLeft}
+	case "right":
+		return tea.KeyMsg{Type: tea.KeyRight}
 	}
 	return tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune(key)}
 }
