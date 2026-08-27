@@ -131,11 +131,11 @@ Confirmed design decisions (brainstormed and validated; do not re-litigate):
 - Modify: `internal/compose/hostcontainers.go`
 - Modify: `internal/compose/hostcontainers_test.go`
 
-- [ ] add `GroupedStatus(ctx) (map[string]map[string]runner.ServiceStatus, error)` on `HostContainers` over `hostPsArgs` output: extract `com.docker.compose.project`/`.service` label VALUES (token-start match per the `isComposeManaged` rule; value read to the next comma — safe because both label values are name-constrained, record that beside the code); no-label containers form the `(unmanaged)` group
-- [ ] reuse `parseHealthFromStatus`, `formatUptime`, `parsePortsString`; scaled services aggregate with the existing rules (Running OR, worst-case Health, oldest Created, longest Uptime)
-- [ ] both local and remote runners get it through the existing three-method `dockerRunner` seam — no new SSH plumbing
-- [ ] write tests through a fake `dockerRunner`: grouping, unmanaged bucket, scaled replicas, label-value-with-comma safety, remote splice unchanged
-- [ ] run tests - must pass before task 6
+- [x] add `GroupedStatus(ctx) (map[string]map[string]runner.ServiceStatus, error)` on `HostContainers` over `hostPsArgs` output: extract `com.docker.compose.project`/`.service` label VALUES (token-start match per the `isComposeManaged` rule; value read to the next comma — safe because both label values are name-constrained, record that beside the code); no-label containers form the `(unmanaged)` group
+- [x] reuse `parseHealthFromStatus`, `formatUptime`, `parsePortsString`; scaled services aggregate with the existing rules (Running OR, worst-case Health, oldest Created, longest Uptime)
+- [x] both local and remote runners get it through the existing three-method `dockerRunner` seam — no new SSH plumbing
+- [x] write tests through a fake `dockerRunner`: grouping, unmanaged bucket, scaled replicas, label-value-with-comma safety, remote splice unchanged
+- [x] run tests - must pass before task 6
 
 ### Task 6: Grouped loader, landing flow, and refresh dispatch (phase 2)
 

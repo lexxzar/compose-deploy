@@ -10,6 +10,8 @@ import (
 	"slices"
 	"strings"
 	"testing"
+
+	"github.com/lexxzar/compose-deploy/internal/runner"
 )
 
 func TestParseHostContainers_NDJSON(t *testing.T) {
@@ -1592,4 +1594,325 @@ func TestNewRemoteHostContainers_InspectSplicesSSHExtraArgs(t *testing.T) {
 	if strings.Contains(remoteCmd, "compose") {
 		t.Errorf("remote inspect command must NOT go through compose: %q", remoteCmd)
 	}
+}
+
+// --- GroupedStatus ---
+
+func TestLabelValue(t *testing.T) {
+	tests := []struct {
+		name   string
+		labels string
+		key    string
+		want   string
+		wantOK bool
+	}{
+		{"at start", "com.docker.compose.project=shop,other=x", composeProjectLabel, "shop", true},
+		{"mid string", "a=1,com.docker.compose.project=shop,b=2", composeProjectLabel, "shop", true},
+		{"at end", "a=1,com.docker.compose.project=shop", composeProjectLabel, "shop", true},
+		{"absent", "a=1,b=2", composeProjectLabel, "", false},
+		{"empty labels", "", composeProjectLabel, "", false},
+		{"empty value", "com.docker.compose.project=,a=1", composeProjectLabel, "", true},
+		{"sibling key does not match", "com.docker.compose.project.working_dir=/srv", composeProjectLabel, "", false},
+		{"value carrying a comma before the key", "desc=a,b,com.docker.compose.project=shop", composeProjectLabel, "shop", true},
+		{"service key", "com.docker.compose.project=shop,com.docker.compose.service=api", composeServiceLabel, "api", true},
+		{"not matched inside another value", "note=xcom.docker.compose.project=fake", composeProjectLabel, "", false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, ok := labelValue(tt.labels, tt.key)
+			if got != tt.want || ok != tt.wantOK {
+				t.Errorf("labelValue(%q, %q) = (%q, %v), want (%q, %v)", tt.labels, tt.key, got, ok, tt.want, tt.wantOK)
+			}
+		})
+	}
+}
+
+// hostPsGrouped carries two compose projects (one of them with a scaled
+// service) plus a hand-started container, so one fixture exercises grouping,
+// replica aggregation and the unmanaged bucket at once.
+const hostPsGrouped = `{"ID":"aaa111222333","Names":"shop-api-1","Image":"shop/api:1","State":"running","Status":"Up 3 hours (healthy)","Ports":"0.0.0.0:8080->80/tcp, :::8080->80/tcp","Labels":"com.docker.compose.project=shop,com.docker.compose.service=api,com.docker.compose.project.working_dir=/srv/shop","CreatedAt":"2026-08-19 10:00:00 +0300 EEST"}
+{"ID":"bbb444555666","Names":"shop-api-2","Image":"shop/api:1","State":"running","Status":"Up 5 hours (unhealthy)","Ports":"0.0.0.0:8081->80/tcp","Labels":"com.docker.compose.project=shop,com.docker.compose.service=api","CreatedAt":"2026-08-18 09:00:00 +0300 EEST"}
+{"ID":"ccc777888999","Names":"shop-db-1","Image":"postgres:16","State":"exited","Status":"Exited (0) 4 hours ago","Ports":"","Labels":"com.docker.compose.project=shop,com.docker.compose.service=db","CreatedAt":"2026-08-18 08:15:00 +0300 EEST"}
+{"ID":"ddd000111222","Names":"blog-web-1","Image":"nginx:1.27","State":"running","Status":"Up 2 days","Ports":"","Labels":"com.docker.compose.project=blog,com.docker.compose.service=web","CreatedAt":"2026-08-20 09:30:00 +0300 EEST"}
+{"ID":"eee333444555","Names":"watchtower","Image":"containrrr/watchtower","State":"running","Status":"Up 10 minutes","Ports":"","Labels":"org.opencontainers.image.title=watchtower","CreatedAt":"2026-08-22 07:00:00 +0300 EEST"}`
+
+func TestHostContainers_GroupedStatus(t *testing.T) {
+	f := &fakeDockerRunner{runOut: []byte(hostPsGrouped)}
+	h := &HostContainers{docker: f}
+
+	got, err := h.GroupedStatus(context.Background())
+	if err != nil {
+		t.Fatalf("GroupedStatus() error = %v", err)
+	}
+	if len(got) != 3 {
+		t.Fatalf("groups = %v, want shop, blog and %s", groupNames(got), UnmanagedProjectName)
+	}
+
+	shop := got["shop"]
+	if len(shop) != 2 {
+		t.Fatalf("shop services = %v, want api and db", shop)
+	}
+	if _, ok := shop["shop-api-1"]; ok {
+		t.Error("shop keyed a container name; the service label must win")
+	}
+	if len(got["blog"]) != 1 || !got["blog"]["web"].Running {
+		t.Errorf("blog = %+v, want a running web service", got["blog"])
+	}
+	un := got[UnmanagedProjectName]
+	if len(un) != 1 {
+		t.Fatalf("unmanaged = %+v, want the watchtower container only", un)
+	}
+	if wt := un["watchtower"]; !wt.Running || wt.Uptime != "10m" {
+		t.Errorf("watchtower = %+v, want running with a 10m uptime", wt)
+	}
+
+	// One host-wide ps call, the same argv the rest of the file uses.
+	if len(f.runCalls) != 1 {
+		t.Fatalf("run calls = %d, want 1", len(f.runCalls))
+	}
+	if strings.Join(f.runCalls[0], " ") != strings.Join(hostPsArgs, " ") {
+		t.Errorf("run args = %v, want %v", f.runCalls[0], hostPsArgs)
+	}
+}
+
+// TestHostContainers_GroupedStatus_ScaledReplicas pins that the aggregation
+// rules match parseContainerStatus: Running is an OR, Health takes the worst
+// case, Created the oldest replica, Uptime the longest-running one, and ports
+// merge through dedupAndSortPorts.
+func TestHostContainers_GroupedStatus_ScaledReplicas(t *testing.T) {
+	h := &HostContainers{docker: &fakeDockerRunner{runOut: []byte(hostPsGrouped)}}
+
+	got, err := h.GroupedStatus(context.Background())
+	if err != nil {
+		t.Fatalf("GroupedStatus() error = %v", err)
+	}
+	api := got["shop"]["api"]
+	if !api.Running {
+		t.Error("api Running = false, want true (any replica running)")
+	}
+	if api.Health != "unhealthy" {
+		t.Errorf("api Health = %q, want unhealthy (worst case wins)", api.Health)
+	}
+	if api.Created != "2026-08-18 09:00" {
+		t.Errorf("api Created = %q, want the oldest replica", api.Created)
+	}
+	if api.Uptime != "5h" {
+		t.Errorf("api Uptime = %q, want the longest-running replica", api.Uptime)
+	}
+	if len(api.Ports) != 2 {
+		t.Fatalf("api Ports = %+v, want 2 after the wildcard mirror collapse", api.Ports)
+	}
+	if api.Ports[0].HostPort != 8080 || api.Ports[1].HostPort != 8081 {
+		t.Errorf("api Ports = %+v, want them sorted by host port", api.Ports)
+	}
+
+	db := got["shop"]["db"]
+	if db.Running || db.Uptime != "" {
+		t.Errorf("db = %+v, want stopped with no uptime", db)
+	}
+	if db.Created != "2026-08-18 08:15" {
+		t.Errorf("db Created = %q", db.Created)
+	}
+}
+
+// TestHostContainers_GroupedStatus_RestartingReplica pins the restarting rule:
+// a replica that is neither up nor exited reports "restarting" only while no
+// running replica has been seen.
+func TestHostContainers_GroupedStatus_RestartingReplica(t *testing.T) {
+	ps := `{"ID":"aaa111222333","Names":"shop-api-1","State":"restarting","Status":"Restarting (1) 5 seconds ago","Labels":"com.docker.compose.project=shop,com.docker.compose.service=api","CreatedAt":"2026-08-19 10:00:00 +0300 EEST"}`
+	h := &HostContainers{docker: &fakeDockerRunner{runOut: []byte(ps)}}
+
+	got, err := h.GroupedStatus(context.Background())
+	if err != nil {
+		t.Fatalf("GroupedStatus() error = %v", err)
+	}
+	api := got["shop"]["api"]
+	if api.Running {
+		t.Error("api Running = true, want false while restarting")
+	}
+	if api.Uptime != "restarting" {
+		t.Errorf("api Uptime = %q, want restarting", api.Uptime)
+	}
+
+	ps += "\n" + `{"ID":"bbb444555666","Names":"shop-api-2","State":"running","Status":"Up 4 hours","Labels":"com.docker.compose.project=shop,com.docker.compose.service=api","CreatedAt":"2026-08-19 11:00:00 +0300 EEST"}`
+	h = &HostContainers{docker: &fakeDockerRunner{runOut: []byte(ps)}}
+	got, err = h.GroupedStatus(context.Background())
+	if err != nil {
+		t.Fatalf("GroupedStatus() error = %v", err)
+	}
+	if api = got["shop"]["api"]; api.Uptime != "4h" || !api.Running {
+		t.Errorf("api = %+v, want the running replica to win over the restarting one", api)
+	}
+}
+
+// TestHostContainers_GroupedStatus_LabelValueWithComma pins the token-start
+// read: a preceding label whose value carries a comma must not shift the
+// project or service reading, and neither value may swallow the label after it.
+func TestHostContainers_GroupedStatus_LabelValueWithComma(t *testing.T) {
+	ps := `{"ID":"aaa111222333","Names":"shop-api-1","State":"running","Status":"Up 1 hour","Labels":"org.opencontainers.image.authors=alice,bob,com.docker.compose.project=shop,com.docker.compose.service=api,com.docker.compose.project.config_files=/srv/shop/compose.yml","CreatedAt":"2026-08-19 10:00:00 +0300 EEST"}`
+	h := &HostContainers{docker: &fakeDockerRunner{runOut: []byte(ps)}}
+
+	got, err := h.GroupedStatus(context.Background())
+	if err != nil {
+		t.Fatalf("GroupedStatus() error = %v", err)
+	}
+	if len(got) != 1 {
+		t.Fatalf("groups = %v, want shop only", groupNames(got))
+	}
+	if _, ok := got["shop"]["api"]; !ok {
+		t.Fatalf("shop = %+v, want an api service", got["shop"])
+	}
+}
+
+// TestHostContainers_GroupedStatus_SiblingKeysAreNotAProject pins the trailing
+// "=" rule: a container carrying only com.docker.compose.project.working_dir is
+// not compose-managed, so it belongs in the unmanaged bucket.
+func TestHostContainers_GroupedStatus_SiblingKeysAreNotAProject(t *testing.T) {
+	ps := `{"ID":"aaa111222333","Names":"odd","State":"running","Status":"Up 1 hour","Labels":"com.docker.compose.project.working_dir=/srv/shop","CreatedAt":"2026-08-19 10:00:00 +0300 EEST"}`
+	h := &HostContainers{docker: &fakeDockerRunner{runOut: []byte(ps)}}
+
+	got, err := h.GroupedStatus(context.Background())
+	if err != nil {
+		t.Fatalf("GroupedStatus() error = %v", err)
+	}
+	if _, ok := got[UnmanagedProjectName]["odd"]; !ok {
+		t.Errorf("groups = %v, want the container in the unmanaged bucket", got)
+	}
+}
+
+// TestHostContainers_GroupedStatus_NameFallbacks pins the two degenerate label
+// shapes: an empty project value reads as unmanaged, and a managed container
+// with no service label falls back to its container name so the row stays
+// addressable.
+func TestHostContainers_GroupedStatus_NameFallbacks(t *testing.T) {
+	ps := `{"ID":"aaa111222333","Names":"blank-proj","State":"running","Status":"Up 1 hour","Labels":"com.docker.compose.project=","CreatedAt":"2026-08-19 10:00:00 +0300 EEST"}
+{"ID":"bbb444555666","Names":"no-svc-label","State":"running","Status":"Up 1 hour","Labels":"com.docker.compose.project=shop","CreatedAt":"2026-08-19 10:00:00 +0300 EEST"}
+{"ID":"ccc777888999","Names":"","State":"created","Status":"Created","Labels":"","CreatedAt":"2026-08-19 10:00:00 +0300 EEST"}`
+	h := &HostContainers{docker: &fakeDockerRunner{runOut: []byte(ps)}}
+
+	got, err := h.GroupedStatus(context.Background())
+	if err != nil {
+		t.Fatalf("GroupedStatus() error = %v", err)
+	}
+	if _, ok := got[UnmanagedProjectName]["blank-proj"]; !ok {
+		t.Errorf("unmanaged = %+v, want the empty-project container", got[UnmanagedProjectName])
+	}
+	if len(got[UnmanagedProjectName]) != 1 {
+		t.Errorf("unmanaged = %+v, want the unnamed container dropped", got[UnmanagedProjectName])
+	}
+	if _, ok := got["shop"]["no-svc-label"]; !ok {
+		t.Errorf("shop = %+v, want the container name as the service key", got["shop"])
+	}
+}
+
+func TestHostContainers_GroupedStatus_EmptyHost(t *testing.T) {
+	h := &HostContainers{docker: &fakeDockerRunner{runOut: []byte("")}}
+
+	got, err := h.GroupedStatus(context.Background())
+	if err != nil {
+		t.Fatalf("GroupedStatus() error = %v", err)
+	}
+	if len(got) != 0 {
+		t.Errorf("GroupedStatus() = %v, want no groups", got)
+	}
+}
+
+func TestHostContainers_GroupedStatus_RunError(t *testing.T) {
+	h := &HostContainers{docker: &fakeDockerRunner{runErr: errors.New("docker daemon not running")}}
+
+	if _, err := h.GroupedStatus(context.Background()); err == nil {
+		t.Fatal("expected an error")
+	} else if !strings.Contains(err.Error(), "listing host containers") ||
+		!strings.Contains(err.Error(), "docker daemon not running") {
+		t.Errorf("error = %v, want it to wrap the run failure", err)
+	}
+}
+
+func TestHostContainers_GroupedStatus_ParseError(t *testing.T) {
+	h := &HostContainers{docker: &fakeDockerRunner{runOut: []byte("not json")}}
+
+	if _, err := h.GroupedStatus(context.Background()); err == nil {
+		t.Fatal("expected an error")
+	} else if !strings.Contains(err.Error(), "parsing host containers") {
+		t.Errorf("error = %v, want a parse error", err)
+	}
+}
+
+// TestHostContainers_GroupedStatus_RealFixture runs the live-daemon capture
+// through the grouping path, so the label reading is validated against real
+// output rather than only the hand-written constants above.
+func TestHostContainers_GroupedStatus_RealFixture(t *testing.T) {
+	data, err := os.ReadFile("testdata/docker_ps_host.json")
+	if err != nil {
+		t.Fatalf("reading fixture: %v", err)
+	}
+	h := &HostContainers{docker: &fakeDockerRunner{runOut: data}}
+
+	got, err := h.GroupedStatus(context.Background())
+	if err != nil {
+		t.Fatalf("GroupedStatus() error = %v", err)
+	}
+	if len(got) < 2 {
+		t.Fatalf("groups = %v, want at least one project plus the unmanaged bucket", groupNames(got))
+	}
+
+	// Every grouped row must also be reachable through the read paths the
+	// screen already uses: the unmanaged bucket must match ListServices.
+	names, err := h.ListServices(context.Background())
+	if err != nil {
+		t.Fatalf("ListServices() error = %v", err)
+	}
+	if len(got[UnmanagedProjectName]) != len(names) {
+		t.Errorf("unmanaged group = %d rows, ListServices = %d", len(got[UnmanagedProjectName]), len(names))
+	}
+	for _, name := range names {
+		if _, ok := got[UnmanagedProjectName][name]; !ok {
+			t.Errorf("unmanaged container %q missing from the grouped map", name)
+		}
+	}
+	for proj, svcs := range got {
+		if proj == "" {
+			t.Error("a group has an empty project name")
+		}
+		for svc := range svcs {
+			if svc == "" {
+				t.Errorf("project %q has a service with an empty name", proj)
+			}
+		}
+	}
+}
+
+// TestHostContainers_GroupedStatus_RemoteSplice pins that the grouped read
+// needs no new SSH plumbing: it goes through the same run seam, so SSHExtraArgs
+// still land immediately before the host argument and the argv is unchanged.
+func TestHostContainers_GroupedStatus_RemoteSplice(t *testing.T) {
+	extras := []string{"-p", "2222"}
+	host := "user@example.com"
+	var captured []string
+	r := &RemoteCompose{Host: host, SocketPath: "/tmp/cdeploy-ctrl-abc-99", SSHExtraArgs: extras}
+	r.SetTestHooks(nil, func(cmd *exec.Cmd) ([]byte, error) {
+		captured = append([]string(nil), cmd.Args...)
+		return []byte(hostPsGrouped), nil
+	})
+
+	got, err := NewRemoteHostContainers(r).GroupedStatus(context.Background())
+	if err != nil {
+		t.Fatalf("GroupedStatus() error = %v", err)
+	}
+	if len(got) != 3 {
+		t.Errorf("groups = %v, want 3", groupNames(got))
+	}
+	assertExtraBeforeHost(t, "HostContainers GroupedStatus", captured, host, extras)
+	if remoteCmd := captured[len(captured)-1]; remoteCmd != `docker 'ps' '-a' '--size=false' '--format' '{{json .}}'` {
+		t.Errorf("remote command = %q", remoteCmd)
+	}
+}
+
+func groupNames(groups map[string]map[string]runner.ServiceStatus) []string {
+	names := make([]string, 0, len(groups))
+	for name := range groups {
+		names = append(names, name)
+	}
+	slices.Sort(names)
+	return names
 }

@@ -10,6 +10,7 @@ import (
 	"regexp"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/lexxzar/compose-deploy/internal/runner"
 )
@@ -31,6 +32,11 @@ type hostPsEntry struct {
 // Docker Compose project. The trailing "=" keeps it from matching the sibling keys
 // com.docker.compose.project.config_files and com.docker.compose.project.working_dir.
 const composeProjectLabel = "com.docker.compose.project="
+
+// composeServiceLabel is the label key that names the compose service a
+// container implements. It keeps its trailing "=" for the same token-start
+// reason composeProjectLabel does.
+const composeServiceLabel = "com.docker.compose.service="
 
 // parseHostContainers parses the output of `docker ps -a --format '{{json .}}'`.
 // NDJSON only, unlike the sibling parseContainerStatus/parseStatsOutput: those
@@ -58,16 +64,41 @@ func parseHostContainers(data []byte) ([]hostPsEntry, error) {
 	return entries, nil
 }
 
-// isComposeManaged reports whether the comma-joined label string carries a
-// com.docker.compose.project key.
+// labelValue returns the value of key in a comma-joined docker label string.
 //
-// The match is anchored at a token start rather than done by splitting into k=v
-// pairs: a label VALUE may legally contain a comma, so a split-and-map can
-// mis-slice. A false verdict would need a label value containing the literal
-// ",com.docker.compose.project=".
+// The key is matched only at a token start rather than by splitting the string
+// into k=v pairs: a label VALUE may legally contain a comma, so a split-and-map
+// can mis-slice. A false match would need a value containing the literal
+// ",<key>".
+//
+// The value is read to the next comma, which truncates a value that itself
+// contains one. That is safe for the only two keys read here: compose project
+// and service names are name-constrained ([a-z0-9][a-z0-9_-]*), so neither can
+// carry a comma. Do not reuse this helper for an arbitrary label key.
+func labelValue(labels, key string) (string, bool) {
+	var rest string
+	switch {
+	case strings.HasPrefix(labels, key):
+		rest = labels[len(key):]
+	default:
+		i := strings.Index(labels, ","+key)
+		if i < 0 {
+			return "", false
+		}
+		rest = labels[i+1+len(key):]
+	}
+	if j := strings.IndexByte(rest, ','); j >= 0 {
+		rest = rest[:j]
+	}
+	return rest, true
+}
+
+// isComposeManaged reports whether the comma-joined label string carries a
+// com.docker.compose.project key. It reads labelValue so the token-start rule
+// lives in one place.
 func isComposeManaged(labels string) bool {
-	return strings.HasPrefix(labels, composeProjectLabel) ||
-		strings.Contains(labels, ","+composeProjectLabel)
+	_, ok := labelValue(labels, composeProjectLabel)
+	return ok
 }
 
 // parseHealthFromStatus extracts the health value from a host-level Status string.
@@ -386,6 +417,128 @@ func (h *HostContainers) ContainerStatus(ctx context.Context) (map[string]runner
 		status[hostContainerName(e.Names)] = st
 	}
 	return status, nil
+}
+
+// GroupedStatus returns every container on the host grouped by compose project:
+// the outer key is the project name, the inner key the service name. Containers
+// with no compose project label are collected under UnmanagedProjectName.
+//
+// It is ONE host-wide `docker ps` call regardless of how many projects the host
+// runs, which is what makes the grouped TUI screen affordable over SSH — a
+// per-project `docker compose ps` would be one round-trip per project.
+//
+// The gap this trades for that price: a service declared in a compose file but
+// never created has no container, so it has no row here. Drilling into a single
+// project goes through ListServices and shows it.
+func (h *HostContainers) GroupedStatus(ctx context.Context) (map[string]map[string]runner.ServiceStatus, error) {
+	out, err := h.docker.run(ctx, hostPsArgs...)
+	if err != nil {
+		return nil, fmt.Errorf("listing host containers: %w", err)
+	}
+	entries, err := parseHostContainers(out)
+	if err != nil {
+		return nil, err
+	}
+	return groupHostContainers(entries), nil
+}
+
+// hostGroupKey resolves the project and service a ps entry belongs to. A
+// container with no project label, or an empty one, lands in the unmanaged
+// bucket under its container name — the same rows unmanagedEntries reports.
+// A managed container missing the service label falls back to its container
+// name so the row is still addressable.
+func hostGroupKey(e hostPsEntry) (proj, svc string) {
+	name := hostContainerName(e.Names)
+	p, ok := labelValue(e.Labels, composeProjectLabel)
+	if !ok || p == "" {
+		return UnmanagedProjectName, name
+	}
+	s, ok := labelValue(e.Labels, composeServiceLabel)
+	if !ok || s == "" {
+		s = name
+	}
+	return p, s
+}
+
+// hostSvcAgg accumulates the replicas of one service. The rules mirror
+// parseContainerStatus exactly — Running is an OR, Health takes the worst case,
+// Created the oldest replica and Uptime the longest-running one — so a scaled
+// service reads the same in the grouped host view as in the per-project one.
+type hostSvcAgg struct {
+	st                 runner.ServiceStatus
+	oldestCreated      time.Time
+	oldestCreatedValid bool
+	longestUpDur       time.Duration
+	longestFromRunning bool
+	ports              []runner.Port
+}
+
+func (a *hostSvcAgg) merge(e hostPsEntry) {
+	running := hostContainerRunning(e)
+	a.st.Running = a.st.Running || running
+	if h := parseHealthFromStatus(e.Status); healthPriority(h) > healthPriority(a.st.Health) {
+		a.st.Health = h
+	}
+	if t, ok := parseCreatedAt(e.CreatedAt); ok && (!a.oldestCreatedValid || t.Before(a.oldestCreated)) {
+		a.oldestCreated, a.oldestCreatedValid = t, true
+	}
+	uptime := formatUptime(e.Status)
+	switch {
+	case running && uptime != "":
+		if d := parseUptimeDuration(uptime); !a.longestFromRunning || d > a.longestUpDur {
+			a.longestUpDur, a.st.Uptime, a.longestFromRunning = d, uptime, true
+		}
+	case uptime == "restarting" && a.st.Uptime == "":
+		a.st.Uptime = uptime
+	}
+	if e.Ports != "" {
+		a.ports = append(a.ports, parsePortsString(e.Ports)...)
+	}
+}
+
+func (a *hostSvcAgg) status() runner.ServiceStatus {
+	st := a.st
+	if a.oldestCreatedValid {
+		st.Created = a.oldestCreated.Format("2006-01-02 15:04")
+	}
+	st.Ports = dedupAndSortPorts(a.ports)
+	return st
+}
+
+// groupHostContainers folds ps entries into the project → service → status map.
+// An entry that resolves to no service name is dropped: it could not be
+// addressed by any read method.
+func groupHostContainers(entries []hostPsEntry) map[string]map[string]runner.ServiceStatus {
+	agg := make(map[string]map[string]*hostSvcAgg)
+	for _, e := range entries {
+		proj, svc := hostGroupKey(e)
+		if svc == "" {
+			continue
+		}
+		group := agg[proj]
+		if group == nil {
+			group = make(map[string]*hostSvcAgg)
+			agg[proj] = group
+		}
+		a := group[svc]
+		if a == nil {
+			a = &hostSvcAgg{}
+			group[svc] = a
+		}
+		a.merge(e)
+	}
+	if len(agg) == 0 {
+		return nil
+	}
+	out := make(map[string]map[string]runner.ServiceStatus, len(agg))
+	for proj, group := range agg {
+		svcs := make(map[string]runner.ServiceStatus, len(group))
+		for svc, a := range group {
+			svcs[svc] = a.status()
+		}
+		out[proj] = svcs
+	}
+	return out
 }
 
 // hostStatsArgs is the host-wide stats argv. It takes the same `{{json .}}`
