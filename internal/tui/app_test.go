@@ -19320,3 +19320,432 @@ func TestGroupedScreen_EmptyHostLeavesLoadingState(t *testing.T) {
 		t.Errorf("an empty host must not render as still loading:\n%s", v)
 	}
 }
+
+// ---------------------------------------------------------------------------
+// Grouped host view (Task 7): fold, header aggregates, grouped rendering.
+// ---------------------------------------------------------------------------
+
+// unmanagedGroupOf builds the synthetic bucket the host-wide fetch produces for
+// containers with no compose project label.
+func unmanagedGroupOf(services ...string) svcGroup {
+	return svcGroup{
+		proj:     compose.Project{Name: compose.UnmanagedProjectName, Unmanaged: true},
+		services: services,
+	}
+}
+
+// groupedScreenModel is groupedModel plus the facts the renderer and the key
+// dispatch need: grouped mode, a terminal size and a live search-match cache.
+func groupedScreenModel(groups ...svcGroup) Model {
+	m := groupedModel(groups...)
+	m.grouped = true
+	m.width, m.height = 100, 30
+	return m
+}
+
+// pressGroupKey drives one key through Update. It is the string-keyed sibling
+// of pressKey (help_test.go), because space arrives as its own tea.KeyType.
+func pressGroupKey(m Model, key string) Model {
+	msg := tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune(key)}
+	if key == " " {
+		msg = tea.KeyMsg{Type: tea.KeySpace}
+	}
+	updated, _ := m.Update(msg)
+	return updated.(Model)
+}
+
+// TestGroupedSpace_OnHeaderFoldsAndUnfolds pins space's first meaning: on a
+// group header it folds, which hides ROWS and nothing else — the selection the
+// group carried survives, because svcRefs ignores fold state.
+func TestGroupedSpace_OnHeaderFoldsAndUnfolds(t *testing.T) {
+	m := groupedScreenModel(svcGroupOf("web", "api", "nginx"), svcGroupOf("db", "postgres"))
+	m.selected[svcKey("web", "api")] = true
+	m.svcCursor = 0 // the "web" header
+
+	m = pressGroupKey(m, " ")
+	if !m.svcGroups[0].folded {
+		t.Fatal("space on a header did not fold the group")
+	}
+	if got := len(m.svcEntries); got != 3 {
+		t.Errorf("folded row count = %d, want 3 (two headers + the open group's one service)", got)
+	}
+	if !m.selected[svcKey("web", "api")] {
+		t.Error("folding cleared the group's selection; folding hides rows, not services")
+	}
+	if got := m.selectedCount(); got != 1 {
+		t.Errorf("selectedCount after fold = %d, want 1", got)
+	}
+
+	m = pressGroupKey(m, " ")
+	if m.svcGroups[0].folded {
+		t.Fatal("a second space did not unfold the group")
+	}
+	if got := len(m.svcEntries); got != 5 {
+		t.Errorf("unfolded row count = %d, want 5", got)
+	}
+}
+
+// The fold rebuild renumbers svcEntries, and searchMatches holds ROW indices —
+// so it must be re-derived, exactly as the grouped reload does.
+func TestGroupedSpace_FoldRecomputesSearchMatches(t *testing.T) {
+	m := groupedScreenModel(svcGroupOf("web", "api", "nginx"), svcGroupOf("db", "api-db"))
+	m.searchQuery = "api"
+	m.searchMatches = computeMatches(m.svcEntries, m.searchQuery)
+	if want := []int{1, 4}; !slices.Equal(m.searchMatches, want) {
+		t.Fatalf("pre-fold matches = %v, want %v", m.searchMatches, want)
+	}
+
+	m.svcCursor = 0
+	m = pressGroupKey(m, " ")
+	if want := []int{2}; !slices.Equal(m.searchMatches, want) {
+		t.Errorf("post-fold matches = %v, want %v (folded rows are gone, the rest renumbered)", m.searchMatches, want)
+	}
+}
+
+// TestGroupedSpace_OnServiceSelects pins space's second meaning, unchanged from
+// the drilled screen.
+func TestGroupedSpace_OnServiceSelects(t *testing.T) {
+	m := groupedScreenModel(svcGroupOf("web", "api"), svcGroupOf("db", "postgres"))
+	m.svcCursor = 1 // the "api" row
+
+	m = pressGroupKey(m, " ")
+	if !m.selected[svcKey("web", "api")] {
+		t.Fatal("space on a service row did not select it")
+	}
+	if m.svcGroups[0].folded {
+		t.Error("space on a service row folded its group")
+	}
+
+	m = pressGroupKey(m, " ")
+	if m.selected[svcKey("web", "api")] {
+		t.Error("space on a selected service row did not deselect it")
+	}
+}
+
+// An unmanaged container has no compose project behind it, so its row draws no
+// checkbox and space must not fill one in.
+func TestGroupedSpace_OnUnmanagedRowIsNoOp(t *testing.T) {
+	m := groupedScreenModel(svcGroupOf("web", "api"), unmanagedGroupOf("watchtower"))
+	m.svcCursor = 3 // the watchtower row
+
+	m = pressGroupKey(m, " ")
+	if len(m.selected) != 0 {
+		t.Errorf("space selected an unmanaged row: %v", m.selected)
+	}
+	if m.svcGroups[1].folded {
+		t.Error("space on an unmanaged SERVICE row folded its group")
+	}
+}
+
+// The unmanaged bucket's own header still folds — the row is a header like any
+// other, and folding is display state, not an operation.
+func TestGroupedSpace_OnUnmanagedHeaderFolds(t *testing.T) {
+	m := groupedScreenModel(svcGroupOf("web", "api"), unmanagedGroupOf("watchtower"))
+	m.svcCursor = 2 // the "(unmanaged)" header
+
+	m = pressGroupKey(m, " ")
+	if !m.svcGroups[1].folded {
+		t.Error("space on the unmanaged header did not fold it")
+	}
+}
+
+// `a` and allSelected read selectableRefs: an unmanaged row draws no checkbox,
+// so select-all must not claim to have ticked it.
+func TestGroupedSelectAll_SkipsUnmanagedRows(t *testing.T) {
+	m := groupedScreenModel(svcGroupOf("web", "api", "nginx"), unmanagedGroupOf("watchtower"))
+
+	m = pressGroupKey(m, "a")
+	want := map[string]bool{svcKey("web", "api"): true, svcKey("web", "nginx"): true}
+	if len(m.selected) != len(want) {
+		t.Fatalf("select-all produced %v, want %v", m.selected, want)
+	}
+	for k := range want {
+		if !m.selected[k] {
+			t.Errorf("select-all missed %q", k)
+		}
+	}
+	if !m.allSelected() {
+		t.Error("allSelected = false after `a`; the unmanaged row must not hold it open")
+	}
+
+	m = pressGroupKey(m, "a")
+	if m.selectedCount() != 0 {
+		t.Errorf("a second `a` did not clear the selection: %v", m.selected)
+	}
+}
+
+// A host with ONLY unmanaged containers has nothing selectable, so allSelected
+// must stay false rather than report an empty set as fully selected.
+func TestAllSelected_UnmanagedOnlyHostIsFalse(t *testing.T) {
+	m := groupedScreenModel(unmanagedGroupOf("watchtower", "portainer"))
+	if m.allSelected() {
+		t.Error("allSelected = true on a host with no selectable rows")
+	}
+}
+
+// TestGroupHeaderLine_Aggregates pins the header's live summary: the running
+// count always, the unhealthy count only when something is wrong.
+func TestGroupHeaderLine_Aggregates(t *testing.T) {
+	m := groupedScreenModel(svcGroupOf("web", "api", "nginx", "cache"), svcGroupOf("db", "postgres"))
+	m.svcStatus = map[string]runner.ServiceStatus{
+		svcKey("web", "api"):     {Running: true},
+		svcKey("web", "nginx"):   {Running: true, Health: "unhealthy"},
+		svcKey("web", "cache"):   {},
+		svcKey("db", "postgres"): {},
+	}
+
+	got := ansi.Strip(m.groupHeaderLine(0))
+	if !strings.Contains(got, "▼ web") {
+		t.Errorf("header = %q, want the open marker and the name", got)
+	}
+	if !strings.Contains(got, "● 2 up") {
+		t.Errorf("header = %q, want the running count", got)
+	}
+	if !strings.Contains(got, "✗ 1") {
+		t.Errorf("header = %q, want the unhealthy count", got)
+	}
+
+	// Nothing unhealthy: the ✗ cell is absent entirely, not "✗ 0".
+	got = ansi.Strip(m.groupHeaderLine(1))
+	if !strings.Contains(got, "● 0 up") {
+		t.Errorf("header = %q, want `● 0 up` for a stopped group", got)
+	}
+	if strings.Contains(got, "✗") {
+		t.Errorf("header = %q, want no unhealthy cell when nothing is unhealthy", got)
+	}
+}
+
+// A folded group keeps its aggregates — that is the whole point of folding one.
+func TestGroupHeaderLine_FoldedKeepsAggregates(t *testing.T) {
+	m := groupedScreenModel(svcGroupOf("web", "api"), svcGroupOf("db", "postgres"))
+	m.svcStatus = map[string]runner.ServiceStatus{svcKey("web", "api"): {Running: true}}
+	m.svcGroups[0].folded = true
+
+	got := ansi.Strip(m.groupHeaderLine(0))
+	if !strings.HasPrefix(got, "▶ web") {
+		t.Errorf("folded header = %q, want the ▶ marker", got)
+	}
+	if !strings.Contains(got, "● 1 up") {
+		t.Errorf("folded header = %q, want the running count", got)
+	}
+}
+
+// A group that owns no services renders a bare header: "0 up" for a project
+// with nothing to run reads as a fault it is not.
+func TestGroupHeaderLine_EmptyGroupIsBare(t *testing.T) {
+	m := groupedScreenModel(svcGroupOf("web", "api"), svcGroupOf("empty"))
+	if got := ansi.Strip(m.groupHeaderLine(1)); got != "▶ empty" && got != "▼ empty" {
+		t.Errorf("empty group header = %q, want the marker and the name only", got)
+	}
+}
+
+// An out-of-range index yields "" rather than panicking, matching groupProjName.
+func TestGroupHeaderLine_OutOfRange(t *testing.T) {
+	m := groupedScreenModel(svcGroupOf("web", "api"))
+	if got := m.groupHeaderLine(7); got != "" {
+		t.Errorf("groupHeaderLine(7) = %q, want the empty string", got)
+	}
+}
+
+// TestViewSelectContainers_GroupedIndent pins the tree shape: service rows sit
+// 2 cells in from their header, the caption follows them, and the header itself
+// does not move.
+func TestViewSelectContainers_GroupedIndent(t *testing.T) {
+	m := groupedScreenModel(svcGroupOf("web", "api"), svcGroupOf("db", "postgres"))
+	m.svcStatus = map[string]runner.ServiceStatus{
+		svcKey("web", "api"):     {Running: true, Uptime: "3h"},
+		svcKey("db", "postgres"): {Running: true, Uptime: "2d"},
+	}
+
+	m.svcCursor = 1 // off the header, so the cursor prefix does not skew it
+	lines := strings.Split(ansi.Strip(m.viewSelectContainers()), "\n")
+	find := func(sub string) string {
+		t.Helper()
+		for _, l := range lines {
+			if strings.Contains(l, sub) {
+				return l
+			}
+		}
+		t.Fatalf("no line containing %q in:\n%s", sub, strings.Join(lines, "\n"))
+		return ""
+	}
+	// Display COLUMN, not byte offset: ● and the fold markers are multi-byte.
+	col := func(line, sub string) int {
+		t.Helper()
+		i := strings.Index(line, sub)
+		if i < 0 {
+			t.Fatalf("%q does not contain %q", line, sub)
+		}
+		return ansi.StringWidth(line[:i])
+	}
+
+	if got := find("▼ web"); !strings.HasPrefix(got, "  ▼ web") {
+		t.Errorf("header line = %q, want it at the cursor column", got)
+	}
+	// cursor(2) + indent(2) + checkbox(3) = the name column starts at 12.
+	if got := find(" api"); !strings.HasPrefix(got, ">   [") {
+		t.Errorf("service line = %q, want the cursor prefix then the 2-cell indent", got)
+	}
+	if got := find(" postgres"); !strings.HasPrefix(got, "    [") {
+		t.Errorf("service line = %q, want a 2-cell indent before the checkbox", got)
+	}
+	if got := col(find("Service"), "Service"); got != 12 {
+		t.Errorf("caption puts Service at column %d, want 12 (10 + the 2-cell indent)", got)
+	}
+	if got := col(find(" api"), "api"); got != 12 {
+		t.Errorf("row puts the name at column %d, want 12 (aligned with the caption)", got)
+	}
+}
+
+// A grouped host that holds exactly ONE project draws no headers, so it must
+// draw no indent either — it renders exactly as the drilled screen does.
+func TestViewSelectContainers_GroupedSingleProjectHasNoIndent(t *testing.T) {
+	m := groupedScreenModel(svcGroupOf("web", "api"))
+	m.svcStatus = map[string]runner.ServiceStatus{svcKey("web", "api"): {Running: true, Uptime: "3h"}}
+
+	out := ansi.Strip(m.viewSelectContainers())
+	if strings.Contains(out, "▼ web") {
+		t.Errorf("a single group must emit no header:\n%s", out)
+	}
+	for _, l := range strings.Split(out, "\n") {
+		if strings.Contains(l, "api") && !strings.HasPrefix(l, "> [") {
+			t.Errorf("single-group service line = %q, want no indent", l)
+		}
+	}
+}
+
+// Unmanaged rows keep the checkbox's 3 cells but draw no checkbox in them, so
+// the columns stay aligned with the compose groups around them.
+func TestViewSelectContainers_UnmanagedRowHasNoCheckbox(t *testing.T) {
+	m := groupedScreenModel(svcGroupOf("web", "api"), unmanagedGroupOf("watchtower"))
+	m.svcStatus = map[string]runner.ServiceStatus{
+		svcKey("web", "api"): {Running: true},
+		svcKey(compose.UnmanagedProjectName, "watchtower"): {Running: true},
+	}
+
+	var svcLine, unmanagedLine string
+	for _, l := range strings.Split(ansi.Strip(m.viewSelectContainers()), "\n") {
+		switch {
+		case strings.Contains(l, "api"):
+			svcLine = l
+		case strings.Contains(l, "watchtower"):
+			unmanagedLine = l
+		}
+	}
+	if svcLine == "" || unmanagedLine == "" {
+		t.Fatal("both a compose row and an unmanaged row must render")
+	}
+	if !strings.HasPrefix(svcLine, "    [ ]") {
+		t.Errorf("compose row = %q, want a checkbox", svcLine)
+	}
+	if strings.Contains(unmanagedLine, "[") {
+		t.Errorf("unmanaged row = %q, want no checkbox", unmanagedLine)
+	}
+	if a, b := strings.Index(svcLine, "api"), strings.Index(unmanagedLine, "watchtower"); a != b {
+		t.Errorf("name columns disagree: compose at %d, unmanaged at %d", a, b)
+	}
+}
+
+// The title's denominator counts selectable rows, so `a` cannot look like it
+// left rows behind.
+func TestViewSelectContainers_TitleCountsSelectableRowsOnly(t *testing.T) {
+	m := groupedScreenModel(svcGroupOf("web", "api", "nginx"), unmanagedGroupOf("watchtower"))
+	m = pressGroupKey(m, "a")
+
+	if got := ansi.Strip(m.viewSelectContainers()); !strings.Contains(got, "(2/2 selected)") {
+		t.Errorf("title must read (2/2 selected) after `a`; got:\n%s", got)
+	}
+}
+
+// The scroll indicators follow the service rows' indent so the windowed list
+// keeps one left edge.
+func TestViewSelectContainers_GroupedScrollIndicatorsIndent(t *testing.T) {
+	many := make([]string, 20)
+	for i := range many {
+		many[i] = fmt.Sprintf("svc%02d", i)
+	}
+	m := groupedScreenModel(svcGroupOf("web", many...), svcGroupOf("db", "postgres"))
+	m.height = 14
+	m.svcCursor = 10
+	m.fixSvcOffset()
+
+	out := ansi.Strip(m.viewSelectContainers())
+	for _, marker := range []string{"▲", "▼"} {
+		for _, l := range strings.Split(out, "\n") {
+			if strings.Contains(l, marker+" ") && strings.Contains(l, "more") {
+				if !strings.HasPrefix(l, "    "+marker) {
+					t.Errorf("indicator line = %q, want the 2-cell indent", l)
+				}
+			}
+		}
+	}
+}
+
+// TestContainerFooter_GroupedIdlePair pins the third footer variant: space
+// names both meanings, enter names the row kind only grouped mode has, and the
+// drilled pair is untouched.
+func TestContainerFooter_GroupedIdlePair(t *testing.T) {
+	m := groupedScreenModel(svcGroupOf("web", "api"), svcGroupOf("db", "postgres"))
+	line1, line2 := m.containerHelpLines()
+	if !strings.Contains(line1, "space fold/select") {
+		t.Errorf("grouped line1 = %q, want the fold/select token", line1)
+	}
+	if !strings.Contains(line2, "enter drill in") {
+		t.Errorf("grouped line2 = %q, want the drill-in token", line2)
+	}
+
+	m.grouped = false
+	if l1, _ := m.containerHelpLines(); !strings.Contains(l1, "space toggle") {
+		t.Errorf("drilled line1 = %q, want the unchanged toggle token", l1)
+	}
+}
+
+// The line COUNT must stay state-independent: containerFooterLines reads the
+// IDLE pair alone, so opening or committing a search cannot resize the list.
+func TestContainerFooter_GroupedLineCountIsStateIndependent(t *testing.T) {
+	for _, width := range []int{40, 50, 60, 80, 120} {
+		base := groupedScreenModel(svcGroupOf("web", "api"), svcGroupOf("db", "postgres"))
+		base.width = width
+		want := base.containerFooterLines()
+
+		searching := base
+		searching.searchInput = textinput.New()
+		searching.searching = true
+		if got := searching.containerFooterLines(); got != want {
+			t.Errorf("width %d: searching footer lines = %d, want %d", width, got, want)
+		}
+		committed := base
+		committed.searchQuery = "api"
+		if got := committed.containerFooterLines(); got != want {
+			t.Errorf("width %d: committed footer lines = %d, want %d", width, got, want)
+		}
+		confirming := base
+		confirming.confirming = true
+		if got := confirming.containerFooterLines(); got != want {
+			t.Errorf("width %d: confirming footer lines = %d, want %d", width, got, want)
+		}
+	}
+}
+
+// Every rendered footer line is clamped, so the grouped pair can never wrap on
+// a narrow pane and steal a service row.
+func TestContainerFooter_GroupedClampsToWidth(t *testing.T) {
+	for _, width := range []int{10, 20, 30, 45, 60} {
+		m := groupedScreenModel(svcGroupOf("web", "api"), svcGroupOf("db", "postgres"))
+		m.width = width
+		lines := strings.Split(m.containerFooter(), "\n")
+		// helpStyle's MarginTop(1) prepends a blank line; it is the gap
+		// svcVisibleCount already reserves, not a footer row.
+		if len(lines) > 0 && strings.TrimSpace(lines[0]) == "" {
+			lines = lines[1:]
+		}
+		if got, want := len(lines), m.containerFooterLines(); got != want {
+			t.Errorf("width %d: footer rendered %d lines, want %d", width, got, want)
+		}
+		for _, l := range lines {
+			if w := ansi.StringWidth(l); w > width {
+				t.Errorf("width %d: footer line %q is %d cells wide", width, ansi.Strip(l), w)
+			}
+		}
+	}
+}

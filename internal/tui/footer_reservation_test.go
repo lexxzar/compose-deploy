@@ -8,6 +8,8 @@ import (
 	"github.com/charmbracelet/bubbles/textinput"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/x/ansi"
+	"github.com/lexxzar/compose-deploy/internal/compose"
+	"github.com/lexxzar/compose-deploy/internal/config"
 )
 
 // TestContainerFooterReservation is a regression pin for the container-list
@@ -821,6 +823,120 @@ func TestContainerFooter_NeverExceedsWidth(t *testing.T) {
 							readOnly, width, st.name, i, w, visible)
 					}
 				}
+			}
+		}
+	}
+}
+
+// TestContainerFooterReservation_Grouped sweeps the same two invariants over
+// the third footer variant, the grouped host view. It needs its own sweep for
+// the reason the read-only sweep does: containerHelpLines returns a different
+// pair, so the one-line/two-line threshold sits at a different width — and the
+// grouped screen adds rows the drilled one has not (group headers), which the
+// reservation counts like any other row.
+func TestContainerFooterReservation_Grouped(t *testing.T) {
+	const perGroup = 12
+	groupNames := []string{"web", "db", "(unmanaged)"}
+	var svcs []string
+	groups := make([]svcGroup, 0, len(groupNames))
+	for gi, gname := range groupNames {
+		names := make([]string, perGroup)
+		for i := range names {
+			names[i] = fmt.Sprintf("%s-svc%02d", gname, i)
+		}
+		svcs = append(svcs, names...)
+		groups = append(groups, svcGroup{
+			proj:     compose.Project{Name: gname, Unmanaged: gi == len(groupNames)-1},
+			services: names,
+		})
+	}
+
+	newModel := func(width int) Model {
+		m := Model{}
+		m.screen = screenSelectContainers
+		m.grouped = true
+		m.selected = map[string]bool{}
+		m.svcGroups = append([]svcGroup(nil), groups...)
+		m.svcEntries = rebuildSvcEntries(m.svcGroups)
+		m.services = svcs
+		m.height = 24
+		m.width = width
+		m.servers = []config.Server{{Name: "prod", Host: "prod.example"}}
+		return m
+	}
+
+	countServiceRows := func(out string) int {
+		n := 0
+		for _, s := range svcs {
+			if strings.Contains(out, s) {
+				n++
+			}
+		}
+		return n
+	}
+	countHeaderRows := func(out string) int {
+		n := 0
+		for _, l := range strings.Split(ansi.Strip(out), "\n") {
+			if strings.HasPrefix(l, "  ▼ ") || strings.HasPrefix(l, "> ▼ ") ||
+				strings.HasPrefix(l, "  ▶ ") || strings.HasPrefix(l, "> ▶ ") {
+				n++
+			}
+		}
+		return n
+	}
+	physLines := func(out string) int {
+		return strings.Count(strings.TrimRight(out, "\n"), "\n") + 1
+	}
+
+	commitSearch := func(m *Model) {
+		m.searchInput = textinput.New()
+		m.searchQuery = "svc1"
+		m.searchMatches = computeMatches(m.svcEntries, m.searchQuery)
+		m.svcCursor = m.searchMatches[0]
+	}
+	states := []struct {
+		name  string
+		setup func(m *Model)
+	}{
+		{"idle", func(m *Model) {}},
+		{"folded", func(m *Model) {
+			m.svcGroups[1].folded = true
+			m.svcEntries = rebuildSvcEntries(m.svcGroups)
+		}},
+		{"searching", func(m *Model) {
+			commitSearch(m)
+			m.searchInput.SetValue("svc1")
+			m.searchInput.Focus()
+			m.searching = true
+		}},
+		{"committed", commitSearch},
+		{"confirming", func(m *Model) {
+			m.confirming = true
+			m.selected = map[string]bool{svcKey("web", "web-svc00"): true}
+		}},
+	}
+
+	for width := 40; width <= 180; width++ {
+		var firstPhys int
+		for i, st := range states {
+			m := newModel(width)
+			st.setup(&m)
+			want := m.svcVisibleCount()
+			out := m.viewSelectContainers()
+			rows := countServiceRows(out) + countHeaderRows(out)
+			phys := physLines(out)
+
+			if rows != want {
+				t.Errorf("width=%d state=%s: rendered %d rows, svcVisibleCount()=%d (headers are rows too)",
+					width, st.name, rows, want)
+			}
+			if i == 0 {
+				firstPhys = phys
+				continue
+			}
+			if phys != firstPhys {
+				t.Errorf("width=%d state=%s: physical line count %d differs from idle %d",
+					width, st.name, phys, firstPhys)
 			}
 		}
 	}

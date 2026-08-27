@@ -30,7 +30,10 @@ type helpGroup struct {
 type helpContext struct {
 	canGoBack bool
 	readOnly  bool
-	phase     progressPhase
+	// grouped marks the host-wide container screen, where space carries a
+	// second meaning (fold a group) that the drilled screen has no row for.
+	grouped bool
+	phase   progressPhase
 }
 
 // helpGroups returns the key reference for the current screen, with the LEAVE
@@ -41,6 +44,7 @@ func (m Model) helpGroups() []helpGroup {
 	return helpGroupsFor(m.screen, helpContext{
 		canGoBack: m.canGoBack(),
 		readOnly:  m.readOnly(),
+		grouped:   m.grouped,
 		phase:     m.progressPhase(),
 	})
 }
@@ -133,6 +137,25 @@ func findGroup() helpGroup {
 		// takes the first esc — and the q that rewrites to it — as "clear",
 		// and only the next one navigates back.
 		{"esc", "clear an active search"},
+	}}
+}
+
+// selectGroup is the container screen's multi-select table. It is flagged as
+// actions for the same reason FIND is: the footer trim left `a` with no other
+// home.
+//
+// space is the one binding whose MEANING depends on the row under the cursor,
+// and only the grouped host view has the second row kind — so only there does
+// the description name both. A key bound in a sub-state must name that state,
+// and "a group header" is exactly that state.
+func selectGroup(grouped bool) helpGroup {
+	toggle := helpEntry{"space", "toggle"}
+	if grouped {
+		toggle = helpEntry{"space", "toggle a service · fold a group"}
+	}
+	return helpGroup{title: "SELECT", actions: true, entries: []helpEntry{
+		toggle,
+		{"a", "all"},
 	}}
 }
 
@@ -234,12 +257,7 @@ func helpGroupsFor(s screen, hc helpContext) []helpGroup {
 				{"↓ j", "down"},
 			}},
 			findGroup(),
-			// SELECT is flagged for the same reason FIND is: the footer trim
-			// left `a` with no other home.
-			{title: "SELECT", actions: true, entries: []helpEntry{
-				{"space", "toggle"},
-				{"a", "all"},
-			}},
+			selectGroup(hc.grouped),
 			leaveGroup(canGoBack),
 			{title: "OPERATE", actions: true, entries: []helpEntry{
 				{"d", "deploy"},

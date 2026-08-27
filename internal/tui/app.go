@@ -2217,6 +2217,31 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 				m.fixSvcOffset()
 				return m, nil
 			}
+			// space carries two meanings, decided by the ROW under the cursor:
+			// a group header folds, a service row selects. Folding is display
+			// state only — svcRefs ignores it, so a service selected before its
+			// group folded still reaches the operation.
+			entry, ok := m.cursorEntry()
+			if !ok {
+				m.fixSvcOffset()
+				return m, nil
+			}
+			if entry.kind == entrySvcGroupHeader {
+				m.svcGroups[entry.groupIdx].folded = !m.svcGroups[entry.groupIdx].folded
+				m.svcEntries = rebuildSvcEntries(m.svcGroups)
+				// searchMatches indexes svcEntries, which the rebuild
+				// renumbered — the same re-derive the grouped reload does.
+				m.searchMatches = computeMatches(m.svcEntries, m.searchQuery)
+				m.clampSvcCursor()
+				m.fixSvcOffset()
+				return m, nil
+			}
+			// An unmanaged container has no compose project to operate on, so
+			// its row draws no checkbox and space must not fill one in.
+			if m.groupUnmanaged(entry.groupIdx) {
+				m.fixSvcOffset()
+				return m, nil
+			}
 			if key := m.svcKeyAt(m.svcCursor); key != "" {
 				m.selected[key] = !m.selected[key]
 			}
@@ -2226,7 +2251,7 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 				return m, nil
 			}
 			allSel := m.allSelected()
-			for _, r := range m.svcRefs() {
+			for _, r := range m.selectableRefs() {
 				m.selected[r.key] = !allSel
 			}
 		case "r":
@@ -4659,7 +4684,7 @@ func (m Model) loadServices() tea.Cmd {
 }
 
 func (m Model) allSelected() bool {
-	refs := m.svcRefs()
+	refs := m.selectableRefs()
 	if len(refs) == 0 {
 		return false
 	}
@@ -4676,7 +4701,7 @@ func (m Model) allSelected() bool {
 // which address services by the name docker compose knows them by.
 func (m Model) selectedContainers() []string {
 	var result []string
-	for _, r := range m.svcRefs() {
+	for _, r := range m.selectableRefs() {
 		if m.selected[r.key] {
 			result = append(result, r.name)
 		}
@@ -4686,7 +4711,7 @@ func (m Model) selectedContainers() []string {
 
 func (m Model) selectedCount() int {
 	count := 0
-	for _, r := range m.svcRefs() {
+	for _, r := range m.selectableRefs() {
 		if m.selected[r.key] {
 			count++
 		}
@@ -5470,6 +5495,11 @@ func (m Model) readOnly() bool {
 // for the two inspection keys that still work. containerFooterLines and
 // containerFooter both read this one helper, so the height math and the render
 // follow the variant for free.
+//
+// The grouped host view gets a third pair. space carries two meanings there
+// (fold a group, select a service) so the token names both, and the row that
+// only grouped mode has — a group header — earns `enter drill in` the slot
+// `l logs` holds on the drilled screen. l keeps its home in the `?` overlay.
 func (m Model) containerHelpLines() (line1, line2 string) {
 	back := "q quit"
 	if m.canGoBack() {
@@ -5477,6 +5507,10 @@ func (m Model) containerHelpLines() (line1, line2 string) {
 	}
 	if m.readOnly() {
 		return fmt.Sprintf("  %s  •  ? keys", back), "  l logs  •  x exec"
+	}
+	if m.grouped {
+		return fmt.Sprintf("  space fold/select  •  %s  •  ? keys", back),
+			"  enter drill in  •  d deploy  •  r restart"
 	}
 	return fmt.Sprintf("  space toggle  •  %s  •  ? keys", back),
 		"  d deploy  •  r restart  •  l logs"
@@ -5550,14 +5584,36 @@ func (m Model) containerFooter() string {
 // the caller's). The fold marker points down on an open group and right on a
 // folded one, mirroring the convention every tree view uses.
 //
+// The aggregates are what make a FOLDED group still worth looking at: `● n up`
+// and, only when something is actually wrong, `✗ n`. A group that owns no
+// services renders a bare header — "0 up" for a project with nothing to run
+// reads as a fault it is not.
+//
 // A single group emits no header at all (rebuildSvcEntries), so this only ever
 // draws on the grouped host view.
 func (m Model) groupHeaderLine(groupIdx int) string {
+	if groupIdx < 0 || groupIdx >= len(m.svcGroups) {
+		return ""
+	}
+	g := m.svcGroups[groupIdx]
 	marker := "▼"
-	if groupIdx >= 0 && groupIdx < len(m.svcGroups) && m.svcGroups[groupIdx].folded {
+	if g.folded {
 		marker = "▶"
 	}
-	return marker + " " + m.groupProjName(groupIdx)
+	line := marker + " " + g.proj.Name
+	if len(g.services) == 0 {
+		return line
+	}
+	up, unhealthy := groupCounts(g, m.svcStatus)
+	dot := statusStoppedDot.Render("●")
+	if up > 0 {
+		dot = statusRunningDot.Render("●")
+	}
+	line += fmt.Sprintf("   %s %d up", dot, up)
+	if unhealthy > 0 {
+		line += fmt.Sprintf("  %s %d", healthUnhealthy.Render("✗"), unhealthy)
+	}
+	return line
 }
 
 func (m Model) viewSelectContainers() string {
@@ -5565,7 +5621,10 @@ func (m Model) viewSelectContainers() string {
 	readOnly := m.readOnly()
 	title := m.breadcrumb() + " > services"
 	if !readOnly {
-		title = fmt.Sprintf("%s (%d/%d selected)", title, m.selectedCount(), len(m.services))
+		// The denominator counts SELECTABLE rows, not every service: the
+		// unmanaged bucket draws no checkboxes, so counting its containers
+		// would make `a` look like it left rows behind.
+		title = fmt.Sprintf("%s (%d/%d selected)", title, m.selectedCount(), len(m.selectableRefs()))
 	}
 	b.WriteString(titleStyle.Render(title))
 
@@ -5585,6 +5644,16 @@ func (m Model) viewSelectContainers() string {
 		}
 		return b.String()
 	}
+
+	// Service rows sit 2 cells in from their group header, so the tree reads as
+	// a tree. The offset comes from hasGroupHeaders, the same predicate that
+	// decides whether headers are emitted at all — a host with exactly one
+	// project draws neither, and renders byte-identically to the drilled screen.
+	indentW := 0
+	if m.hasGroupHeaders() {
+		indentW = 2
+	}
+	indent := strings.Repeat(" ", indentW)
 
 	// Windowed rendering
 	visible := m.svcVisibleCount()
@@ -5683,7 +5752,7 @@ func (m Model) viewSelectContainers() string {
 	// Top gap: show scroll-up indicator or blank line
 	if start > 0 {
 		b.WriteString("\n")
-		b.WriteString(descStyle.Render(fmt.Sprintf("  ▲ %d more", start)))
+		b.WriteString(descStyle.Render(fmt.Sprintf("  %s▲ %d more", indent, start)))
 		b.WriteString("\n")
 	} else {
 		b.WriteString("\n\n")
@@ -5717,10 +5786,13 @@ func (m Model) viewSelectContainers() string {
 		// Left padding: cursor(2) + checkbox(3) + space(1) + health(1) + space(1) + dot(1) + space(1) = 10
 		// Read-only drops the checkbox but keeps the space that follows it: 10 - 3 = 7.
 		// Then the "Service" caption sits in the same column as service names.
+		// Grouped mode adds the service rows' 2-cell indent on top, so the
+		// caption keeps sitting exactly above the names.
 		namePad := 10
 		if readOnly {
 			namePad = 7
 		}
+		namePad += indentW
 		header := strings.Repeat(" ", namePad) + fmt.Sprintf("%-*s", maxName, "Service")
 		if maxCreated > 0 {
 			header += fmt.Sprintf("  %-*s", maxCreated, "Created")
@@ -5761,9 +5833,16 @@ func (m Model) viewSelectContainers() string {
 		// below keeps the 7-cell caption pad in lockstep.
 		checkbox := ""
 		if !readOnly {
-			checkbox = checkboxOff.Render("[ ]")
-			if m.selected[key] {
+			switch {
+			case m.groupUnmanaged(entry.groupIdx):
+				// Unmanaged rows carry no checkbox — they cannot be selected —
+				// but they keep its 3 cells so the columns stay aligned with
+				// the compose groups above and below them.
+				checkbox = "   "
+			case m.selected[key]:
 				checkbox = checkboxOn.Render("[x]")
+			default:
+				checkbox = checkboxOff.Render("[ ]")
 			}
 		}
 
@@ -5802,7 +5881,7 @@ func (m Model) viewSelectContainers() string {
 		if pad := maxName - nameWidth; pad > 0 {
 			nameCell += strings.Repeat(" ", pad)
 		}
-		line := fmt.Sprintf("%s%s %s %s %s", cursor, checkbox, health, dot, nameCell)
+		line := fmt.Sprintf("%s%s%s %s %s %s", cursor, indent, checkbox, health, dot, nameCell)
 		if maxCreated > 0 {
 			line += fmt.Sprintf("  %-*s", maxCreated, st.Created)
 		}
@@ -5830,7 +5909,7 @@ func (m Model) viewSelectContainers() string {
 	// help/confirm bar so the total line count stays constant.
 	below := len(m.svcEntries) - end
 	if below > 0 {
-		b.WriteString(descStyle.Render(fmt.Sprintf("  ▼ %d more", below)))
+		b.WriteString(descStyle.Render(fmt.Sprintf("  %s▼ %d more", indent, below)))
 		b.WriteString("\n")
 	}
 

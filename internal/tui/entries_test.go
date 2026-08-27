@@ -509,3 +509,94 @@ func TestFlattenQualified(t *testing.T) {
 		t.Errorf("flattenQualified() = %v; the two db services collided", got)
 	}
 }
+
+// groupsHaveHeaders is the single home of the header rule, and the renderer's
+// indent reads it too — so a grouped host holding exactly one project must
+// report false, or the drilled screen and the one-project host would disagree.
+func TestGroupsHaveHeaders(t *testing.T) {
+	tests := []struct {
+		name   string
+		groups []svcGroup
+		want   bool
+	}{
+		{"none", nil, false},
+		{"one", []svcGroup{{proj: compose.Project{Name: "web"}}}, false},
+		{"two", []svcGroup{{proj: compose.Project{Name: "web"}}, {proj: compose.Project{Name: "db"}}}, true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := groupsHaveHeaders(tt.groups); got != tt.want {
+				t.Errorf("groupsHaveHeaders = %v, want %v", got, tt.want)
+			}
+			m := Model{svcGroups: tt.groups}
+			if got := m.hasGroupHeaders(); got != tt.want {
+				t.Errorf("hasGroupHeaders = %v, want %v", got, tt.want)
+			}
+			// The rule and the entry model may never disagree.
+			hasHeader := false
+			for _, e := range rebuildSvcEntries(tt.groups) {
+				if e.kind == entrySvcGroupHeader {
+					hasHeader = true
+				}
+			}
+			if len(tt.groups) > 0 && hasHeader != tt.want {
+				t.Errorf("rebuildSvcEntries emitted headers = %v, want %v", hasHeader, tt.want)
+			}
+		})
+	}
+}
+
+func TestGroupCounts(t *testing.T) {
+	g := svcGroup{
+		proj:     compose.Project{Name: "web"},
+		services: []string{"api", "nginx", "cache", "gone"},
+	}
+	status := map[string]runner.ServiceStatus{
+		svcKey("web", "api"):   {Running: true},
+		svcKey("web", "nginx"): {Running: true, Health: "unhealthy"},
+		svcKey("web", "cache"): {Health: "starting"},
+		// "gone" has no entry at all — the host reports only containers that
+		// exist, and an absent one must inflate neither total.
+		svcKey("db", "api"): {Running: true},
+	}
+	up, unhealthy := groupCounts(g, status)
+	if up != 2 {
+		t.Errorf("up = %d, want 2", up)
+	}
+	if unhealthy != 1 {
+		t.Errorf("unhealthy = %d, want 1", unhealthy)
+	}
+
+	if up, unhealthy = groupCounts(g, nil); up != 0 || unhealthy != 0 {
+		t.Errorf("groupCounts with no status = (%d, %d), want (0, 0)", up, unhealthy)
+	}
+}
+
+// selectableRefs drops the unmanaged bucket: those rows draw no checkbox, so
+// nothing that reads a selection may count them.
+func TestSelectableRefs_DropsUnmanaged(t *testing.T) {
+	m := Model{svcGroups: []svcGroup{
+		{proj: compose.Project{Name: "web"}, services: []string{"api", "nginx"}},
+		{proj: compose.Project{Name: compose.UnmanagedProjectName, Unmanaged: true}, services: []string{"watchtower"}},
+	}}
+	if got := len(m.svcRefs()); got != 3 {
+		t.Fatalf("svcRefs = %d, want 3 (every service, unmanaged included)", got)
+	}
+	refs := m.selectableRefs()
+	if len(refs) != 2 {
+		t.Fatalf("selectableRefs = %v, want the two compose services", refs)
+	}
+	for _, r := range refs {
+		if r.groupIdx != 0 {
+			t.Errorf("selectableRefs kept %+v from the unmanaged bucket", r)
+		}
+	}
+	if !m.groupUnmanaged(1) {
+		t.Error("groupUnmanaged(1) = false, want true")
+	}
+	for _, gi := range []int{-1, 0, 7} {
+		if m.groupUnmanaged(gi) {
+			t.Errorf("groupUnmanaged(%d) = true, want false", gi)
+		}
+	}
+}

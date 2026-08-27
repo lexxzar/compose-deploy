@@ -43,11 +43,11 @@ func rebuildSvcEntries(groups []svcGroup) []svcEntry {
 	if len(groups) == 0 {
 		return nil
 	}
-	single := len(groups) == 1
+	headers := groupsHaveHeaders(groups)
 
 	var entries []svcEntry
 	for gi, g := range groups {
-		if !single {
+		if headers {
 			entries = append(entries, svcEntry{kind: entrySvcGroupHeader, groupIdx: gi})
 		}
 		if g.folded {
@@ -58,6 +58,40 @@ func rebuildSvcEntries(groups []svcGroup) []svcEntry {
 		}
 	}
 	return entries
+}
+
+// groupsHaveHeaders is the single home of the "does this screen draw group
+// headers" rule: more than one group. rebuildSvcEntries emits the header rows
+// off it and the renderer takes its 2-cell service indent off the same call, so
+// a host that happens to hold exactly one project renders byte-identically to
+// the drilled screen.
+func groupsHaveHeaders(groups []svcGroup) bool { return len(groups) > 1 }
+
+// hasGroupHeaders reports whether the container screen currently draws group
+// header rows. Render decisions that must follow the entry model — the service
+// indent, the caption pad, the scroll indicators — read it rather than
+// m.grouped: grouped mode with a single project emits no headers.
+func (m Model) hasGroupHeaders() bool { return groupsHaveHeaders(m.svcGroups) }
+
+// groupCounts totals one group's live state for its header row: how many of its
+// services are running, and how many report a failing healthcheck. A service
+// with no status entry counts as neither — the host-wide fetch reports only
+// containers that exist, and a project whose containers were all removed must
+// read "0 up" rather than inflate the total.
+func groupCounts(g svcGroup, status map[string]runner.ServiceStatus) (up, unhealthy int) {
+	for _, name := range g.services {
+		st, ok := status[svcKey(g.proj.Name, name)]
+		if !ok {
+			continue
+		}
+		if st.Running {
+			up++
+		}
+		if st.Health == "unhealthy" {
+			unhealthy++
+		}
+	}
+	return up, unhealthy
 }
 
 // svcKeySep separates the project half of a qualified key from the service
@@ -149,6 +183,33 @@ func (m Model) svcRefs() []svcRef {
 		}
 	}
 	return refs
+}
+
+// groupUnmanaged reports whether the group at gi is the synthetic unmanaged
+// bucket. Its rows are read-only host containers with no compose file behind
+// them, so they carry no checkbox and never enter a selection.
+func (m Model) groupUnmanaged(gi int) bool {
+	if gi < 0 || gi >= len(m.svcGroups) {
+		return false
+	}
+	return m.svcGroups[gi].proj.Unmanaged
+}
+
+// selectableRefs is svcRefs minus the unmanaged bucket. Selection feeds the
+// compose pipelines, and an unmanaged container has no compose project to run
+// one against, so `a`, allSelected and the title's denominator all read this
+// rather than svcRefs — otherwise `a` would appear to select rows whose
+// checkbox is not even drawn.
+func (m Model) selectableRefs() []svcRef {
+	refs := m.svcRefs()
+	out := refs[:0:0]
+	for _, r := range refs {
+		if m.groupUnmanaged(r.groupIdx) {
+			continue
+		}
+		out = append(out, r)
+	}
+	return out
 }
 
 // cursorEntry returns the row under the cursor. The cursor indexes svcEntries,

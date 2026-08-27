@@ -109,9 +109,16 @@ var helpKeyAliases = map[string]string{
 // covers all three progress tables instead of whichever one it happened to
 // sample.
 func helpKeyTokens(s screen, canGoBack, readOnly bool) map[string]bool {
+	return helpKeyTokensCtx(s, helpContext{canGoBack: canGoBack, readOnly: readOnly})
+}
+
+// helpKeyTokensCtx is helpKeyTokens with the whole context spelled out, for the
+// variants a bare (canGoBack, readOnly) pair cannot name.
+func helpKeyTokensCtx(s screen, hc helpContext) map[string]bool {
 	out := map[string]bool{}
 	for _, phase := range allProgressPhases {
-		for _, g := range helpGroupsFor(s, helpContext{canGoBack: canGoBack, readOnly: readOnly, phase: phase}) {
+		hc.phase = phase
+		for _, g := range helpGroupsFor(s, hc) {
 			for _, e := range g.entries {
 				for _, tok := range strings.Fields(e.keys) {
 					if alias, ok := helpKeyAliases[tok]; ok {
@@ -1642,4 +1649,75 @@ func TestHelpGroups_EscClearsQueryBeforeBack(t *testing.T) {
 			}
 		}
 	})
+}
+
+// TestHelpGroups_GroupedSelectNamesFold pins the one description that varies by
+// mode. space carries two meanings on the grouped host view — fold a group
+// header, select a service row — and a key bound in a sub-state must name that
+// state. The drilled screen has no header row, so its description must NOT
+// mention folding.
+func TestHelpGroups_GroupedSelectNamesFold(t *testing.T) {
+	selectDesc := func(grouped bool) string {
+		t.Helper()
+		for _, g := range helpGroupsFor(screenSelectContainers, helpContext{canGoBack: true, grouped: grouped}) {
+			if g.title != "SELECT" {
+				continue
+			}
+			for _, e := range g.entries {
+				if e.keys == "space" {
+					return e.desc
+				}
+			}
+		}
+		t.Fatalf("grouped=%v: no space entry in the SELECT group", grouped)
+		return ""
+	}
+
+	got := selectDesc(true)
+	for _, want := range []string{"service", "fold"} {
+		if !strings.Contains(got, want) {
+			t.Errorf("grouped space desc = %q, want it to name %q", got, want)
+		}
+	}
+	if drilled := selectDesc(false); strings.Contains(drilled, "fold") {
+		t.Errorf("drilled space desc = %q, want no mention of folding (no header rows exist there)", drilled)
+	}
+}
+
+// The grouped variant must name exactly the same KEYS as the writable table the
+// drift pin already checks against handleKey — only the description differs.
+// Comparing the two sets both ways extends that pin to grouped mode without a
+// second hand-maintained key list to drift.
+func TestHelpGroups_GroupedNamesTheSameKeys(t *testing.T) {
+	for _, canGoBack := range []bool{true, false} {
+		drilled := helpKeyTokensCtx(screenSelectContainers, helpContext{canGoBack: canGoBack})
+		grouped := helpKeyTokensCtx(screenSelectContainers, helpContext{canGoBack: canGoBack, grouped: true})
+		for k := range drilled {
+			if !grouped[k] {
+				t.Errorf("canGoBack=%v: grouped table drops bound key %q", canGoBack, k)
+			}
+		}
+		for k := range grouped {
+			if !drilled[k] {
+				t.Errorf("canGoBack=%v: grouped table names %q, which the screen does not bind", canGoBack, k)
+			}
+		}
+	}
+}
+
+// Group ORDER is load-bearing: splitHelpGroups cuts sequentially, so LEAVE must
+// stay 4th of 6 in BOTH container variants.
+func TestHelpGroups_GroupedKeepsGroupOrder(t *testing.T) {
+	want := []string{"MOVE", "FIND", "SELECT", "LEAVE", "OPERATE", "INSPECT"}
+	for _, grouped := range []bool{false, true} {
+		groups := helpGroupsFor(screenSelectContainers, helpContext{canGoBack: true, grouped: grouped})
+		if len(groups) != len(want) {
+			t.Fatalf("grouped=%v: %d groups, want %d", grouped, len(groups), len(want))
+		}
+		for i, g := range groups {
+			if g.title != want[i] {
+				t.Errorf("grouped=%v: group %d is %q, want %q", grouped, i, g.title, want[i])
+			}
+		}
+	}
 }

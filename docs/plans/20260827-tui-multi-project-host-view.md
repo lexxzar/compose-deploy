@@ -168,14 +168,21 @@ Confirmed design decisions (brainstormed and validated; do not re-litigate):
 - Modify: `internal/tui/help.go`
 - Modify: `internal/tui/help_test.go`
 - Modify: `internal/tui/footer_reservation_test.go`
+- Modify: `internal/tui/entries.go` + `_test.go` (➕ the pure row-model rules — `groupsHaveHeaders`, `groupCounts`, `groupUnmanaged`, `selectableRefs` — live beside the other row-model code, not in `app.go`)
+- Modify: `internal/tui/app_test.go` (➕ the fold/render/selection pins)
 
-- [ ] `space` on a header toggles `folded`, calls `rebuildSvcEntries` + `fixSvcOffset`; `space` on a service selects as today; `space` on an unmanaged row is a no-op with `fixSvcOffset()` first
-- [ ] header renders `▼/▶ name  ● n up  ✗ n` aggregates; service rows indent 2 cells; captions pad and scroll indicators get the offset; unmanaged rows render NO checkbox cell; `a`/`allSelected()` skip unmanaged rows; title counts selectable rows only
-- [ ] footer: decide the grouped idle pair in `containerHelpLines()`; the line COUNT stays state-independent; every line clamped with `clampToWidth` and measured with `ansi.StringWidth`
-- [ ] grouped mode refuses `d`/`r`/`s`/`R`/`c` for now (⚠️ scaffolding until Task 9 — the writable help table names keys the gate refuses for two tasks; accepted, remove in Task 9)
-- [ ] name the fold binding in `helpGroupsFor` with a description distinguishing header vs service `space`; group ORDER unchanged (LEAVE stays 4th of 6)
-- [ ] write tests: fold/unfold rebuild, aggregate counts, refusal gates, unmanaged row rendering/selection skips, footer reservation; extend `TestHelpGroups_NamesEveryBoundKey` both directions
-- [ ] run tests - must pass before task 8
+⚠️ Deviations:
+- The indent and the header rows key off `hasGroupHeaders()` (`len(svcGroups) > 1`), NOT `m.grouped`. `rebuildSvcEntries` already emits no header for a single group, so a grouped host that happens to hold ONE project would otherwise indent rows under a header that does not exist. One predicate now feeds both the entry model and the renderer.
+- The grouped idle footer pair names the END-STATE keys (`enter drill in`, `d deploy`, `r restart`), which Tasks 8-9 make live. This is the same accepted scaffolding the checkbox below grants the writable help table, kept consistent so the footer is decided once rather than rewritten in each of the next two tasks.
+- `selectedCount`/`selectedContainers` moved to `selectableRefs()` alongside `allSelected()`/`a`. An unmanaged key can never enter `m.selected`, so this changes no behaviour — it keeps every selection read on one predicate.
+
+- [x] `space` on a header toggles `folded`, calls `rebuildSvcEntries` + `fixSvcOffset`; `space` on a service selects as today; `space` on an unmanaged row is a no-op with `fixSvcOffset()` first
+- [x] header renders `▼/▶ name  ● n up  ✗ n` aggregates; service rows indent 2 cells; captions pad and scroll indicators get the offset; unmanaged rows render NO checkbox cell; `a`/`allSelected()` skip unmanaged rows; title counts selectable rows only
+- [x] footer: decide the grouped idle pair in `containerHelpLines()`; the line COUNT stays state-independent; every line clamped with `clampToWidth` and measured with `ansi.StringWidth`
+- [x] grouped mode refuses `d`/`r`/`s`/`R`/`c` for now (⚠️ scaffolding until Task 9 — the writable help table names keys the gate refuses for two tasks; accepted, remove in Task 9) — landed in Task 6; pinned by `TestGroupedScreen_RefusesComposerBoundKeys`
+- [x] name the fold binding in `helpGroupsFor` with a description distinguishing header vs service `space`; group ORDER unchanged (LEAVE stays 4th of 6)
+- [x] write tests: fold/unfold rebuild, aggregate counts, refusal gates, unmanaged row rendering/selection skips, footer reservation; extend `TestHelpGroups_NamesEveryBoundKey` both directions (➕ done via `TestHelpGroups_GroupedNamesTheSameKeys`, which compares the grouped token set against the already-pinned writable one in both directions — no second hand-maintained key list to drift)
+- [x] run tests - must pass before task 8
 
 ### Task 8: Drill-in, drill-out, and action-time composer (phase 2)
 
