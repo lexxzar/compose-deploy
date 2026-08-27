@@ -137,6 +137,9 @@ func helpKeyTokensCtx(s screen, hc helpContext) map[string]bool {
 func TestHelpGroups_NamesEveryBoundKey(t *testing.T) {
 	bound := map[screen][]string{
 		screenSelectServer: {"q", "ctrl+c", "up", "k", "down", "j", "enter", "s"},
+		// The named variant is the DRILLED one (see the helpKeyTokens call
+		// below), so the grouped-only fold keys — z, Z, ← and → — are not in
+		// this set; TestHelpGroups_GroupedNamesTheSameKeys pins those.
 		screenSelectContainers: {
 			"q", "ctrl+c", "esc", "enter", "up", "k", "down", "j", " ", "a",
 			"r", "d", "s", "R", "n", "N", "/", "l", "c", "x", "U", "i",
@@ -1690,11 +1693,14 @@ func TestHelpGroups_GroupedSelectNamesFold(t *testing.T) {
 	}
 }
 
-// The grouped variant must name exactly the same KEYS as the writable table the
-// drift pin already checks against handleKey — only the description differs.
-// Comparing the two sets both ways extends that pin to grouped mode without a
-// second hand-maintained key list to drift.
+// The grouped variant must name every key the writable table names — that half
+// rides the drift pin already checked against handleKey — plus exactly the fold
+// keys the grouped host view binds and the drilled screen does not. Those four
+// are the one hand-maintained list here; both directions run against it, so a
+// grouped-only key added to the table without a binding (or bound without a
+// row) still fails.
 func TestHelpGroups_GroupedNamesTheSameKeys(t *testing.T) {
+	groupedOnly := map[string]bool{"z": true, "Z": true, "left": true, "right": true}
 	for _, canGoBack := range []bool{true, false} {
 		drilled := helpKeyTokensCtx(screenSelectContainers, helpContext{canGoBack: canGoBack})
 		grouped := helpKeyTokensCtx(screenSelectContainers, helpContext{canGoBack: canGoBack, grouped: true})
@@ -1704,8 +1710,16 @@ func TestHelpGroups_GroupedNamesTheSameKeys(t *testing.T) {
 			}
 		}
 		for k := range grouped {
-			if !drilled[k] {
+			if !drilled[k] && !groupedOnly[k] {
 				t.Errorf("canGoBack=%v: grouped table names %q, which the screen does not bind", canGoBack, k)
+			}
+		}
+		for k := range groupedOnly {
+			if !grouped[k] {
+				t.Errorf("canGoBack=%v: grouped table drops grouped-only key %q", canGoBack, k)
+			}
+			if drilled[k] {
+				t.Errorf("canGoBack=%v: drilled table names grouped-only key %q", canGoBack, k)
 			}
 		}
 	}

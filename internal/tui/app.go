@@ -385,6 +385,15 @@ type Model struct {
 	// autoUpdatesAllowed all branch on it.
 	grouped bool
 
+	// groupFoldPending arms the one-shot "land folded" fold. Every landing
+	// site goes through enterGroupedContainers, which sets it; the FIRST
+	// grouped payload that installs rows consumes it and clears it again.
+	// The one-shot is the whole point: that same branch is the 5-second
+	// reload, which must preserve the folds the user opened, so a flat "fold
+	// on a grouped payload" would re-fold the screen every tick. Drill-out
+	// lands through the same body and re-folds on purpose.
+	groupFoldPending bool
+
 	// svcStatus and stats are keyed by the QUALIFIED key svcKey produces, not
 	// by the bare service name a Composer returns: two projects on one host
 	// routinely both own a "db", and a bare key would let one overwrite the
@@ -1165,6 +1174,9 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			// every row; restoreCursorRow puts it back on the same row below.
 			cursorID := m.cursorRowID()
 			m.setGroups(buildSvcGroups(msg.projects, msg.hostStatus, m.svcGroups))
+			// Before anything below re-derives from the rows: a fold
+			// renumbers every one of them.
+			m.applyPendingGroupFold()
 			m.svcStatus = flattenQualified(msg.hostStatus)
 			// The fresh status map carries no verdicts, and this branch is the
 			// 5-second refresh as well as the initial load — without the replay
@@ -2547,13 +2559,7 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 				return m, nil
 			}
 			if entry.kind == entrySvcGroupHeader {
-				m.svcGroups[entry.groupIdx].folded = !m.svcGroups[entry.groupIdx].folded
-				m.svcEntries = rebuildSvcEntries(m.svcGroups)
-				// searchMatches indexes svcEntries, which the rebuild
-				// renumbered — the same re-derive the grouped reload does.
-				m.searchMatches = computeMatches(m.svcEntries, m.searchQuery)
-				m.clampSvcCursor()
-				m.fixSvcOffset()
+				m.foldGroupAt(entry.groupIdx, !m.svcGroups[entry.groupIdx].folded)
 				return m, nil
 			}
 			// An unmanaged container has no compose project to operate on, so
@@ -2565,6 +2571,38 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			if key := m.svcKeyAt(m.svcCursor); key != "" {
 				m.selected[key] = !m.selected[key]
 			}
+		case "z", "left", "right":
+			// The fold keys act on the cursor's GROUP, from a service row as
+			// well as from its header — space folds only from the header, and
+			// twenty rows into a project that means scrolling back up to close
+			// it. Grouped-only: the drilled screen is one group and draws no
+			// header to fold.
+			if m.readOnly() || !m.grouped {
+				m.fixSvcOffset()
+				return m, nil
+			}
+			gi, ok := m.cursorGroupIdx()
+			if !ok {
+				m.fixSvcOffset()
+				return m, nil
+			}
+			// z toggles; the arrows are directional.
+			folded := !m.svcGroups[gi].folded
+			switch key {
+			case "left":
+				folded = true
+			case "right":
+				folded = false
+			}
+			m.foldGroupAt(gi, folded)
+			return m, nil
+		case "Z":
+			if m.readOnly() || !m.grouped {
+				m.fixSvcOffset()
+				return m, nil
+			}
+			m.foldAllGroups(m.anyGroupUnfolded())
+			return m, nil
 		case "a":
 			if m.readOnly() {
 				m.fixSvcOffset()
@@ -6097,6 +6135,12 @@ func (m *Model) enterGroupedContainers() tea.Cmd {
 	m.projDir = ""
 	m.drilledFromHost = false
 	m.clearContainerScreen()
+	// Land folded. The header aggregates ARE the host summary, and on a host
+	// running ten projects an unfolded landing buries them under ninety rows.
+	// Set here rather than applied here because clearContainerScreen just
+	// nilled the rows: the first grouped payload folds and clears the flag.
+	// Drill-out lands through this body too, and re-folding there is intended.
+	m.groupFoldPending = true
 	m.confirming = false
 	m.pendingExec = false
 	m.warning = ""
@@ -6407,6 +6451,93 @@ func (m *Model) clampSvcCursor() {
 	}
 	if m.svcCursor < 0 {
 		m.svcCursor = 0
+	}
+}
+
+// applyPendingGroupFold folds every group once per landing on the grouped host
+// view, then clears the flag whether or not it folded — a host that later gains
+// a second project must not fold under an ordinary 5-second reload.
+//
+// A LONE group is left open on purpose: folding it leaves one header row and
+// nothing else on screen, which is a worse first frame than the rows it hides.
+//
+// setGroups already built the entries from the unfolded state, so the fold has
+// to rebuild them again.
+func (m *Model) applyPendingGroupFold() {
+	if !m.groupFoldPending {
+		return
+	}
+	m.groupFoldPending = false
+	if len(m.svcGroups) < 2 {
+		return
+	}
+	for i := range m.svcGroups {
+		m.svcGroups[i].folded = true
+	}
+	m.svcEntries = rebuildSvcEntries(m.svcGroups)
+}
+
+// foldGroupAt sets one group's fold state and settles what the rebuild
+// invalidates. Every fold key goes through it — space on a header, z, ← and →
+// — so the five-step sequence has one home.
+//
+// A fold that changes nothing settles nothing: ← and → are directional, so
+// they land on an already-folded (already-open) group routinely, and re-aiming
+// the cursor at the header there would move it for a keypress that did not
+// change the screen.
+func (m *Model) foldGroupAt(gi int, folded bool) {
+	if gi < 0 || gi >= len(m.svcGroups) || m.svcGroups[gi].folded == folded {
+		m.fixSvcOffset()
+		return
+	}
+	m.svcGroups[gi].folded = folded
+	m.settleFold(gi)
+}
+
+// foldAllGroups is Z: one key with the shape `a` already uses for the
+// selection — any group open means fold, otherwise unfold.
+func (m *Model) foldAllGroups(folded bool) {
+	aim := -1
+	if gi, ok := m.cursorGroupIdx(); ok {
+		aim = gi
+	}
+	for i := range m.svcGroups {
+		m.svcGroups[i].folded = folded
+	}
+	m.settleFold(aim)
+}
+
+// anyGroupUnfolded is the predicate behind Z's single meaning.
+func (m Model) anyGroupUnfolded() bool {
+	for _, g := range m.svcGroups {
+		if !g.folded {
+			return true
+		}
+	}
+	return false
+}
+
+// settleFold rebuilds the rows a fold renumbered and re-anchors everything that
+// indexes them: searchMatches holds ROW indices, and the row under the cursor is
+// gone whenever a group closes from one of its service rows.
+func (m *Model) settleFold(aimGroup int) {
+	m.svcEntries = rebuildSvcEntries(m.svcGroups)
+	m.searchMatches = computeMatches(m.svcEntries, m.searchQuery)
+	m.aimCursorAtGroupHeader(aimGroup)
+	m.clampSvcCursor()
+	m.fixSvcOffset()
+}
+
+// aimCursorAtGroupHeader puts the cursor on the group's own header, the row the
+// user is still looking at once its services are hidden. A miss is a real
+// state, not a bug — a lone unfolded group emits no header (groupsHaveHeaders)
+// — so the clamp that follows settles it instead.
+func (m *Model) aimCursorAtGroupHeader(gi int) {
+	for i, e := range m.svcEntries {
+		if e.kind == entrySvcGroupHeader && e.groupIdx == gi {
+			m.svcCursor = i
+			return
+		}
 	}
 }
 

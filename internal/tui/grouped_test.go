@@ -1376,8 +1376,13 @@ func groupedScreenModel(groups ...svcGroup) Model {
 // of pressKey (help_test.go), because space arrives as its own tea.KeyType.
 func pressGroupKey(m Model, key string) Model {
 	msg := tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune(key)}
-	if key == " " {
+	switch key {
+	case " ":
 		msg = tea.KeyMsg{Type: tea.KeySpace}
+	case "left":
+		msg = tea.KeyMsg{Type: tea.KeyLeft}
+	case "right":
+		msg = tea.KeyMsg{Type: tea.KeyRight}
 	}
 	updated, _ := m.Update(msg)
 	return updated.(Model)
@@ -1463,6 +1468,276 @@ func TestGroupedSpace_OnUnmanagedRowIsNoOp(t *testing.T) {
 	}
 	if m.svcGroups[1].folded {
 		t.Error("space on an unmanaged SERVICE row folded its group")
+	}
+}
+
+// foldedCount is the fold state of the whole screen in one number, for the
+// tests that assert on all of it.
+func foldedCount(m Model) int {
+	n := 0
+	for _, g := range m.svcGroups {
+		if g.folded {
+			n++
+		}
+	}
+	return n
+}
+
+// groupedLanding drives a real landing: enterGroupedContainers arms the
+// one-shot fold, and the load batch it returns carries the payload that
+// consumes it.
+func groupedLanding(t *testing.T, m Model) Model {
+	t.Helper()
+	cmd := m.enterGroupedContainers()
+	if cmd == nil {
+		t.Fatal("enterGroupedContainers() returned no load batch")
+	}
+	updated, _ := m.Update(cmd())
+	return updated.(Model)
+}
+
+// A host running several projects lands FOLDED: the header aggregates are the
+// host summary, and ten projects of eight services bury them under ninety rows.
+func TestGroupedLanding_MultipleGroupsArriveFolded(t *testing.T) {
+	g, projects := groupedFixture()
+	m := groupedLanding(t, groupedTestModel(g, projects))
+
+	if len(m.svcGroups) != 3 {
+		t.Fatalf("landed with %d groups, want 3", len(m.svcGroups))
+	}
+	if got := foldedCount(m); got != 3 {
+		t.Errorf("%d of 3 groups folded on landing", got)
+	}
+	if got := len(m.svcEntries); got != 3 {
+		t.Errorf("row count = %d, want 3 (one header per folded group)", got)
+	}
+}
+
+// A single-project host lands OPEN. Folding it would leave one header row and
+// nothing else on screen, which hides the whole host to summarise one project.
+func TestGroupedLanding_SingleGroupArrivesOpen(t *testing.T) {
+	g := &mockGrouper{groupedStatus: map[string]map[string]runner.ServiceStatus{
+		"blog": {"web": {Running: true}, "api": {}},
+	}}
+	projects := []compose.Project{{Name: "blog", ConfigDir: "/srv/blog"}}
+	m := groupedLanding(t, groupedTestModel(g, projects))
+
+	if len(m.svcGroups) != 1 {
+		t.Fatalf("landed with %d groups, want 1", len(m.svcGroups))
+	}
+	if m.svcGroups[0].folded {
+		t.Fatal("a lone group must land open; folded it shows one header and no rows")
+	}
+	if got := len(m.svcEntries); got != 2 {
+		t.Errorf("row count = %d, want 2 (the group's services, no header)", got)
+	}
+}
+
+// The fold is ONE-SHOT. The grouped servicesMsg branch is also the 5-second
+// reload, so a group the user opened must stay open across every later payload.
+func TestGroupedLanding_FoldFiresOnceNotOnEveryReload(t *testing.T) {
+	g, projects := groupedFixture()
+	m := groupedLanding(t, groupedTestModel(g, projects))
+	if m.groupFoldPending {
+		t.Fatal("the landing payload must consume the one-shot")
+	}
+
+	m.svcCursor = 0
+	m = pressGroupKey(m, "right")
+	if m.svcGroups[0].folded {
+		t.Fatal("precondition: the user opened the first group")
+	}
+
+	updated, _ := m.Update(m.loadGroups()())
+	m = updated.(Model)
+
+	if m.svcGroups[0].folded {
+		t.Error("the 5-second reload re-folded a group the user opened")
+	}
+	if got := foldedCount(m); got != 2 {
+		t.Errorf("%d groups folded after the reload, want 2 (the two untouched ones)", got)
+	}
+}
+
+// The flag is cleared whether or not it folded, so a host that GAINS a second
+// project does not fold under an ordinary reload.
+func TestGroupedLanding_SingleGroupHostDoesNotFoldWhenItGrows(t *testing.T) {
+	g := &mockGrouper{groupedStatus: map[string]map[string]runner.ServiceStatus{
+		"blog": {"web": {Running: true}},
+	}}
+	projects := []compose.Project{{Name: "blog", ConfigDir: "/srv/blog"}}
+	m := groupedTestModel(g, projects)
+	m = groupedLanding(t, m)
+
+	g.groupedStatus["shop"] = map[string]runner.ServiceStatus{"api": {Running: true}}
+	m.projectLoader = func(ctx context.Context) ([]compose.Project, error) {
+		return []compose.Project{{Name: "blog", ConfigDir: "/srv/blog"}, {Name: "shop", ConfigDir: "/srv/shop"}}, nil
+	}
+	updated, _ := m.Update(m.loadGroups()())
+	m = updated.(Model)
+
+	if got := foldedCount(m); got != 0 {
+		t.Errorf("%d groups folded on a plain reload; the one-shot was already spent", got)
+	}
+}
+
+// Drill-out lands through enterGroupedContainers like every other entry, so it
+// re-folds — that is the intent, not a side effect.
+func TestGroupedLanding_DrillOutRefolds(t *testing.T) {
+	m, _ := drillTestModel(t)
+	m.svcCursor = 2 // the shop header
+	updated, _ := m.Update(keyMsgFor("enter"))
+	m = updated.(Model)
+	if m.grouped {
+		t.Fatal("precondition: drill-in should have left grouped mode")
+	}
+
+	updated, cmd := m.Update(tea.KeyMsg{Type: tea.KeyEsc})
+	m = updated.(Model)
+	if cmd == nil {
+		t.Fatal("drill-out must reload the host view")
+	}
+	updated, _ = m.Update(cmd())
+	m = updated.(Model)
+
+	if got := foldedCount(m); got != len(m.svcGroups) || len(m.svcGroups) != 3 {
+		t.Errorf("%d of %d groups folded after drill-out, want all 3", got, len(m.svcGroups))
+	}
+}
+
+// z folds from a SERVICE row, which is the whole point: space folds only from
+// the header, twenty rows above. The cursor lands on the header, because the
+// row it sat on is gone.
+func TestGroupedFold_ZFoldsFromAServiceRow(t *testing.T) {
+	m := groupedScreenModel(svcGroupOf("web", "api", "nginx"), svcGroupOf("db", "postgres"))
+	m.selected[svcKey("web", "nginx")] = true
+	m.svcCursor = 2 // the "nginx" row, inside the web group
+
+	m = pressGroupKey(m, "z")
+
+	if !m.svcGroups[0].folded {
+		t.Fatal("z on a service row did not fold its group")
+	}
+	if m.svcCursor != 0 {
+		t.Errorf("svcCursor = %d, want 0 (the folded group's own header)", m.svcCursor)
+	}
+	if !m.selected[svcKey("web", "nginx")] {
+		t.Error("folding dropped the selection; it hides rows, not services")
+	}
+
+	m = pressGroupKey(m, "z")
+	if m.svcGroups[0].folded {
+		t.Error("a second z did not unfold the group")
+	}
+}
+
+// Z is one key with the shape `a` already uses: any group open means fold all,
+// otherwise unfold all.
+func TestGroupedFold_ZAllTogglesEveryGroup(t *testing.T) {
+	m := groupedScreenModel(svcGroupOf("web", "api"), svcGroupOf("db", "postgres"), unmanagedGroupOf("watchtower"))
+	m.svcGroups[1].folded = true
+	m.setGroups(m.svcGroups)
+	m.svcCursor = 1 // the "api" row
+
+	m = pressGroupKey(m, "Z")
+	if got := foldedCount(m); got != 3 {
+		t.Fatalf("%d of 3 groups folded, want all — one open group means fold all", got)
+	}
+	if m.svcCursor != 0 {
+		t.Errorf("svcCursor = %d, want 0 (the cursor group's header)", m.svcCursor)
+	}
+
+	m = pressGroupKey(m, "Z")
+	if got := foldedCount(m); got != 0 {
+		t.Errorf("%d groups still folded, want 0 — all closed means unfold all", got)
+	}
+}
+
+// ← and → are directional and idempotent, unlike z.
+func TestGroupedFold_ArrowsAreDirectional(t *testing.T) {
+	m := groupedScreenModel(svcGroupOf("web", "api", "nginx"), svcGroupOf("db", "postgres"))
+	m.svcCursor = 2 // the "nginx" row
+
+	m = pressGroupKey(m, "left")
+	if !m.svcGroups[0].folded {
+		t.Fatal("left did not fold the cursor's group")
+	}
+	m = pressGroupKey(m, "left")
+	if !m.svcGroups[0].folded {
+		t.Error("a second left unfolded the group; left only ever folds")
+	}
+
+	m = pressGroupKey(m, "right")
+	if m.svcGroups[0].folded {
+		t.Fatal("right did not unfold the group")
+	}
+	m = pressGroupKey(m, "right")
+	if m.svcGroups[0].folded {
+		t.Error("a second right folded the group; right only ever unfolds")
+	}
+	if m.svcGroups[1].folded {
+		t.Error("the arrows touched a group the cursor was not in")
+	}
+
+	// A no-op fold must not move the cursor either: right lands on an open
+	// group routinely, and re-aiming at the header there is not a no-op.
+	m.svcCursor = 2 // the "nginx" row again
+	m = pressGroupKey(m, "right")
+	if m.svcCursor != 2 {
+		t.Errorf("svcCursor = %d after a no-op right, want 2", m.svcCursor)
+	}
+}
+
+// The fold keys are grouped-only and write-only: the drilled screen has one
+// group and no header to fold, and a read-only host must advertise no no-op.
+func TestGroupedFold_KeysAreInertDrilledAndReadOnly(t *testing.T) {
+	keys := []string{"z", "Z", "left", "right"}
+
+	for _, key := range keys {
+		m := singleGroupModel([]string{"api", "web"})
+		m.screen = screenSelectContainers
+		m.width, m.height = 100, 30
+
+		m = pressGroupKey(m, key)
+		if m.svcGroups[0].folded || len(m.svcEntries) != 2 {
+			t.Errorf("drilled %q: folded=%v rows=%d, want false/2", key, m.svcGroups[0].folded, len(m.svcEntries))
+		}
+	}
+
+	for _, key := range keys {
+		m := groupedScreenModel(unmanagedGroupOf("watchtower", "portainer"))
+		if !m.readOnly() {
+			t.Fatal("precondition: an unmanaged-only host reads as read-only")
+		}
+
+		m = pressGroupKey(m, key)
+		if m.svcGroups[0].folded {
+			t.Errorf("read-only %q folded the unmanaged bucket", key)
+		}
+	}
+}
+
+// A fold renumbers every row, and searchMatches holds ROW indices — the new
+// keys owe the same re-derive the space path already does.
+func TestGroupedFold_KeysRecomputeSearchMatches(t *testing.T) {
+	for _, key := range []string{"z", "Z", "left"} {
+		m := groupedScreenModel(svcGroupOf("web", "api", "nginx"), svcGroupOf("db", "api-db"))
+		m.searchQuery = "api"
+		m.searchMatches = computeMatches(m.svcEntries, m.searchQuery)
+		if want := []int{1, 4}; !slices.Equal(m.searchMatches, want) {
+			t.Fatalf("%q: pre-fold matches = %v, want %v", key, m.searchMatches, want)
+		}
+		m.svcCursor = 1 // the "api" row, inside the web group
+
+		m = pressGroupKey(m, key)
+
+		want := []int{2}
+		if key == "Z" {
+			want = nil
+		}
+		if !slices.Equal(m.searchMatches, want) {
+			t.Errorf("%q: post-fold matches = %v, want %v", key, m.searchMatches, want)
+		}
 	}
 }
 

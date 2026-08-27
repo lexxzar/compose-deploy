@@ -298,6 +298,16 @@ func (m Model) cursorGroup() (svcGroup, bool) {
 	return m.svcGroups[e.groupIdx], true
 }
 
+// cursorGroupIdx is cursorGroup by INDEX, for the fold keys: they WRITE the
+// group's fold state, and cursorGroup hands back a copy of the struct.
+func (m Model) cursorGroupIdx() (int, bool) {
+	e, ok := m.cursorEntry()
+	if !ok || e.groupIdx < 0 || e.groupIdx >= len(m.svcGroups) {
+		return 0, false
+	}
+	return e.groupIdx, true
+}
+
 // groupCounts totals one group's live state for its header row: how many of its
 // services are running, how many report a failing healthcheck, and how many have
 // an image update waiting. A service with no status entry counts as none of the

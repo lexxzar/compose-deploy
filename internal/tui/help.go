@@ -168,6 +168,11 @@ func findGroup() helpGroup {
 // the description name both. A key bound in a sub-state must name that state,
 // and "a group header" is exactly that state.
 //
+// z, Z and the arrows are grouped-only for the same reason space's second
+// meaning is: the drilled screen is one group and draws no header to fold.
+// They live here and in no footer — the grouped idle pair already carries six
+// tokens.
+//
 // enter joins the group in grouped mode and carries BOTH its meanings on that
 // one row, the way inspectGroup's read-only enter does: the drill-in is
 // grouped-mode-only, the confirmation is not, and one key cannot occupy two
@@ -180,6 +185,9 @@ func selectGroup(grouped bool) helpGroup {
 		return helpGroup{title: "SELECT", actions: true, entries: []helpEntry{
 			{"space", "toggle a service · fold a group"},
 			{"a", "all"},
+			{"z", "fold or unfold the group"},
+			{"← →", "fold · unfold the group"},
+			{"Z", "fold or unfold every group"},
 			{"enter", "drill into the project · confirm the prompt"},
 		}}
 	}
