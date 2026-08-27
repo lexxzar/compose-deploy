@@ -329,7 +329,7 @@ func groupCounts(g svcGroup, status map[string]runner.ServiceStatus) (up, unheal
 }
 
 // buildSvcGroups folds the grouped payload — the project list from the
-// ProjectLoader and the host-wide status map from GroupHost — into the row
+// ProjectLoader and the host-wide status map from GroupHostStatus — into the row
 // model.
 //
 // Project ORDER comes from the loader, not from the status map: the loader

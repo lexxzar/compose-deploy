@@ -144,11 +144,13 @@ type RollbackPreparer interface {
 // container screen costs a constant number of round-trips instead of one per
 // project.
 //
-// The two halves arrive in ONE call rather than two methods. Split, each half
-// had to list the containers itself, so a single 5-second refresh tick issued
-// the same `docker ps` twice — a doubled SSH round-trip for a byte-identical
-// answer. The snapshot carries the stats half's own error, so a stats failure
-// still degrades to a soft warning beside live rows.
+// TWO methods over ONE listing. The status half hands back an opaque
+// compose.HostEntries that the stats half consumes, so the pair still lists the
+// containers once — but the rows paint as soon as `docker ps` returns instead
+// of waiting on `docker stats --no-stream`, which costs ~2s on a real daemon
+// and used to sit in front of every first paint and every 5-second refresh.
+// The stats half's error is its own for the same reason: it degrades to a soft
+// warning beside live rows, while a status failure leaves no screen at all.
 //
 // Declared here and type-asserted on the concrete composer, exactly like
 // Inspector and UpdateDetailer, so runner.Composer and its five mocks stay
@@ -160,7 +162,8 @@ type RollbackPreparer interface {
 // A factory that cannot produce one (a test mock) simply yields no grouped
 // data: the screen renders the projects the loader found with no status.
 type HostGrouper interface {
-	GroupHost(ctx context.Context) (compose.GroupedHostSnapshot, error)
+	GroupHostStatus(ctx context.Context) (compose.GroupedHostSnapshot, error)
+	GroupHostStats(ctx context.Context, entries compose.HostEntries) (map[string]map[string]runner.ServiceStats, error)
 }
 
 // ReadOnlyComposer marks a composer whose write methods refuse. The method is
@@ -629,16 +632,16 @@ type servicesMsg struct {
 	services []string
 	status   map[string]runner.ServiceStatus
 
-	// The GROUPED shape carries the stats half too: one host-wide read serves
-	// both, so splitting them across two messages would cost a second
-	// `docker ps`. statsErr is separate from err for the same reason the
-	// snapshot keeps them apart — a stats failure is a soft warning, a status
-	// failure leaves no screen at all.
+	// The GROUPED shape carries the LISTING its status half was folded from,
+	// not the stats. The CPU/Mem join is chained off this message rather than
+	// batched beside it — one host-wide `docker ps` still serves both, but the
+	// rows no longer wait on the ~2s `docker stats --no-stream`. hostEntries is
+	// what groupedStatsCmd consumes; it is a zero value on every failure path
+	// and whenever no HostGrouper was reachable.
 	groupedPayload bool
 	projects       []compose.Project
 	hostStatus     map[string]map[string]runner.ServiceStatus
-	hostStats      map[string]map[string]runner.ServiceStats
-	statsErr       error
+	hostEntries    compose.HostEntries
 
 	err     error
 	session uint64 // reuses m.statusSession: loadServices fetches both list + initial status, so it lives in the same context lifecycle as refreshStatus
@@ -970,7 +973,9 @@ func NewModel(composer runner.Composer, logWriter io.Writer, factory ComposerFac
 		m.screen = screenSelectContainers
 		m.grouped = true
 		m.statsRequested = true
-		m.refreshInFlight = true // Init() will fire loadGroups, which carries the stats half
+		// Init() will fire loadGroups; its servicesMsg either clears the flag or
+		// re-arms it for the stats half it chains.
+		m.refreshInFlight = true
 		// Grouped mode never scans automatically (autoUpdatesAllowed is false
 		// there), so the flag must start clear or the first U would be refused
 		// by a guard with no fetch behind it.
@@ -1095,12 +1100,15 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// statusSession is intentional — loadServices is the initial-fetch sibling
 		// of refreshStatus and lives in the same lifecycle.
 		if msg.groupedPayload && msg.session == m.statusSession {
-			// The grouped fetch carries the stats half, so it is also the
-			// arrival that clears the fetch-stacking guard — and it must do so
-			// BEFORE the screen check, exactly as statsMsg does. A response
-			// that lands while the user is on the logs/config/progress screen
-			// would otherwise leave the flag stuck at true and silence the
-			// periodic refresh for the rest of the visit.
+			// The grouped fetch is TWO messages — rows here, CPU/Mem in the
+			// statsMsg the accepted-payload branch below chains — so the guard
+			// is settled in two steps. Clear it FIRST, unconditionally, exactly
+			// as statsMsg does and BEFORE the screen check: a response that
+			// lands while the user is on the logs/config/progress screen, or
+			// under an armed prompt, ends the cycle here, and leaving the flag
+			// set would silence the periodic refresh for the rest of the visit.
+			// The one branch that continues the cycle re-arms it together with
+			// the Cmd that clears it again.
 			m.refreshInFlight = false
 		}
 		if m.screen != screenSelectContainers || msg.session != m.statusSession {
@@ -1147,18 +1155,10 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			cursorID := m.cursorRowID()
 			m.setGroups(buildSvcGroups(msg.projects, msg.hostStatus, m.svcGroups))
 			m.svcStatus = flattenQualified(msg.hostStatus)
-			// The stats half rides the same message and fails on its own: a
-			// stats outage is a soft warning beside live rows, never a reason
-			// to lose the list. m.stats is cleared alongside the error so the
-			// screen never shows stale CPU/Mem cells next to "stats
-			// unavailable" — the same rule the drilled statsMsg branch keeps.
-			if msg.statsErr != nil {
-				m.statsErr = msg.statsErr
-				m.stats = nil
-			} else {
-				m.statsErr = nil
-				m.stats = flattenQualified(msg.hostStats)
-			}
+			// m.stats and m.statsErr are deliberately NOT touched here: the
+			// chained statsMsg owns both, and the previous cycle's cells are
+			// what the rows carry until it lands.
+
 			// The fresh status map carries no verdicts, and this branch is the
 			// 5-second refresh as well as the initial load — without the replay
 			// every glyph a U scan painted would vanish on the next tick, and
@@ -1175,6 +1175,16 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			// searchMatches indexes svcEntries, which the rebuild renumbered.
 			m.searchMatches = computeMatches(m.svcEntries, m.searchQuery)
 			m.fixSvcOffset()
+			// Chain the stats half off the listing this payload came from. This
+			// is the ONE site that sets refreshInFlight outside a fetch
+			// dispatch, and it is safe for exactly one reason: it is paired
+			// with the Cmd whose statsMsg clears the flag again, and that
+			// message always arrives. Every other path out of this handler
+			// leaves the clear above standing, so the guard cannot latch.
+			if cmd := m.groupedStatsCmd(msg.hostEntries); cmd != nil {
+				m.refreshInFlight = true
+				return m, cmd
+			}
 			return m, nil
 		}
 		m.setSingleGroup(sortServices(msg.services))
@@ -5020,28 +5030,31 @@ func (m Model) hostGrouper() HostGrouper {
 	return hg
 }
 
-// loadGroups is the grouped screen's WHOLE fetch: the ProjectLoader for the
-// project list and ORDER, plus one host-wide GroupHost for every container's
-// state AND its CPU/memory. It reuses statusSession because it is loadServices'
+// loadGroups is the grouped screen's ROW fetch: the ProjectLoader for the
+// project list and ORDER, plus one host-wide GroupHostStatus for every
+// container's state. It reuses statusSession because it is loadServices'
 // grouped counterpart — same lifecycle, same context changes, same staleness
 // rule.
 //
-// Status and stats travel in one message because they come from one read. A
-// separate grouped stats Cmd had to list the containers again, so every
-// 5-second tick paid a second `docker ps` over the same SSH hop.
+// It does NOT fetch CPU/memory. The listing GroupHostStatus made rides along in
+// hostEntries and the servicesMsg handler chains groupedStatsCmd off it, so the
+// pair still costs ONE `docker ps` while the rows paint without waiting on
+// `docker stats --no-stream` — a ~2s host-wide call that, folded in here, sat
+// in front of the first painted row and in front of every 5-second refresh.
 //
 // A loader failure and a host-ps failure both land in svcErr: neither leaves a
 // usable screen, so both are the primary error. The stats half fails
-// independently into statsErr, carried on the same message.
+// independently into statsErr, on its own message.
 //
 // A factory with no HostGrouper behind it (a test mock) reports no host data
 // rather than an error: the projects the loader found still render.
 //
 // EVERY return — the failures included — carries groupedPayload. The flag is
-// the message's SHAPE, not its success, and in grouped mode this message is the
-// only arrival that clears refreshInFlight (statsRefreshCmd is nil there, so no
-// statsMsg ever comes). An error return that dropped the flag latched the guard
-// true for the rest of the visit and silenced the 5-second refresh, so a single
+// the message's SHAPE, not its success, and this message is where the grouped
+// refreshInFlight guard is settled: it clears the flag before the screen check
+// and re-arms it only when it chains the stats half. An error return that
+// dropped the flag never reached that clear, latching the guard true for the
+// rest of the visit and silencing the 5-second refresh, so a single
 // `docker compose ls` hiccup froze the host view on its error line with no
 // self-heal path.
 func (m Model) loadGroups() tea.Cmd {
@@ -5060,7 +5073,7 @@ func (m Model) loadGroups() tea.Cmd {
 		if hg == nil {
 			return servicesMsg{groupedPayload: true, projects: projects, session: session}
 		}
-		snap, err := hg.GroupHost(ctx)
+		snap, err := hg.GroupHostStatus(ctx)
 		if err != nil {
 			return servicesMsg{groupedPayload: true, err: err, session: session}
 		}
@@ -5068,10 +5081,35 @@ func (m Model) loadGroups() tea.Cmd {
 			groupedPayload: true,
 			projects:       projects,
 			hostStatus:     snap.Status,
-			hostStats:      snap.Stats,
-			statsErr:       snap.StatsErr,
+			hostEntries:    snap.Entries,
 			session:        session,
 		}
+	}
+}
+
+// groupedStatsCmd is the second half of the grouped fetch: the host-wide
+// CPU/memory join over the listing loadGroups already made. It is CHAINED off
+// the grouped servicesMsg rather than batched beside loadGroups, because it
+// consumes that listing — which is what keeps the refresh at one `docker ps`
+// while letting the rows paint first.
+//
+// It rides statsSession, the counter the drilled refreshStats uses: it is the
+// same fetch in the other mode, and every context change bumps both counters
+// together, so a status message that passed its session gate cannot chain a
+// stats fetch under a stale one.
+//
+// nil when the factory yields no HostGrouper. The caller reads that nil as "the
+// cycle ends here" and keeps the refreshInFlight clear.
+func (m Model) groupedStatsCmd(entries compose.HostEntries) tea.Cmd {
+	hg := m.hostGrouper()
+	if hg == nil {
+		return nil
+	}
+	ctx := m.ctx
+	session := m.statsSession
+	return func() tea.Msg {
+		stats, err := hg.GroupHostStats(ctx, entries)
+		return statsMsg{groupedPayload: true, hostStats: stats, err: err, session: session}
 	}
 }
 
@@ -5080,9 +5118,11 @@ func (m Model) loadGroups() tea.Cmd {
 // exact per-project calls it always made.
 //
 // Grouped mode has no single composer to ask, so it goes host-wide — and its
-// ONE call carries both halves, which is why statsRefreshCmd returns nil there.
-// Every call site batches the pair, and tea.Batch drops a nil, so no site needs
-// to know which mode it is in.
+// stats half cannot be dispatched here at all, because it needs the listing the
+// status half returns; groupedStatsCmd is chained off the arrival instead,
+// which is why statsRefreshCmd returns nil in grouped mode. Every call site
+// batches the pair, and tea.Batch drops a nil, so no site needs to know which
+// mode it is in.
 func (m Model) statusRefreshCmd() tea.Cmd {
 	if m.grouped {
 		return m.loadGroups()
@@ -5105,7 +5145,8 @@ func (m Model) statsRefreshCmd() tea.Cmd {
 // initial picks the drilled half: an entry that must also DISCOVER the service
 // list goes through loadServices, a plain refresh through ContainerStatus.
 // Grouped mode makes no distinction — loadGroups is both — and contributes no
-// stats command at all, because loadGroups already carries that half.
+// stats command at all, because its stats half is chained off the arrival (see
+// groupedStatsCmd), not batched here.
 //
 // Pointer receiver: maybeRefreshUpdatesCmd mutates updatesErr and
 // updateInFlight, and every caller owns the same Model this writes to.

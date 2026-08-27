@@ -431,26 +431,41 @@ func (h *HostContainers) ContainerStatus(ctx context.Context) (map[string]runner
 	return status, nil
 }
 
-// GroupedHostSnapshot is one host-wide read of the docker host: every
-// container's status grouped by compose project (the outer key is the project
-// name, the inner key the service name), the same shape for CPU/memory, and the
-// stats half's own error.
+// HostEntries is an opaque handle to ONE `docker ps` listing. GroupHostStatus
+// returns it and GroupHostStats consumes it, which is what keeps the two halves
+// of the grouped host view at one listing between them while leaving them two
+// separate calls: the caller can paint the rows the status half produced and
+// fetch CPU/memory afterwards, instead of blocking the first frame on the
+// ~2s host-wide `docker stats --no-stream`.
 //
-// StatsErr is carried separately from the call's error because the two halves
-// carry different weight on screen: without status there is no list at all,
-// while missing CPU/Mem cells are a soft warning beside live rows. One call
-// serving both must not collapse that distinction.
-type GroupedHostSnapshot struct {
-	Status   map[string]map[string]runner.ServiceStatus
-	Stats    map[string]map[string]runner.ServiceStats
-	StatsErr error
+// It is opaque on purpose — no caller outside this package can build or read
+// one, so the listing cannot be forged, filtered or re-ordered between the two
+// calls. The zero value is an empty listing, which GroupHostStats answers
+// without touching docker.
+type HostEntries struct {
+	entries []hostPsEntry
 }
 
-// GroupHost returns the whole grouped host view in ONE `docker ps` plus ONE
-// `docker stats`, regardless of how many projects the host runs. That fixed
-// cost is what makes the grouped TUI screen affordable over SSH: a per-project
-// `docker compose ps` would be one round-trip per project, and asking for
-// status and stats separately would list the containers twice per refresh.
+// GroupedHostSnapshot is the STATUS half of one host-wide read: every
+// container's state grouped by compose project (the outer key is the project
+// name, the inner key the service name), plus the listing it was folded from so
+// the stats half can join against the same containers.
+type GroupedHostSnapshot struct {
+	Status  map[string]map[string]runner.ServiceStatus
+	Entries HostEntries
+}
+
+// GroupHostStatus returns the grouped host view's rows in ONE `docker ps`,
+// regardless of how many projects the host runs. That fixed cost is what makes
+// the grouped TUI screen affordable over SSH: a per-project `docker compose ps`
+// would be one round-trip per project.
+//
+// It makes NO stats call. The two halves are two methods over one listing
+// rather than one method doing both, because `docker stats --no-stream` costs
+// ~2s on a real daemon and the rows must not wait for it — folding both into
+// one call put that ~2s in front of the first painted row and in front of every
+// 5-second refresh. GroupHostStats takes the returned handle, so the split
+// costs no second `docker ps`.
 //
 // Containers with no compose project label are collected under
 // UnmanagedProjectName.
@@ -458,14 +473,26 @@ type GroupedHostSnapshot struct {
 // The gap this trades for the price: a service declared in a compose file but
 // never created has no container, so it has no row here. Drilling into a single
 // project goes through ListServices and shows it.
-func (h *HostContainers) GroupHost(ctx context.Context) (GroupedHostSnapshot, error) {
+func (h *HostContainers) GroupHostStatus(ctx context.Context) (GroupedHostSnapshot, error) {
 	entries, err := h.hostEntries(ctx)
 	if err != nil {
 		return GroupedHostSnapshot{}, err
 	}
-	snap := GroupedHostSnapshot{Status: groupHostContainers(entries)}
-	snap.Stats, snap.StatsErr = h.groupedStats(ctx, entries)
-	return snap, nil
+	return GroupedHostSnapshot{
+		Status:  groupHostContainers(entries),
+		Entries: HostEntries{entries: entries},
+	}, nil
+}
+
+// GroupHostStats is the CPU/memory half of the grouped host view: ONE host-wide
+// `docker stats`, joined by container ID against the listing GroupHostStatus
+// already made and split per compose project.
+//
+// Its error is the caller's to render softly: a stats outage leaves the rows
+// GroupHostStatus produced intact, so it belongs beside them as a warning
+// rather than replacing the screen.
+func (h *HostContainers) GroupHostStats(ctx context.Context, e HostEntries) (map[string]map[string]runner.ServiceStats, error) {
+	return h.groupedStats(ctx, e.entries)
 }
 
 // hostGroupKey resolves the project and service a ps entry belongs to. A

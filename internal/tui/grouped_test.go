@@ -14,6 +14,7 @@ import (
 	"os/exec"
 	"slices"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -273,23 +274,37 @@ type mockGrouper struct {
 	statsErr2     error
 	statusCalls2  int
 	statsCalls2   int
+	// statsEntered is closed by the stats half before it blocks, and statsGate
+	// releases it. Both nil by default, so every other test drives a
+	// non-blocking double.
+	statsEntered chan struct{}
+	statsGate    chan struct{}
 }
 
-func (m *mockGrouper) GroupHost(ctx context.Context) (compose.GroupedHostSnapshot, error) {
+func (m *mockGrouper) GroupHostStatus(ctx context.Context) (compose.GroupedHostSnapshot, error) {
 	m.statusCalls2++
 	if m.statusErr2 != nil {
 		return compose.GroupedHostSnapshot{}, m.statusErr2
 	}
+	return compose.GroupedHostSnapshot{Status: m.groupedStatus}, nil
+}
+
+func (m *mockGrouper) GroupHostStats(ctx context.Context, entries compose.HostEntries) (map[string]map[string]runner.ServiceStats, error) {
+	if m.statsEntered != nil {
+		close(m.statsEntered)
+	}
+	if m.statsGate != nil {
+		<-m.statsGate
+	}
 	m.statsCalls2++
-	return compose.GroupedHostSnapshot{
-		Status:   m.groupedStatus,
-		Stats:    m.groupedStats,
-		StatsErr: m.statsErr2,
-	}, nil
+	if m.statsErr2 != nil {
+		return nil, m.statsErr2
+	}
+	return m.groupedStats, nil
 }
 
 // Compile-time pin, for the same reason the Inspector block above carries one:
-// the grouped screen reaches GroupHost through a runtime type assertion, so a
+// the grouped screen reaches the seam through a runtime type assertion, so a
 // signature drift on the real implementation would leave the suite green while
 // the whole host view silently rendered no status.
 var _ HostGrouper = (*compose.HostContainers)(nil)
@@ -353,10 +368,11 @@ func TestLoadGroups_MergesLoaderAndHostStatus(t *testing.T) {
 
 func TestLoadGroups_ErrorPaths(t *testing.T) {
 	// EVERY return carries groupedPayload, failures included: the flag is the
-	// message's SHAPE, and in grouped mode this message is the only arrival that
-	// clears refreshInFlight (statsRefreshCmd is nil there). An error return
-	// without it latched the guard and silenced the 5-second refresh for the
-	// rest of the visit.
+	// message's SHAPE, and this message is where refreshInFlight is settled —
+	// on a failure it is the LAST arrival of the cycle, since there is no
+	// listing to chain the stats half off. An error return without the flag
+	// latched the guard and silenced the 5-second refresh for the rest of the
+	// visit.
 	t.Run("no loader", func(t *testing.T) {
 		g, _ := groupedFixture()
 		m := groupedTestModel(g, nil)
@@ -518,15 +534,29 @@ func TestGroupedServicesMsg_ShrinkClampsCursor(t *testing.T) {
 	}
 }
 
-// The grouped fetch carries status AND stats in one message: one host-wide read
-// serves both, so a second Cmd would list the containers twice per refresh.
+// groupedCycle drives the WHOLE grouped fetch: the loadGroups arrival, then the
+// stats half that arrival chains. Two messages is the shape — the rows must not
+// wait on the host-wide `docker stats` — so any test that wants CPU/Mem cells
+// has to run both.
+func groupedCycle(t *testing.T, m Model) Model {
+	t.Helper()
+	updated, cmd := m.Update(m.loadGroups()())
+	m = updated.(Model)
+	if cmd == nil {
+		return m
+	}
+	updated, _ = m.Update(cmd())
+	return updated.(Model)
+}
+
+// The grouped fetch is one `docker ps` split across two messages: the rows
+// arrive first, the CPU/Mem join is chained off the listing they came from.
 func TestGroupedStatsMsg_Hydrates(t *testing.T) {
 	g, projects := groupedFixture()
 	m := groupedTestModel(g, projects)
 	m.refreshInFlight = true
 
-	updated, _ := m.Update(m.loadGroups()())
-	m = updated.(Model)
+	m = groupedCycle(t, m)
 
 	if m.statsErr != nil {
 		t.Fatalf("statsErr = %v", m.statsErr)
@@ -540,6 +570,11 @@ func TestGroupedStatsMsg_Hydrates(t *testing.T) {
 	if _, ok := m.stats["api"]; ok {
 		t.Error("a bare-name stats key survived arrival")
 	}
+	// One listing between the two halves: the stats half consumes the handle
+	// the status half returned instead of running its own `docker ps`.
+	if g.statusCalls2 != 1 || g.statsCalls2 != 1 {
+		t.Errorf("seam calls = %d status / %d stats, want 1/1", g.statusCalls2, g.statsCalls2)
+	}
 }
 
 // A stats failure never costs the status view: it lands in statsErr, which the
@@ -548,8 +583,7 @@ func TestGroupedStatsMsg_FailureIsSoft(t *testing.T) {
 	g, projects := groupedFixture()
 	g.statsErr2 = errors.New("docker stats failed")
 	m := groupedTestModel(g, projects)
-	updated, _ := m.Update(m.loadGroups()())
-	m = updated.(Model)
+	m = groupedCycle(t, m)
 
 	if m.statsErr == nil {
 		t.Fatal("statsErr should carry the stats failure")
@@ -559,6 +593,9 @@ func TestGroupedStatsMsg_FailureIsSoft(t *testing.T) {
 	}
 	if len(m.svcGroups) != 3 {
 		t.Error("the grouped rows should survive a stats failure")
+	}
+	if m.refreshInFlight {
+		t.Error("a failed stats half must still clear refreshInFlight")
 	}
 }
 
@@ -571,17 +608,24 @@ func TestLoadGroups_NoGrouperIsEmptyNotAnError(t *testing.T) {
 		return []compose.Project{{Name: "shop", ConfigDir: "/srv/shop"}}, nil
 	}
 	msg := m.loadGroups()().(servicesMsg)
-	if msg.err != nil || !msg.groupedPayload || msg.hostStatus != nil || msg.hostStats != nil {
+	if msg.err != nil || !msg.groupedPayload || msg.hostStatus != nil {
 		t.Errorf("servicesMsg = %+v, want an empty grouped payload with no error", msg)
+	}
+	// And nothing to chain: no HostGrouper means no stats half, so the cycle
+	// ends at this message and the guard clear must stay with it.
+	if m.groupedStatsCmd(msg.hostEntries) != nil {
+		t.Error("groupedStatsCmd must be nil without a HostGrouper, or refreshInFlight latches")
 	}
 	if len(msg.projects) != 1 {
 		t.Errorf("projects = %v, want the loader result to survive", msg.projects)
 	}
 }
 
-// statsRefreshCmd is nil in grouped mode: loadGroups already carries the stats
-// half, and a second command would be a second `docker ps`. Every call site
-// batches the pair, and tea.Batch drops a nil, so no site needs a mode branch.
+// statsRefreshCmd is nil in grouped mode: the grouped stats half needs the
+// listing loadGroups returns, so it is CHAINED off the arrival instead of
+// batched beside it — batching it would be a second `docker ps`. Every call
+// site batches the pair, and tea.Batch drops a nil, so no site needs a mode
+// branch.
 func TestStatsRefreshCmd_NilInGroupedMode(t *testing.T) {
 	g, projects := groupedFixture()
 	m := groupedTestModel(g, projects)
@@ -603,13 +647,22 @@ func TestRefreshTick_GroupedDispatchesHostWideFetches(t *testing.T) {
 	m := groupedTestModel(g, projects)
 	m.refreshInFlight = false
 
-	_, cmd := m.Update(refreshTickMsg{})
+	updated, cmd := m.Update(refreshTickMsg{})
+	m = updated.(Model)
 	batch, ok := cmd().(tea.BatchMsg)
 	if !ok {
 		t.Fatalf("tick produced %T, want a fetch batch", cmd())
 	}
+	// The tick fans out the status half only; the stats half is chained off its
+	// arrival, so it takes feeding the message back to reach the second call.
 	for _, c := range batch {
-		c()
+		if msg := c(); msg != nil {
+			updated, next := m.Update(msg)
+			m = updated.(Model)
+			if next != nil {
+				next()
+			}
+		}
 	}
 	if g.statusCalls2 != 1 || g.statsCalls2 != 1 {
 		t.Errorf("grouped tick made %d status / %d stats calls, want 1/1", g.statusCalls2, g.statsCalls2)
@@ -664,7 +717,13 @@ func TestInit_GroupedDispatchesGroupedLoad(t *testing.T) {
 		t.Fatalf("Init() produced %T, want a batch", m.Init()())
 	}
 	for _, c := range batch {
-		c()
+		if msg := c(); msg != nil {
+			updated, next := m.Update(msg)
+			m = updated.(Model)
+			if next != nil {
+				next()
+			}
+		}
 	}
 	if g.statusCalls2 != 1 || g.statsCalls2 != 1 {
 		t.Errorf("Init() made %d grouped status / %d grouped stats calls, want 1/1", g.statusCalls2, g.statsCalls2)
@@ -3070,12 +3129,12 @@ func TestGroupHeaderRow_IsClampedToWidth(t *testing.T) {
 
 // --- second-round review pins -------------------------------------------
 
-// In grouped mode the grouped servicesMsg is the ONLY arrival that can clear
-// refreshInFlight: statsRefreshCmd is nil there, so no statsMsg ever comes and
-// no statusMsg either. An error return that dropped groupedPayload latched the
-// guard true and turned every later refreshTickMsg into a pure reschedule, so
-// one transient `docker compose ls` failure froze the host view on its error
-// line for the rest of the visit.
+// A grouped fetch that FAILS ends the cycle at the servicesMsg: there is no
+// listing to chain the stats half off, so nothing else will ever arrive to
+// clear refreshInFlight. An error return that dropped groupedPayload never
+// reached the clear, latching the guard true and turning every later
+// refreshTickMsg into a pure reschedule, so one transient `docker compose ls`
+// failure froze the host view on its error line for the rest of the visit.
 func TestGroupedFetchError_ClearsRefreshInFlightAndKeepsTicking(t *testing.T) {
 	g, projects := groupedFixture()
 	m := groupedTestModel(g, projects)
@@ -3153,7 +3212,7 @@ func TestGroupedReload_IsDroppedWhileAPromptIsArmed(t *testing.T) {
 	m = reloaded.(Model)
 
 	if m.refreshInFlight {
-		t.Fatal("the dropped payload must still clear refreshInFlight — the guard sits AFTER the clear")
+		t.Fatal("the dropped payload must still clear refreshInFlight — the guard sits AFTER the clear, and a dropped payload chains no stats half")
 	}
 	if !m.selected[svcKey("shop", "api")] {
 		t.Fatal("a reload under an armed prompt must not prune the selection it names")
@@ -3990,5 +4049,224 @@ func TestUpdateDetailsMsg_RepaintsTheGroupedInspectScreen(t *testing.T) {
 	}
 	if got.inspectSummary == before {
 		t.Error("the inspect screen was not repainted for the batch that landed")
+	}
+}
+
+// --- grouped fetch: two messages over one listing --------------------------
+
+// The grouped screen's first paint used to sit behind `docker stats
+// --no-stream`, which measured ~2s on a real daemon against ~0.09s for the
+// listing pair that actually produces the rows. The seam is two methods over
+// one listing now, so the rows must be on the Model while the stats half is
+// still running.
+func TestGroupedFirstPaint_DoesNotWaitOnStats(t *testing.T) {
+	g, projects := groupedFixture()
+	g.statsEntered = make(chan struct{})
+	g.statsGate = make(chan struct{})
+	// Release the stats half however the test ends, so a failure cannot strand
+	// the goroutine below.
+	var once sync.Once
+	release := func() { once.Do(func() { close(g.statsGate) }) }
+	t.Cleanup(release)
+
+	m := groupedTestModel(g, projects)
+	m.refreshInFlight = true
+
+	// The status half must return on its own; a merged seam would block here.
+	updated, cmd := m.Update(m.loadGroups()())
+	m = updated.(Model)
+
+	if len(m.svcGroups) != 3 {
+		t.Fatalf("groups = %d, want the rows painted before the stats half runs", len(m.svcGroups))
+	}
+	if !m.svcStatus[svcKey("shop", "api")].Running {
+		t.Error("the status half must be applied on the first message")
+	}
+	if cmd == nil {
+		t.Fatal("the grouped arrival must chain the stats half")
+	}
+	if !m.refreshInFlight {
+		t.Error("the chaining arrival re-arms refreshInFlight; the chained statsMsg owns the clear")
+	}
+
+	done := make(chan tea.Msg, 1)
+	go func() { done <- cmd() }()
+
+	// While the stats call is blocked, the rows are already on screen.
+	<-g.statsEntered
+	if len(m.svcEntries) == 0 {
+		t.Fatal("the rows must survive while the stats half is still in flight")
+	}
+	if m.stats != nil {
+		t.Errorf("stats = %v, want none until the chained message lands", m.stats)
+	}
+
+	release()
+	updated, _ = m.Update(<-done)
+	m = updated.(Model)
+
+	if m.stats[svcKey("shop", "api")].CPUPercent != 12.5 {
+		t.Errorf("stats = %v, want the chained half to fill shop/api", m.stats)
+	}
+	if m.refreshInFlight {
+		t.Error("the chained statsMsg must clear refreshInFlight")
+	}
+}
+
+// refreshInFlight is the fetch-stacking guard: latched true, the 5-second
+// refresh dies silently for the rest of the session. The grouped cycle is two
+// messages now, so the clear has ONE rule — the arrival that ends the cycle
+// owns it, and the only arrival that may leave the flag set is the one that
+// chains the stats half.
+func TestGroupedArrivals_ClearRefreshInFlight(t *testing.T) {
+	tests := []struct {
+		name string
+		// setup runs on a fresh grouped model with refreshInFlight already
+		// armed, and returns the message to deliver.
+		setup     func(t *testing.T, m *Model, g *mockGrouper) tea.Msg
+		wantFlag  bool // refreshInFlight after the arrival
+		wantChain bool // the arrival returned the stats half
+	}{
+		{
+			name: "no loader",
+			setup: func(t *testing.T, m *Model, g *mockGrouper) tea.Msg {
+				m.projectLoader = nil
+				return m.loadGroups()()
+			},
+		},
+		{
+			name: "loader failure",
+			setup: func(t *testing.T, m *Model, g *mockGrouper) tea.Msg {
+				m.projectLoader = func(ctx context.Context) ([]compose.Project, error) {
+					return nil, errors.New("compose ls failed")
+				}
+				return m.loadGroups()()
+			},
+		},
+		{
+			name: "host ps failure",
+			setup: func(t *testing.T, m *Model, g *mockGrouper) tea.Msg {
+				g.statusErr2 = errors.New("docker ps failed")
+				return m.loadGroups()()
+			},
+		},
+		{
+			name: "no grouper behind the factory",
+			setup: func(t *testing.T, m *Model, g *mockGrouper) tea.Msg {
+				mc := &mockComposer{}
+				m.composerFactory = mockFactory(mc)
+				return m.loadGroups()()
+			},
+		},
+		{
+			name: "dropped under an armed prompt",
+			setup: func(t *testing.T, m *Model, g *mockGrouper) tea.Msg {
+				m.confirming = true
+				return m.loadGroups()()
+			},
+		},
+		{
+			name: "arrives off-screen",
+			setup: func(t *testing.T, m *Model, g *mockGrouper) tea.Msg {
+				msg := m.loadGroups()()
+				m.screen = screenLogs
+				return msg
+			},
+		},
+		{
+			name: "success chains the stats half",
+			setup: func(t *testing.T, m *Model, g *mockGrouper) tea.Msg {
+				return m.loadGroups()()
+			},
+			wantFlag:  true,
+			wantChain: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			g, projects := groupedFixture()
+			m := groupedTestModel(g, projects)
+			m.refreshInFlight = true
+			msg := tt.setup(t, &m, g)
+
+			updated, cmd := m.Update(msg)
+			m = updated.(Model)
+
+			if m.refreshInFlight != tt.wantFlag {
+				t.Errorf("refreshInFlight = %v, want %v", m.refreshInFlight, tt.wantFlag)
+			}
+			if (cmd != nil) != tt.wantChain {
+				t.Errorf("chained cmd = %v, want %v", cmd != nil, tt.wantChain)
+			}
+			if !tt.wantChain {
+				return
+			}
+			// The chained half always answers, so the flag always comes back
+			// down — that pairing is what makes the re-arm safe.
+			updated, _ = m.Update(cmd())
+			if updated.(Model).refreshInFlight {
+				t.Error("the chained statsMsg must clear refreshInFlight")
+			}
+		})
+	}
+}
+
+// A stale grouped arrival must not touch the guard at all: the context-change
+// site that bumped the session already reset it, and a stale message that
+// cleared it would let the tick stack a second fetch on the live one.
+func TestGroupedArrival_StaleSessionLeavesTheGuardAlone(t *testing.T) {
+	g, projects := groupedFixture()
+	m := groupedTestModel(g, projects)
+	msg := m.loadGroups()().(servicesMsg)
+	m.statusSession++
+	m.refreshInFlight = true
+
+	updated, cmd := m.Update(msg)
+	m = updated.(Model)
+
+	if !m.refreshInFlight {
+		t.Error("a stale grouped arrival must leave refreshInFlight to its owner")
+	}
+	if cmd != nil {
+		t.Error("a stale grouped arrival must not chain a stats fetch")
+	}
+	if g.statsCalls2 != 0 {
+		t.Errorf("stats calls = %d, want none for a stale arrival", g.statsCalls2)
+	}
+}
+
+// The chained stats half rides statsSession, the counter the drilled
+// refreshStats uses. Both counters are bumped at every context change, so a
+// stats message dispatched under one context can never land in another.
+func TestGroupedStatsChain_RidesStatsSession(t *testing.T) {
+	g, projects := groupedFixture()
+	m := groupedTestModel(g, projects)
+
+	updated, cmd := m.Update(m.loadGroups()())
+	m = updated.(Model)
+	if cmd == nil {
+		t.Fatal("precondition: the arrival must chain the stats half")
+	}
+	msg, ok := cmd().(statsMsg)
+	if !ok {
+		t.Fatalf("chained cmd produced %T, want statsMsg", cmd())
+	}
+	if !msg.groupedPayload {
+		t.Error("the chained message must carry the grouped shape, or its keys land bare")
+	}
+	if msg.session != m.statsSession {
+		t.Errorf("session = %d, want statsSession %d", msg.session, m.statsSession)
+	}
+
+	m.statsSession++
+	m.refreshInFlight = true
+	updated, _ = m.Update(msg)
+	m = updated.(Model)
+	if m.stats != nil {
+		t.Errorf("stats = %v, want a stale chained message dropped", m.stats)
+	}
+	if !m.refreshInFlight {
+		t.Error("a stale statsMsg must leave refreshInFlight to its owner")
 	}
 }
