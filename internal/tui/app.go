@@ -184,16 +184,10 @@ type ConnectCallback func(server config.Server) (connectCmd *exec.Cmd, factory C
 
 const warnNoSelection = "No service is selected"
 
-// warnCrossProject refuses a d/r/s selection that spans two compose projects.
-// Scaffolding: the batch pipeline runs one project at a time, so until the
-// sequential runner lands the screen refuses what it cannot execute rather
-// than dropping half the selection on the floor.
-const warnCrossProject = "Selection spans projects — select services in one project"
-
 // warnRollbackCrossProject refuses a rollback capture that spans projects.
-// Unlike warnCrossProject this one is permanent: a rollback restores one
-// project's recorded digests from that project's own snapshot file, and there
-// is no host-wide snapshot to restore from.
+// d/r/s accept one (the progress screen runs a pipeline per project), but a
+// rollback restores one project's recorded digests from that project's own
+// snapshot file, and there is no host-wide snapshot to restore from.
 const warnRollbackCrossProject = "Rollback covers one project at a time"
 
 // serverEntryKind distinguishes selectable items from visual group headers.
@@ -409,7 +403,27 @@ type Model struct {
 	failed       bool
 	eventCh      <-chan runner.StepEvent
 	cancel       context.CancelFunc
-	opContainers []string // the operation's resolved target services; seeds the wait target set
+	opContainers []string // the CURRENT batch's resolved target services; seeds the wait target set
+
+	// Screen 2: progress — batch sequence. One operation can span several
+	// compose projects, and runner.Run closes the events channel it is given,
+	// so the batches cannot share one: each runs its own pipeline, in screen
+	// order, and the next starts only when the previous one reports done.
+	//
+	// batchStepCount is the per-batch step count, which turns batchIdx into the
+	// step range that owns an incoming StepEvent. A ZERO value means "one range
+	// covering every step" — that is what keeps a hand-built Model (tests) and
+	// any future single-pipeline caller resolving events exactly as before.
+	//
+	// batchSession invalidates a pipelineDoneMsg whose sequence is over: esc
+	// cancels the running batch, and the message it already queued must not
+	// advance the sequence it was cancelled out of. Bumped on esc-cancel and on
+	// every departure from screenProgress — never in enterProgress, so a
+	// zero-valued pipelineDoneMsg still resolves against a fresh sequence.
+	batches        []opBatch
+	batchIdx       int
+	batchStepCount int
+	batchSession   uint64
 
 	// Screen 2: progress — health-wait sub-state. After a Deploy/Restart/Rollback
 	// pipeline completes (m.done), the progress screen enters a waiting sub-state
@@ -525,9 +539,31 @@ type Model struct {
 	height    int
 }
 
+// statusSkipped marks a step that will never run because an earlier batch of
+// the same sequence failed or was cancelled. It is a TUI-only status: the
+// runner never emits it, because a runner.Run that stops emits StatusFailed and
+// then closes its channel.
+const statusSkipped = "skipped"
+
+// stepState is one row of the progress screen. name is the RUNNER step name and
+// is what a StepEvent is matched against; label is what the screen draws. The
+// two differ only in a multi-batch sequence, where the label carries the
+// project prefix ("web: Pulling") that makes two identically-named steps
+// distinguishable on screen — the match itself never uses the label, because
+// the same five names repeat in every batch.
 type stepState struct {
 	name   string
-	status string // "", "running", "done", "failed"
+	label  string
+	status string // "", "running", "done", "failed", "skipped"
+}
+
+// display returns the drawn text. An empty label falls back to the runner name,
+// which keeps a hand-built stepState (tests) rendering as it always did.
+func (s stepState) display() string {
+	if s.label != "" {
+		return s.label
+	}
+	return s.name
 }
 
 // Messages
@@ -675,7 +711,16 @@ type updateDetailsMsg struct {
 // time regardless of how many transitions into the screen happen.
 type refreshTickMsg struct{}
 
-type pipelineDoneMsg struct{}
+// pipelineDoneMsg reports that one batch's events channel closed. It carries
+// its own identity because a sequence runs several pipelines: batchIdx names
+// the batch that finished and session the sequence it belonged to, so a message
+// from a cancelled or already-superseded batch can never advance the one
+// running now. Both are captured in waitForEvent, at the moment the read is
+// scheduled.
+type pipelineDoneMsg struct {
+	batchIdx int
+	session  uint64
+}
 
 // waitTickMsg fires after runner.DefaultWaitPoll to schedule the next health
 // poll. session is captured at scheduling time and compared against
@@ -1585,8 +1630,27 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, tea.Batch(cmds...)
 
 	case pipelineDoneMsg:
+		// Three gates: the screen, the sequence (esc-cancel and every departure
+		// bump batchSession) and the batch index. Without the last two, a done
+		// message queued by a batch the user cancelled out of would start the
+		// next batch of a sequence that is over.
+		if m.screen != screenProgress || msg.session != m.batchSession || msg.batchIdx != m.batchIdx {
+			return m, nil
+		}
 		if m.failed {
 			return m, nil
+		}
+		if m.batchIdx+1 < len(m.batches) {
+			// This batch's pipeline has closed its channel, so its context is
+			// finished — cancel it to release it before the next batch takes
+			// over m.cancel, which esc reads.
+			if m.cancel != nil {
+				m.cancel()
+			}
+			m.batchIdx++
+			// Hoisted: startBatch mutates the receiver.
+			cmd := m.startBatch()
+			return m, cmd
 		}
 		m.done = true
 		// StopOnly has no health phase; a failed pipeline never reaches here.
@@ -1597,10 +1661,17 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 		targets := m.opContainers
-		if len(targets) == 0 {
+		if len(targets) == 0 && !m.grouped {
 			targets = m.services
 		}
 		if len(targets) == 0 {
+			// Drilled mode with no services, or a grouped whole-project batch
+			// whose empty target set means ALL services. m.services is
+			// host-wide in grouped mode, so it is NOT the fallback there — it
+			// would seed the wait with other projects' services, which this
+			// composer can never report healthy. Resolving the whole-project
+			// set needs a ListServices call, which the per-batch wait phase
+			// owns.
 			return m, nil // nothing to wait on
 		}
 		m.waiting = true
@@ -2078,30 +2149,33 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 				if m.pendingExec {
 					return m.enterExec()
 				}
-				containers := m.selectedContainers()
+				var batches []opBatch
 				switch {
 				case m.pendingOp == runner.Rollback:
 					// Rollback uses the set captured at R-press, not the live
 					// selection (which the async fetch let drift). This keeps the
 					// pipeline/prep target identical to what was validated and shown
 					// in the confirm prompt. Its composer is bound at R-press too,
-					// because the snapshot fetch already needed one.
-					containers = m.rollbackTargets
+					// because the snapshot fetch already needed one — which is why
+					// startBatch does NOT rebind for a Rollback.
+					batches = []opBatch{{proj: m.currentProject(), services: m.rollbackTargets}}
 				case m.grouped:
-					// Grouped mode holds no composer between actions, so the
-					// batch binds one now. armOperation refused anything but a
-					// single batch, so the partition below is the same one the
-					// prompt named — recomputed rather than captured because
-					// the prompt swallows every key that could change it.
-					batches := m.partitionSelection()
-					if len(batches) != 1 || !m.bindProjComposer(batches[0].proj) {
+					// The partition is recomputed rather than captured: the
+					// prompt swallows every key that could change it, so this is
+					// the same set the prompt named. Each batch binds its own
+					// composer as the sequence reaches it; the first one is
+					// validated here so a broken factory refuses before the
+					// screen changes.
+					batches = m.partitionSelection()
+					if len(batches) == 0 || !m.bindProjComposer(batches[0].proj) {
 						m.confirming = false
 						m.fixSvcOffset()
 						return m, nil
 					}
-					containers = batches[0].services
+				default:
+					batches = []opBatch{{proj: m.currentProject(), services: m.selectedContainers()}}
 				}
-				return m.enterProgress(containers)
+				return m.enterProgress(batches)
 			case "esc":
 				m.confirming = false
 				m.pendingExec = false
@@ -3061,9 +3135,16 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 				if m.done && (m.pendingOp == runner.Deploy || m.pendingOp == runner.Restart || m.pendingOp == runner.Rollback) {
 					if m.updateCache != nil {
 						delete(m.updateCache, m.updatesCacheKey())
+						// A sequence touches one project per batch, and each
+						// keeps its OWN cache entry — the current key names at
+						// most one of them, so every batch's key goes too.
+						for _, b := range m.batches {
+							delete(m.updateCache, m.projUpdatesCacheKey(b.proj))
+						}
 					}
 				}
 				m.screen = screenSelectContainers
+				m.clearBatchSequence()
 				m.unbindGroupedComposer()
 				m.confirming = false
 				m.steps = nil
@@ -3108,6 +3189,12 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			if m.cancel != nil {
 				m.cancel()
 			}
+			// The cancelled batch is still going to close its channel, so the
+			// pipelineDoneMsg it produces is already on its way. Bump the
+			// sequence it names so it cannot advance to the next batch, and say
+			// on screen that the remaining batches will not run.
+			m.batchSession++
+			m.markBatchesSkipped(m.batchIdx + 1)
 		}
 		var cmd tea.Cmd
 		m.logViewport, cmd = m.logViewport.Update(msg)
@@ -3118,7 +3205,11 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 }
 
 func (m Model) handleStepEvent(event runner.StepEvent) (tea.Model, tea.Cmd) {
-	for i := range m.steps {
+	// Resolve the event inside the CURRENT batch's step range. A global name
+	// scan would land on the first batch's "Pulling" for every batch, because
+	// runner.Steps returns the same five names each time.
+	lo, hi := m.currentStepRange()
+	for i := lo; i < hi; i++ {
 		if m.steps[i].name == event.Step {
 			m.steps[i].status = event.Status
 			break
@@ -3127,6 +3218,9 @@ func (m Model) handleStepEvent(event runner.StepEvent) (tea.Model, tea.Cmd) {
 
 	if event.Status == runner.StatusFailed {
 		m.failed = true
+		// The sequence stops here, so the batches behind this one never run.
+		// Their rows must say so rather than sit at ○, which reads as pending.
+		m.markBatchesSkipped(m.batchIdx + 1)
 		return m, nil
 	}
 
@@ -3147,37 +3241,97 @@ func (m Model) handleStepEvent(event runner.StepEvent) (tea.Model, tea.Cmd) {
 // the empty-selection rule earns its keep: the cursor names a project, so `d`
 // on a group header is the whole-project operation.
 //
-// A selection that spans projects is refused for now — see warnCrossProject.
+// A selection that spans projects is accepted: the progress screen runs one
+// pipeline per batch, in screen order, and stops at the first failure.
 func (m *Model) armOperation(op runner.Operation) {
 	if !m.grouped && m.selectedCount() == 0 {
 		m.warning = warnNoSelection
 		m.fixSvcOffset()
 		return
 	}
-	batches := m.partitionSelection()
-	switch {
-	case len(batches) == 0:
+	if len(m.partitionSelection()) == 0 {
 		m.warning = warnNoSelection
-	case len(batches) > 1:
-		m.warning = warnCrossProject
-	default:
-		m.pendingOp = op
-		m.confirming = true
+		m.fixSvcOffset()
+		return
 	}
+	m.pendingOp = op
+	m.confirming = true
 	m.fixSvcOffset()
 }
 
-func (m *Model) enterProgress(containers []string) (tea.Model, tea.Cmd) {
+// currentStepRange returns the half-open [lo, hi) slice of m.steps that belongs
+// to the batch now running. A zero batchStepCount means the whole slice, which
+// is the single-pipeline shape every Model literal in the tests carries.
+func (m Model) currentStepRange() (int, int) {
+	if m.batchStepCount <= 0 {
+		return 0, len(m.steps)
+	}
+	lo := min(m.batchIdx*m.batchStepCount, len(m.steps))
+	hi := min(lo+m.batchStepCount, len(m.steps))
+	return lo, hi
+}
+
+// markBatchesSkipped marks every not-yet-started step from batch `from` onward
+// as skipped. Only steps still at their zero status are touched, so a running
+// or finished row keeps the verdict the pipeline gave it.
+//
+// A single-batch sequence never reaches the loop (from == len(batches)), which
+// is what keeps its rendering byte-identical: an unreached step of the batch
+// that FAILED stays ○, exactly as before.
+func (m *Model) markBatchesSkipped(from int) {
+	if m.batchStepCount <= 0 || from < 0 || from >= len(m.batches) {
+		return
+	}
+	for i := from * m.batchStepCount; i < len(m.steps); i++ {
+		if m.steps[i].status == "" {
+			m.steps[i].status = statusSkipped
+		}
+	}
+}
+
+// clearBatchSequence drops the batch bookkeeping and invalidates any
+// pipelineDoneMsg still in flight. Every departure from screenProgress calls
+// it, so a sequence can never outlive the screen that ran it.
+func (m *Model) clearBatchSequence() {
+	m.batches = nil
+	m.batchIdx = 0
+	m.batchStepCount = 0
+	m.batchSession++
+}
+
+// enterProgress opens the progress screen over a batch sequence and launches
+// the first batch. The step rows for EVERY batch are built up front, so the
+// screen shows the whole plan from the start instead of growing a project at a
+// time; only the labels carry the project prefix, and only when there is more
+// than one batch, which keeps a single-project run byte-identical to what it
+// has always drawn.
+func (m *Model) enterProgress(batches []opBatch) (tea.Model, tea.Cmd) {
 	op := m.pendingOp
 	m.screen = screenProgress
 	m.rollbackErr = ""
 	// Leaving screenSelectContainers for an operation: search is ephemeral.
 	m.clearSearch()
 
+	if len(batches) == 0 {
+		// Defensive: every caller partitions first and refuses an empty result.
+		// A zero-batch sequence would leave the screen with no pipeline at all,
+		// so fall back to the current project's whole service set.
+		batches = []opBatch{{proj: m.currentProject()}}
+	}
+	m.batches = batches
+	m.batchIdx = 0
+
 	stepNames := runner.Steps(op)
-	m.steps = make([]stepState, len(stepNames))
-	for i, name := range stepNames {
-		m.steps[i] = stepState{name: name}
+	m.batchStepCount = len(stepNames)
+	m.steps = make([]stepState, 0, len(stepNames)*len(batches))
+	for _, b := range batches {
+		for _, name := range stepNames {
+			label := name
+			if len(batches) > 1 {
+				label = b.proj.Name + ": " + name
+			}
+			m.steps = append(m.steps, stepState{name: name, label: label})
+		}
 	}
 
 	vpHeight := m.height - len(m.steps) - 8
@@ -3190,6 +3344,33 @@ func (m *Model) enterProgress(containers []string) (tea.Model, tea.Cmd) {
 	}
 	m.logViewport = viewport.New(w, vpHeight)
 
+	// Hoisted out of the return statement: startBatch mutates the receiver, and
+	// the evaluation order of a return's operands is unspecified.
+	cmd := m.startBatch()
+	return *m, cmd
+}
+
+// startBatch launches the batch at m.batchIdx. Each batch gets its OWN events
+// channel, because runner.Run closes the channel it is given — sharing one
+// would close it after the first batch and report the whole sequence done.
+func (m *Model) startBatch() tea.Cmd {
+	if m.batchIdx < 0 || m.batchIdx >= len(m.batches) {
+		return nil
+	}
+	b := m.batches[m.batchIdx]
+	op := m.pendingOp
+
+	// Rollback keeps the composer bound at R-press: the snapshot fetch already
+	// needed one, and the prep validated the captured targets against it. Every
+	// other op binds the batch's project here, which is what lets the sequence
+	// walk from one project to the next. bindProjComposer is a no-op in drilled
+	// mode, where the screen owns its composer.
+	if op != runner.Rollback && !m.bindProjComposer(b.proj) {
+		m.failed = true
+		m.markBatchesSkipped(m.batchIdx)
+		return nil
+	}
+
 	ctx, cancel := context.WithCancel(context.Background())
 	m.cancel = cancel
 
@@ -3201,10 +3382,10 @@ func (m *Model) enterProgress(containers []string) (tea.Model, tea.Cmd) {
 		logW = io.Discard
 	}
 
-	// Remember the target set so pipelineDoneMsg can seed the health-wait
-	// reducer without re-deriving it (Rollback in particular does not use the
-	// container-screen selection).
-	m.opContainers = containers
+	// Remember this batch's target set so pipelineDoneMsg can seed the
+	// health-wait reducer without re-deriving it (Rollback in particular does
+	// not use the container-screen selection).
+	m.opContainers = b.services
 
 	if op == runner.Rollback {
 		// Rollback prep (pull missing blobs, generate the override, set
@@ -3213,16 +3394,19 @@ func (m *Model) enterProgress(containers []string) (tea.Model, tea.Cmd) {
 		// ITSELF only after a successful prep. Do NOT return waitForEvent here:
 		// nothing writes to `events` until prep succeeds, so consuming events
 		// starts on the rollbackPreppedMsg success path instead.
-		return *m, tea.Batch(m.spinner.Tick, m.prepareRollbackCmd(ctx, containers, logW, events))
+		return tea.Batch(m.spinner.Tick, m.prepareRollbackCmd(ctx, b.services, logW, events))
 	}
 
 	// For a Deploy, snapshot the currently-running image digests FIRST — inside
 	// the same goroutine, before runner.Run touches anything (pre-Stop ordering)
-	// — so `cdeploy rollback` / the TUI `R` key can restore them. Best-effort:
-	// warnings go to the op log writer and never block the pipeline. Composers
-	// without the capability (test mocks) skip it entirely. Values are captured
-	// into locals so the goroutine never races the returning *Model.
+	// — so `cdeploy rollback` / the TUI `R` key can restore them. The snapshot
+	// is per BATCH: each project keeps its own state file, so a two-project
+	// deploy records two. Best-effort: warnings go to the op log writer and
+	// never block the pipeline. Composers without the capability (test mocks)
+	// skip it entirely. Values are captured into locals so the goroutine never
+	// races the returning *Model.
 	composer := m.composer
+	containers := b.services
 	go func() {
 		if op == runner.Deploy {
 			if s, ok := composer.(Snapshotter); ok {
@@ -3232,7 +3416,7 @@ func (m *Model) enterProgress(containers []string) (tea.Model, tea.Cmd) {
 		runner.Run(ctx, composer, op, containers, logW, events)
 	}()
 
-	return *m, tea.Batch(m.spinner.Tick, m.waitForEvent())
+	return tea.Batch(m.spinner.Tick, m.waitForEvent())
 }
 
 // fetchRollbackSnapshot returns a Cmd that reads the host-side deploy snapshot
@@ -3365,13 +3549,18 @@ func recordDeploySnapshot(ctx context.Context, s Snapshotter, services []string,
 	}
 }
 
-// waitForEvent returns a Cmd that waits for the next StepEvent.
+// waitForEvent returns a Cmd that waits for the next StepEvent. The channel
+// close is the batch's done signal, so the message it produces carries the
+// batch identity captured HERE — the Model may have moved on by the time the
+// read completes.
 func (m Model) waitForEvent() tea.Cmd {
 	ch := m.eventCh
+	idx := m.batchIdx
+	session := m.batchSession
 	return func() tea.Msg {
 		event, ok := <-ch
 		if !ok {
-			return pipelineDoneMsg{}
+			return pipelineDoneMsg{batchIdx: idx, session: session}
 		}
 		return stepEventMsg(event)
 	}
@@ -4583,6 +4772,18 @@ func servicesWithUpdate(results map[string]bool) []string {
 func (m Model) updatesCacheKey() string {
 	key := m.projDir + "|" + m.serverName
 	if m.readOnly() {
+		return "unmanaged|" + key
+	}
+	return key
+}
+
+// projUpdatesCacheKey is updatesCacheKey for a project the Model is not
+// currently pointed at. A batch sequence runs projects the container screen has
+// since left, so the invalidation after a successful operation cannot go
+// through the current-context key alone.
+func (m Model) projUpdatesCacheKey(proj compose.Project) string {
+	key := proj.ConfigDir + "|" + m.serverName
+	if proj.Unmanaged {
 		return "unmanaged|" + key
 	}
 	return key
@@ -6573,7 +6774,12 @@ func (m Model) viewProgress() string {
 	// an empty selection there means the cursor's whole project, so the title
 	// reads the set the pipeline actually got.
 	target := strings.Join(m.selectedContainers(), ", ")
-	if m.grouped {
+	switch {
+	case len(m.batches) > 1:
+		// A sequence spans projects, so a bare service list cannot say which
+		// "api" is meant. The prompt named the batches; the title repeats them.
+		target = formatBatchTargets(m.batches)
+	case m.grouped:
 		target = strings.Join(m.opContainers, ", ")
 		if target == "" {
 			target = "all services"
@@ -6588,16 +6794,19 @@ func (m Model) viewProgress() string {
 		switch s.status {
 		case runner.StatusDone:
 			icon = stepDone.Render("✓")
-			label = stepDone.Render(s.name)
+			label = stepDone.Render(s.display())
 		case runner.StatusRunning:
 			icon = m.spinner.View()
-			label = stepRunning.Render(s.name)
+			label = stepRunning.Render(s.display())
 		case runner.StatusFailed:
 			icon = stepFailed.Render("✗")
-			label = stepFailed.Render(s.name)
+			label = stepFailed.Render(s.display())
+		case statusSkipped:
+			icon = stepWaiting.Render("−")
+			label = stepWaiting.Render(s.display() + " (skipped)")
 		default:
 			icon = stepWaiting.Render("○")
-			label = stepWaiting.Render(s.name)
+			label = stepWaiting.Render(s.display())
 		}
 		b.WriteString(fmt.Sprintf("  %s %s\n", icon, label))
 	}

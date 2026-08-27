@@ -234,14 +234,24 @@ Confirmed design decisions (brainstormed and validated; do not re-litigate):
 - Modify: `internal/tui/app.go`
 - Modify: `internal/tui/app_test.go`
 
-- [ ] generalize `enterProgress(batches []opBatch)`: build `m.steps` for ALL batches upfront with project-prefixed DISPLAY names; add `m.batches`, `m.batchIdx`, and a `batchSession` sequence counter
-- [ ] `handleStepEvent` resolves an event within the CURRENT batch's step range (`batchIdx` + per-batch offset) — never by global name scan
-- [ ] `pipelineDoneMsg` gains batch index + `batchSession`; handler gated on screen + session + index; interim rule: advance directly to batch i+1 on `pipelineDoneMsg` (Task 11 intercepts with the wait phase and introduces `batchDoneMsg`)
-- [ ] batch i: `composerFactory(proj)` → Deploy snapshot (Snapshotter assert, per batch) → `runner.Run` into a fresh events channel; single-batch path stays byte-equivalent to today
-- [ ] batch failure marks remaining steps skipped and stops; `esc` cancels the current batch ctx and marks the rest skipped — a late `pipelineDoneMsg` from the cancelled batch must NOT advance (session gate); mid-op `q`/`ctrl+c` no-op rules unchanged
-- [ ] update-cache invalidation on success deletes the cache entry of EVERY batch's key; clear `batches`/`batchIdx` at every progress departure site
-- [ ] write tests: two-batch happy path with SHARED step names (pins the range lookup), failure-stops-sequence, esc mid-sequence does not advance, single-batch equivalence, departure cleanup
-- [ ] run tests - must pass before task 11
+⚠️ Deviations:
+- **`batchSession` is bumped at INVALIDATION sites only — never in `enterProgress`.** It starts at 0, so a zero-valued `pipelineDoneMsg{}` still resolves against a fresh sequence, which is what keeps the existing `Update(pipelineDoneMsg{})` pins (and `TestQualifiedKeys_NeverCrossIntoRunner`) driving the handler instead of being dropped by their own gate. The two bump sites are the `esc`-cancel and `clearBatchSequence()` at the progress departure.
+- **`stepState` gained `label`, not a renamed `name`.** `name` stays the RUNNER step name (what a `StepEvent` matches); `label` is what the screen draws and carries the `"web: "` prefix only when `len(batches) > 1`. A hand-built `stepState{name: …}` therefore still renders and matches exactly as before.
+- **`markBatchesSkipped(from)` starts at batch `from`, so a single-batch failure skips NOTHING** — the failed batch's own unreached steps stay `○`, which is byte-identical to today's rendering. Only the batches behind the failure are marked, because they are the rows a reader would otherwise take for "still to come".
+- **The `--wait` seed does NOT fall back to `m.services` in grouped mode.** `m.services` is host-wide there, so a whole-project batch (empty target set) would seed the wait with other projects' services against one project's composer — a guaranteed timeout. The interim skips the wait for that case; Task 11's per-batch phase resolves it via `ListServices`.
+- **`startBatch` does not rebind the composer for `Rollback`.** `R` binds it at press time (the snapshot fetch already needed one) and the prep validated the captured targets against it; rebinding from the batch's project would risk swapping it under a capture the selection has since drifted from.
+- ➕ `warnCrossProject` and `TestGroupedScreen_RefusesCrossProjectSelection` are DELETED — Task 9 named this task as the one that removes them. The replacement pin (`TestGroupedScreen_ArmsCrossProjectSelection`) asserts the same keys now arm a two-batch prompt.
+- ➕ `updatesCacheKey()` gained the sibling `projUpdatesCacheKey(proj)`, since a sequence invalidates projects the container screen has since left.
+- ⚠️ Pre-existing, NOT introduced here: `go test -race ./internal/tui/` reports a data race in `TestQualifiedKeys_NeverCrossIntoRunner` (the test polls `recordingComposer.gotContainers` while the pipeline goroutine writes it). It reproduces on the parent commit. The project's documented command is `go test ./...`, which is clean.
+
+- [x] generalize `enterProgress(batches []opBatch)`: build `m.steps` for ALL batches upfront with project-prefixed DISPLAY names; add `m.batches`, `m.batchIdx`, and a `batchSession` sequence counter
+- [x] `handleStepEvent` resolves an event within the CURRENT batch's step range (`batchIdx` + per-batch offset) — never by global name scan
+- [x] `pipelineDoneMsg` gains batch index + `batchSession`; handler gated on screen + session + index; interim rule: advance directly to batch i+1 on `pipelineDoneMsg` (Task 11 intercepts with the wait phase and introduces `batchDoneMsg`)
+- [x] batch i: `composerFactory(proj)` → Deploy snapshot (Snapshotter assert, per batch) → `runner.Run` into a fresh events channel; single-batch path stays byte-equivalent to today
+- [x] batch failure marks remaining steps skipped and stops; `esc` cancels the current batch ctx and marks the rest skipped — a late `pipelineDoneMsg` from the cancelled batch must NOT advance (session gate); mid-op `q`/`ctrl+c` no-op rules unchanged
+- [x] update-cache invalidation on success deletes the cache entry of EVERY batch's key; clear `batches`/`batchIdx` at every progress departure site
+- [x] write tests: two-batch happy path with SHARED step names (pins the range lookup), failure-stops-sequence, esc mid-sequence does not advance, single-batch equivalence, departure cleanup
+- [x] run tests - must pass before task 11
 
 ### Task 11: Per-batch wait phase (phase 3)
 

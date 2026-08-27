@@ -14442,7 +14442,7 @@ func TestSearchClearedOnEnterProgress(t *testing.T) {
 	m.searchMatches = computeMatches(m.svcEntries, "w")
 	m.svcCursor = m.searchMatches[0]
 
-	updated, _ := m.enterProgress([]string{"web"})
+	updated, _ := m.enterProgress([]opBatch{{proj: m.currentProject(), services: []string{"web"}}})
 	m = updated.(Model)
 
 	if m.screen != screenProgress {
@@ -14947,7 +14947,7 @@ func TestEnterProgress_DeploySnapshotsBeforeStop(t *testing.T) {
 	m.width = 80
 	m.height = 24
 
-	updated, _ := m.enterProgress([]string{"web"})
+	updated, _ := m.enterProgress([]opBatch{{proj: m.currentProject(), services: []string{"web"}}})
 	m = updated.(Model)
 
 	// Drain the pipeline events to completion (channel close = goroutine done).
@@ -14979,7 +14979,7 @@ func TestEnterProgress_NonSnapshotterMockRunsAsToday(t *testing.T) {
 	m.width = 80
 	m.height = 24
 
-	updated, _ := m.enterProgress([]string{"web"})
+	updated, _ := m.enterProgress([]opBatch{{proj: m.currentProject(), services: []string{"web"}}})
 	m = updated.(Model)
 
 	if m.screen != screenProgress {
@@ -19319,26 +19319,32 @@ func TestGroupedScreen_ConfirmPromptClampsToWidth(t *testing.T) {
 	}
 }
 
-// A selection that spans two projects needs two pipelines, which the sequential
-// runner does not yet drive — refuse it rather than silently dropping half.
-func TestGroupedScreen_RefusesCrossProjectSelection(t *testing.T) {
+// A selection that spans two projects is a two-batch sequence, not a refusal:
+// the progress screen runs one pipeline per project, in screen order.
+func TestGroupedScreen_ArmsCrossProjectSelection(t *testing.T) {
 	base := groupedOpModel(t)
+	base.width = 100
+	base.height = 24
 	base.selected["blog/web"] = true
 	base.selected["shop/api"] = true
 
 	for _, key := range []string{"d", "r", "s"} {
 		t.Run(key, func(t *testing.T) {
 			m := base
-			updated, cmd := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune(key)})
+			updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune(key)})
 			got := updated.(Model)
-			if got.confirming {
-				t.Errorf("%q armed a cross-project confirmation", key)
+			if !got.confirming {
+				t.Fatalf("%q refused a cross-project selection; warning = %q", key, got.warning)
 			}
-			if got.warning != warnCrossProject {
-				t.Errorf("%q warning = %q, want %q", key, got.warning, warnCrossProject)
+			if got.warning != "" {
+				t.Errorf("%q warning = %q, want none", key, got.warning)
 			}
-			if cmd != nil {
-				t.Errorf("%q produced a command", key)
+			if shape := batchShape(got.partitionSelection()); len(shape) != 2 {
+				t.Fatalf("batches = %v, want two", shape)
+			}
+			// The prompt names both batches in screen order.
+			if view := got.viewSelectContainers(); !strings.Contains(view, "blog (web) → shop (api)") {
+				t.Errorf("prompt must name both batches, got:\n%s", view)
 			}
 		})
 	}
@@ -20395,5 +20401,409 @@ func TestGroupedScreen_BoundReadOnlyComposerDoesNotFlipTheScreen(t *testing.T) {
 	line1, _ := m.containerHelpLines()
 	if !strings.Contains(line1, "fold") {
 		t.Errorf("footer = %q, want the grouped pair to survive a bound composer", line1)
+	}
+}
+
+// --- Task 10: sequential batch pipeline -------------------------------------
+
+// batchComposer records the pipeline calls one project's composer received, so
+// a sequence test can assert BOTH which services each batch ran and the order
+// the batches ran in. The log is shared across the sequence's composers.
+type batchComposer struct {
+	mockComposer
+	name   string
+	log    *[]string
+	failOn string // runner step name to fail at; "" never fails
+}
+
+func (c *batchComposer) step(name string, containers []string) error {
+	*c.log = append(*c.log, c.name+":"+name+"("+strings.Join(containers, ",")+")")
+	if c.failOn == name {
+		return errors.New(c.name + " " + name + " failed")
+	}
+	return nil
+}
+
+func (c *batchComposer) Stop(_ context.Context, containers []string, _ io.Writer) error {
+	return c.step(runner.StepStopping, containers)
+}
+func (c *batchComposer) Remove(_ context.Context, containers []string, _ io.Writer) error {
+	return c.step(runner.StepRemoving, containers)
+}
+func (c *batchComposer) Pull(_ context.Context, containers []string, _ io.Writer) error {
+	return c.step(runner.StepPulling, containers)
+}
+func (c *batchComposer) Create(_ context.Context, containers []string, _ io.Writer) error {
+	return c.step(runner.StepCreating, containers)
+}
+func (c *batchComposer) Start(_ context.Context, containers []string, _ io.Writer) error {
+	return c.step(runner.StepStarting, containers)
+}
+
+// drainBatch stands in for the bubbletea loop for ONE batch: it feeds every
+// event the running pipeline produced through Update, then delivers that
+// batch's pipelineDoneMsg. The test reads the channel itself instead of
+// invoking waitForEvent, so exactly one reader exists.
+func drainBatch(t *testing.T, m Model) Model {
+	t.Helper()
+	ch := m.eventCh
+	if ch == nil {
+		t.Fatal("no batch is running: eventCh is nil")
+	}
+	idx, session := m.batchIdx, m.batchSession
+	done := make(chan []runner.StepEvent, 1)
+	go func() {
+		var evs []runner.StepEvent
+		for ev := range ch {
+			evs = append(evs, ev)
+		}
+		done <- evs
+	}()
+	var evs []runner.StepEvent
+	select {
+	case evs = <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("batch pipeline did not finish")
+	}
+	for _, ev := range evs {
+		updated, _ := m.Update(stepEventMsg(ev))
+		m = updated.(Model)
+	}
+	updated, _ := m.Update(pipelineDoneMsg{batchIdx: idx, session: session})
+	return updated.(Model)
+}
+
+// twoBatchModel arms a cross-project Deploy over blog/web + shop/api and
+// confirms it, leaving the model on the progress screen with batch 0 running.
+func twoBatchModel(t *testing.T, log *[]string, failOn map[string]string) (Model, map[string]*batchComposer) {
+	t.Helper()
+	g, projects := groupedFixture()
+	made := map[string]*batchComposer{}
+	m := groupedTestModel(g, projects)
+	m.composerFactory = func(p compose.Project) runner.Composer {
+		if p.Unmanaged {
+			return g
+		}
+		if c, ok := made[p.Name]; ok {
+			return c
+		}
+		c := &batchComposer{name: p.Name, log: log, failOn: failOn[p.Name]}
+		made[p.Name] = c
+		return c
+	}
+	updated, _ := m.Update(m.loadGroups()())
+	m = updated.(Model)
+	m.width, m.height = 100, 24
+	m.selected["blog/web"] = true
+	m.selected["shop/api"] = true
+
+	armed, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'d'}})
+	m = armed.(Model)
+	if !m.confirming {
+		t.Fatalf("precondition: d must arm the confirmation; warning = %q", m.warning)
+	}
+	running, _ := m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	m = running.(Model)
+	if m.screen != screenProgress {
+		t.Fatalf("precondition: screen = %d, want screenProgress", m.screen)
+	}
+	return m, made
+}
+
+// The step rows for BOTH batches exist from the start, project-prefixed so the
+// five repeated names stay distinguishable, and the batches run in screen order
+// with each project's own composer seeing only its own services.
+func TestBatchSequence_TwoBatchesRunInOrder(t *testing.T) {
+	var log []string
+	m, made := twoBatchModel(t, &log, nil)
+
+	perBatch := len(runner.Steps(runner.Deploy))
+	if m.batchStepCount != perBatch {
+		t.Errorf("batchStepCount = %d, want %d", m.batchStepCount, perBatch)
+	}
+	if len(m.steps) != 2*perBatch {
+		t.Fatalf("steps = %d, want %d (two batches)", len(m.steps), 2*perBatch)
+	}
+	if m.steps[0].label != "blog: "+runner.StepStopping {
+		t.Errorf("steps[0].label = %q, want the blog prefix", m.steps[0].label)
+	}
+	if m.steps[perBatch].label != "shop: "+runner.StepStopping {
+		t.Errorf("steps[%d].label = %q, want the shop prefix", perBatch, m.steps[perBatch].label)
+	}
+	if m.steps[0].name != runner.StepStopping || m.steps[perBatch].name != runner.StepStopping {
+		t.Error("name must stay the RUNNER step name in both batches — it is what a StepEvent matches")
+	}
+
+	// Batch 0 (blog). The events carry the same five names batch 1 will, so a
+	// global name scan would mark blog's rows for shop's events too.
+	m = drainBatch(t, m)
+	if m.batchIdx != 1 {
+		t.Fatalf("batchIdx = %d, want 1 (the sequence must advance)", m.batchIdx)
+	}
+	for i := 0; i < perBatch; i++ {
+		if m.steps[i].status != runner.StatusDone {
+			t.Errorf("steps[%d] (blog) status = %q, want done", i, m.steps[i].status)
+		}
+	}
+	for i := perBatch; i < len(m.steps); i++ {
+		if m.steps[i].status != "" {
+			t.Errorf("steps[%d] (shop) status = %q before its batch ran, want pending", i, m.steps[i].status)
+		}
+	}
+	if m.done {
+		t.Error("done must not be set while a batch is still to run")
+	}
+
+	// Batch 1 (shop) — a FRESH events channel, because runner.Run closes the
+	// one it is given.
+	m = drainBatch(t, m)
+	for i := range m.steps {
+		if m.steps[i].status != runner.StatusDone {
+			t.Errorf("steps[%d] status = %q, want done after both batches", i, m.steps[i].status)
+		}
+	}
+	if !m.done {
+		t.Error("done must be set once the last batch finishes")
+	}
+
+	want := []string{
+		"blog:Stopping(web)", "blog:Removing(web)", "blog:Pulling(web)", "blog:Creating(web)", "blog:Starting(web)",
+		"shop:Stopping(api)", "shop:Removing(api)", "shop:Pulling(api)", "shop:Creating(api)", "shop:Starting(api)",
+	}
+	if !slices.Equal(log, want) {
+		t.Errorf("pipeline calls =\n%v\nwant\n%v", log, want)
+	}
+	if len(made) != 2 {
+		t.Errorf("factory built %d composers, want one per batch", len(made))
+	}
+	// The wait phase seeds from the LAST batch's own services, in bare form.
+	if !slices.Equal(m.waitState.Services, []string{"api"}) {
+		t.Errorf("waitState.Services = %v, want [api] (the last batch)", m.waitState.Services)
+	}
+}
+
+// A failed batch stops the sequence: the batches behind it never run and say so
+// on screen rather than sitting at ○, which reads as "still to come".
+func TestBatchSequence_FailureStopsSequence(t *testing.T) {
+	var log []string
+	m, made := twoBatchModel(t, &log, map[string]string{"blog": runner.StepRemoving})
+
+	perBatch := len(runner.Steps(runner.Deploy))
+	m = drainBatch(t, m)
+
+	if !m.failed {
+		t.Fatal("a failed step must mark the operation failed")
+	}
+	if m.batchIdx != 0 {
+		t.Errorf("batchIdx = %d, want 0 — a failed batch must not advance", m.batchIdx)
+	}
+	if m.done {
+		t.Error("done must never be set after a failure")
+	}
+	if m.steps[1].status != runner.StatusFailed {
+		t.Errorf("steps[1] status = %q, want failed", m.steps[1].status)
+	}
+	// The failed batch's unreached steps stay pending (unchanged behaviour);
+	// the batches behind it are skipped.
+	for i := 2; i < perBatch; i++ {
+		if m.steps[i].status != "" {
+			t.Errorf("steps[%d] status = %q, want pending inside the failed batch", i, m.steps[i].status)
+		}
+	}
+	for i := perBatch; i < len(m.steps); i++ {
+		if m.steps[i].status != statusSkipped {
+			t.Errorf("steps[%d] status = %q, want %q", i, m.steps[i].status, statusSkipped)
+		}
+	}
+	if _, ok := made["shop"]; ok {
+		t.Error("the second batch's composer must never be built after a failure")
+	}
+	want := []string{"blog:Stopping(web)", "blog:Removing(web)"}
+	if !slices.Equal(log, want) {
+		t.Errorf("pipeline calls = %v, want %v", log, want)
+	}
+	if view := m.viewProgress(); !strings.Contains(view, "(skipped)") {
+		t.Errorf("the progress screen must name the skipped rows, got:\n%s", view)
+	}
+}
+
+// esc cancels the running batch. The pipelineDoneMsg it already queued must NOT
+// start the next one — that is what the sequence session gates.
+func TestBatchSequence_EscDoesNotAdvance(t *testing.T) {
+	var log []string
+	m, made := twoBatchModel(t, &log, nil)
+
+	idx, session := m.batchIdx, m.batchSession
+	perBatch := len(runner.Steps(runner.Deploy))
+
+	cancelled, _ := m.Update(tea.KeyMsg{Type: tea.KeyEsc})
+	m = cancelled.(Model)
+	if m.screen != screenProgress {
+		t.Fatalf("esc mid-op must stay on the progress screen, got screen %d", m.screen)
+	}
+	if m.batchSession == session {
+		t.Error("esc must bump batchSession so the queued done message cannot advance")
+	}
+	for i := perBatch; i < len(m.steps); i++ {
+		if m.steps[i].status != statusSkipped {
+			t.Errorf("steps[%d] status = %q, want %q after a cancel", i, m.steps[i].status, statusSkipped)
+		}
+	}
+
+	// The message the cancelled batch queued lands now.
+	stale, cmd := m.Update(pipelineDoneMsg{batchIdx: idx, session: session})
+	m = stale.(Model)
+	if m.batchIdx != 0 {
+		t.Errorf("batchIdx = %d, want 0 — a cancelled sequence must not advance", m.batchIdx)
+	}
+	if m.done {
+		t.Error("a stale done message must not resolve the operation")
+	}
+	if cmd != nil {
+		t.Error("a stale done message must produce no command")
+	}
+	if _, ok := made["shop"]; ok {
+		t.Error("the second batch must never start after a cancel")
+	}
+}
+
+// A done message from an earlier batch of the SAME sequence is stale too: only
+// the batch now running may report itself finished.
+func TestBatchSequence_RejectsStaleBatchIndex(t *testing.T) {
+	var log []string
+	m, _ := twoBatchModel(t, &log, nil)
+	m = drainBatch(t, m) // batch 0 done, batch 1 running
+
+	replayed, cmd := m.Update(pipelineDoneMsg{batchIdx: 0, session: m.batchSession})
+	got := replayed.(Model)
+	if got.batchIdx != 1 {
+		t.Errorf("batchIdx = %d, want 1 — a replayed batch-0 message must be dropped", got.batchIdx)
+	}
+	if cmd != nil {
+		t.Error("a replayed done message must produce no command")
+	}
+	// Off-screen delivery is dropped as well.
+	m.screen = screenSelectContainers
+	offScreen, cmd := m.Update(pipelineDoneMsg{batchIdx: 1, session: m.batchSession})
+	if got := offScreen.(Model); got.done {
+		t.Error("a done message that arrives off the progress screen must be dropped")
+	}
+	if cmd != nil {
+		t.Error("an off-screen done message must produce no command")
+	}
+}
+
+// One project is still one batch, and it must render and behave exactly as it
+// did before the sequence existed: bare step labels, no skipped rows.
+func TestBatchSequence_SingleBatchEquivalence(t *testing.T) {
+	var log []string
+	mc := &batchComposer{name: "app", log: &log, failOn: runner.StepRemoving}
+	m := NewModel(mc, io.Discard, mockFactory(&mc.mockComposer), nil, nil)
+	installFakeTick(&m)
+	m.screen = screenSelectContainers
+	m.projName, m.projDir = "app", "/srv/app"
+	m.setSingleGroup([]string{"web"})
+	m.composer = mc
+	m.selected[m.svcKeyAt(0)] = true
+	m.width, m.height = 80, 24
+
+	armed, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'d'}})
+	m = armed.(Model)
+	if !m.confirming {
+		t.Fatal("precondition: d must arm the confirmation on the drilled screen")
+	}
+	running, _ := m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	m = running.(Model)
+
+	if len(m.batches) != 1 || m.batches[0].proj.Name != "app" {
+		t.Fatalf("batches = %+v, want one app batch", m.batches)
+	}
+	if len(m.steps) != len(runner.Steps(runner.Deploy)) {
+		t.Fatalf("steps = %d, want one batch's worth", len(m.steps))
+	}
+	for i, s := range m.steps {
+		if s.label != s.name {
+			t.Errorf("steps[%d].label = %q, want the bare name %q for a single batch", i, s.label, s.name)
+		}
+	}
+
+	m = drainBatch(t, m)
+	if !m.failed {
+		t.Fatal("the failing step must mark the operation failed")
+	}
+	for i := 2; i < len(m.steps); i++ {
+		if m.steps[i].status != "" {
+			t.Errorf("steps[%d] status = %q, want pending — a single batch has nothing to skip", i, m.steps[i].status)
+		}
+	}
+	if view := m.viewProgress(); strings.Contains(view, "(skipped)") {
+		t.Errorf("a single-batch failure must render exactly as before, got:\n%s", view)
+	}
+}
+
+// Leaving the progress screen drops the sequence and invalidates any done
+// message still in flight.
+func TestBatchSequence_DepartureClearsSequence(t *testing.T) {
+	var log []string
+	m, _ := twoBatchModel(t, &log, nil)
+	m = drainBatch(t, m)
+	m = drainBatch(t, m)
+	if !m.done {
+		t.Fatal("precondition: both batches must finish")
+	}
+	session := m.batchSession
+
+	back, _ := m.Update(tea.KeyMsg{Type: tea.KeyEsc}) // first esc skips the wait
+	m = back.(Model)
+	back, _ = m.Update(tea.KeyMsg{Type: tea.KeyEsc}) // second esc leaves the screen
+	m = back.(Model)
+
+	if m.screen != screenSelectContainers {
+		t.Fatalf("screen = %d, want screenSelectContainers", m.screen)
+	}
+	if m.batches != nil || m.batchIdx != 0 || m.batchStepCount != 0 {
+		t.Errorf("batch state survived the departure: %+v idx=%d count=%d", m.batches, m.batchIdx, m.batchStepCount)
+	}
+	if m.batchSession == session {
+		t.Error("the departure must bump batchSession")
+	}
+}
+
+// A sequence touches one project per batch, and each keeps its own update-cache
+// entry — the current key names at most one of them.
+func TestBatchSequence_InvalidatesEveryBatchCacheKey(t *testing.T) {
+	var log []string
+	m, _ := twoBatchModel(t, &log, nil)
+	m.serverName = "prod"
+	m.updateCache = map[string]updateEntry{
+		"/srv/blog|prod":  {fetchedAt: time.Now(), results: map[string]bool{"web": true}},
+		"/srv/shop|prod":  {fetchedAt: time.Now(), results: map[string]bool{"api": true}},
+		"/srv/other|prod": {fetchedAt: time.Now(), results: map[string]bool{"x": true}},
+	}
+	m = drainBatch(t, m)
+	m = drainBatch(t, m)
+
+	back, _ := m.Update(tea.KeyMsg{Type: tea.KeyEsc}) // skip the wait
+	m = back.(Model)
+	back, _ = m.Update(tea.KeyMsg{Type: tea.KeyEsc}) // leave the screen
+	m = back.(Model)
+
+	for _, key := range []string{"/srv/blog|prod", "/srv/shop|prod"} {
+		if _, ok := m.updateCache[key]; ok {
+			t.Errorf("cache entry %q survived a successful deploy of that project", key)
+		}
+	}
+	if _, ok := m.updateCache["/srv/other|prod"]; !ok {
+		t.Error("a project the sequence never touched must keep its cache entry")
+	}
+}
+
+// The progress title names every batch, because a bare service list cannot say
+// which "api" a two-project sequence means.
+func TestBatchSequence_ProgressTitleNamesEveryBatch(t *testing.T) {
+	var log []string
+	m, _ := twoBatchModel(t, &log, nil)
+	if view := m.viewProgress(); !strings.Contains(view, "blog (web) → shop (api)") {
+		t.Errorf("title must name both batches, got:\n%s", view)
 	}
 }
