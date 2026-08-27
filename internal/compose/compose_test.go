@@ -2735,3 +2735,113 @@ func TestCommand_ProjectName(t *testing.T) {
 		}
 	})
 }
+
+// docker reports the project's whole config_files list; ConfigDir is only
+// filepath.Dir of the first entry, and a directory does not name a file.
+func TestParseProjects_CarriesConfigFiles(t *testing.T) {
+	data := []byte(`[
+	  {"Name":"blue","Status":"running(2)","ConfigFiles":"/srv/app/prod.yml,/srv/app/extra.yml"},
+	  {"Name":"labelonly","Status":"running(1)","ConfigFiles":""}
+	]`)
+	projects, err := parseProjects(data)
+	if err != nil {
+		t.Fatalf("parseProjects: %v", err)
+	}
+	byName := map[string]Project{}
+	for _, p := range projects {
+		byName[p.Name] = p
+	}
+	blue := byName["blue"]
+	if !slices.Equal(blue.ConfigFiles, []string{"/srv/app/prod.yml", "/srv/app/extra.yml"}) {
+		t.Errorf("ConfigFiles = %v, want the full ordered list", blue.ConfigFiles)
+	}
+	if blue.ConfigDir != "/srv/app" {
+		t.Errorf("ConfigDir = %q, want /srv/app", blue.ConfigDir)
+	}
+	// An empty label stays the "no directory, no files" sentinel.
+	if byName["labelonly"].ConfigFiles != nil || byName["labelonly"].ConfigDir != "" {
+		t.Errorf("label-only project = %+v, want empty ConfigFiles and ConfigDir", byName["labelonly"])
+	}
+}
+
+// -p pins WHICH project a command addresses; ComposeFiles pins WHAT that project
+// is made of. Without the second half, a project created from `-f prod.yml -p
+// prod` was recreated from a sibling docker-compose.yml under the right label.
+func TestCommand_ComposeFiles(t *testing.T) {
+	c := &Compose{
+		ProjectDir:   "/srv/app",
+		UID:          "1000:1000",
+		ProjectName:  "prod",
+		ComposeFiles: []string{"/srv/app/prod.yml", "/srv/app/extra.yml"},
+	}
+	got := c.command(context.Background(), "up", "--no-start").Args[1:]
+	want := []string{
+		"compose",
+		"-f", "/srv/app/prod.yml",
+		"-f", "/srv/app/extra.yml",
+		"-p", "prod",
+		"up", "--no-start",
+	}
+	if !slices.Equal(got, want) {
+		t.Errorf("args = %v, want %v", got, want)
+	}
+
+	// The rollback override stack wins: PrepareRollback already seeds it with
+	// the project's own files and the override must stay last.
+	c.ExtraComposeFiles = []string{"/srv/app/prod.yml", "/tmp/override.yml"}
+	got = c.command(context.Background(), "up", "--no-start").Args[1:]
+	want = []string{
+		"compose",
+		"-f", "/srv/app/prod.yml",
+		"-f", "/tmp/override.yml",
+		"-p", "prod",
+		"up", "--no-start",
+	}
+	if !slices.Equal(got, want) {
+		t.Errorf("args = %v, want %v", got, want)
+	}
+
+	// nil ComposeFiles keeps the pre-existing argv byte for byte.
+	plain := &Compose{ProjectDir: "/srv/app", UID: "1000:1000"}
+	if got := plain.command(context.Background(), "ps").Args[1:]; !slices.Equal(got, []string{"compose", "ps"}) {
+		t.Errorf("args = %v, want the unchanged default", got)
+	}
+}
+
+// A project whose only file is non-canonical must not be probed for the four
+// default names: the probe reports "no compose file found" for a project the
+// host view just listed, or finds a sibling project's file.
+func TestFindComposeFile_UsesReportedFileSet(t *testing.T) {
+	c := &Compose{ProjectDir: "/nonexistent", ComposeFiles: []string{"/srv/app/stack.yml"}}
+	got, err := c.findComposeFile()
+	if err != nil {
+		t.Fatalf("findComposeFile: %v", err)
+	}
+	if got != "/srv/app/stack.yml" {
+		t.Errorf("findComposeFile = %q, want /srv/app/stack.yml", got)
+	}
+}
+
+// The rollback override is stacked on top of the project's WHOLE file set, in
+// load order — `-f` disables auto-discovery, so a multi-file project recreated
+// from its first file alone loses the rest of its definition.
+func TestPrepareRollback_StacksTheWholeReportedFileSet(t *testing.T) {
+	c := &Compose{
+		ProjectDir:   "/srv/app",
+		ComposeFiles: []string{"/srv/app/prod.yml", "/srv/app/extra.yml"},
+		runCmd:       func(cmd *exec.Cmd) error { return nil },
+		outputCmd:    func(cmd *exec.Cmd) ([]byte, error) { return []byte("{}"), nil },
+	}
+	entries := map[string]SnapshotEntry{"web": {Image: "nginx:1", Digest: "sha256:aa"}}
+	cleanup, err := c.PrepareRollback(context.Background(), entries, []string{"web"}, io.Discard)
+	if err != nil {
+		t.Fatalf("PrepareRollback: %v", err)
+	}
+	defer cleanup()
+	if len(c.ExtraComposeFiles) != 3 {
+		t.Fatalf("ExtraComposeFiles = %v, want both project files plus the override", c.ExtraComposeFiles)
+	}
+	if c.ExtraComposeFiles[0] != "/srv/app/prod.yml" || c.ExtraComposeFiles[1] != "/srv/app/extra.yml" {
+		t.Errorf("ExtraComposeFiles = %v, want the project's files first in load order", c.ExtraComposeFiles)
+	}
+}

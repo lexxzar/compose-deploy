@@ -18,6 +18,7 @@ import (
 var (
 	logDir       string
 	projectDir   string
+	projectName  string
 	serverName   string
 	sshTarget    string
 	identityFile string
@@ -61,6 +62,13 @@ Remote server configuration (~/.cdeploy/servers.yml):
 			// `--ssh`. Reject early in the TUI path.
 			if identityFile != "" {
 				return fmt.Errorf("--identity is not valid for the interactive TUI; use it with a subcommand")
+			}
+			// `--project-name` is CLI-only too. The TUI discovers projects
+			// through `docker compose ls` and carries each row's real name into
+			// the composer it builds, so naming one up front would either be
+			// ignored or silently override the row the user picked.
+			if projectName != "" {
+				return fmt.Errorf("--project-name is not valid for the interactive TUI; use it with a subcommand")
 			}
 
 			dir := projectDir
@@ -188,6 +196,7 @@ Remote server configuration (~/.cdeploy/servers.yml):
 
 	rootCmd.PersistentFlags().StringVar(&logDir, "log-dir", "", "log directory (default ~/.cdeploy/logs/)")
 	rootCmd.PersistentFlags().StringVarP(&projectDir, "project-dir", "C", "", "docker compose project directory (default: current directory)")
+	rootCmd.PersistentFlags().StringVarP(&projectName, "project-name", "p", "", "docker compose project name (default: derived from the project directory)")
 	rootCmd.PersistentFlags().StringVarP(&serverName, "server", "s", "", "remote server name from ~/.cdeploy/servers.yml")
 	rootCmd.PersistentFlags().StringVarP(&sshTarget, "ssh", "S", "", "ad-hoc SSH connection string [user@]host[:port] (mutually exclusive with --server)")
 	rootCmd.PersistentFlags().StringVarP(&identityFile, "identity", "i", "", "path to SSH private key (requires --ssh)")
@@ -213,12 +222,20 @@ func Execute() error {
 // names while several of them share one ConfigDir. Dropping the name made every
 // such row address the directory's default project instead — the picker showed
 // one project and `d`/`r`/`s` stopped and removed another's containers.
+//
+// The FILE SET is carried for the same reason at one level down. `-p` pins which
+// project a command addresses; the files pin what that project is made of. A
+// project created from `-f prod.yml` in a directory that also holds a
+// docker-compose.yml was recreated from the wrong service definitions under the
+// right label, and a project whose only file is stack.yml reported "no compose
+// file found" from the `c` screen and from rollback prep.
 func localComposerFor(proj compose.Project, detector *compose.Compose, standalone, detected bool) runner.Composer {
 	if proj.Unmanaged {
 		return compose.NewLocalHostContainers(detector)
 	}
 	lc := compose.New(proj.ConfigDir)
 	lc.ProjectName = proj.Name
+	lc.ComposeFiles = proj.ConfigFiles
 	if detected {
 		lc.SetStandalone(standalone)
 	}
@@ -229,12 +246,18 @@ func localComposerFor(proj compose.Project, detector *compose.Compose, standalon
 // reuses the LIVE RemoteCompose so the existing ControlMaster socket carries
 // the docker ps / stats / logs calls; a compose project gets a fresh composer
 // pointed at the same host, named by the same project the row came from.
+//
+// SSHExtraArgs is copied along with the rest: it carries the ad-hoc port and
+// `-i <key>` that reach the host at all, so a composer built without them would
+// dial a different endpoint than the connection it was derived from.
 func remoteComposerFor(proj compose.Project, rc *compose.RemoteCompose, standalone bool) runner.Composer {
 	if proj.Unmanaged {
 		return compose.NewRemoteHostContainers(rc)
 	}
 	newRC := compose.NewRemote(rc.Host, proj.ConfigDir)
 	newRC.ProjectName = proj.Name
+	newRC.ComposeFiles = proj.ConfigFiles
+	newRC.SSHExtraArgs = rc.SSHExtraArgs
 	newRC.SetStandalone(standalone)
 	return newRC
 }

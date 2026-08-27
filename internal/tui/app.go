@@ -1164,10 +1164,12 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			// every glyph a U scan painted would vanish on the next tick, and
 			// nothing in grouped mode would fetch it back.
 			m.hydrateGroupedUpdates()
-			// This branch is the 5-second refresh, so it is also where a soft
-			// update warning ages out: U is the only thing that can refresh a
-			// grouped scan, so no other path would ever clear the text.
-			m.expireGroupedUpdatesErr()
+			// This branch is the 5-second refresh AND the initial load, so it
+			// is where the soft update warning is re-derived: U is the only
+			// thing that can refresh a grouped scan, so no other path would
+			// ever clear the text — or put it back after a landing site blanked
+			// it. See syncGroupedUpdatesErr.
+			m.syncGroupedUpdatesErr()
 			m.pruneSelection()
 			m.restoreCursorRow(cursorID)
 			// searchMatches indexes svcEntries, which the rebuild renumbered.
@@ -1209,6 +1211,20 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// has navigated to project B and silently overwrite the new svcStatus
 		// map. Mirrors the statsSession filter on statsMsg.
 		if m.screen != screenSelectContainers || msg.session != m.statusSession {
+			return m, nil
+		}
+		// A failure replaces the WHOLE container view with the error screen,
+		// which draws neither the confirm prompt nor the search bar. The key
+		// swallow that makes every row action inert while svcErr is set sits
+		// BELOW both sub-state intercepts in handleKey, so it can only stop a
+		// prompt from being ARMED — an already-armed one would vanish behind the
+		// error text while `enter` still ran the operation against a selection
+		// the user can no longer see. That is the exact failure the swallow
+		// exists to prevent, one path narrower. servicesMsg drops its whole
+		// payload while confirming for the same reason; here only the ERROR is
+		// dropped, because a successful status refresh just repaints the dots.
+		// Nothing is lost — the next tick after the sub-state closes refetches.
+		if msg.err != nil && m.containerSubStateActive() {
 			return m, nil
 		}
 		if msg.err != nil {
@@ -1487,7 +1503,15 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			// render path), and its setInspectContent does SetXOffset(0), so
 			// calling it for a foreign entry would reset the pane's horizontal
 			// scroll to show data that did not change.
-			if msg.forKey == m.updatesCacheKey() {
+			//
+			// The key compared is inspectUpdateKey(), the one the inspect screen
+			// actually reads through — NOT updatesCacheKey(). In grouped mode
+			// the model holds no project identity, so updatesCacheKey resolves
+			// to the degenerate "\x00|<server>" and never equals the batch's
+			// key: a batch landing while the inspect screen was open repainted
+			// nothing, and the rows appeared only after esc and a second `i`.
+			// Off the inspect screen the call is a no-op either way.
+			if msg.forKey == m.inspectUpdateKey() {
 				m.redrawInspectFromCache()
 			}
 		}
@@ -2079,6 +2103,16 @@ func (m Model) confirmPromptArmed() bool {
 		return m.settingsDelete
 	}
 	return false
+}
+
+// containerSubStateActive reports whether the container screen is in a sub-state
+// the svcErr error view cannot draw: an armed confirmation prompt, or an open
+// search bar. Both are handled by intercepts ABOVE the svcErr key swallow in
+// handleKey, so a failure landing while one is up would hide it while its keys
+// stayed live — the armed-prompt case runs a Deploy/Restart/Stop against an
+// invisible selection. It is the one gate on statusMsg's error path.
+func (m Model) containerSubStateActive() bool {
+	return m.confirming || m.searching
 }
 
 // typingInInput reports whether an open text input is capturing raw runes on
@@ -5200,6 +5234,17 @@ func (m *Model) updateDetailsCmd(entry updateEntry, key string) tea.Cmd {
 // verdict, a composer without UpdateDetailer, a batch already in flight — makes
 // updateDetailsCmd return nil without touching anything.
 func (m *Model) refillUpdateDetailsCmd() tea.Cmd {
+	// Grouped mode owns neither the single cache key this reads nor the single
+	// composer the fetch would run through — the same reason
+	// maybeRefreshUpdatesCmd returns before its own call. updatesCacheKey()
+	// resolves to the degenerate "\x00|<server>" there, so a refill would fetch
+	// one project's details into another project's entry (and raise
+	// detailsInFlight for it) whenever any composer happened to be bound. The
+	// guard lives HERE rather than at the call sites so the arrival tail, which
+	// runs on every updateDetailsMsg regardless of screen, cannot miss it.
+	if m.grouped {
+		return nil
+	}
 	entry, fresh := m.updatesCacheLookup()
 	if !fresh || entry.err || entry.details != nil {
 		return nil
@@ -5360,20 +5405,22 @@ func (m *Model) hydrateGroupedUpdates() {
 	}
 }
 
-// expireGroupedUpdatesErr drops the soft update warning once no visible group
-// still holds an UNEXPIRED failure entry.
+// syncGroupedUpdatesErr re-derives the soft update warning from the visible
+// groups' cache entries. It both DROPS a warning whose failure entry has expired
+// and RESTORES one the current group list still justifies.
 //
-// Grouped mode never refetches verdicts on its own — U is the only trigger — so
-// none of the drilled clear paths (the fresh-success cache hit, the statusMsg
-// self-heal) can ever run there. Without this the warning from one failed U
-// outlives the failure it describes for the rest of the visit.
-func (m *Model) expireGroupedUpdatesErr() {
-	if m.updatesErr == "" {
-		return
-	}
-	if m.groupedUpdatesErr() == "" {
-		m.updatesErr = ""
-	}
+// The restore half is not symmetry for its own sake — it is the cache-hit rule
+// every other path already keeps (see updatesCacheLookup's callers). Grouped
+// mode never refetches verdicts on its own, U is the only trigger, and the three
+// landing sites — enterGroupedContainers, drillIntoGroup and backToServerScreen
+// — all blank m.updatesErr on the way through. Without a restore, drilling into
+// one group and pressing esc erased the warning a failed U had raised for
+// another, leaving that group's glyph column blank with nothing on screen
+// explaining why and no path able to bring either back for the whole 30-second
+// error TTL. An early return on an already-empty field is exactly what made the
+// old expire-only form unable to do it.
+func (m *Model) syncGroupedUpdatesErr() {
+	m.updatesErr = m.groupedUpdatesErr()
 }
 
 // groupedUpdatesErr returns the soft update warning the VISIBLE groups justify:
@@ -5469,9 +5516,9 @@ func (m *Model) maybeRefreshUpdatesCmd() tea.Cmd {
 		// Grouped mode owns neither the single cache key this helper looks up
 		// nor the single composer a refill would fetch through — updatesCacheKey
 		// would resolve to whichever project was drilled last. Nothing is
-		// scheduled from here until U scopes a scan to one group. The warning
-		// still has to age out, which is the one thing this branch does.
-		m.expireGroupedUpdatesErr()
+		// scheduled from here until U scopes a scan to one group. Re-deriving
+		// the warning from the visible groups is the one thing this branch does.
+		m.syncGroupedUpdatesErr()
 		return nil
 	}
 	if m.updateInFlight {

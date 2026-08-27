@@ -2861,13 +2861,13 @@ func TestGroupedUpdatesErr_ExpiresWithItsCacheEntry(t *testing.T) {
 	m.updatesErr = "registry unreachable"
 
 	m.updateCache = map[string]updateEntry{key: {fetchedAt: time.Now(), err: true, errMsg: "registry unreachable"}}
-	m.expireGroupedUpdatesErr()
+	m.syncGroupedUpdatesErr()
 	if m.updatesErr == "" {
 		t.Error("a FRESH failure entry must keep its warning")
 	}
 
 	m.updateCache[key] = updateEntry{fetchedAt: time.Now().Add(-2 * updatesErrorTTL), err: true}
-	m.expireGroupedUpdatesErr()
+	m.syncGroupedUpdatesErr()
 	if m.updatesErr != "" {
 		t.Errorf("updatesErr = %q, want it cleared once the entry expired", m.updatesErr)
 	}
@@ -3834,5 +3834,161 @@ func TestGroupedRefreshError_GatesRowActions(t *testing.T) {
 	}
 	if _, cmd := m.Update(tea.KeyMsg{Type: tea.KeyCtrlC}); cmd == nil {
 		t.Error("ctrl+c must still quit from the error screen")
+	}
+}
+
+// The svcErr key swallow sits BELOW the confirmation intercept, so it can only
+// stop a prompt from being ARMED. servicesMsg drops its whole payload while
+// confirming; statusMsg had no such guard, so an in-flight refreshStatus that
+// failed mid-prompt hid the prompt behind the error screen while enter still
+// launched the operation against a selection the user could no longer see.
+func TestStatusMsgError_DroppedWhileAConfirmationIsArmed(t *testing.T) {
+	m := groupedScreenModel(svcGroupOf("shop", "api"))
+	m.grouped = false
+	m.svcCursor = 0
+	m.selected = map[string]bool{svcKey("shop", "api"): true}
+	m.confirming = true
+	m.pendingOp = runner.Deploy
+
+	updated, _ := m.Update(statusMsg{err: errors.New("docker daemon gone"), session: m.statusSession})
+	got := updated.(Model)
+
+	if got.svcErr != nil {
+		t.Fatalf("svcErr = %v, want the error dropped while a prompt is armed", got.svcErr)
+	}
+	if !got.confirming {
+		t.Error("the armed prompt must survive the dropped refresh")
+	}
+	if !strings.Contains(ansi.Strip(got.viewSelectContainers()), "Deploy") {
+		t.Error("the confirm prompt must still be drawn")
+	}
+}
+
+// The search bar is the other sub-state the error view cannot draw: keystrokes
+// went into an input that was not on screen.
+func TestStatusMsgError_DroppedWhileSearching(t *testing.T) {
+	m := groupedScreenModel(svcGroupOf("shop", "api"))
+	m.grouped = false
+	m.searching = true
+
+	updated, _ := m.Update(statusMsg{err: errors.New("docker daemon gone"), session: m.statusSession})
+	got := updated.(Model)
+	if got.svcErr != nil {
+		t.Fatalf("svcErr = %v, want the error dropped while the search bar is open", got.svcErr)
+	}
+	if !got.searching {
+		t.Error("the open search bar must survive the dropped refresh")
+	}
+}
+
+// A successful status refresh is harmless mid-prompt — it only repaints the
+// dots — so the guard must be scoped to the ERROR path.
+func TestStatusMsgSuccess_StillLandsWhileConfirming(t *testing.T) {
+	m := groupedScreenModel(svcGroupOf("shop", "api"))
+	m.grouped = false
+	m.confirming = true
+
+	updated, _ := m.Update(statusMsg{status: map[string]runner.ServiceStatus{"api": {Running: true}}, session: m.statusSession})
+	got := updated.(Model)
+	if st := got.svcStatus[svcKey("shop", "api")]; !st.Running {
+		t.Error("a successful status refresh must still land while confirming")
+	}
+}
+
+// Every grouped landing site blanks updatesErr, and U is the only thing that can
+// refresh a grouped scan — so the warning has to be re-derived from the cache
+// when the group list is installed, not merely aged out.
+func TestGroupedUpdatesErr_RestoredOnTheGroupedPayload(t *testing.T) {
+	g, projects := groupedFixture()
+	m := groupedTestModel(g, projects)
+	updated, _ := m.Update(m.loadGroups()())
+	m = updated.(Model)
+
+	// A failed U on blog caches an error entry and raises the warning.
+	blog := compose.Project{Name: "blog", ConfigDir: "/srv/blog"}
+	m.updateCache = map[string]updateEntry{
+		m.projUpdatesCacheKey(blog): {fetchedAt: time.Now(), err: true, errMsg: "registry unreachable"},
+	}
+	// Drilling in and back out blanks the field; nothing re-derived it.
+	m.updatesErr = ""
+
+	again, _ := m.Update(m.loadGroups()())
+	got := again.(Model)
+	if got.updatesErr != "registry unreachable" {
+		t.Errorf("updatesErr = %q, want the cached failure restored", got.updatesErr)
+	}
+
+	// And it still ages out once the entry expires.
+	got.updateCache[got.projUpdatesCacheKey(blog)] = updateEntry{fetchedAt: time.Now().Add(-2 * updatesErrorTTL), err: true, errMsg: "registry unreachable"}
+	expired, _ := got.Update(got.loadGroups()())
+	if e := expired.(Model).updatesErr; e != "" {
+		t.Errorf("updatesErr = %q, want it cleared once the entry expired", e)
+	}
+}
+
+// The refill reads the CURRENT cache key and fetches through the CURRENT
+// composer. Grouped mode has neither — updatesCacheKey resolves to the
+// degenerate "\x00|" there — so a refill would fill one project's details into
+// another project's entry. maybeRefreshUpdatesCmd guards its own call site; the
+// updateDetailsMsg arrival tail runs on every screen and cannot.
+func TestRefillUpdateDetails_RefusesInGroupedMode(t *testing.T) {
+	m := groupedScreenModel(svcGroupOf("shop", "api"))
+	// A composer IS bound in the failing case the guard covers: grouped mode
+	// binds one at press time for the read keys (l, x, i, c).
+	m.composer = &mockDetailComposer{}
+	m.updateCache = map[string]updateEntry{
+		m.updatesCacheKey(): {fetchedAt: time.Now(), results: map[string]bool{"api": true}},
+	}
+	if cmd := m.refillUpdateDetailsCmd(); cmd != nil {
+		t.Error("a refill fired in grouped mode against the degenerate key")
+	}
+	if m.detailsInFlight {
+		t.Error("the refused refill raised detailsInFlight for a foreign entry")
+	}
+	m.grouped = false
+	if cmd := m.refillUpdateDetailsCmd(); cmd == nil {
+		t.Error("the drilled refill must still fire — the guard is grouped-only")
+	}
+}
+
+// The redraw gate must compare the batch's key against the key the INSPECT
+// screen reads through, not against updatesCacheKey(). Grouped mode has no
+// project identity, so updatesCacheKey resolves to the degenerate "\x00|" and
+// never equals the batch's key: a detail batch landing while the inspect screen
+// was open repainted nothing, and the rows appeared only after esc and a second `i`.
+func TestUpdateDetailsMsg_RepaintsTheGroupedInspectScreen(t *testing.T) {
+	m, _ := groupedUpdatesModel(t)
+	m.svcCursor = 3 // shop/api
+	m = pressU(t, m)
+
+	key := m.projUpdatesCacheKey(compose.Project{Name: "shop", ConfigDir: "/srv/shop"})
+	entry := m.updateCache[key]
+	if entry.results == nil {
+		t.Fatal("precondition: the scan must have written a success entry")
+	}
+	if key == m.updatesCacheKey() {
+		t.Fatal("precondition: grouped mode must not resolve to the group's own key")
+	}
+
+	// Stand on the inspect screen with a raw document in hand so
+	// rebuildInspectSummary has something to draw.
+	m.screen = screenInspect
+	m.inspectService = "api"
+	m.inspectRaw = []byte(`[{"Name":"/shop-api-1","State":{"Status":"running"},"Config":{"Image":"nginx:1"}}]`)
+	m.width, m.height = 100, 30
+	m.rebuildInspectSummary()
+	before := m.inspectSummary
+
+	updated, _ := m.Update(updateDetailsMsg{
+		details:  map[string]compose.UpdateDetail{"api": {NewID: "sha256:beef"}},
+		forKey:   key,
+		forEntry: entry.fetchedAt,
+	})
+	got := updated.(Model)
+	if got.updateCache[key].details == nil {
+		t.Fatal("the batch did not merge onto its entry")
+	}
+	if got.inspectSummary == before {
+		t.Error("the inspect screen was not repainted for the batch that landed")
 	}
 }

@@ -2,6 +2,8 @@ package compose
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"os"
@@ -17,16 +19,16 @@ import (
 var hex12RE = regexp.MustCompile(`^[0-9a-f]{12}$`)
 
 func TestSnapshotKeyFormat(t *testing.T) {
-	key := snapshotKey("/opt/myapp")
+	key := snapshotKey("/opt/myapp", "")
 	if !hex12RE.MatchString(key) {
 		t.Fatalf("snapshotKey = %q, want 12 lowercase hex chars", key)
 	}
 	// Deterministic: same input -> same key.
-	if got := snapshotKey("/opt/myapp"); got != key {
+	if got := snapshotKey("/opt/myapp", ""); got != key {
 		t.Fatalf("snapshotKey not deterministic: %q vs %q", got, key)
 	}
 	// Different input -> different key (sanity).
-	if snapshotKey("/opt/other") == key {
+	if snapshotKey("/opt/other", "") == key {
 		t.Fatalf("distinct dirs produced the same key")
 	}
 }
@@ -42,27 +44,27 @@ func TestLocalProjectDirRelAbsSameKey(t *testing.T) {
 		t.Fatalf("Getwd: %v", err)
 	}
 
-	relKey := snapshotKey(localProjectDir("./myapp"))
-	absKey := snapshotKey(localProjectDir(filepath.Join(cwd, "myapp")))
+	relKey := snapshotKey(localProjectDir("./myapp"), "")
+	absKey := snapshotKey(localProjectDir(filepath.Join(cwd, "myapp")), "")
 	if relKey != absKey {
 		t.Fatalf("rel vs abs keys differ: rel=%q abs=%q", relKey, absKey)
 	}
 }
 
 func TestLocalProjectDirTrailingSlashSameKey(t *testing.T) {
-	if snapshotKey(localProjectDir("/opt/app/")) != snapshotKey(localProjectDir("/opt/app")) {
+	if snapshotKey(localProjectDir("/opt/app/"), "") != snapshotKey(localProjectDir("/opt/app"), "") {
 		t.Fatalf("trailing slash changed the local key")
 	}
-	if snapshotKey(localProjectDir("/opt//app")) != snapshotKey(localProjectDir("/opt/app")) {
+	if snapshotKey(localProjectDir("/opt//app"), "") != snapshotKey(localProjectDir("/opt/app"), "") {
 		t.Fatalf("redundant separators changed the local key")
 	}
 }
 
 func TestRemoteProjectDirNormalization(t *testing.T) {
-	base := snapshotKey(remoteProjectDir("/opt/app"))
+	base := snapshotKey(remoteProjectDir("/opt/app"), "")
 	cases := []string{"/opt/app/", "/opt//app", "/opt/./app", "/opt/app/."}
 	for _, in := range cases {
-		if got := snapshotKey(remoteProjectDir(in)); got != base {
+		if got := snapshotKey(remoteProjectDir(in), ""); got != base {
 			t.Errorf("remoteProjectDir(%q) keyed differently: got %q want %q", in, got, base)
 		}
 	}
@@ -73,8 +75,8 @@ func TestRemoteProjectDirNormalization(t *testing.T) {
 }
 
 func TestStateFileRelPath(t *testing.T) {
-	got := stateFileRelPath("/opt/myapp")
-	want := ".cdeploy/state/" + snapshotKey("/opt/myapp") + ".json"
+	got := stateFileRelPath("/opt/myapp", "")
+	want := ".cdeploy/state/" + snapshotKey("/opt/myapp", "") + ".json"
 	if got != want {
 		t.Fatalf("stateFileRelPath = %q, want %q", got, want)
 	}
@@ -744,7 +746,7 @@ func TestWriteSnapshotRoundTrip(t *testing.T) {
 	}
 
 	// File lands under $HOME/.cdeploy/state/<key>.json.
-	path := filepath.Join(home, ".cdeploy", "state", snapshotKey(localProjectDir("/proj"))+".json")
+	path := filepath.Join(home, ".cdeploy", "state", snapshotKey(localProjectDir("/proj"), "")+".json")
 	if _, err := os.Stat(path); err != nil {
 		t.Fatalf("state file not written at %s: %v", path, err)
 	}
@@ -801,7 +803,7 @@ func TestWriteSnapshotOverwritesCorruptExisting(t *testing.T) {
 	ctx := context.Background()
 
 	// Seed a corrupt state file.
-	path := filepath.Join(home, ".cdeploy", "state", snapshotKey(localProjectDir("/proj"))+".json")
+	path := filepath.Join(home, ".cdeploy", "state", snapshotKey(localProjectDir("/proj"), "")+".json")
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		t.Fatalf("mkdir: %v", err)
 	}
@@ -841,7 +843,7 @@ func TestWriteSnapshotRefusesFutureSchema(t *testing.T) {
 	c := &Compose{ProjectDir: "/proj"}
 	ctx := context.Background()
 
-	path := filepath.Join(home, ".cdeploy", "state", snapshotKey(localProjectDir("/proj"))+".json")
+	path := filepath.Join(home, ".cdeploy", "state", snapshotKey(localProjectDir("/proj"), "")+".json")
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		t.Fatalf("mkdir: %v", err)
 	}
@@ -875,7 +877,7 @@ func TestWriteSnapshotRefusesUnreadable(t *testing.T) {
 	t.Setenv("HOME", home)
 	c := &Compose{ProjectDir: "/proj"}
 
-	path := filepath.Join(home, ".cdeploy", "state", snapshotKey(localProjectDir("/proj"))+".json")
+	path := filepath.Join(home, ".cdeploy", "state", snapshotKey(localProjectDir("/proj"), "")+".json")
 	// Make the state path a directory: os.ReadFile returns a non-ErrNotExist
 	// error, which models a transient/IO read failure (not corrupt JSON).
 	if err := os.MkdirAll(path, 0o755); err != nil {
@@ -892,7 +894,7 @@ func TestReadSnapshotUnknownSchemaTyped(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)
 	c := &Compose{ProjectDir: "/proj"}
-	path := filepath.Join(home, ".cdeploy", "state", snapshotKey(localProjectDir("/proj"))+".json")
+	path := filepath.Join(home, ".cdeploy", "state", snapshotKey(localProjectDir("/proj"), "")+".json")
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		t.Fatalf("mkdir: %v", err)
 	}
@@ -1325,5 +1327,151 @@ func TestLockStateFile_Serializes(t *testing.T) {
 		// expected: acquired after release
 	case <-time.After(2 * time.Second):
 		t.Fatal("second lock not acquired after the first was released")
+	}
+}
+
+// Two `docker compose -p` projects can share one ConfigDir — that is the whole
+// reason the composers carry a project name. On the directory alone they also
+// shared one state file, and mergeSnapshot merges by SERVICE name, so deploying
+// one overwrote the other's `web` entry and a later rollback pinned the wrong
+// project's digest.
+func TestSnapshotKeyNamedProjectsInOneDirStayDistinct(t *testing.T) {
+	blue := snapshotKey("/srv/app", "blue")
+	green := snapshotKey("/srv/app", "green")
+	if blue == green {
+		t.Fatalf("two -p projects in one directory shared a state key: %q", blue)
+	}
+	if !hex12RE.MatchString(blue) || !hex12RE.MatchString(green) {
+		t.Fatalf("keys are not 12 hex chars: %q %q", blue, green)
+	}
+	// The two halves cannot be confused for one another: the separator is NUL,
+	// which no filesystem path and no docker project name can contain, so a
+	// dir-only payload can never spell a (dir, name) payload.
+	if snapshotKey("/srv/appblue", "") == blue {
+		t.Error("concatenating the halves without the separator collided")
+	}
+	if snapshotKey("/srv", "app\x00blue") == blue {
+		t.Error("a name carrying the separator spelled another pair's key")
+	}
+}
+
+// An EMPTY name must keep the historical dir-only hash, byte for byte: every
+// state file on every host was written under it, and every CLI verb without
+// --project-name still addresses the directory's default project.
+func TestSnapshotKeyEmptyNameIsTheLegacyDirOnlyHash(t *testing.T) {
+	sum := sha256.Sum256([]byte("/opt/myapp"))
+	want := hex.EncodeToString(sum[:])[:12]
+	if got := snapshotKey("/opt/myapp", ""); got != want {
+		t.Fatalf("snapshotKey(dir, \"\") = %q, want the legacy %q", got, want)
+	}
+}
+
+// A state file written before the name entered the key must not be orphaned by
+// the upgrade: a NAMED composer whose own file does not exist yet still reads it.
+func TestReadSnapshotFallsBackToTheLegacyDirOnlyFile(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+
+	// Write the pre-upgrade file by hand, under the DIR-ONLY key with no
+	// project_name recorded — exactly what an older binary produced.
+	legacy := filepath.Join(home, ".cdeploy", "state", snapshotKey(localProjectDir("/proj"), "")+".json")
+	if err := os.MkdirAll(filepath.Dir(legacy), 0o755); err != nil {
+		t.Fatalf("MkdirAll: %v", err)
+	}
+	payload := `{"schema":1,"project_dir":"/proj","services":{"web":{"image":"nginx","digest":"sha256:old","recorded_at":"2026-01-01T00:00:00Z"}}}`
+	if err := os.WriteFile(legacy, []byte(payload), 0o644); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+
+	c := &Compose{ProjectDir: "/proj", ProjectName: "blue"}
+	got, err := c.ReadSnapshot(context.Background())
+	if err != nil {
+		t.Fatalf("ReadSnapshot: %v", err)
+	}
+	if got == nil || got.Services["web"].Digest != "sha256:old" {
+		t.Fatalf("the existing dir-only state file was orphaned: %+v", got)
+	}
+}
+
+// The fallback is a READ only. A named deploy writes its own file and must not
+// carry the dir-only file's entries forward: those belong to whatever project
+// the DIRECTORY resolves to, and persisting them into a named project's history
+// is the wrong-image rollback in slow motion.
+func TestWriteSnapshotDoesNotMergeTheLegacyFile(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+
+	legacy := filepath.Join(home, ".cdeploy", "state", snapshotKey(localProjectDir("/proj"), "")+".json")
+	if err := os.MkdirAll(filepath.Dir(legacy), 0o755); err != nil {
+		t.Fatalf("MkdirAll: %v", err)
+	}
+	payload := `{"schema":1,"project_dir":"/proj","services":{"web":{"image":"nginx","digest":"sha256:green","recorded_at":"2026-01-01T00:00:00Z"}}}`
+	if err := os.WriteFile(legacy, []byte(payload), 0o644); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+
+	c := &Compose{ProjectDir: "/proj", ProjectName: "blue"}
+	fresh := &Snapshot{
+		Schema:      snapshotSchemaVersion,
+		ProjectDir:  localProjectDir("/proj"),
+		ProjectName: "blue",
+		Services:    map[string]SnapshotEntry{"api": {Image: "api", Digest: "sha256:blue", RecordedAt: "2026-02-01T00:00:00Z"}},
+	}
+	if err := c.WriteSnapshot(context.Background(), fresh); err != nil {
+		t.Fatalf("WriteSnapshot: %v", err)
+	}
+
+	own := filepath.Join(home, ".cdeploy", "state", snapshotKey(localProjectDir("/proj"), "blue")+".json")
+	data, err := os.ReadFile(own)
+	if err != nil {
+		t.Fatalf("named state file not written at %s: %v", own, err)
+	}
+	snap, err := parseSnapshot(data)
+	if err != nil {
+		t.Fatalf("parseSnapshot: %v", err)
+	}
+	if _, ok := snap.Services["web"]; ok {
+		t.Error("the dir-only file's entries were merged into the named project's history")
+	}
+	if snap.ProjectName != "blue" {
+		t.Errorf("project_name = %q, want blue", snap.ProjectName)
+	}
+	if snap.Services["api"].Digest != "sha256:blue" {
+		t.Errorf("own entry missing: %+v", snap.Services)
+	}
+}
+
+// A file that names a DIFFERENT project is refused rather than rolled back onto.
+func TestReadSnapshotRefusesAForeignProjectName(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+
+	own := filepath.Join(home, ".cdeploy", "state", snapshotKey(localProjectDir("/proj"), "blue")+".json")
+	if err := os.MkdirAll(filepath.Dir(own), 0o755); err != nil {
+		t.Fatalf("MkdirAll: %v", err)
+	}
+	payload := `{"schema":1,"project_dir":"/proj","project_name":"green","services":{}}`
+	if err := os.WriteFile(own, []byte(payload), 0o644); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+
+	c := &Compose{ProjectDir: "/proj", ProjectName: "blue"}
+	_, err := c.ReadSnapshot(context.Background())
+	if !errors.Is(err, errSnapshotProject) {
+		t.Fatalf("err = %v, want errSnapshotProject", err)
+	}
+}
+
+// SnapshotServices stamps the composer's project name so the refusal above has
+// something to check.
+func TestMergeSnapshotCarriesTheProjectName(t *testing.T) {
+	fresh := &Snapshot{Schema: 1, ProjectDir: "/p", ProjectName: "blue", Services: map[string]SnapshotEntry{}}
+	got := mergeSnapshot(nil, fresh)
+	if got.ProjectName != "blue" {
+		t.Errorf("ProjectName = %q, want blue", got.ProjectName)
+	}
+	// A nil fresh keeps the existing name (defensive no-op path).
+	if got := mergeSnapshot(&Snapshot{ProjectName: "green"}, nil); got.ProjectName != "green" {
+		t.Errorf("ProjectName = %q, want green", got.ProjectName)
 	}
 }

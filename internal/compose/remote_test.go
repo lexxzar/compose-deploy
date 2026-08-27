@@ -3009,7 +3009,7 @@ func TestRemoteReadSnapshot_CatCommand(t *testing.T) {
 	if !strings.Contains(rc, "[ -f") {
 		t.Errorf("read command should guard with [ -f ], got: %q", rc)
 	}
-	wantPath := "$HOME/" + stateFileRelPath(remoteProjectDir("/proj"))
+	wantPath := "$HOME/" + stateFileRelPath(remoteProjectDir("/proj"), "")
 	if !strings.Contains(rc, wantPath) {
 		t.Errorf("read command should reference %q, got: %q", wantPath, rc)
 	}
@@ -3547,4 +3547,178 @@ func TestRemoteCommand_ProjectName(t *testing.T) {
 			t.Errorf("remote exec argv drifted:\n%v\n%v", na.Args, pa.Args)
 		}
 	})
+}
+
+// The remote key carries the project name for the same reason the local one
+// does, and an unnamed composer keeps emitting the historical single-file read
+// command byte for byte.
+func TestRemoteStatePath_NamedProjectsInOneDirStayDistinct(t *testing.T) {
+	blue := (&RemoteCompose{ProjectDir: "/srv/app", ProjectName: "blue"}).remoteStatePath()
+	green := (&RemoteCompose{ProjectDir: "/srv/app", ProjectName: "green"}).remoteStatePath()
+	if blue == green {
+		t.Fatalf("two -p projects in one remote directory shared a state path: %q", blue)
+	}
+	unnamed := (&RemoteCompose{ProjectDir: "/srv/app"}).remoteStatePath()
+	if unnamed != "$HOME/"+stateFileRelPath(remoteProjectDir("/srv/app"), "") {
+		t.Errorf("unnamed remote state path changed: %q", unnamed)
+	}
+	if (&RemoteCompose{ProjectDir: "/srv/app"}).remoteLegacyStatePath() != "" {
+		t.Error("an unnamed composer must have no separate legacy path")
+	}
+}
+
+// A NAMED remote project falls back to the dir-only file in the SAME round trip,
+// so a state file written before the name entered the key is not orphaned.
+func TestRemoteReadSnapshot_FallsBackToLegacyPathInOneRoundTrip(t *testing.T) {
+	var rc string
+	calls := 0
+	r := &RemoteCompose{
+		Host:        "user@example.com",
+		ProjectDir:  "/proj",
+		ProjectName: "blue",
+		SocketPath:  "/tmp/cdeploy-ctrl-abc-99",
+		outputCmd: func(cmd *exec.Cmd) ([]byte, error) {
+			calls++
+			rc = cmd.Args[len(cmd.Args)-1]
+			return []byte(`{"schema":1,"project_dir":"/proj","services":{"web":{"image":"nginx","digest":"sha256:old","recorded_at":"x"}}}`), nil
+		},
+	}
+	snap, err := r.ReadSnapshot(context.Background())
+	if err != nil {
+		t.Fatalf("ReadSnapshot: %v", err)
+	}
+	if snap == nil || snap.Services["web"].Digest != "sha256:old" {
+		t.Fatalf("parsed snapshot wrong: %+v", snap)
+	}
+	if calls != 1 {
+		t.Errorf("SSH round trips = %d, want 1", calls)
+	}
+	if !strings.Contains(rc, "elif [ -f") {
+		t.Errorf("named read command should carry the elif fallback, got: %q", rc)
+	}
+	if !strings.Contains(rc, "$HOME/"+stateFileRelPath(remoteProjectDir("/proj"), "blue")) {
+		t.Errorf("read command should reference the NAMED path, got: %q", rc)
+	}
+	if !strings.Contains(rc, "$HOME/"+stateFileRelPath(remoteProjectDir("/proj"), "")) {
+		t.Errorf("read command should reference the legacy path, got: %q", rc)
+	}
+}
+
+// The remote write-merge reads the project's OWN file only — the fallback file
+// belongs to whatever project the directory resolves to.
+func TestRemoteWriteSnapshot_MergeReadHasNoFallback(t *testing.T) {
+	var readCmd string
+	r := &RemoteCompose{
+		Host:        "user@example.com",
+		ProjectDir:  "/proj",
+		ProjectName: "blue",
+		SocketPath:  "/tmp/cdeploy-ctrl-abc-99",
+		outputCmd: func(cmd *exec.Cmd) ([]byte, error) {
+			readCmd = cmd.Args[len(cmd.Args)-1]
+			return []byte(""), nil
+		},
+		runCmd: func(cmd *exec.Cmd) error { return nil },
+	}
+	fresh := &Snapshot{Schema: 1, ProjectDir: "/proj", ProjectName: "blue", Services: map[string]SnapshotEntry{}}
+	if err := r.WriteSnapshot(context.Background(), fresh); err != nil {
+		t.Fatalf("WriteSnapshot: %v", err)
+	}
+	if strings.Contains(readCmd, "elif [ -f") {
+		t.Errorf("the write-merge read must not fall back to the dir-only file, got: %q", readCmd)
+	}
+}
+
+// -p pins WHICH project; the file set pins WHAT that project is. Both must reach
+// remoteCommand AND ExecCommand, which builds its own argv.
+func TestRemoteComposeFilesReachEveryArgvBuilder(t *testing.T) {
+	r := &RemoteCompose{
+		Host:         "user@example.com",
+		ProjectDir:   "/srv/app",
+		ProjectName:  "blue",
+		ComposeFiles: []string{"/srv/app/prod.yml", "/srv/app/extra.yml"},
+		SocketPath:   "/tmp/cdeploy-ctrl-abc-99",
+	}
+	want := "-f '/srv/app/prod.yml' -f '/srv/app/extra.yml' -p 'blue' "
+
+	cmd := r.remoteCommand(context.Background(), "ps", "-a")
+	if got := cmd.Args[len(cmd.Args)-1]; !strings.Contains(got, "docker compose "+want+"'ps'") {
+		t.Errorf("remoteCommand = %q, want it to carry %q", got, want)
+	}
+
+	ec, err := r.ExecCommand(context.Background(), "web", []string{"sh"})
+	if err != nil {
+		t.Fatalf("ExecCommand: %v", err)
+	}
+	if got := ec.Args[len(ec.Args)-1]; !strings.Contains(got, "docker compose "+want+"'exec'") {
+		t.Errorf("ExecCommand = %q, want it to carry %q", got, want)
+	}
+}
+
+// The rollback override stack wins over ComposeFiles: PrepareRollback already
+// seeds it with the project's own files, and the override has to stay last.
+func TestRemoteComposeFileList_ExtraWinsOverComposeFiles(t *testing.T) {
+	r := &RemoteCompose{
+		ComposeFiles:      []string{"/a.yml"},
+		ExtraComposeFiles: []string{"/a.yml", "/tmp/override.yml"},
+	}
+	got := r.composeFileList()
+	if len(got) != 2 || got[1] != "/tmp/override.yml" {
+		t.Errorf("composeFileList = %v, want the override stack", got)
+	}
+}
+
+// A nil ComposeFiles and an empty ProjectName must produce the byte-identical
+// pre-existing command string.
+func TestRemoteComposeFlags_EmptyIsByteIdentical(t *testing.T) {
+	r := &RemoteCompose{Host: "h", ProjectDir: "/p", SocketPath: "/s"}
+	if got := r.composeFlags(); got != "" {
+		t.Errorf("composeFlags = %q, want empty", got)
+	}
+}
+
+// A project reported with a non-canonical file set must not be probed for the
+// four default names — the probe would show and edit a sibling project's file,
+// or fail outright.
+func TestFindRemoteComposeFile_UsesReportedFileSet(t *testing.T) {
+	r := &RemoteCompose{
+		Host:         "user@example.com",
+		ProjectDir:   "/srv/app",
+		ComposeFiles: []string{"/srv/app/stack.yml"},
+		SocketPath:   "/tmp/cdeploy-ctrl-abc-99",
+		outputCmd: func(cmd *exec.Cmd) ([]byte, error) {
+			t.Error("no SSH probe should run when the file set is known")
+			return nil, nil
+		},
+	}
+	got, err := r.findRemoteComposeFile(context.Background())
+	if err != nil {
+		t.Fatalf("findRemoteComposeFile: %v", err)
+	}
+	if got != "/srv/app/stack.yml" {
+		t.Errorf("findRemoteComposeFile = %q, want /srv/app/stack.yml", got)
+	}
+}
+
+// ConfigFile must not prefix ProjectDir onto an already-absolute reported path.
+func TestRemoteConfigFile_DoesNotDoublePrefixAbsolutePath(t *testing.T) {
+	var rc string
+	r := &RemoteCompose{
+		Host:         "user@example.com",
+		ProjectDir:   "/srv/app",
+		ComposeFiles: []string{"/srv/app/stack.yml"},
+		SocketPath:   "/tmp/cdeploy-ctrl-abc-99",
+		outputCmd: func(cmd *exec.Cmd) ([]byte, error) {
+			rc = cmd.Args[len(cmd.Args)-1]
+			return []byte("services: {}"), nil
+		},
+	}
+	if _, err := r.ConfigFile(context.Background()); err != nil {
+		t.Fatalf("ConfigFile: %v", err)
+	}
+	if strings.Contains(rc, "/srv/app//srv/app") {
+		t.Errorf("ConfigFile double-prefixed the absolute path: %q", rc)
+	}
+	if !strings.Contains(rc, "cat '/srv/app/stack.yml'") {
+		t.Errorf("ConfigFile = %q, want it to cat the reported file", rc)
+	}
 }

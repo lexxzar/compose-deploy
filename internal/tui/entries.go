@@ -358,33 +358,66 @@ func buildSvcGroups(projects []compose.Project, host map[string]map[string]runne
 	}
 
 	groups := make([]svcGroup, 0, len(projects))
-	seen := make(map[string]bool, len(projects))
+	at := make(map[string]int, len(projects))
+	authentic := make(map[string]bool, len(projects))
 	// add takes the project as the loader reported it, because `host` is keyed
 	// by the RAW label and the lookup has to match. Everything the Model then
 	// keeps is the sanitized form — the group's name, its service names, the
 	// fold lookup and the dedupe — so no label-derived byte reaches a render
 	// site or a qualified key unfiltered. See sanitizeName.
+	//
+	// COLLISIONS are resolved in favour of the name that needed no sanitizing.
+	// Ordering comes from the loader, which sorts RAW names, so a label crafted
+	// to sanitize onto a real project's name can sort BEFORE it — and a plain
+	// first-wins dedupe then dropped the real project and left the forged row
+	// carrying an attacker-chosen ConfigDir under the real project's display
+	// name, which is what the factory would have been handed on `d`/`r`/`s`.
+	// Compose rejects every byte sanitizeName strips, so `raw == sanitized`
+	// holds for anything compose itself could have produced: the authentic row
+	// always wins, and only two forged rows can still race each other.
 	add := func(p compose.Project) {
 		raw := p.Name
 		p.Name = sanitizeName(raw)
-		if p.Name == "" || seen[p.Name] {
+		if p.Name == "" {
 			return
 		}
-		seen[p.Name] = true
-		svcs := make([]string, 0, len(host[raw]))
-		for name := range host[raw] {
-			svcs = append(svcs, sanitizeName(name))
+		safe := raw == p.Name
+		i, dup := at[p.Name]
+		if dup && (authentic[p.Name] || !safe) {
+			return
 		}
-		groups = append(groups, svcGroup{proj: p, services: sortServices(svcs), folded: folded[p.Name]})
+		// Service names collapse the same way, and svcs is sorted but was never
+		// deduped — two rows under one svcKey addressed each other's state.
+		svcs := make([]string, 0, len(host[raw]))
+		seenSvc := make(map[string]bool, len(host[raw]))
+		for name := range host[raw] {
+			name = sanitizeName(name)
+			if name == "" || seenSvc[name] {
+				continue
+			}
+			seenSvc[name] = true
+			svcs = append(svcs, name)
+		}
+		g := svcGroup{proj: p, services: sortServices(svcs), folded: folded[p.Name]}
+		authentic[p.Name] = safe
+		if dup {
+			groups[i] = g
+			return
+		}
+		at[p.Name] = len(groups)
+		groups = append(groups, g)
 	}
 	for _, p := range projects {
 		add(p)
 	}
 
+	// The leftover pass is the "never leave a running container invisible"
+	// safety net, so it pre-filters nothing: add() owns the dedupe, including
+	// the authentic-wins rule, and a name already grouped simply returns there.
 	var extra []string
 	unmanagedExtra := false
 	for name := range host {
-		if seen[sanitizeName(name)] || name == "" {
+		if name == "" {
 			continue
 		}
 		if name == compose.UnmanagedProjectName {

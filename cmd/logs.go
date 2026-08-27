@@ -57,14 +57,14 @@ func runLogs(ctx context.Context, service string, follow bool, tail int) error {
 	var c runner.Composer
 	switch {
 	case sshTarget != "":
-		rc, cleanup, err := resolveSSHRemote(ctx, sshTarget, projectDir, identityFile, logsNewRemote)
+		rc, cleanup, err := resolveSSHRemote(ctx, sshTarget, projectDir, projectName, identityFile, logsNewRemote)
 		if err != nil {
 			return err
 		}
 		defer cleanup()
 		c = rc
 	case serverName != "":
-		rc, cleanup, err := resolveServerRemote(ctx, serverName, projectDir, logsNewRemote)
+		rc, cleanup, err := resolveServerRemote(ctx, serverName, projectDir, projectName, logsNewRemote)
 		if err != nil {
 			return err
 		}
@@ -83,6 +83,7 @@ func runLogs(ctx context.Context, service string, follow bool, tail int) error {
 			return fmt.Errorf("no compose file found in %s (use -s to specify a remote server)", dir)
 		}
 		lc := logsNewLocal(dir)
+		lc.ProjectName = projectName
 		if err := lc.Detect(ctx); err != nil {
 			return err
 		}

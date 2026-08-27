@@ -49,7 +49,18 @@ type Project struct {
 	// no config_files label. Empty is the single "no directory behind this
 	// project" sentinel every consumer tests against.
 	ConfigDir string
-	Unmanaged bool
+	// ConfigFiles is the project's own compose file set, exactly as docker
+	// reports it in the com.docker.compose.project.config_files label — the
+	// FULL list, in order, not just the first entry. ConfigDir is only
+	// filepath.Dir of the first one, and a directory does not name a file:
+	// `docker compose -f prod.yml -p prod up` and a sibling docker-compose.yml
+	// share one directory, so a composer that re-discovered a file by the four
+	// canonical names loaded the wrong service definitions under the right
+	// project label. Empty when docker reports no config_files (the Unmanaged
+	// row, and any label-only project), which is the same "auto-discover"
+	// sentinel the pre-ConfigFiles behavior had.
+	ConfigFiles []string
+	Unmanaged   bool
 }
 
 // Compile-time interface satisfaction checks.
@@ -111,10 +122,7 @@ func parseProjects(data []byte) ([]Project, error) {
 
 	projects := make([]Project, 0, len(entries))
 	for _, e := range entries {
-		configFile := e.ConfigFiles
-		if i := strings.Index(configFile, ","); i >= 0 {
-			configFile = configFile[:i]
-		}
+		files := splitConfigFiles(e.ConfigFiles)
 		// filepath.Dir("") returns ".", not "" — and docker reports an empty
 		// ConfigFiles for any project it discovers from the
 		// com.docker.compose.project label alone (the sibling config_files
@@ -122,18 +130,33 @@ func parseProjects(data []byte) ([]Project, error) {
 		// consumer resolve to cdeploy's own working directory instead of
 		// refusing, so the empty sentinel is preserved here.
 		configDir := ""
-		if configFile != "" {
-			configDir = filepath.Dir(configFile)
+		if len(files) > 0 {
+			configDir = filepath.Dir(files[0])
 		}
 		projects = append(projects, Project{
-			Name:      e.Name,
-			Status:    e.Status,
-			ConfigDir: configDir,
+			Name:        e.Name,
+			Status:      e.Status,
+			ConfigDir:   configDir,
+			ConfigFiles: files,
 		})
 	}
 
 	sortProjects(projects)
 	return projects, nil
+}
+
+// splitConfigFiles turns docker's comma-separated config_files value into the
+// ordered file list. Blank entries are dropped so a trailing comma or an empty
+// label yields nil — the "docker reported no compose file" sentinel every
+// consumer tests with len() == 0.
+func splitConfigFiles(s string) []string {
+	var files []string
+	for _, f := range strings.Split(s, ",") {
+		if f = strings.TrimSpace(f); f != "" {
+			files = append(files, f)
+		}
+	}
+	return files
 }
 
 // sortProjects sorts projects by name, case-insensitive.
@@ -145,9 +168,18 @@ func sortProjects(projects []Project) {
 	}
 }
 
-// findComposeFile returns the path to the first recognized compose file in ProjectDir.
-// It probes the same candidates as HasComposeFile but returns the full path.
+// findComposeFile returns the path to this project's main compose file.
+//
+// When docker reported the project's own file set (ComposeFiles) that first
+// entry IS the main file — probing the four canonical names instead would show
+// and edit a sibling project's docker-compose.yml, and would report "no compose
+// file found" for a project whose only file is named stack.yml. The probe stays
+// as the fallback for a composer built from a bare directory (the local fast
+// track, every CLI verb).
 func (c *Compose) findComposeFile() (string, error) {
+	if len(c.ComposeFiles) > 0 {
+		return c.ComposeFiles[0], nil
+	}
 	for _, name := range composeFiles {
 		p := filepath.Join(c.ProjectDir, name)
 		if _, err := os.Stat(p); err == nil {
@@ -238,6 +270,17 @@ type Compose struct {
 	// compose file MUST be first in this slice. Default nil = no `-f` flags,
 	// producing byte-identical argv to the pre-ExtraComposeFiles behavior.
 	ExtraComposeFiles []string
+
+	// ComposeFiles is the project's OWN compose file set (Project.ConfigFiles,
+	// as docker reported it). When non-empty and ExtraComposeFiles is not set,
+	// it supplies the `-f` pairs, so the composer loads the files the project
+	// was actually created from instead of whatever default-named file the
+	// directory happens to hold. ProjectName pins WHICH project a command
+	// addresses; this pins WHICH FILES define it — without both, a project
+	// created from `-f prod.yml -p prod` was recreated from a sibling
+	// docker-compose.yml under the right label. Default nil = auto-discovery,
+	// byte-identical argv to the pre-ComposeFiles behavior.
+	ComposeFiles []string
 
 	// ProjectName, when non-empty, is spliced into every compose invocation as
 	// `-p <name>` before the subcommand. Compose otherwise derives the project
@@ -376,7 +419,7 @@ func withStderr(err error) error {
 }
 
 func (c *Compose) command(ctx context.Context, args ...string) *exec.Cmd {
-	fileArgs := append(composeFileArgs(c.ExtraComposeFiles), projectNameArgs(c.ProjectName)...)
+	fileArgs := append(composeFileArgs(c.composeFileList()), projectNameArgs(c.ProjectName)...)
 	var cmd *exec.Cmd
 	if c.Standalone {
 		cmd = exec.CommandContext(ctx, "docker-compose", append(fileArgs, args...)...)
@@ -390,6 +433,18 @@ func (c *Compose) command(ctx context.Context, args ...string) *exec.Cmd {
 		cmd.Dir = c.ProjectDir
 	}
 	return cmd
+}
+
+// composeFileList returns the `-f` file set for the next invocation.
+// ExtraComposeFiles wins when set because it is the ROLLBACK override stack,
+// which PrepareRollback already seeds with this project's own files followed by
+// the generated digest pin — so the two are never both needed at once, and the
+// override must stay last for the compose merge to pin the image.
+func (c *Compose) composeFileList() []string {
+	if len(c.ExtraComposeFiles) > 0 {
+		return c.ExtraComposeFiles
+	}
+	return c.ComposeFiles
 }
 
 // composeFileArgs expands a list of compose files into `-f <file>` argv pairs.

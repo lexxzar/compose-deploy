@@ -903,3 +903,69 @@ func TestBuildSvcGroups_FoldSurvivesSanitizing(t *testing.T) {
 		t.Errorf("fold state lost across a refresh: %+v", second)
 	}
 }
+
+// TestBuildSvcGroups_AuthenticNameWinsACollision is the displacement pin. Order
+// comes from the loader, which sorts RAW names, so a label crafted to sanitize
+// onto a real project's name can sort BEFORE it. A plain first-wins dedupe then
+// dropped the real project and left the forged row — carrying an attacker-chosen
+// ConfigDir — occupying the real project's display name, which is what
+// bindProjComposer / drillIntoGroup would hand to the composer factory.
+func TestBuildSvcGroups_AuthenticNameWinsACollision(t *testing.T) {
+	const forged = "we\x01b" // sanitizes to "web" and sorts before it
+	host := map[string]map[string]runner.ServiceStatus{
+		forged: {"evil": {Running: true}},
+		"web":  {"nginx": {Running: true}},
+	}
+	// The loader's order: the forged name first, exactly as sortProjects would.
+	projects := []compose.Project{
+		{Name: forged, ConfigDir: "/tmp/attacker"},
+		{Name: "web", ConfigDir: "/srv/web"},
+	}
+	got := buildSvcGroups(projects, host, nil)
+	if len(got) != 1 {
+		t.Fatalf("groups = %v, want the collision collapsed to one", groupShape(got))
+	}
+	if got[0].proj.Name != "web" {
+		t.Fatalf("group name = %q, want web", got[0].proj.Name)
+	}
+	if got[0].proj.ConfigDir != "/srv/web" {
+		t.Errorf("ConfigDir = %q, want the REAL project's /srv/web", got[0].proj.ConfigDir)
+	}
+	if len(got[0].services) != 1 || got[0].services[0] != "nginx" {
+		t.Errorf("services = %v, want the real project's [nginx]", got[0].services)
+	}
+}
+
+// The same collapse inside one group produced duplicate rows: svcs was sorted
+// but never deduped, so one svcKey addressed two rows.
+func TestBuildSvcGroups_DedupesCollidingServiceNames(t *testing.T) {
+	host := map[string]map[string]runner.ServiceStatus{
+		"web": {"api": {Running: true}, "ap\x01i": {}},
+	}
+	got := buildSvcGroups([]compose.Project{{Name: "web", ConfigDir: "/srv/web"}}, host, nil)
+	if len(got) != 1 {
+		t.Fatalf("groups = %v, want one", groupShape(got))
+	}
+	if len(got[0].services) != 1 || got[0].services[0] != "api" {
+		t.Errorf("services = %v, want the single deduped [api]", got[0].services)
+	}
+}
+
+// The leftover pass is the "never leave a running container invisible" net, so a
+// real project the loader missed must still appear even when a forged label
+// already claimed its sanitized name.
+func TestBuildSvcGroups_LeftoverRealProjectDisplacesAForgedRow(t *testing.T) {
+	const forged = "we\x01b"
+	host := map[string]map[string]runner.ServiceStatus{
+		forged: {"evil": {}},
+		"web":  {"nginx": {Running: true}},
+	}
+	// Only the forged project is reported by the loader; `web` is a leftover.
+	got := buildSvcGroups([]compose.Project{{Name: forged, ConfigDir: "/tmp/attacker"}}, host, nil)
+	if len(got) != 1 {
+		t.Fatalf("groups = %v, want one", groupShape(got))
+	}
+	if got[0].proj.ConfigDir != "" || len(got[0].services) != 1 || got[0].services[0] != "nginx" {
+		t.Errorf("group = %+v, want the real leftover web group", got[0])
+	}
+}

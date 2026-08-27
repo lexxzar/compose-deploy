@@ -53,20 +53,62 @@ type SnapshotEntry struct {
 
 // Snapshot is the on-disk state-file shape (schema 1). Services is keyed by
 // compose service name.
+//
+// ProjectName records which compose project the entries belong to, and is
+// omitted (and empty on read) for a directory-addressed project — every file
+// written before the name entered the key. It is what makes the dir-only
+// fallback safe: a file that names a DIFFERENT project is refused rather than
+// rolled back onto.
 type Snapshot struct {
-	Schema     int                      `json:"schema"`
-	ProjectDir string                   `json:"project_dir"`
-	Services   map[string]SnapshotEntry `json:"services"`
+	Schema      int                      `json:"schema"`
+	ProjectDir  string                   `json:"project_dir"`
+	ProjectName string                   `json:"project_name,omitempty"`
+	Services    map[string]SnapshotEntry `json:"services"`
 }
 
-// snapshotKey derives the 12-hex state-file key from a project directory.
-// projectDir MUST already be normalized by the caller (localProjectDir for a
-// local host, remoteProjectDir for a remote host) so that equivalent path
-// spellings — `./myapp` resolved against cwd vs an explicit absolute path, or
-// a trailing slash — collapse to a single key. The hash is taken verbatim.
-func snapshotKey(projectDir string) string {
-	sum := sha256.Sum256([]byte(projectDir))
+// errSnapshotProject is returned when an on-disk snapshot records a project name
+// other than the one being read. Distinguishable from a schema/corruption error
+// so the caller can say WHY it refuses.
+var errSnapshotProject = errors.New("snapshot belongs to another project")
+
+// snapshotKey derives the 12-hex state-file key from a project directory and a
+// project name. projectDir MUST already be normalized by the caller
+// (localProjectDir for a local host, remoteProjectDir for a remote host) so that
+// equivalent path spellings — `./myapp` resolved against cwd vs an explicit
+// absolute path, or a trailing slash — collapse to a single key.
+//
+// The DIRECTORY DOES NOT IDENTIFY A PROJECT. `docker compose -p blue` and
+// `docker compose -p green` in /srv/app are two projects with two container
+// sets, and on the directory alone they shared one state file: mergeSnapshot
+// merges by SERVICE NAME, so deploying green overwrote blue's `web` entry and a
+// later rollback of blue pinned green's digest — a wrong-image deployment with
+// no warning. NUL separates the halves because no filesystem path and no docker
+// project name can contain it (a POSIX path is NUL-terminated at the syscall
+// boundary), so no (dir, name) pair can spell another's key.
+//
+// An EMPTY name keeps the historical dir-only hash, byte for byte: every state
+// file on every host was written under it, and a composer built from a bare
+// directory (the local fast track, every CLI verb without --project-name) still
+// addresses whatever project that directory resolves to.
+func snapshotKey(projectDir, projectName string) string {
+	payload := projectDir
+	if projectName != "" {
+		payload += "\x00" + projectName
+	}
+	sum := sha256.Sum256([]byte(payload))
 	return hex.EncodeToString(sum[:])[:12]
+}
+
+// checkSnapshotProject refuses a snapshot recorded for a different project than
+// the one being read. An empty recorded name is a pre-ProjectName file (or a
+// directory-addressed one) and is accepted: it is the only thing the dir-only
+// read fallback can find, and refusing it would orphan every state file written
+// before the name entered the key.
+func checkSnapshotProject(snap *Snapshot, projectName string) error {
+	if snap == nil || snap.ProjectName == "" || snap.ProjectName == projectName {
+		return nil
+	}
+	return fmt.Errorf("%w: recorded %q, wanted %q", errSnapshotProject, snap.ProjectName, projectName)
 }
 
 // localProjectDir normalizes a LOCAL project directory for keying. filepath.Abs
@@ -99,8 +141,8 @@ func remoteProjectDir(dir string) string {
 // normalized (see snapshotKey). POSIX "/" separators are used unconditionally
 // because the state lives under the docker host's home directory, which is
 // POSIX for every supported target.
-func stateFileRelPath(projectDir string) string {
-	return path.Join(".cdeploy", "state", snapshotKey(projectDir)+".json")
+func stateFileRelPath(projectDir, projectName string) string {
+	return path.Join(".cdeploy", "state", snapshotKey(projectDir, projectName)+".json")
 }
 
 // mergeSnapshot combines an existing on-disk snapshot with a freshly-captured
@@ -116,6 +158,7 @@ func mergeSnapshot(existing, fresh *Snapshot) *Snapshot {
 	}
 	if existing != nil {
 		merged.ProjectDir = existing.ProjectDir
+		merged.ProjectName = existing.ProjectName
 		for name, entry := range existing.Services {
 			merged.Services[name] = entry
 		}
@@ -124,6 +167,11 @@ func mergeSnapshot(existing, fresh *Snapshot) *Snapshot {
 		if fresh.ProjectDir != "" {
 			merged.ProjectDir = fresh.ProjectDir
 		}
+		// The fresh name wins even when EMPTY is what it carries: merging a
+		// dir-only legacy file forward under a named key must stamp the name,
+		// and a directory-addressed write must not inherit a name from a file
+		// it is replacing.
+		merged.ProjectName = fresh.ProjectName
 		for name, entry := range fresh.Services {
 			merged.Services[name] = entry
 		}
@@ -297,9 +345,10 @@ func (c *Compose) SnapshotServices(ctx context.Context, services []string) (Snap
 	}
 
 	snap := &Snapshot{
-		Schema:     snapshotSchemaVersion,
-		ProjectDir: localProjectDir(c.ProjectDir),
-		Services:   map[string]SnapshotEntry{},
+		Schema:      snapshotSchemaVersion,
+		ProjectDir:  localProjectDir(c.ProjectDir),
+		ProjectName: c.ProjectName,
+		Services:    map[string]SnapshotEntry{},
 	}
 	recordedAt := snapshotClock().Format(time.RFC3339)
 	var warnings []string
@@ -461,25 +510,86 @@ func sortedStringKeys(m map[string]string) []string {
 }
 
 // localStatePath returns the absolute path of this project's state file under
-// $HOME/.cdeploy/state/. The key is derived from the normalized project dir so
-// `-C ./app` and its absolute spelling share one file.
+// $HOME/.cdeploy/state/. The key is derived from the normalized project dir and
+// the project name, so `-C ./app` and its absolute spelling share one file while
+// two `-p` projects in one directory do not.
 func (c *Compose) localStatePath() (string, error) {
+	return localStateFile(snapshotKey(localProjectDir(c.ProjectDir), c.ProjectName))
+}
+
+// localLegacyStatePath is the DIR-ONLY path this project's state used before the
+// name entered the key. It is a READ fallback only — writes always go to
+// localStatePath — so an existing state file keeps serving a project the TUI now
+// addresses by name, instead of being orphaned by the upgrade. Empty key means
+// the composer is unnamed and the two paths are the same file.
+func (c *Compose) localLegacyStatePath() (string, error) {
+	if c.ProjectName == "" {
+		return "", nil
+	}
+	return localStateFile(snapshotKey(localProjectDir(c.ProjectDir), ""))
+}
+
+func localStateFile(key string) (string, error) {
 	home, err := os.UserHomeDir()
 	if err != nil {
 		return "", fmt.Errorf("resolving home directory: %w", err)
 	}
-	key := snapshotKey(localProjectDir(c.ProjectDir))
 	return filepath.Join(home, ".cdeploy", "state", key+".json"), nil
 }
 
 // ReadSnapshot reads and parses this project's local state file. A missing file
 // returns (nil, nil) — the normal first-deploy case, distinguishable from a
 // parse/schema error (which is returned as a typed error via parseSnapshot).
+//
+// A named project whose own file does not exist falls back to the dir-only path
+// (see localLegacyStatePath). That file is accepted only when it records no
+// project name or this one — a file that names a DIFFERENT project is refused,
+// because restoring another project's digests is exactly the wrong-image
+// deployment the named key exists to prevent.
 func (c *Compose) ReadSnapshot(ctx context.Context) (*Snapshot, error) {
+	snap, err := c.readPrimarySnapshot()
+	if err != nil || snap != nil {
+		return snap, err
+	}
+	legacy, err := c.localLegacyStatePath()
+	if err != nil || legacy == "" {
+		return nil, err
+	}
+	snap, err = readSnapshotFile(legacy)
+	if err != nil || snap == nil {
+		return nil, err
+	}
+	if err := checkSnapshotProject(snap, c.ProjectName); err != nil {
+		return nil, err
+	}
+	return snap, nil
+}
+
+// readPrimarySnapshot reads ONLY this project's own state file, with no dir-only
+// fallback. WriteSnapshot merges against this rather than ReadSnapshot on
+// purpose: the fallback file was written for whatever project the DIRECTORY
+// resolves to, so merging it forward would persist another project's entries
+// into a named project's history — the wrong-image rollback in slow motion. A
+// rollback may still READ it (it is the only history that project has until its
+// first named deploy); nothing writes it back.
+func (c *Compose) readPrimarySnapshot() (*Snapshot, error) {
 	path, err := c.localStatePath()
 	if err != nil {
 		return nil, err
 	}
+	snap, err := readSnapshotFile(path)
+	if err != nil || snap == nil {
+		return nil, err
+	}
+	if err := checkSnapshotProject(snap, c.ProjectName); err != nil {
+		return nil, err
+	}
+	return snap, nil
+}
+
+// readSnapshotFile reads and parses one state file, returning (nil, nil) when it
+// does not exist.
+func readSnapshotFile(path string) (*Snapshot, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
@@ -562,7 +672,7 @@ func (c *Compose) WriteSnapshot(ctx context.Context, fresh *Snapshot) error {
 	if unlock, lerr := lockStateFile(path); lerr == nil {
 		defer unlock()
 	}
-	existing, err := existingForMerge(c.ReadSnapshot(ctx))
+	existing, err := existingForMerge(c.readPrimarySnapshot())
 	if err != nil {
 		return fmt.Errorf("refusing to overwrite snapshot state: %w", err)
 	}
@@ -651,21 +761,14 @@ func (c *Compose) runDockerCmdStream(ctx context.Context, dockerArgs []string, w
 func (c *Compose) PrepareRollback(ctx context.Context, entries map[string]SnapshotEntry, services []string, w io.Writer) (func(), error) {
 	targets := rollbackTargets(entries, services)
 
-	// Discover the main compose file first so a project with no compose file
-	// fails fast, before any (potentially slow) pull.
-	main, err := c.findComposeFile()
+	// Resolve the project's own file set first so a project with no compose
+	// file fails fast, before any (potentially slow) pull. A multi-file project
+	// stacks ALL of its files ahead of the override: `-f` disables
+	// auto-discovery, so dropping the rest would recreate the services from a
+	// partial definition.
+	main, err := c.rollbackBaseFiles()
 	if err != nil {
 		return nil, fmt.Errorf("rollback prep: %w", err)
-	}
-	// findComposeFile returns filepath.Join(ProjectDir, name), which stays
-	// RELATIVE when ProjectDir is relative (e.g. `-C ./app`). command() sets
-	// cmd.Dir = ProjectDir and docker resolves `-f` against that cwd, so a
-	// relative `-f app/compose.yml` would be re-prefixed to ./app/app/compose.yml
-	// and fail. Absolutize so the `-f` path is cwd-independent (and the derived
-	// project name stays stable). The remote path uses a bare name + `cd`, so
-	// only the local side needs this.
-	if abs, aerr := filepath.Abs(main); aerr == nil {
-		main = abs
 	}
 
 	// Advisory same-digest check (best-effort, non-fatal).
@@ -703,12 +806,40 @@ func (c *Compose) PrepareRollback(ctx context.Context, entries map[string]Snapsh
 		return nil, fmt.Errorf("rollback prep: closing override file: %w", err)
 	}
 
-	c.ExtraComposeFiles = []string{main, tmpPath}
+	c.ExtraComposeFiles = append(main, tmpPath)
 	cleanup := func() {
 		os.Remove(tmpPath)
 		c.ExtraComposeFiles = nil
 	}
 	return cleanup, nil
+}
+
+// rollbackBaseFiles returns the compose files the rollback override is stacked
+// on TOP of, in load order, as absolute paths.
+//
+// findComposeFile returns filepath.Join(ProjectDir, name), which stays RELATIVE
+// when ProjectDir is relative (e.g. `-C ./app`). command() sets cmd.Dir =
+// ProjectDir and docker resolves `-f` against that cwd, so a relative
+// `-f app/compose.yml` would be re-prefixed to ./app/app/compose.yml and fail.
+// Absolutizing keeps the `-f` path cwd-independent (and the derived project name
+// stable). ComposeFiles come from docker already absolute; Abs is a no-op there.
+func (c *Compose) rollbackBaseFiles() ([]string, error) {
+	files := c.ComposeFiles
+	if len(files) == 0 {
+		main, err := c.findComposeFile()
+		if err != nil {
+			return nil, err
+		}
+		files = []string{main}
+	}
+	out := make([]string, 0, len(files)+1)
+	for _, f := range files {
+		if abs, aerr := filepath.Abs(f); aerr == nil {
+			f = abs
+		}
+		out = append(out, f)
+	}
+	return out, nil
 }
 
 // warnAlreadyAtSnapshot writes an "already at snapshot" advisory to w for each

@@ -2,6 +2,7 @@ package cmd
 
 import (
 	"errors"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -453,5 +454,56 @@ func TestDetectGuard_ConcurrentResolveAndVerdict(t *testing.T) {
 	wg.Wait()
 	if standalone, detected := d.verdict(); !standalone || !detected {
 		t.Errorf("verdict = (%v,%v), want (true,true)", standalone, detected)
+	}
+}
+
+// -p pins WHICH project; the reported file set pins WHAT that project is made
+// of. A project created from `-f prod.yml` in a directory that also holds a
+// docker-compose.yml was recreated from the wrong service definitions under the
+// right label, and a stack.yml-only project failed every file read.
+func TestComposerFor_CarriesTheReportedFileSet(t *testing.T) {
+	proj := compose.Project{
+		Name:        "prod",
+		ConfigDir:   "/srv/app",
+		ConfigFiles: []string{"/srv/app/prod.yml", "/srv/app/extra.yml"},
+	}
+
+	lc, ok := localComposerFor(proj, compose.New(t.TempDir()), false, false).(*compose.Compose)
+	if !ok {
+		t.Fatal("local factory did not return a *compose.Compose")
+	}
+	if !slices.Equal(lc.ComposeFiles, proj.ConfigFiles) {
+		t.Errorf("local ComposeFiles = %v, want %v", lc.ComposeFiles, proj.ConfigFiles)
+	}
+
+	rc := compose.NewRemote("prod.example.com", "/srv/base")
+	rc.SSHExtraArgs = []string{"-p", "2222", "-i", "/tmp/key"}
+	rc.SetStandalone(false)
+	newRC, ok := remoteComposerFor(proj, rc, false).(*compose.RemoteCompose)
+	if !ok {
+		t.Fatal("remote factory did not return a *compose.RemoteCompose")
+	}
+	if !slices.Equal(newRC.ComposeFiles, proj.ConfigFiles) {
+		t.Errorf("remote ComposeFiles = %v, want %v", newRC.ComposeFiles, proj.ConfigFiles)
+	}
+	// SSHExtraArgs carries the port and the identity that reach the host at
+	// all; a composer built without them would dial a different endpoint than
+	// the connection it was derived from.
+	if !slices.Equal(newRC.SSHExtraArgs, rc.SSHExtraArgs) {
+		t.Errorf("SSHExtraArgs = %v, want %v", newRC.SSHExtraArgs, rc.SSHExtraArgs)
+	}
+}
+
+// --project-name is the CLI's half of the same fix. Without it `cdeploy deploy
+// -C /srv/app` still addressed the directory's default project while the TUI
+// addressed `blue`, and the two wrote different rollback snapshots.
+func TestProjectNameFlagRegistered(t *testing.T) {
+	root := NewRootCmd()
+	f := root.PersistentFlags().Lookup("project-name")
+	if f == nil {
+		t.Fatal("--project-name is not registered")
+	}
+	if f.Shorthand != "p" {
+		t.Errorf("shorthand = %q, want p", f.Shorthand)
 	}
 }
