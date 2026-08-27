@@ -639,3 +639,143 @@ func TestCursorGroup(t *testing.T) {
 		t.Error("an empty row model must report no group")
 	}
 }
+
+// batchShape renders the partition compactly so a test can assert order and
+// membership in one comparison. "(all)" marks the empty slice the runner reads
+// as every service.
+func batchShape(batches []opBatch) []string {
+	out := make([]string, 0, len(batches))
+	for _, b := range batches {
+		if len(b.services) == 0 {
+			out = append(out, b.proj.Name+":all")
+			continue
+		}
+		out = append(out, b.proj.Name+":"+strings.Join(b.services, ","))
+	}
+	return out
+}
+
+func partitionModel() Model {
+	m := Model{selected: map[string]bool{}}
+	m.svcGroups = []svcGroup{
+		{proj: compose.Project{Name: "web"}, services: []string{"nginx", "api"}},
+		{proj: compose.Project{Name: "shop"}, services: []string{"api", "db"}},
+		{proj: compose.Project{Name: compose.UnmanagedProjectName, Unmanaged: true}, services: []string{"watchtower"}},
+	}
+	m.svcEntries = rebuildSvcEntries(m.svcGroups)
+	return m
+}
+
+func TestPartitionSelection_OrderedByScreenPosition(t *testing.T) {
+	m := partitionModel()
+	// Select bottom-up and out of group order; the partition must still come
+	// back in row order, because that is the order the batches will run in.
+	m.selected["shop/db"] = true
+	m.selected["web/api"] = true
+	m.selected["shop/api"] = true
+
+	got := batchShape(m.partitionSelection())
+	want := []string{"web:api", "shop:api,db"}
+	if !slices.Equal(got, want) {
+		t.Errorf("partitionSelection() = %v, want %v", got, want)
+	}
+}
+
+func TestPartitionSelection_EmptySelectionIsTheCursorGroup(t *testing.T) {
+	m := partitionModel()
+	// rows: 0 header web, 1 nginx, 2 api, 3 header shop, 4 api, 5 db,
+	//       6 header (unmanaged), 7 watchtower
+	cases := []struct {
+		cursor int
+		want   []string
+	}{
+		{0, []string{"web:all"}},  // header
+		{2, []string{"web:all"}},  // service row inside web
+		{3, []string{"shop:all"}}, // header
+		{5, []string{"shop:all"}}, // service row inside shop
+		{6, nil},                  // unmanaged header: no pipeline to run
+		{7, nil},                  // unmanaged service row
+		{99, nil},                 // no row at all
+	}
+	for _, tc := range cases {
+		m.svcCursor = tc.cursor
+		got := batchShape(m.partitionSelection())
+		if len(got) == 0 && len(tc.want) == 0 {
+			continue
+		}
+		if !slices.Equal(got, tc.want) {
+			t.Errorf("cursor %d: partitionSelection() = %v, want %v", tc.cursor, got, tc.want)
+		}
+	}
+}
+
+// The whole-group batch must carry an EMPTY slice, not the row list: the rows
+// come from `docker ps`, so a never-created service has none — only the empty
+// slice reaches it, because compose resolves it as "all".
+func TestPartitionSelection_WholeGroupBatchCarriesNoServices(t *testing.T) {
+	m := partitionModel()
+	m.svcCursor = 1
+	batches := m.partitionSelection()
+	if len(batches) != 1 {
+		t.Fatalf("partitionSelection() = %v, want one batch", batchShape(batches))
+	}
+	if len(batches[0].services) != 0 {
+		t.Errorf("whole-group batch services = %v, want empty (compose resolves all)", batches[0].services)
+	}
+}
+
+// An unmanaged key cannot be selected (the space handler refuses it), but the
+// partition refuses it a second time so a stale key can never become a batch
+// against a project that has no compose file.
+func TestPartitionSelection_UnmanagedNeverEntersABatch(t *testing.T) {
+	m := partitionModel()
+	m.selected[svcKey(compose.UnmanagedProjectName, "watchtower")] = true
+	m.selected["web/nginx"] = true
+
+	got := batchShape(m.partitionSelection())
+	if !slices.Equal(got, []string{"web:nginx"}) {
+		t.Errorf("partitionSelection() = %v, want [web:nginx]", got)
+	}
+}
+
+func TestPartitionSelection_NoGroups(t *testing.T) {
+	m := Model{selected: map[string]bool{}}
+	if batches := m.partitionSelection(); batches != nil {
+		t.Errorf("partitionSelection() = %v on an empty row model, want nil", batchShape(batches))
+	}
+}
+
+func TestFormatBatchTargets(t *testing.T) {
+	tests := []struct {
+		name    string
+		batches []opBatch
+		want    string
+	}{
+		{"none", nil, ""},
+		{
+			"one project with services",
+			[]opBatch{{proj: compose.Project{Name: "web"}, services: []string{"nginx", "api"}}},
+			"web (nginx, api)",
+		},
+		{
+			"whole project",
+			[]opBatch{{proj: compose.Project{Name: "db"}}},
+			"db (all)",
+		},
+		{
+			"two projects",
+			[]opBatch{
+				{proj: compose.Project{Name: "web"}, services: []string{"nginx", "api"}},
+				{proj: compose.Project{Name: "db"}},
+			},
+			"web (nginx, api) → db (all)",
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := formatBatchTargets(tc.batches); got != tc.want {
+				t.Errorf("formatBatchTargets() = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}

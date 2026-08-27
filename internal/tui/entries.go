@@ -1,6 +1,8 @@
 package tui
 
 import (
+	"strings"
+
 	"github.com/lexxzar/compose-deploy/internal/compose"
 	"github.com/lexxzar/compose-deploy/internal/runner"
 )
@@ -328,4 +330,72 @@ func (m Model) cursorGroup() (svcGroup, bool) {
 		return svcGroup{}, false
 	}
 	return m.svcGroups[e.groupIdx], true
+}
+
+// opBatch is one project's share of an operation: the project to build a
+// composer for, and the BARE service names inside it that the pipeline should
+// touch.
+//
+// An EMPTY services slice is not "nothing" — runner reads it as ALL services,
+// resolved by compose itself. That is the only way a whole-project batch can
+// reach a service that was never created: the host-wide `docker ps` behind the
+// grouped view reports containers, so a never-created service has no row.
+type opBatch struct {
+	proj     compose.Project
+	services []string
+}
+
+// partitionSelection splits the current selection into one batch per project,
+// in SCREEN order — svcGroups is the row order, so the batches run top to
+// bottom, which is the order the confirmation prompt names them in.
+//
+// The unmanaged bucket never enters a batch: its rows have no compose project
+// behind them, so there is no pipeline to run. Its keys cannot reach m.selected
+// either (the space handler refuses them), so the skip here is the second half
+// of one rule rather than a duplicate check.
+//
+// An EMPTY selection resolves to ONE batch — the cursor's group, with an empty
+// services slice, i.e. the whole project including its never-created services.
+// A cursor on the unmanaged bucket (or on no row at all) yields no batch, which
+// callers report as "nothing selected".
+func (m Model) partitionSelection() []opBatch {
+	var batches []opBatch
+	for _, g := range m.svcGroups {
+		if g.proj.Unmanaged {
+			continue
+		}
+		var svcs []string
+		for _, name := range g.services {
+			if m.selected[svcKey(g.proj.Name, name)] {
+				svcs = append(svcs, name)
+			}
+		}
+		if len(svcs) > 0 {
+			batches = append(batches, opBatch{proj: g.proj, services: svcs})
+		}
+	}
+	if len(batches) > 0 {
+		return batches
+	}
+	g, ok := m.cursorGroup()
+	if !ok || g.proj.Unmanaged {
+		return nil
+	}
+	return []opBatch{{proj: g.proj}}
+}
+
+// formatBatchTargets names the batches for the confirmation prompt:
+// "web (nginx, api) → db (all)". A batch with no services reads "(all)"
+// because that is what an empty slice means downstream — spelling it out is
+// what keeps the prompt honest about how much a whole-group op touches.
+func formatBatchTargets(batches []opBatch) string {
+	parts := make([]string, 0, len(batches))
+	for _, b := range batches {
+		if len(b.services) == 0 {
+			parts = append(parts, b.proj.Name+" (all)")
+			continue
+		}
+		parts = append(parts, b.proj.Name+" ("+strings.Join(b.services, ", ")+")")
+	}
+	return strings.Join(parts, " → ")
 }

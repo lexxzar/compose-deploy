@@ -184,6 +184,18 @@ type ConnectCallback func(server config.Server) (connectCmd *exec.Cmd, factory C
 
 const warnNoSelection = "No service is selected"
 
+// warnCrossProject refuses a d/r/s selection that spans two compose projects.
+// Scaffolding: the batch pipeline runs one project at a time, so until the
+// sequential runner lands the screen refuses what it cannot execute rather
+// than dropping half the selection on the floor.
+const warnCrossProject = "Selection spans projects — select services in one project"
+
+// warnRollbackCrossProject refuses a rollback capture that spans projects.
+// Unlike warnCrossProject this one is permanent: a rollback restores one
+// project's recorded digests from that project's own snapshot file, and there
+// is no host-wide snapshot to restore from.
+const warnRollbackCrossProject = "Rollback covers one project at a time"
+
 // serverEntryKind distinguishes selectable items from visual group headers.
 type serverEntryKind int
 
@@ -2067,12 +2079,27 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 					return m.enterExec()
 				}
 				containers := m.selectedContainers()
-				if m.pendingOp == runner.Rollback {
+				switch {
+				case m.pendingOp == runner.Rollback:
 					// Rollback uses the set captured at R-press, not the live
 					// selection (which the async fetch let drift). This keeps the
 					// pipeline/prep target identical to what was validated and shown
-					// in the confirm prompt.
+					// in the confirm prompt. Its composer is bound at R-press too,
+					// because the snapshot fetch already needed one.
 					containers = m.rollbackTargets
+				case m.grouped:
+					// Grouped mode holds no composer between actions, so the
+					// batch binds one now. armOperation refused anything but a
+					// single batch, so the partition below is the same one the
+					// prompt named — recomputed rather than captured because
+					// the prompt swallows every key that could change it.
+					batches := m.partitionSelection()
+					if len(batches) != 1 || !m.bindProjComposer(batches[0].proj) {
+						m.confirming = false
+						m.fixSvcOffset()
+						return m, nil
+					}
+					containers = batches[0].services
 				}
 				return m.enterProgress(containers)
 			case "esc":
@@ -2135,23 +2162,6 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 
 		m.warning = ""
-
-		// Grouped mode spans every project at once, so there is no single
-		// composer to run a pipeline with. The read keys (l, x, i, c) bind one
-		// from the cursor row's group at press time; the write ops cannot,
-		// because a selection may span projects — they are refused here until
-		// the batch pipeline lands.
-		//
-		// Each refusal re-clamps first: the dispatch cleared m.warning above,
-		// which frees the warning footer line and grows svcVisibleCount() by
-		// one — the same rule the read-only gates follow.
-		if m.grouped {
-			switch key {
-			case "d", "r", "s", "R":
-				m.fixSvcOffset()
-				return m, nil
-			}
-		}
 
 		switch key {
 		case "ctrl+c":
@@ -2265,37 +2275,19 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 				m.fixSvcOffset()
 				return m, nil
 			}
-			if m.selectedCount() > 0 {
-				m.pendingOp = runner.Restart
-				m.confirming = true
-			} else {
-				m.warning = warnNoSelection
-			}
-			m.fixSvcOffset()
+			m.armOperation(runner.Restart)
 		case "d":
 			if m.readOnly() {
 				m.fixSvcOffset()
 				return m, nil
 			}
-			if m.selectedCount() > 0 {
-				m.pendingOp = runner.Deploy
-				m.confirming = true
-			} else {
-				m.warning = warnNoSelection
-			}
-			m.fixSvcOffset()
+			m.armOperation(runner.Deploy)
 		case "s":
 			if m.readOnly() {
 				m.fixSvcOffset()
 				return m, nil
 			}
-			if m.selectedCount() > 0 {
-				m.pendingOp = runner.StopOnly
-				m.confirming = true
-			} else {
-				m.warning = warnNoSelection
-			}
-			m.fixSvcOffset()
+			m.armOperation(runner.StopOnly)
 		case "R":
 			// Roll the selected services back to the last-deployed digests. Needs
 			// the concrete-composer RollbackPreparer capability (ReadSnapshot +
@@ -2311,13 +2303,34 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 				m.fixSvcOffset()
 				return m, nil
 			}
+			// Grouped mode: a rollback restores ONE project's recorded digests
+			// from that project's own snapshot file, so a capture that spans
+			// projects is refused outright — before any composer is bound,
+			// since there is no single project to bind. Everything below then
+			// runs against the one project the capture names, in the same order
+			// the drilled screen has always used.
+			if m.grouped {
+				batches := m.partitionSelection()
+				if len(batches) > 1 {
+					m.warning = warnRollbackCrossProject
+					m.fixSvcOffset()
+					return m, nil
+				}
+				if len(batches) == 0 || !m.bindProjComposer(batches[0].proj) {
+					m.fixSvcOffset()
+					return m, nil
+				}
+			}
 			if _, ok := m.composer.(RollbackPreparer); !ok {
+				m.unbindGroupedComposer()
 				return m, nil
 			}
 			if len(m.services) == 0 {
+				m.unbindGroupedComposer()
 				return m, nil
 			}
 			if m.selectedCount() == 0 {
+				m.unbindGroupedComposer()
 				m.warning = warnNoSelection
 				m.fixSvcOffset()
 				return m, nil
@@ -3122,6 +3135,36 @@ func (m Model) handleStepEvent(event runner.StepEvent) (tea.Model, tea.Cmd) {
 	}
 
 	return m, m.waitForEvent()
+}
+
+// armOperation is the shared d/r/s body: it partitions the selection into
+// batches and arms the confirmation prompt over them.
+//
+// The drilled screen keeps its own "select something first" contract. A
+// project's whole service set is one keystroke away there (`a`), so an
+// unselected `d` has always meant a mistake rather than "deploy everything",
+// and the grouped view is no reason to reinterpret it. Grouped mode is where
+// the empty-selection rule earns its keep: the cursor names a project, so `d`
+// on a group header is the whole-project operation.
+//
+// A selection that spans projects is refused for now — see warnCrossProject.
+func (m *Model) armOperation(op runner.Operation) {
+	if !m.grouped && m.selectedCount() == 0 {
+		m.warning = warnNoSelection
+		m.fixSvcOffset()
+		return
+	}
+	batches := m.partitionSelection()
+	switch {
+	case len(batches) == 0:
+		m.warning = warnNoSelection
+	case len(batches) > 1:
+		m.warning = warnCrossProject
+	default:
+		m.pendingOp = op
+		m.confirming = true
+	}
+	m.fixSvcOffset()
 }
 
 func (m *Model) enterProgress(containers []string) (tea.Model, tea.Cmd) {
@@ -5133,17 +5176,28 @@ func (m *Model) enterGroupedContainers() tea.Cmd {
 // Drilled mode already holds the right composer, so it is a pure pass-through
 // there; every caller can therefore call it unconditionally.
 func (m *Model) bindCursorComposer() bool {
+	g, ok := m.cursorGroup()
+	if !m.grouped {
+		return true
+	}
+	if !ok {
+		return false
+	}
+	return m.bindProjComposer(g.proj)
+}
+
+// bindProjComposer is bindCursorComposer's addressed twin: it binds the
+// action-time composer for a NAMED project rather than the cursor's. The
+// operation keys need it because a batch is decided by the SELECTION, which may
+// sit in a group the cursor has since left.
+func (m *Model) bindProjComposer(proj compose.Project) bool {
 	if !m.grouped {
 		return true
 	}
 	if m.composerFactory == nil {
 		return false
 	}
-	g, ok := m.cursorGroup()
-	if !ok {
-		return false
-	}
-	c := m.composerFactory(g.proj)
+	c := m.composerFactory(proj)
 	if c == nil {
 		return false
 	}
@@ -6125,9 +6179,20 @@ func (m Model) viewSelectContainers() string {
 			prompt = fmt.Sprintf("  Rollback %s%s?  enter confirm  •  esc cancel",
 				strings.Join(containers, ", "), m.rollbackAgeSuffix(containers))
 		default:
+			// Grouped mode names the batches ("web (nginx, api) → db (all)"):
+			// a bare service list would not say which project each name lives
+			// in, and the whole-group case has no names at all.
+			target := strings.Join(m.selectedContainers(), ", ")
+			if m.grouped {
+				target = formatBatchTargets(m.partitionSelection())
+			}
 			prompt = fmt.Sprintf("  %s %s?  enter confirm  •  esc cancel",
-				m.pendingOp.String(), strings.Join(m.selectedContainers(), ", "))
+				m.pendingOp.String(), target)
 		}
+		// One physical line, always: a batch list grows with the number of
+		// projects and services it names, and a wrapped prompt would overflow
+		// the row containerFooterLines reserved for it.
+		prompt = clampToWidth(prompt, m.width)
 		// Pad the prompt to however many lines the help footer occupies at this
 		// width (containerFooterLines is the single source for that count), so
 		// the list does not gain a row the moment the prompt appears.
@@ -6504,9 +6569,18 @@ func (m Model) viewInspect() string {
 
 func (m Model) viewProgress() string {
 	var b strings.Builder
-	containers := m.selectedContainers()
+	// The drilled screen's selection IS the target set. Grouped mode's is not:
+	// an empty selection there means the cursor's whole project, so the title
+	// reads the set the pipeline actually got.
+	target := strings.Join(m.selectedContainers(), ", ")
+	if m.grouped {
+		target = strings.Join(m.opContainers, ", ")
+		if target == "" {
+			target = "all services"
+		}
+	}
 
-	b.WriteString(titleStyle.Render(fmt.Sprintf("%s > %s > %s", m.breadcrumb(), m.pendingOp.String(), strings.Join(containers, ", "))))
+	b.WriteString(titleStyle.Render(fmt.Sprintf("%s > %s > %s", m.breadcrumb(), m.pendingOp.String(), target)))
 	b.WriteString("\n\n")
 
 	for _, s := range m.steps {

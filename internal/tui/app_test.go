@@ -19227,28 +19227,289 @@ func TestGroupedScreen_IsRootWithoutServers(t *testing.T) {
 // the write ops are refused rather than left to dereference nil. The READ keys
 // (l, x, i, c) bind one from the cursor row's group instead — see the drill-in
 // tests below.
-func TestGroupedScreen_RefusesComposerBoundKeys(t *testing.T) {
+// groupedOpModel builds the loaded grouped screen used by the operation pins.
+// Rows: 0 header blog, 1 web, 2 header shop, 3 api, 4 db,
+//
+//	5 header (unmanaged), 6 watchtower.
+func groupedOpModel(t *testing.T) Model {
+	t.Helper()
 	g, projects := groupedFixture()
-	base := groupedTestModel(g, projects)
-	updated, _ := base.Update(base.loadGroups()())
-	base = updated.(Model)
-	base.svcCursor = 1 // a service row, not a header
+	m := groupedTestModel(g, projects)
+	updated, _ := m.Update(m.loadGroups()())
+	m = updated.(Model)
+	if got := len(m.svcEntries); got != 7 {
+		t.Fatalf("precondition: %d rows, want 7", got)
+	}
+	return m
+}
 
-	for _, key := range []string{"d", "r", "s", "R"} {
+// An empty selection is not a mistake in grouped mode: the cursor names a
+// project, so d/r/s arm the whole-project batch that the runner reads as ALL
+// services — including the never-created ones the host-wide ps cannot see.
+func TestGroupedScreen_ArmsWholeGroupOpFromCursor(t *testing.T) {
+	base := groupedOpModel(t)
+	base.width = 100
+	base.height = 24
+
+	ops := map[string]runner.Operation{"d": runner.Deploy, "r": runner.Restart, "s": runner.StopOnly}
+	for _, key := range []string{"d", "r", "s"} {
+		t.Run(key, func(t *testing.T) {
+			m := base
+			m.svcCursor = 3 // shop/api, a service row inside the second group
+			updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune(key)})
+			got := updated.(Model)
+			if !got.confirming {
+				t.Fatalf("%q did not arm a confirmation; warning = %q", key, got.warning)
+			}
+			if got.pendingOp != ops[key] {
+				t.Errorf("%q armed %v, want %v", key, got.pendingOp, ops[key])
+			}
+			batches := got.partitionSelection()
+			if len(batches) != 1 || batches[0].proj.Name != "shop" || len(batches[0].services) != 0 {
+				t.Fatalf("batches = %+v, want one whole-project shop batch", batches)
+			}
+			if view := got.viewSelectContainers(); !strings.Contains(view, "shop (all)") {
+				t.Errorf("prompt must name the batch; got:\n%s", view)
+			}
+		})
+	}
+}
+
+// The confirmation prompt names the project each service belongs to, because a
+// bare service list cannot say which "api" is meant on a host that has two.
+func TestGroupedScreen_ConfirmPromptNamesTheBatch(t *testing.T) {
+	m := groupedOpModel(t)
+	m.width = 100
+	m.height = 24
+	m.selected["shop/api"] = true
+	m.selected["shop/db"] = true
+
+	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'d'}})
+	m = updated.(Model)
+	if !m.confirming {
+		t.Fatalf("d did not arm a confirmation; warning = %q", m.warning)
+	}
+	view := m.viewSelectContainers()
+	if !strings.Contains(view, "Deploy shop (api, db)?") {
+		t.Errorf("prompt should name the batch, got:\n%s", view)
+	}
+}
+
+// The prompt occupies exactly the rows containerFooterLines reserved for it, so
+// a batch list long enough to wrap must be truncated rather than pushed onto a
+// second physical line.
+func TestGroupedScreen_ConfirmPromptClampsToWidth(t *testing.T) {
+	m := groupedOpModel(t)
+	m.width = 40
+	m.height = 24
+	m.selected["shop/api"] = true
+	m.selected["shop/db"] = true
+	m.confirming = true
+	m.pendingOp = runner.Deploy
+
+	want := m.containerFooterLines()
+	view := m.viewSelectContainers()
+	lines := strings.Split(view, "\n")
+	// The prompt is the tail of the view: the reserved bar line, helpStyle's
+	// MarginTop blank, then the prompt padded to the footer's line count.
+	for _, line := range lines[len(lines)-want:] {
+		if w := ansi.StringWidth(line); w > m.width {
+			t.Errorf("prompt line %q is %d cells wide, want <= %d", line, w, m.width)
+		}
+	}
+}
+
+// A selection that spans two projects needs two pipelines, which the sequential
+// runner does not yet drive — refuse it rather than silently dropping half.
+func TestGroupedScreen_RefusesCrossProjectSelection(t *testing.T) {
+	base := groupedOpModel(t)
+	base.selected["blog/web"] = true
+	base.selected["shop/api"] = true
+
+	for _, key := range []string{"d", "r", "s"} {
 		t.Run(key, func(t *testing.T) {
 			m := base
 			updated, cmd := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune(key)})
 			got := updated.(Model)
-			if got.screen != screenSelectContainers {
-				t.Errorf("%q navigated away: screen = %d", key, got.screen)
-			}
 			if got.confirming {
-				t.Errorf("%q armed a confirmation with no composer to run it", key)
+				t.Errorf("%q armed a cross-project confirmation", key)
+			}
+			if got.warning != warnCrossProject {
+				t.Errorf("%q warning = %q, want %q", key, got.warning, warnCrossProject)
 			}
 			if cmd != nil {
-				t.Errorf("%q produced a command in grouped mode", key)
+				t.Errorf("%q produced a command", key)
 			}
 		})
+	}
+}
+
+// The unmanaged bucket has no compose project behind it, so an operation keyed
+// off the cursor there has nothing to run and must say so.
+func TestGroupedScreen_UnmanagedCursorHasNoOperation(t *testing.T) {
+	base := groupedOpModel(t)
+
+	for _, cursor := range []int{5, 6} { // the unmanaged header and its row
+		for _, key := range []string{"d", "r", "s"} {
+			m := base
+			m.svcCursor = cursor
+			updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune(key)})
+			got := updated.(Model)
+			if got.confirming {
+				t.Errorf("cursor %d: %q armed an operation on the unmanaged bucket", cursor, key)
+			}
+			if got.warning != warnNoSelection {
+				t.Errorf("cursor %d: %q warning = %q, want %q", cursor, key, got.warning, warnNoSelection)
+			}
+		}
+	}
+}
+
+// Grouped mode holds no composer between actions, so confirming an operation
+// must bind the BATCH's one — the cursor's group is not necessarily the
+// selection's.
+func TestGroupedScreen_ConfirmBindsTheBatchComposer(t *testing.T) {
+	g, projects := groupedFixture()
+	target := &mockComposer{services: []string{"api", "db"}}
+	var asked []string
+	m := groupedTestModel(g, projects)
+	m.composerFactory = func(p compose.Project) runner.Composer {
+		if p.Unmanaged {
+			return g
+		}
+		asked = append(asked, p.Name)
+		return target
+	}
+	updated, _ := m.Update(m.loadGroups()())
+	m = updated.(Model)
+	m.width = 80
+	m.height = 24
+	m.selected["shop/api"] = true
+	m.svcCursor = 1 // blog/web: the cursor is NOT in the selected group
+
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'d'}})
+	m = updated.(Model)
+	if !m.confirming {
+		t.Fatalf("d did not arm a confirmation; warning = %q", m.warning)
+	}
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	m = updated.(Model)
+
+	if m.screen != screenProgress {
+		t.Fatalf("screen = %d, want screenProgress", m.screen)
+	}
+	if m.composer != runner.Composer(target) {
+		t.Error("the batch composer was not bound before the pipeline started")
+	}
+	if len(asked) == 0 || asked[len(asked)-1] != "shop" {
+		t.Errorf("factory asked for %v, want the selected group (shop) last", asked)
+	}
+	if len(m.opContainers) != 1 || m.opContainers[0] != "api" {
+		t.Errorf("opContainers = %v, want the batch's bare service names", m.opContainers)
+	}
+}
+
+// A rollback restores one project's recorded digests from that project's own
+// snapshot file. There is no host-wide snapshot, so a capture that spans
+// projects is refused permanently — not as scaffolding.
+func TestGroupedScreen_RollbackRefusesCrossProject(t *testing.T) {
+	g, projects := groupedFixture()
+	rb := &mockRollbackComposer{
+		mockComposer: mockComposer{services: []string{"api", "db"}},
+		snap:         rollbackTestSnapshot(),
+	}
+	m := groupedTestModel(g, projects)
+	m.composerFactory = func(p compose.Project) runner.Composer {
+		if p.Unmanaged {
+			return g
+		}
+		return rb
+	}
+	updated, _ := m.Update(m.loadGroups()())
+	base := updated.(Model)
+
+	t.Run("cross project refused", func(t *testing.T) {
+		m := base
+		// A fresh map per subtest: the Model is a value but m.selected is a
+		// reference, so a shared one would leak the first case's targets.
+		m.selected = map[string]bool{"blog/web": true, "shop/api": true}
+		updated, cmd := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'R'}})
+		got := updated.(Model)
+		if got.warning != warnRollbackCrossProject {
+			t.Errorf("warning = %q, want %q", got.warning, warnRollbackCrossProject)
+		}
+		if cmd != nil {
+			t.Error("a cross-project R must not fire a snapshot fetch")
+		}
+		if got.rollbackTargets != nil {
+			t.Errorf("rollbackTargets = %v, want nothing captured", got.rollbackTargets)
+		}
+		if got.composer != nil {
+			t.Error("a refused R must not leave a composer bound in grouped mode")
+		}
+	})
+
+	t.Run("single project fires the fetch", func(t *testing.T) {
+		m := base
+		m.selected = map[string]bool{"shop/api": true, "shop/db": true}
+		updated, cmd := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'R'}})
+		got := updated.(Model)
+		if got.warning != "" {
+			t.Errorf("warning = %q, want none", got.warning)
+		}
+		if cmd == nil {
+			t.Fatal("a single-project R must fire the snapshot fetch")
+		}
+		if got.composer != runner.Composer(rb) {
+			t.Error("R must bind the captured project's composer")
+		}
+		if !slices.Equal(got.rollbackTargets, []string{"api", "db"}) {
+			t.Errorf("rollbackTargets = %v, want [api db] (bare names)", got.rollbackTargets)
+		}
+	})
+}
+
+// The grouped whole-group op has no selection to name, so the progress title
+// reads the set the pipeline actually got rather than an empty tail.
+func TestGroupedScreen_ProgressTitleNamesTheTarget(t *testing.T) {
+	base := groupedOpModel(t)
+	base.width = 100
+	base.height = 24
+
+	t.Run("whole group", func(t *testing.T) {
+		m := base
+		m.svcCursor = 2 // the shop header
+		m.opContainers = nil
+		m.pendingOp = runner.Deploy
+		m.screen = screenProgress
+		if view := m.viewProgress(); !strings.Contains(view, "Deploy > all services") {
+			t.Errorf("title should name the whole-group target, got:\n%s", view)
+		}
+	})
+
+	t.Run("named services", func(t *testing.T) {
+		m := base
+		m.opContainers = []string{"api", "db"}
+		m.pendingOp = runner.Deploy
+		m.screen = screenProgress
+		if view := m.viewProgress(); !strings.Contains(view, "Deploy > api, db") {
+			t.Errorf("title should name the batch services, got:\n%s", view)
+		}
+	})
+}
+
+// A composer without the rollback capability leaves R inert, and grouped mode
+// must not stay holding the composer it bound to find that out.
+func TestGroupedScreen_RollbackNonPreparerUnbinds(t *testing.T) {
+	m := groupedOpModel(t)
+	m.selected["shop/api"] = true
+	updated, cmd := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'R'}})
+	got := updated.(Model)
+	if cmd != nil || got.confirming {
+		t.Error("R on a non-preparer composer must be a silent no-op")
+	}
+	if got.composer != nil {
+		t.Error("R must unbind the grouped composer it probed")
 	}
 }
 

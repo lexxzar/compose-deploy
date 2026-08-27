@@ -213,12 +213,20 @@ Confirmed design decisions (brainstormed and validated; do not re-litigate):
 **Files:**
 - Modify: `internal/tui/app.go`
 - Modify: `internal/tui/app_test.go`
+- Modify: `internal/tui/entries.go` + `_test.go` (➕ `opBatch`, `partitionSelection` and `formatBatchTargets` are pure row-model rules, so they live beside the other row-model code rather than in `app.go`)
 
-- [ ] add `opBatch{proj compose.Project, services []string}` and `partitionSelection()` ordered by screen position; empty selection → ONE batch: cursor's group with an EMPTY services slice (= all services, compose-resolved, never-created included); unmanaged never enters a batch
-- [ ] remove the task-7 temporary gate; confirmation prompt names the batches (`deploy: web (nginx, api) → db (all)? (y/n)`) and clamps to width
-- [ ] `R` refuses a capture that spans groups (existing warning slot); single-group `R` path unchanged
-- [ ] write tests: partitioning order, empty-selection → empty slice, unmanaged exclusion, cross-group `R` refusal, prompt clamping
-- [ ] run tests - must pass before task 10
+⚠️ Deviations:
+- **The empty-selection rule applies in GROUPED mode only.** `partitionSelection()` implements it unconditionally (it is a pure row-model rule and is unit-tested both ways), but `armOperation` keeps the drilled screen's long-standing `warnNoSelection` guard. Reinterpreting an unselected `d` on the single-project screen as "deploy everything" is a semantic change to a destructive key that no checkbox asks for, and `TestWarning_ShownWhenNoSelection` pins it. Task 10 does not need to revisit this.
+- **A selection that spans projects is still refused** (`warnCrossProject`), because the sequential runner is Task 10. This is the same accepted scaffolding shape as Task 7's gate, narrowed from "all of `d`/`r`/`s`/`R`" to "more than one batch"; removing it is the one-line change at the top of `armOperation`. Without it, confirming a multi-project op would call `enterProgress` with one composer and silently drop the other batch.
+- **The composer binds at the confirming `enter`, not at the `d`/`r`/`s` press** (unlike `x`, which must keep it across the prompt). Nothing that changes the partition can happen while the prompt is armed — every key but `enter`/`esc`/`ctrl+c` is swallowed — so the prompt recomputes rather than captures, which is what keeps `opBatch` off the Model and out of the departure-site cleanup list until Task 10 needs it there.
+- **`R` binds through the new `bindProjComposer`, addressed by the batch's project rather than the cursor's** — the selection may sit in a group the cursor has since left. Its three existing early-returns gained an `unbindGroupedComposer()` so a probe that finds no `RollbackPreparer` does not leave grouped mode holding one project's composer. All three are no-ops in drilled mode, so that path stays byte-identical.
+- ➕ `viewProgress`'s title read `selectedContainers()`, which is empty for a whole-group op — the new grouped path would have rendered a blank target during a real deploy. Grouped mode now reads `m.opContainers` there and falls back to `all services`; drilled mode is untouched.
+
+- [x] add `opBatch{proj compose.Project, services []string}` and `partitionSelection()` ordered by screen position; empty selection → ONE batch: cursor's group with an EMPTY services slice (= all services, compose-resolved, never-created included); unmanaged never enters a batch
+- [x] remove the task-7 temporary gate; confirmation prompt names the batches (`deploy: web (nginx, api) → db (all)? (y/n)`) and clamps to width
+- [x] `R` refuses a capture that spans groups (existing warning slot); single-group `R` path unchanged
+- [x] write tests: partitioning order, empty-selection → empty slice, unmanaged exclusion, cross-group `R` refusal, prompt clamping
+- [x] run tests - must pass before task 10
 
 ### Task 10: Sequential progress pipeline (phase 3)
 
