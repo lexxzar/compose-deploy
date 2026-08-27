@@ -1741,6 +1741,166 @@ func TestGroupedFold_KeysRecomputeSearchMatches(t *testing.T) {
 	}
 }
 
+// The fold aims the cursor at the group it just closed, never at the first
+// header on screen: closing the SECOND project from one of its rows must leave
+// the cursor on that project, or every fold jumps to the top of the host.
+func TestGroupedFold_AimsAtTheCursorsOwnGroupHeader(t *testing.T) {
+	for _, key := range []string{"z", "left", "Z"} {
+		m := groupedScreenModel(svcGroupOf("web", "api", "nginx"), svcGroupOf("db", "postgres", "redis"))
+		m.svcCursor = 5 // "redis", the last row of the SECOND group
+
+		m = pressGroupKey(m, key)
+
+		if !m.svcGroups[1].folded {
+			t.Fatalf("%q did not fold the cursor's group", key)
+		}
+		want := 3 // the db header, still row 3 with web open
+		if key == "Z" {
+			want = 1 // both folded: the web header, then db's
+		}
+		if m.svcCursor != want {
+			t.Errorf("%q: svcCursor = %d, want %d (the cursor group's OWN header)", key, m.svcCursor, want)
+		}
+	}
+}
+
+// A fold shrinks the row count under a scrolled window, so it owes the same
+// re-clamp every cursor move does — without it the window runs past the last
+// row and the cursor sits outside it.
+func TestGroupedFold_ReclampsTheScrollWindow(t *testing.T) {
+	build := func() Model {
+		var web, db []string
+		for i := 0; i < 10; i++ {
+			web = append(web, fmt.Sprintf("web-%02d", i))
+			db = append(db, fmt.Sprintf("db-%02d", i))
+		}
+		m := groupedScreenModel(svcGroupOf("web", web...), svcGroupOf("db", db...))
+		m.height = 12
+		m.svcCursor = len(m.svcEntries) - 1
+		m.fixSvcOffset()
+		return m
+	}
+
+	for _, key := range []string{"z", "Z", "left"} {
+		m := build()
+		if m.svcOffset == 0 {
+			t.Fatalf("%q: precondition: the list must scroll at this height", key)
+		}
+
+		m = pressGroupKey(m, key)
+
+		visible := m.svcVisibleCount()
+		maxOffset := len(m.svcEntries) - visible
+		if maxOffset < 0 {
+			maxOffset = 0
+		}
+		if m.svcOffset > maxOffset {
+			t.Errorf("%q: svcOffset = %d, want at most %d; the window runs past the last row", key, m.svcOffset, maxOffset)
+		}
+		if m.svcCursor < m.svcOffset || m.svcCursor >= m.svcOffset+visible {
+			t.Errorf("%q: cursor %d outside the window [%d,%d)", key, m.svcCursor, m.svcOffset, m.svcOffset+visible)
+		}
+	}
+}
+
+// The typing intercept sits ABOVE the key switch, so z and Z are literal runes
+// while the search bar is open — a query naming zookeeper has to be typable.
+func TestGroupedFold_KeysAreLiteralWhileSearching(t *testing.T) {
+	for _, key := range []string{"z", "Z"} {
+		m := groupedScreenModel(svcGroupOf("web", "api", "nginx"), svcGroupOf("db", "zookeeper"))
+		m.searchInput = textinput.New()
+		m.searchInput.Focus()
+		m.searching = true
+
+		m = pressGroupKey(m, key)
+
+		if m.searchQuery != key {
+			t.Errorf("%q: searchQuery = %q, want the keystroke in the bar", key, m.searchQuery)
+		}
+		if foldedCount(m) != 0 {
+			t.Errorf("%q folded a group instead of typing", key)
+		}
+		if !m.searching {
+			t.Errorf("%q closed the search bar", key)
+		}
+	}
+}
+
+// An svcErr replaces the whole list with the error screen, so every row key
+// goes inert — the fold keys included, or the user reshapes a list that is not
+// on screen and cannot see what changed.
+func TestGroupedFold_KeysInertOnTheErrorScreen(t *testing.T) {
+	for _, key := range []string{"z", "Z", "left", "right"} {
+		m := groupedScreenModel(svcGroupOf("web", "api", "nginx"), svcGroupOf("db", "postgres"))
+		m.svcGroups[1].folded = true
+		m.setGroups(m.svcGroups)
+		m.svcErr = errors.New("docker daemon gone")
+		m.svcCursor = 3 // the folded db header: z and right would open it, Z would close web
+
+		m = pressGroupKey(m, key)
+
+		if m.svcGroups[0].folded || !m.svcGroups[1].folded {
+			t.Errorf("%q changed the fold state behind the error screen (web folded=%v, db folded=%v)",
+				key, m.svcGroups[0].folded, m.svcGroups[1].folded)
+		}
+	}
+}
+
+// The confirmation intercept swallows the fold keys too. The armed prompt names
+// a batch that enter resolves AGAIN from the cursor, and a fold re-aims the
+// cursor at a group header — so folding behind the prompt edits its target.
+func TestGroupedFold_KeysInertWhileAConfirmationIsArmed(t *testing.T) {
+	for _, key := range []string{"z", "Z", "left", "right"} {
+		m := groupedOpModel(t)
+		m.width, m.height = 100, 24
+		m.svcCursor = 3 // shop/api, a service row inside the second group
+		armed, _ := m.Update(keyMsgFor("d"))
+		m = armed.(Model)
+		if !m.confirming {
+			t.Fatalf("precondition: d did not arm a prompt; warning = %q", m.warning)
+		}
+
+		m = pressGroupKey(m, key)
+
+		if !m.confirming {
+			t.Errorf("%q dismissed the armed prompt", key)
+		}
+		if foldedCount(m) != 0 {
+			t.Errorf("%q folded a group behind the armed prompt", key)
+		}
+		if m.svcCursor != 3 {
+			t.Errorf("%q moved the cursor to row %d, retargeting the armed batch", key, m.svcCursor)
+		}
+	}
+}
+
+// The one-shot fold runs BEFORE the branch re-derives anything from the rows.
+// searchMatches holds ROW indices, and the landing payload is async: the user
+// can open the search bar while it is still in flight.
+func TestGroupedLanding_FoldsBeforeTheRowDerivedStateSettles(t *testing.T) {
+	g, projects := groupedFixture()
+	m := groupedTestModel(g, projects)
+	cmd := m.enterGroupedContainers()
+	if cmd == nil {
+		t.Fatal("enterGroupedContainers() returned no load batch")
+	}
+	m.searchInput = textinput.New()
+	m.searchInput.Focus()
+	m.searching = true
+	m.searchQuery = "web"
+
+	updated, _ := m.Update(cmd())
+	got := updated.(Model)
+
+	if n := foldedCount(got); n != len(got.svcGroups) || n == 0 {
+		t.Fatalf("precondition: %d of %d groups folded on landing", n, len(got.svcGroups))
+	}
+	if len(got.searchMatches) != 0 {
+		t.Errorf("searchMatches = %v; every group is folded, so no service row can match — the matches were derived before the fold",
+			got.searchMatches)
+	}
+}
+
 // The unmanaged bucket's own header still folds — the row is a header like any
 // other, and folding is display state, not an operation.
 func TestGroupedSpace_OnUnmanagedHeaderFolds(t *testing.T) {
