@@ -354,11 +354,16 @@ Confirmed design decisions (brainstormed and validated; do not re-litigate):
 - [x] `go build -o cdeploy .` and `go vet ./...` clean (`gofmt -l internal/tui/` clean too)
 
 ### Task 15: [Final] Update documentation
-- [ ] create `docs/architecture/tui-multi-project.md` with the rationale and test pins (entry model, qualified keys + boundary rule, batch sequencing + message identity, grouped-mode update rules, action-time composer binding)
-- [ ] update `CLAUDE.md`: TUI state machine (screen count, deleted picker), container-screen paragraphs, session-counter site lists (including the inverted `connectResultMsg` success-path rule), ephemeral-on-departure count, "Adding a New TUI Screen" counts
+
+⚠️ Deviations:
+- ➕ **`README.md` was updated too**, though no checkbox names it. The task is "Update documentation" and the README's TUI section still listed seven screens with "Project select" as #2 and described reaching the `(unmanaged)` row through a picker that Task 13 deleted — a user-facing doc describing a screen that no longer exists. The edit is scoped to the screen list, the progress-screen paragraph (multi-project sequencing), and the "Unmanaged containers" narrative (group instead of picker row, the host view's self-refresh replacing the old snapshot caveat, `U` scoping).
+- ➕ **`docs/architecture/unmanaged-containers.md` got a supersession note** on its picker-row section plus two factual patches (`autoUpdatesAllowed()` now `!readOnly() && !grouped`; the view is reached through the host view, not the picker). The section is otherwise still accurate and was left verbatim rather than rewritten — `WithUnmanagedRow`, the `ComposerFactory` widening and the cache-key collision rules all survive unchanged.
+- The plan asked for five `Multi-project host view — …` digest paragraphs in `CLAUDE.md`; SIX landed. The per-batch wait gate went into the existing **TUI wait phase & `R` rollback** paragraph instead of a seventh, since that is where the reader of `wait-snapshots-rollback.md` looks.
+- [x] create `docs/architecture/tui-multi-project.md` with the rationale and test pins (entry model, qualified keys + boundary rule, batch sequencing + message identity, grouped-mode update rules, action-time composer binding)
+- [x] update `CLAUDE.md`: TUI state machine (screen count, deleted picker), container-screen paragraphs, session-counter site lists (including the inverted `connectResultMsg` success-path rule), ephemeral-on-departure count, "Adding a New TUI Screen" counts
   - ➕ the `?`-overlay paragraph states `progressPhase()` resolves `waiting` first "since it implies `done`" — Task 11 made a mid-sequence gate open with `done` FALSE, so the ordering rule stays but its reason must be restated (a gate can be open with `done` set, with `failed` set, or with neither)
   - ➕ the wait-phase paragraph must say the gate is PER BATCH: `pipelineDoneMsg` opens it, `batchDoneMsg` (not `pipelineDoneMsg`) releases the next batch, a whole-project batch resolves its targets through `waitTargetsMsg`/`ListServices`, and a failing gate stops the sequence only when a batch is still to come
-- [ ] move this plan to `docs/plans/completed/`
+- [x] moved by the orchestrator at completion
 
 ## Post-Completion
 *Items requiring manual intervention - no checkboxes, informational only*

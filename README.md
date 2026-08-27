@@ -56,15 +56,14 @@ cdeploy
 
 After you select a remote server, the server name is shown in the breadcrumb on subsequent screens. If that server has a `color` set in `~/.cdeploy/servers.yml`, the breadcrumb renders it as a colored badge; if `color` is omitted, the breadcrumb stays plain text.
 
-The TUI has seven main screens, plus an inline settings editor reachable from screen 1:
+The TUI has six main screens, plus an inline settings editor reachable from screen 1:
 
 1. **Server select** — choose a remote server or "Local" (only shown when servers are configured); press `s` to open the settings editor for managing servers
-2. **Project select** — pick a Docker Compose project (auto-skipped if the current directory has a compose file). When the host also runs containers that no compose project owns, an extra `(unmanaged)` row appears at the end of the list with the container count — see [Unmanaged containers](#unmanaged-containers-read-only)
-3. **Service select** — pick services (`space` toggles one, `a` toggles all) and choose an action (`r` restart, `d` deploy, `s` stop, `R` rollback, `l` logs, `i` inspect, `c` config, `x` exec, `U` re-check updates); press `/` to search-and-jump to a service by name substring and `n`/`N` to cycle through matches (search moves the cursor and highlights matches without filtering the list or touching your selection); also shows CPU% and Mem (used/limit) columns for running services, refreshed on screen entry and after every operation. Services whose registry image is newer than the local copy get a yellow `⇧` marker next to the service name; the indicator is cached for 10 minutes and `U` forces a refresh. `R` reads the host-side deploy snapshot and, when one exists, asks to confirm a digest-pinned rollback of the selected services (the prompt shows how long ago the snapshot was recorded). The footer shows only the most-used keys; press `?` for the full key list for the current screen. On the `(unmanaged)` row this screen is read-only — see [Unmanaged containers](#unmanaged-containers-read-only).
-4. **Progress** — watch step-by-step execution with status indicators. After a deploy, restart, or rollback the screen enters a **health-wait** sub-state: it polls each targeted service and shows a live per-service verdict (`♥` healthy, `●` running with no healthcheck, `✗` failed, `~` pending) with a countdown to the timeout. Press `esc` to skip the wait (the operation stays "done"). A failed deploy wait shows the hint `press R on the services screen to roll back`.
-5. **Logs** — live-stream logs for the selected service. `w` toggles soft-wrap, `p` toggles JSON pretty-print, and scrolling up pauses the auto-follow (`G` jumps back to the live tail). Press `f` to open a live **filter** (a grep that hides non-matching lines while the stream keeps buffering underneath; a leading `!` excludes matching lines) and `/` to open a **search** that highlights and jumps within the (possibly filtered) view (`n`/`N` cycle through matches). Both use case-insensitive substring matching by default; `ctrl+r` toggles Go regular-expression (RE2) mode. `esc` peels back one layer at a time — closing an open search or filter input, then clearing a committed search, then a committed filter, and finally leaving the screen.
-6. **Config** — inspect or edit the compose file, toggle between raw and resolved config, and see validation status
-7. **Inspect** — read-only view of what the container under the cursor actually holds: state, health (including the last healthcheck probe output), image id, mounts and environment (plus the update verdict, and which image an available update would move it to), with `r` toggling to the raw `docker inspect` JSON — see [Container Inspect Screen](#container-inspect-screen)
+2. **Services** — one screen with two modes. The **host view** shows every Docker Compose project on the host as a foldable group, plus an `(unmanaged)` group for containers no project owns — see [Unmanaged containers](#unmanaged-containers-read-only). `space` on a group header folds it, `enter` drills into that project, and a selection may span projects: the operation then runs one pipeline per project, in screen order, and stops at the first failure. Drilling in gives the **single-project view**, which is the same screen over one project and also lists services that have never been created (the host view can only show containers that exist). `esc` drills back out to the host view, and again to the server list. In both modes: pick services (`space` toggles one, `a` toggles all) and choose an action (`r` restart, `d` deploy, `s` stop, `R` rollback, `l` logs, `i` inspect, `c` config, `x` exec, `U` re-check updates); press `/` to search-and-jump to a service by name substring and `n`/`N` to cycle through matches (search moves the cursor and highlights matches without filtering the list or touching your selection); also shows CPU% and Mem (used/limit) columns for running services, refreshed on screen entry and after every operation. Services whose registry image is newer than the local copy get a yellow `⇧` marker next to the service name; the indicator is cached for 10 minutes and `U` forces a refresh. `R` reads the host-side deploy snapshot and, when one exists, asks to confirm a digest-pinned rollback of the selected services (the prompt shows how long ago the snapshot was recorded). The footer shows only the most-used keys; press `?` for the full key list for the current screen. Rows in the `(unmanaged)` group are read-only — see [Unmanaged containers](#unmanaged-containers-read-only).
+3. **Progress** — watch step-by-step execution with status indicators. After a deploy, restart, or rollback the screen enters a **health-wait** sub-state: it polls each targeted service and shows a live per-service verdict (`♥` healthy, `●` running with no healthcheck, `✗` failed, `~` pending) with a countdown to the timeout. Press `esc` to skip the wait (the operation stays "done"). A failed deploy wait shows the hint `press R on the services screen to roll back`. An operation that spans several projects shows every project's steps up front, prefixed with the project name, and each project's health wait must pass before the next project starts; a failure marks the remaining projects `(skipped)`.
+4. **Logs** — live-stream logs for the selected service. `w` toggles soft-wrap, `p` toggles JSON pretty-print, and scrolling up pauses the auto-follow (`G` jumps back to the live tail). Press `f` to open a live **filter** (a grep that hides non-matching lines while the stream keeps buffering underneath; a leading `!` excludes matching lines) and `/` to open a **search** that highlights and jumps within the (possibly filtered) view (`n`/`N` cycle through matches). Both use case-insensitive substring matching by default; `ctrl+r` toggles Go regular-expression (RE2) mode. `esc` peels back one layer at a time — closing an open search or filter input, then clearing a committed search, then a committed filter, and finally leaving the screen.
+5. **Config** — inspect or edit the compose file, toggle between raw and resolved config, and see validation status
+6. **Inspect** — read-only view of what the container under the cursor actually holds: state, health (including the last healthcheck probe output), image id, mounts and environment (plus the update verdict, and which image an available update would move it to), with `r` toggling to the raw `docker inspect` JSON — see [Container Inspect Screen](#container-inspect-screen)
 
 #### Navigation
 
@@ -81,31 +80,35 @@ The TUI has seven main screens, plus an inline settings editor reachable from sc
 
 #### Unmanaged containers (read-only)
 
-Containers started outside Docker Compose — a `docker run` postgres, a watchtower, a monitoring agent — carry no `com.docker.compose.project` label and belong to no project. The project picker gathers them into one synthetic row:
+Containers started outside Docker Compose — a `docker run` postgres, a watchtower, a monitoring agent — carry no `com.docker.compose.project` label and belong to no project. The host view gathers them into one group at the end of the list:
 
 ```
-cdeploy > prod > select project
+cdeploy > prod > services
 
-> my-app        /srv/my-app
-  other-stack   /srv/other
-  (unmanaged)   3 containers
+▼ my-app        ● 3 up
+    [ ] ♥ ● web
+    [ ] ♥ ● db
+▶ other-stack   ● 2 up
+▼ (unmanaged)   ● 3 up
+        ♥ ● watchtower
+          ● postgres
 ```
 
-Select it to get the usual service screen over those containers: status dot, health icon, Created, Uptime, Ports, CPU, Mem, and the `⇧` update indicator, in the same columns as a compose project. This works against a remote server through the existing SSH connection, so you can inspect hand-started containers on production without installing anything there and without opening a second SSH session.
+They get the same columns a compose service does: status dot, health icon, Created, Uptime, Ports, CPU, Mem, and the `⇧` update indicator. This works against a remote server through the existing SSH connection, so you can inspect hand-started containers on production without installing anything there and without opening a second SSH session.
 
-**Reaching the picker.** The row lives on the project-select screen, so you need to get there. `cdeploy` shows the picker when the current directory has no compose file, or when servers are configured (pick the server, or `Local`, and the picker opens). It skips the picker when you run `cdeploy` from inside a project directory with no servers configured — that session goes straight to the compose project's services and has no way back to the picker. Run `cdeploy` from a directory with no compose file, or pass `-C` a directory with none, to get the picker in that case.
+**Reaching the group.** It lives on the host view, so you need to get there. `cdeploy` shows the host view when the current directory has no compose file, or after you pick a server (or `Local`) on the server-select screen. It skips the host view when you run `cdeploy` from inside a project directory with no servers configured — that session goes straight to that project's services with nothing above it. Run `cdeploy` from a directory with no compose file, or pass `-C` a directory with none, to get the host view in that case.
 
-**The list is a snapshot.** The row count is taken when the project list loads, and the container list is fetched once when you select the row. Neither refreshes while you stay on the screen: a container started by hand while the screen is open does not appear, and one that was removed keeps its row with a stopped dot. Status, health, ports and CPU/Mem for the containers that ARE listed do refresh every 5 seconds. To resync the list, go back to the server picker and select the server (or `Local`) again, which reloads it; a local session with no configured servers has no server picker, so restart the TUI.
+**The host view refreshes itself.** The project list and the container rows are re-fetched every 5 seconds along with status, health, ports and CPU/Mem, so a container started or removed by hand appears or disappears on its own; your cursor, selection, and which groups are folded all survive the refresh. The single-project view you get by drilling in does not re-list — it refreshes status only — so press `esc` and drill in again to pick up a service added to the compose file while you were looking at it.
 
-**The screen is read-only.** A container with no compose file cannot be deployed, rolled back, or shown a config, so those keys are not merely refused — they are absent from the footer and from the `?` key list, and the rows carry no selection checkbox:
+**These rows are read-only.** A container with no compose file cannot be deployed, rolled back, or shown a config. On the host view the unmanaged rows carry no selection checkbox and the write keys refuse while the cursor sits on one; press `enter` on the `(unmanaged)` header to drill in, and the whole screen switches to its read-only variant, where those keys are absent from the footer and from the `?` key list as well:
 
-| Key | On the unmanaged screen |
-|-----|-------------------------|
+| Key | On an unmanaged row |
+|-----|---------------------|
 | `l` `i` `x` `U` | Work as usual — logs, inspect, exec, force an update check |
 | `/` `n` `N` `esc` `q` `?` arrows | Work as usual — search, navigate, back, key list |
 | `d` `r` `s` `R` `c` `space` `a` | Inert and unadvertised — deploy, restart, stop, rollback, config, and multi-select need a compose project |
 
-**Update checks are opt-in here.** The `⇧` glyph does not appear on its own on this screen — press `U`. A compose project bounds the check to its own service list, but the unmanaged list comes from `docker ps -a`, so every distinct image on the host would cost a registry manifest request on every visit; that can exhaust an anonymous registry rate limit and break a later `docker pull` from the same host. `cdeploy list --updates` is opt-in for the same reason.
+**Update checks are opt-in here.** The `⇧` glyph does not appear on its own — press `U`, which checks the group under the cursor. The same rule covers the whole host view, not just this group: no automatic check runs there, because it would fan out across every project on the host at once. A compose project bounds the check to its own service list, but the unmanaged list comes from `docker ps -a`, so every distinct image on the host would cost a registry manifest request on every visit; that can exhaust an anonymous registry rate limit and break a later `docker pull` from the same host. `cdeploy list --updates` is opt-in for the same reason.
 
 `i` matters most here: a hand-started container has no compose file, so [inspect](#container-inspect-screen) is the only way to see its environment, mounts, image id and healthcheck output.
 
