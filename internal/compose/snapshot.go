@@ -56,9 +56,10 @@ type SnapshotEntry struct {
 //
 // ProjectName records which compose project the entries belong to, and is
 // omitted (and empty on read) for a directory-addressed project — every file
-// written before the name entered the key. It is what makes the dir-only
-// fallback safe: a file that names a DIFFERENT project is refused rather than
-// rolled back onto.
+// written before the name entered the key. It guards the MERGE and the ROLLBACK
+// READ: mergeSnapshot merges by SERVICE name, so checkSnapshotProject refuses a
+// file that names a DIFFERENT project rather than merging another project's
+// digests forward or rolling back onto them.
 type Snapshot struct {
 	Schema      int                      `json:"schema"`
 	ProjectDir  string                   `json:"project_dir"`
@@ -100,10 +101,12 @@ func snapshotKey(projectDir, projectName string) string {
 }
 
 // checkSnapshotProject refuses a snapshot recorded for a different project than
-// the one being read. An empty recorded name is a pre-ProjectName file (or a
-// directory-addressed one) and is accepted: it is the only thing the dir-only
-// read fallback can find, and refusing it would orphan every state file written
-// before the name entered the key.
+// the one being read. An empty recorded name is ACCEPTED, and must stay so for
+// two reasons that now coincide on one key: every file written before
+// ProjectName existed records no name at all, and canonicalStateName folds a
+// directory's OWN project onto the empty name, so the current writer of that
+// same key stamps "" as well. Refusing it would orphan every pre-upgrade state
+// file and reject the file the directory-addressed path writes today.
 func checkSnapshotProject(snap *Snapshot, projectName string) error {
 	if snap == nil || snap.ProjectName == "" || snap.ProjectName == projectName {
 		return nil
@@ -167,10 +170,11 @@ func mergeSnapshot(existing, fresh *Snapshot) *Snapshot {
 		if fresh.ProjectDir != "" {
 			merged.ProjectDir = fresh.ProjectDir
 		}
-		// The fresh name wins even when EMPTY is what it carries: merging a
-		// dir-only legacy file forward under a named key must stamp the name,
-		// and a directory-addressed write must not inherit a name from a file
-		// it is replacing.
+		// The fresh name wins even when EMPTY is what it carries, so a
+		// directory-addressed write cannot inherit a name from the file it
+		// merges onto. Both WriteSnapshot bodies re-derive the stamp from the
+		// composer's stateName() after this call, so fresh is never the last
+		// word — this is defence in depth, not the rule that sets the name.
 		merged.ProjectName = fresh.ProjectName
 		for name, entry := range fresh.Services {
 			merged.Services[name] = entry

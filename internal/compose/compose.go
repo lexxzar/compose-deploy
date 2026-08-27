@@ -66,10 +66,19 @@ type Project struct {
 // Compile-time interface satisfaction checks.
 var _ runner.Composer = (*Compose)(nil)
 
-// composeFile candidates for HasComposeFile detection.
+// composeFiles are the default main-file names compose's auto-discovery probes,
+// IN COMPOSE'S OWN PRECEDENCE ORDER (compose-go DefaultFileNames).
+//
+// The ORDER is load-bearing: compose does not load every default name it finds,
+// it takes the FIRST that exists and warns about the rest. Verified against
+// compose v2.40.3 — a directory holding all four logs `Using .../compose.yaml`
+// and loads that one alone. findComposeFile probes this slice in order to pick
+// the main file for the config screen and for rollback prep, and
+// composeDiscoveredFiles resolves the PinComposeFilesLocal decision from it, so
+// a reordering here silently points both at the wrong file.
 var composeFiles = []string{
-	"compose.yml",
 	"compose.yaml",
+	"compose.yml",
 	"docker-compose.yml",
 	"docker-compose.yaml",
 }

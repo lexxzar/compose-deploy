@@ -1,8 +1,10 @@
 package compose
 
 import (
+	"os"
 	"path"
 	"regexp"
+	"slices"
 	"strings"
 )
 
@@ -61,10 +63,18 @@ var composeProjectNameRune = regexp.MustCompile(`[a-z0-9_-]`)
 // key, then `.env`, before falling back to this rule. cdeploy reads NONE of
 // those: the environment is invisible over SSH, so honoring it locally would
 // split the local and remote keys for one project, and parsing `.env` or the
-// compose file means replicating compose's interpolation. When one of them
-// names a project this derivation does not predict, the named and unnamed
-// spellings key two files and a rollback reports "no snapshot" — a safe
-// failure, never a wrong image.
+// compose file means replicating compose's interpolation.
+//
+// When one of them names a project this derivation does not predict, the named
+// and unnamed spellings key two files and a rollback reports "no snapshot" — a
+// safe failure for a `-p`-addressed project, which is the case this design
+// targets. It is NOT safe in one narrower shape: two DIFFERENT projects sharing
+// one directory and BOTH addressed with an empty name (each selected by its own
+// `name:` key, `.env` or COMPOSE_PROJECT_NAME) fold onto the same dir-only
+// file, and mergeSnapshot merges by SERVICE name, so one can pin the other's
+// digest. That is not a regression — before the name entered the key EVERY
+// project in a directory shared one file — so this rule narrows the hazard
+// rather than introducing it.
 func composeDefaultProjectName(dir string) string {
 	if dir == "" {
 		return ""
@@ -87,10 +97,15 @@ func (r *RemoteCompose) stateName() string {
 }
 
 // composeOverrideFiles are the default override names compose loads ALONGSIDE
-// the main file during auto-discovery. They belong in the auto-discoverable set
-// even though HasComposeFile does not probe for them: a project created with an
-// override reports both files, and pinning that pair would be indistinguishable
-// from pinning a hand-picked `-f` set.
+// the main file during auto-discovery, in compose's own precedence order. They
+// belong in the auto-discoverable set even though HasComposeFile does not probe
+// for them: a project created with an override reports both files, and pinning
+// that pair would be indistinguishable from pinning a hand-picked `-f` set.
+//
+// Overrides carry the same first-wins rule as the main names, and the list is
+// independent of which main file was chosen — verified against compose v2.40.3,
+// where a compose.yaml main plus both compose.override.yaml and
+// docker-compose.override.yml logs `Using .../compose.override.yaml`.
 var composeOverrideFiles = []string{
 	"compose.override.yml",
 	"compose.override.yaml",
@@ -114,6 +129,11 @@ var composeOverrideFiles = []string{
 // without the pin, a project created from prod.yml was recreated from a sibling
 // docker-compose.yml under the right label. Returning nil means auto-discover,
 // which is byte-identical to the pre-ComposeFiles argv.
+//
+// This is a MEMBERSHIP test, and compose resolves discovery by PRECEDENCE — see
+// PinComposeFilesLocal, which closes that gap where a stat is free. This pure
+// form is what the REMOTE picker rows use, because a stat there costs an SSH
+// round trip per row on the 5-second grouped reload.
 func PinComposeFiles(configDir string, files []string) []string {
 	if len(files) == 0 || configDir == "" {
 		return files
@@ -126,8 +146,86 @@ func PinComposeFiles(configDir string, files []string) []string {
 	return nil
 }
 
-// autoDiscoverable reports whether compose's own file discovery in dir would
-// find f: it must live directly in dir and carry a default name.
+// PinComposeFilesLocal is PinComposeFiles for a LOCAL project directory, where
+// the directory can be read and compose's discovery PRECEDENCE resolved for
+// real.
+//
+// Membership is not enough. Compose does not load every default name it finds:
+// it takes the first by precedence and warns about the rest. Verified against
+// compose v2.40.3 — a directory holding compose.yaml and docker-compose.yml
+// logs `Using .../compose.yaml` and loads that one alone. So a project created
+// from an explicit `-f docker-compose.yml` there reports a file set every entry
+// of which carries a default name, loses its pin, and every later
+// stop → rm -f → pull → create → start resolves compose.yaml instead: the
+// containers are removed and recreated from the WRONG service definitions under
+// the right `-p` label, which is the failure the pin exists to prevent.
+//
+// The pin is dropped only when discovery run NOW resolves the same MAIN file
+// the row reports and adds nothing the row does not already have on disk. Two
+// asymmetries are deliberate, and both keep the original override-healing rule
+// intact:
+//   - a file discovery finds that the row LACKS — a docker-compose.override.yml
+//     added after the containers were created — still drops the pin, because
+//     picking that up is the whole reason PinComposeFiles exists;
+//   - a reported file that no longer EXISTS is ignored, because `-f` at a
+//     deleted file is a hard error where discovery simply proceeds without it.
+func PinComposeFilesLocal(configDir string, files []string) []string {
+	if len(files) == 0 || configDir == "" {
+		return files
+	}
+	discovered := composeDiscoveredFiles(configDir)
+	if len(discovered) == 0 || path.Clean(files[0]) != discovered[0] {
+		return files
+	}
+	for _, f := range files[1:] {
+		f = path.Clean(f)
+		if !slices.Contains(discovered, f) && composeFileExists(f) {
+			return files
+		}
+	}
+	return nil
+}
+
+// composeDiscoveredFiles returns the file set compose's auto-discovery actually
+// resolves in dir: the first EXISTING entry of composeFiles, plus the first
+// existing entry of composeOverrideFiles. Nil when dir holds no default-named
+// main file, which is also what compose reports as "no configuration file
+// provided".
+func composeDiscoveredFiles(dir string) []string {
+	if dir == "" {
+		return nil
+	}
+	clean := path.Clean(dir)
+	main := firstExistingIn(clean, composeFiles)
+	if main == "" {
+		return nil
+	}
+	if override := firstExistingIn(clean, composeOverrideFiles); override != "" {
+		return []string{main, override}
+	}
+	return []string{main}
+}
+
+func firstExistingIn(dir string, names []string) string {
+	for _, name := range names {
+		if p := path.Join(dir, name); composeFileExists(p) {
+			return p
+		}
+	}
+	return ""
+}
+
+func composeFileExists(p string) bool {
+	st, err := os.Stat(p)
+	return err == nil && !st.IsDir()
+}
+
+// autoDiscoverable reports whether f lives directly in dir and carries one of
+// the names compose's discovery probes. That is NECESSARY for discovery to load
+// f but not SUFFICIENT: compose keeps only the first match by precedence, which
+// a name alone cannot tell. Deciding on that needs the directory read
+// (PinComposeFilesLocal); this predicate is the name-only approximation the
+// remote path is limited to.
 func autoDiscoverable(dir, f string) bool {
 	if f == "" || path.Dir(f) != path.Clean(dir) {
 		return false

@@ -2,7 +2,9 @@ package compose
 
 import (
 	"context"
+	"os"
 	"os/exec"
+	"path/filepath"
 	"slices"
 	"strings"
 	"testing"
@@ -212,5 +214,154 @@ func TestPinComposeFiles(t *testing.T) {
 				t.Errorf("PinComposeFiles(%q, %v) = %v, want %v", tt.dir, tt.files, got, tt.want)
 			}
 		})
+	}
+}
+
+// The order of composeFiles/remoteComposeFiles IS compose's discovery
+// precedence, verified against compose v2.40.3: a directory holding all four
+// logs `Using .../compose.yaml`. findComposeFile and findRemoteComposeFile
+// probe these slices in order to pick a project's main file, and
+// composeDiscoveredFiles resolves the local pin decision from the first, so a
+// reordering silently points both at the wrong file.
+func TestComposeFileCandidatesAreInPrecedenceOrder(t *testing.T) {
+	want := []string{"compose.yaml", "compose.yml", "docker-compose.yml", "docker-compose.yaml"}
+	if !slices.Equal(composeFiles, want) {
+		t.Errorf("composeFiles = %v, want compose's precedence order %v", composeFiles, want)
+	}
+	if !slices.Equal(remoteComposeFiles, want) {
+		t.Errorf("remoteComposeFiles = %v, want compose's precedence order %v", remoteComposeFiles, want)
+	}
+	wantOverrides := []string{
+		"compose.override.yml",
+		"compose.override.yaml",
+		"docker-compose.override.yml",
+		"docker-compose.override.yaml",
+	}
+	if !slices.Equal(composeOverrideFiles, wantOverrides) {
+		t.Errorf("composeOverrideFiles = %v, want %v", composeOverrideFiles, wantOverrides)
+	}
+}
+
+// REQUIREMENT: a project created with an explicit `-f` naming a LOWER-precedence
+// default file must keep its pin. Compose does not load every default name it
+// finds — it takes the first by precedence — so a name-only membership test
+// dropped the pin and every later stop → rm -f → pull → create → start
+// recreated the project from the higher-precedence sibling's service
+// definitions under the right `-p` label.
+func TestPinComposeFilesLocal(t *testing.T) {
+	tests := []struct {
+		name    string
+		present []string
+		files   []string
+		pinned  bool
+	}{
+		{
+			name:    "a -f docker-compose.yml project beside a compose.yaml keeps its pin",
+			present: []string{"compose.yaml", "docker-compose.yml"},
+			files:   []string{"docker-compose.yml"},
+			pinned:  true,
+		},
+		{
+			name:    "compose.yml loses to compose.yaml too",
+			present: []string{"compose.yaml", "compose.yml"},
+			files:   []string{"compose.yml"},
+			pinned:  true,
+		},
+		{
+			name:    "docker-compose.yaml loses to docker-compose.yml",
+			present: []string{"docker-compose.yml", "docker-compose.yaml"},
+			files:   []string{"docker-compose.yaml"},
+			pinned:  true,
+		},
+		{
+			name:    "the file discovery actually resolves is not pinned",
+			present: []string{"compose.yaml", "docker-compose.yml"},
+			files:   []string{"compose.yaml"},
+			pinned:  false,
+		},
+		{
+			name:    "the only default file in the directory is not pinned",
+			present: []string{"docker-compose.yml"},
+			files:   []string{"docker-compose.yml"},
+			pinned:  false,
+		},
+		{
+			name:    "a reported main plus the override discovery resolves is not pinned",
+			present: []string{"docker-compose.yml", "docker-compose.override.yml"},
+			files:   []string{"docker-compose.yml", "docker-compose.override.yml"},
+			pinned:  false,
+		},
+		{
+			name:    "an override added after the containers were created still heals",
+			present: []string{"docker-compose.yml", "docker-compose.override.yml"},
+			files:   []string{"docker-compose.yml"},
+			pinned:  false,
+		},
+		{
+			name:    "a reported override that no longer exists is not pinned",
+			present: []string{"docker-compose.yml"},
+			files:   []string{"docker-compose.yml", "docker-compose.override.yml"},
+			pinned:  false,
+		},
+		{
+			name:    "a reported override that lost the precedence race keeps its pin",
+			present: []string{"docker-compose.yml", "docker-compose.override.yml", "compose.override.yml"},
+			files:   []string{"docker-compose.yml", "docker-compose.override.yml"},
+			pinned:  true,
+		},
+		{
+			name:    "a hand-picked -f name keeps its pin",
+			present: []string{"docker-compose.yml", "prod.yml"},
+			files:   []string{"prod.yml"},
+			pinned:  true,
+		},
+		{
+			name:    "a directory with no default file at all pins the reported set",
+			present: []string{"stack.yml"},
+			files:   []string{"stack.yml"},
+			pinned:  true,
+		},
+		{
+			name:    "a second main name after the first keeps the pin",
+			present: []string{"compose.yaml", "docker-compose.yml"},
+			files:   []string{"compose.yaml", "docker-compose.yml"},
+			pinned:  true,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			dir := t.TempDir()
+			for _, name := range tt.present {
+				if err := os.WriteFile(filepath.Join(dir, name), []byte("services: {}\n"), 0o600); err != nil {
+					t.Fatalf("writing %s: %v", name, err)
+				}
+			}
+			files := make([]string, len(tt.files))
+			for i, name := range tt.files {
+				files[i] = filepath.Join(dir, name)
+			}
+			got := PinComposeFilesLocal(dir, files)
+			if tt.pinned {
+				if !slices.Equal(got, files) {
+					t.Errorf("PinComposeFilesLocal(%v) = %v, want the set pinned", tt.files, got)
+				}
+				return
+			}
+			if got != nil {
+				t.Errorf("PinComposeFilesLocal(%v) = %v, want nil (auto-discover)", tt.files, got)
+			}
+		})
+	}
+}
+
+// The degenerate inputs must behave exactly as the pure form does — a picker
+// row with no reported files, and the unmanaged row's empty ConfigDir.
+func TestPinComposeFilesLocalPassesThroughDegenerateInputs(t *testing.T) {
+	if got := PinComposeFilesLocal(t.TempDir(), nil); got != nil {
+		t.Errorf("empty set = %v, want nil", got)
+	}
+	files := []string{"/srv/app/docker-compose.yml"}
+	if got := PinComposeFilesLocal("", files); !slices.Equal(got, files) {
+		t.Errorf("no config dir = %v, want the set untouched", got)
 	}
 }

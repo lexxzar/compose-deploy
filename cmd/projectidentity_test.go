@@ -390,10 +390,24 @@ func TestProjectNameDoesNotOverrideProjectDir(t *testing.T) {
 
 // REQUIREMENT: a compose file set adopted from a stale container label must not
 // silently disable auto-discovery. Both TUI factories route the row's files
-// through compose.PinComposeFiles, which drops a set auto-discovery would find
-// anyway — so a docker-compose.override.yml added after the containers were
-// created is picked up instead of being frozen out forever.
+// through a PinComposeFiles variant, which drops a set auto-discovery would
+// find anyway — so a docker-compose.override.yml added after the containers
+// were created is picked up instead of being frozen out forever.
 func TestPickerRowsDoNotPinAutoDiscoverableFiles(t *testing.T) {
+	// The local factory resolves compose's discovery PRECEDENCE against the
+	// real directory, so this half needs one.
+	dir := t.TempDir()
+	writeComposeFiles(t, dir, "docker-compose.yml", "prod.yml")
+	discoverableLocal := compose.Project{
+		Name:        "app",
+		ConfigDir:   dir,
+		ConfigFiles: []string{filepath.Join(dir, "docker-compose.yml")},
+	}
+	handPickedLocal := compose.Project{
+		Name:        "prod",
+		ConfigDir:   dir,
+		ConfigFiles: []string{filepath.Join(dir, "prod.yml")},
+	}
 	discoverable := compose.Project{
 		Name:        "app",
 		ConfigDir:   "/srv/app",
@@ -405,19 +419,19 @@ func TestPickerRowsDoNotPinAutoDiscoverableFiles(t *testing.T) {
 		ConfigFiles: []string{"/srv/app/prod.yml"},
 	}
 
-	lc, ok := localComposerFor(discoverable, compose.New("/srv/app"), false, true).(*compose.Compose)
+	lc, ok := localComposerFor(discoverableLocal, compose.New(dir), false, true).(*compose.Compose)
 	if !ok {
 		t.Fatal("localComposerFor did not build a *compose.Compose")
 	}
 	if len(lc.ComposeFiles) != 0 {
 		t.Errorf("ComposeFiles = %v, want auto-discovery for a default-named file", lc.ComposeFiles)
 	}
-	lc, ok = localComposerFor(handPicked, compose.New("/srv/app"), false, true).(*compose.Compose)
+	lc, ok = localComposerFor(handPickedLocal, compose.New(dir), false, true).(*compose.Compose)
 	if !ok {
 		t.Fatal("localComposerFor did not build a *compose.Compose")
 	}
-	if !slices.Equal(lc.ComposeFiles, handPicked.ConfigFiles) {
-		t.Errorf("ComposeFiles = %v, want the hand-picked %v", lc.ComposeFiles, handPicked.ConfigFiles)
+	if !slices.Equal(lc.ComposeFiles, handPickedLocal.ConfigFiles) {
+		t.Errorf("ComposeFiles = %v, want the hand-picked %v", lc.ComposeFiles, handPickedLocal.ConfigFiles)
 	}
 
 	live := compose.NewRemote("user@host", "/srv/app")
@@ -467,5 +481,56 @@ func TestNoIdentityLookupOnTheWritePath(t *testing.T) {
 	}
 	if calls != 0 {
 		t.Errorf("`docker compose ls` ran %d times while resolving identity, want 0", calls)
+	}
+}
+
+// writeComposeFiles drops empty compose files into dir so a discovery probe can
+// see them. No docker is involved.
+func writeComposeFiles(t *testing.T, dir string, names ...string) {
+	t.Helper()
+	for _, name := range names {
+		if err := os.WriteFile(filepath.Join(dir, name), []byte("services: {}\n"), 0o600); err != nil {
+			t.Fatalf("writing %s: %v", name, err)
+		}
+	}
+}
+
+// REQUIREMENT (the reported defect): compose discovery is PRECEDENCE, not
+// membership. A project created with an explicit `-f docker-compose.yml` in a
+// directory that ALSO holds a compose.yaml reports a default-named file that
+// discovery would NOT resolve — compose loads compose.yaml there and only warns
+// about the rest. Dropping the pin made every later stop → rm -f → pull →
+// create → start recreate the project from compose.yaml's service definitions
+// under the right `-p` label.
+func TestLocalPickerRowPinsALowerPrecedenceDefaultFile(t *testing.T) {
+	dir := t.TempDir()
+	writeComposeFiles(t, dir, "compose.yaml", "docker-compose.yml")
+	shadowed := compose.Project{
+		Name:        "app",
+		ConfigDir:   dir,
+		ConfigFiles: []string{filepath.Join(dir, "docker-compose.yml")},
+	}
+
+	lc, ok := localComposerFor(shadowed, compose.New(dir), false, true).(*compose.Compose)
+	if !ok {
+		t.Fatal("localComposerFor did not build a *compose.Compose")
+	}
+	if !slices.Equal(lc.ComposeFiles, shadowed.ConfigFiles) {
+		t.Errorf("ComposeFiles = %v, want the shadowed set pinned %v", lc.ComposeFiles, shadowed.ConfigFiles)
+	}
+
+	// The negative half: the file discovery DOES resolve keeps auto-discovery,
+	// so a later docker-compose.override.yml is still picked up.
+	resolved := compose.Project{
+		Name:        "app",
+		ConfigDir:   dir,
+		ConfigFiles: []string{filepath.Join(dir, "compose.yaml")},
+	}
+	lc, ok = localComposerFor(resolved, compose.New(dir), false, true).(*compose.Compose)
+	if !ok {
+		t.Fatal("localComposerFor did not build a *compose.Compose")
+	}
+	if len(lc.ComposeFiles) != 0 {
+		t.Errorf("ComposeFiles = %v, want auto-discovery for the resolved main file", lc.ComposeFiles)
 	}
 }

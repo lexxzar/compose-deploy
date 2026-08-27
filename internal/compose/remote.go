@@ -110,10 +110,13 @@ func classifySSHError(err error, stderrText string) error {
 // Compile-time interface satisfaction checks.
 var _ runner.Composer = (*RemoteCompose)(nil)
 
-// remoteComposeFiles lists the compose file candidates to probe on the remote host.
+// remoteComposeFiles lists the compose file candidates to probe on the remote
+// host, in compose's own precedence order — the remote twin of composeFiles,
+// and load-bearing for the same reason: findRemoteComposeFile probes it in
+// order and returns the FIRST hit as the project's main file.
 var remoteComposeFiles = []string{
-	"compose.yml",
 	"compose.yaml",
+	"compose.yml",
 	"docker-compose.yml",
 	"docker-compose.yaml",
 }

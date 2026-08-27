@@ -251,16 +251,19 @@ func fastTrackComposer(dir string, standalone bool) runner.Composer {
 // docker-compose.yml was recreated from the wrong service definitions under the
 // right label, and a project whose only file is stack.yml reported "no compose
 // file found" from the `c` screen and from rollback prep. It goes through
-// PinComposeFiles, which drops a file set auto-discovery would find anyway —
-// `-f` disables discovery, and the label docker reports was stamped when the
+// PinComposeFilesLocal, which drops a file set auto-discovery would find anyway
+// — `-f` disables discovery, and the label docker reports was stamped when the
 // containers were created, so pinning it froze out any override added later.
+// The LOCAL variant reads the directory, so it drops the pin only when
+// discovery's PRECEDENCE resolves the row's own main file: a default name is
+// not enough, since compose keeps just the first of the ones it finds.
 func localComposerFor(proj compose.Project, detector *compose.Compose, standalone, detected bool) runner.Composer {
 	if proj.Unmanaged {
 		return compose.NewLocalHostContainers(detector)
 	}
 	lc := compose.New(proj.ConfigDir)
 	lc.ProjectName = proj.Name
-	lc.ComposeFiles = compose.PinComposeFiles(proj.ConfigDir, proj.ConfigFiles)
+	lc.ComposeFiles = compose.PinComposeFilesLocal(proj.ConfigDir, proj.ConfigFiles)
 	if detected {
 		lc.SetStandalone(standalone)
 	}
@@ -275,6 +278,13 @@ func localComposerFor(proj compose.Project, detector *compose.Compose, standalon
 // SSHExtraArgs is copied along with the rest: it carries the ad-hoc port and
 // `-i <key>` that reach the host at all, so a composer built without them would
 // dial a different endpoint than the connection it was derived from.
+//
+// The file set goes through the pure PinComposeFiles, NOT the precedence-aware
+// PinComposeFilesLocal: resolving discovery needs the project directory read,
+// and here that is an SSH round trip per row on every 5-second grouped reload.
+// The gap that leaves is a project created from an explicit `-f` naming a
+// LOWER-precedence default file (a `-f docker-compose.yml` project in a
+// directory that also holds compose.yaml) — see PinComposeFilesLocal.
 func remoteComposerFor(proj compose.Project, rc *compose.RemoteCompose, standalone bool) runner.Composer {
 	if proj.Unmanaged {
 		return compose.NewRemoteHostContainers(rc)

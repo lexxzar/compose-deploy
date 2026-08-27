@@ -684,6 +684,9 @@ func runList(ctx context.Context, jsonOutput, showStats, showUpdates bool) error
 			return nil
 		}
 
+		// The remote rows keep the pure PinComposeFiles: resolving compose's
+		// discovery precedence needs the project directory read, which is an
+		// SSH round trip per project here. See remoteComposerFor in root.go.
 		factory := func(proj compose.Project) runner.Composer {
 			rc2 := listNewRemote(server.Host, proj.ConfigDir)
 			rc2.ProjectName = proj.Name
@@ -750,7 +753,7 @@ func runList(ctx context.Context, jsonOutput, showStats, showUpdates bool) error
 	factory := func(proj compose.Project) runner.Composer {
 		lc := listNewLocal(proj.ConfigDir)
 		lc.ProjectName = proj.Name
-		lc.ComposeFiles = compose.PinComposeFiles(proj.ConfigDir, proj.ConfigFiles)
+		lc.ComposeFiles = compose.PinComposeFilesLocal(proj.ConfigDir, proj.ConfigFiles)
 		lc.SetStandalone(c.Standalone)
 		return lc
 	}
