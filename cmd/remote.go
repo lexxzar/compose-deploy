@@ -29,23 +29,17 @@ func checkRemoteMutex(serverName, sshTarget, identityFile string) error {
 }
 
 // prepareLocalComposer readies a LOCAL composer for a subcommand: it stamps the
-// `--project-name` override, detects the docker compose variant, and resolves
-// the composer's canonical project identity.
+// `--project-name` override and detects the docker compose variant.
 //
-// The resolve step is what keeps every entry point addressing ONE project. A
-// composer built from a bare directory names no project, so compose derives one
-// from the directory while the TUI — whose rows come from `docker compose ls` —
-// addresses the project's real name. The two then keyed two different rollback
-// state files for the same containers, and a CLI rollback restored digests a
-// TUI deploy never recorded. ResolveProject also supplies the project's own
-// compose file set, so `-p prod` can no longer rebuild prod from a sibling
-// project's auto-discovered docker-compose.yml.
+// It deliberately performs NO project lookup. The identity is exactly what the
+// caller typed — `-C` says where, `-p` says which — so `deploy -C /opt/appA -p
+// web` addresses /opt/appA and never a directory docker happens to report for
+// some other project called web, and `deploy -p brand-new -a` can create a
+// project that does not exist yet. Convergence with the TUI's named rows comes
+// from canonicalStateName instead, which needs no host state at all.
 func prepareLocalComposer(ctx context.Context, lc *compose.Compose, projectName string) error {
 	lc.ProjectName = projectName
-	if err := lc.Detect(ctx); err != nil {
-		return err
-	}
-	return lc.ResolveProject(ctx)
+	return lc.Detect(ctx)
 }
 
 // resolveSSHRemote parses an ad-hoc SSH connection string and builds a
@@ -105,10 +99,6 @@ func resolveSSHRemote(
 		_ = rc.Close()
 		return nil, noopCleanup, err
 	}
-	if err := rc.ResolveProject(ctx); err != nil {
-		_ = rc.Close()
-		return nil, noopCleanup, err
-	}
 
 	return rc, func() { _ = rc.Close() }, nil
 }
@@ -153,10 +143,6 @@ func resolveServerRemote(
 		return nil, noopCleanup, fmt.Errorf("connecting to %s: %w", serverName, err)
 	}
 	if err := rc.Detect(ctx); err != nil {
-		_ = rc.Close()
-		return nil, noopCleanup, err
-	}
-	if err := rc.ResolveProject(ctx); err != nil {
 		_ = rc.Close()
 		return nil, noopCleanup, err
 	}

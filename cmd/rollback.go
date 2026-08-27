@@ -127,7 +127,7 @@ func rollbackPrep(all bool, containers []string, out io.Writer) func(context.Con
 // while a missing file yields a nil snap handled here.
 func resolveRollbackTargets(snap *compose.Snapshot, all bool, containers []string) ([]string, error) {
 	if snap == nil {
-		return nil, fmt.Errorf("no rollback snapshot found for this project; run 'cdeploy deploy' first to record one")
+		return nil, fmt.Errorf("no rollback snapshot found for this project; run 'cdeploy deploy' first to record one, or pass --project-name if the project was deployed under one")
 	}
 
 	var targets []string

@@ -3550,8 +3550,10 @@ func TestRemoteCommand_ProjectName(t *testing.T) {
 }
 
 // The remote key carries the project name for the same reason the local one
-// does, and an unnamed composer keeps emitting the historical single-file read
-// command byte for byte.
+// does, an unnamed composer keeps emitting the historical single-file path byte
+// for byte, and a composer naming the DIRECTORY'S OWN project keys that same
+// historical path — which is what makes a TUI drill-in and a bare CLI rollback
+// read one remote file with no host lookup.
 func TestRemoteStatePath_NamedProjectsInOneDirStayDistinct(t *testing.T) {
 	blue := (&RemoteCompose{ProjectDir: "/srv/app", ProjectName: "blue"}).remoteStatePath()
 	green := (&RemoteCompose{ProjectDir: "/srv/app", ProjectName: "green"}).remoteStatePath()
@@ -3562,20 +3564,25 @@ func TestRemoteStatePath_NamedProjectsInOneDirStayDistinct(t *testing.T) {
 	if unnamed != "$HOME/"+stateFileRelPath(remoteProjectDir("/srv/app"), "") {
 		t.Errorf("unnamed remote state path changed: %q", unnamed)
 	}
-	if (&RemoteCompose{ProjectDir: "/srv/app"}).remoteLegacyStatePath() != "" {
-		t.Error("an unnamed composer must have no separate legacy path")
+	if blue == unnamed {
+		t.Error("a -p project must not key the directory's own state path")
+	}
+	deflt := (&RemoteCompose{ProjectDir: "/srv/app", ProjectName: "app"}).remoteStatePath()
+	if deflt != unnamed {
+		t.Errorf("the directory's default project keyed %q, want the dir-only %q", deflt, unnamed)
 	}
 }
 
-// A NAMED remote project falls back to the dir-only file in the SAME round trip,
-// so a state file written before the name entered the key is not orphaned.
-func TestRemoteReadSnapshot_FallsBackToLegacyPathInOneRoundTrip(t *testing.T) {
+// A remote read is ONE round trip and ONE path. The dir-only fallback the
+// earlier design needed is gone: a composer naming the directory's own project
+// already keys the dir-only file, so there is no second path to try.
+func TestRemoteReadSnapshot_IsOnePathInOneRoundTrip(t *testing.T) {
 	var rc string
 	calls := 0
 	r := &RemoteCompose{
 		Host:        "user@example.com",
 		ProjectDir:  "/proj",
-		ProjectName: "blue",
+		ProjectName: "proj",
 		SocketPath:  "/tmp/cdeploy-ctrl-abc-99",
 		outputCmd: func(cmd *exec.Cmd) ([]byte, error) {
 			calls++
@@ -3593,19 +3600,15 @@ func TestRemoteReadSnapshot_FallsBackToLegacyPathInOneRoundTrip(t *testing.T) {
 	if calls != 1 {
 		t.Errorf("SSH round trips = %d, want 1", calls)
 	}
-	if !strings.Contains(rc, "elif [ -f") {
-		t.Errorf("named read command should carry the elif fallback, got: %q", rc)
-	}
-	if !strings.Contains(rc, "$HOME/"+stateFileRelPath(remoteProjectDir("/proj"), "blue")) {
-		t.Errorf("read command should reference the NAMED path, got: %q", rc)
+	if strings.Contains(rc, "elif [ -f") {
+		t.Errorf("the read command must carry no fallback branch, got: %q", rc)
 	}
 	if !strings.Contains(rc, "$HOME/"+stateFileRelPath(remoteProjectDir("/proj"), "")) {
-		t.Errorf("read command should reference the legacy path, got: %q", rc)
+		t.Errorf("read command should reference the dir-only path, got: %q", rc)
 	}
 }
 
-// The remote write-merge reads the project's OWN file only — the fallback file
-// belongs to whatever project the directory resolves to.
+// The remote write-merge reads the project's OWN file only.
 func TestRemoteWriteSnapshot_MergeReadHasNoFallback(t *testing.T) {
 	var readCmd string
 	r := &RemoteCompose{

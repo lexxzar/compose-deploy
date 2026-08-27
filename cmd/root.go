@@ -126,7 +126,7 @@ Remote server configuration (~/.cdeploy/servers.yml):
 					// Servers available — local Docker not required.
 				} else {
 					standalone, _ := localDetect.verdict()
-					c = fastTrackComposer(cmd.Context(), dir, standalone)
+					c = fastTrackComposer(dir, standalone)
 				}
 			}
 
@@ -219,22 +219,16 @@ func Execute() error {
 // fastTrackComposer builds the composer the TUI starts on when the working
 // directory holds a compose file and the project picker is skipped.
 //
-// It is deliberately NOT the shared localDetector, which stays identity-free so
-// the project loader keeps enumerating every project on the host. This one
-// resolves the directory's canonical project identity — the same name, file set
-// and config directory a picker row would have carried — so the fast track and a
-// grouped drill-in address ONE project and key ONE rollback state file. Without
-// it the same containers were deployed under two identities: `entryLocal` wrote
-// sha256(dir) and `drillIntoGroup` wrote sha256(dir+NUL+name).
-//
-// The resolve error is ignored because it cannot happen here: ResolveProject
-// only refuses a project name the CALLER supplied, and this composer supplies
-// none. A lookup that fails leaves it directory-addressed, exactly as it was
-// before resolution existed.
-func fastTrackComposer(ctx context.Context, dir string, standalone bool) runner.Composer {
+// It names no project, exactly like `docker compose` run in that directory: it
+// addresses the project compose derives from the directory. A picker row for
+// that same project carries that derived name explicitly, and canonicalStateName
+// folds the two spellings onto one rollback state file — so the fast track and a
+// grouped drill-in converge with NO host lookup. Resolving the name from
+// `docker compose ls` is what a previous round did, and it made the identity
+// depend on containers the deploy pipeline removes.
+func fastTrackComposer(dir string, standalone bool) runner.Composer {
 	lc := rootNewLocal(dir)
 	lc.SetStandalone(standalone)
-	_ = lc.ResolveProject(ctx)
 	return lc
 }
 
@@ -256,14 +250,17 @@ func fastTrackComposer(ctx context.Context, dir string, standalone bool) runner.
 // project created from `-f prod.yml` in a directory that also holds a
 // docker-compose.yml was recreated from the wrong service definitions under the
 // right label, and a project whose only file is stack.yml reported "no compose
-// file found" from the `c` screen and from rollback prep.
+// file found" from the `c` screen and from rollback prep. It goes through
+// PinComposeFiles, which drops a file set auto-discovery would find anyway —
+// `-f` disables discovery, and the label docker reports was stamped when the
+// containers were created, so pinning it froze out any override added later.
 func localComposerFor(proj compose.Project, detector *compose.Compose, standalone, detected bool) runner.Composer {
 	if proj.Unmanaged {
 		return compose.NewLocalHostContainers(detector)
 	}
 	lc := compose.New(proj.ConfigDir)
 	lc.ProjectName = proj.Name
-	lc.ComposeFiles = proj.ConfigFiles
+	lc.ComposeFiles = compose.PinComposeFiles(proj.ConfigDir, proj.ConfigFiles)
 	if detected {
 		lc.SetStandalone(standalone)
 	}
@@ -284,7 +281,7 @@ func remoteComposerFor(proj compose.Project, rc *compose.RemoteCompose, standalo
 	}
 	newRC := compose.NewRemote(rc.Host, proj.ConfigDir)
 	newRC.ProjectName = proj.Name
-	newRC.ComposeFiles = proj.ConfigFiles
+	newRC.ComposeFiles = compose.PinComposeFiles(proj.ConfigDir, proj.ConfigFiles)
 	newRC.SSHExtraArgs = rc.SSHExtraArgs
 	newRC.SetStandalone(standalone)
 	return newRC

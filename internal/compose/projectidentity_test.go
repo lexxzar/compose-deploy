@@ -2,7 +2,6 @@ package compose
 
 import (
 	"context"
-	"errors"
 	"os/exec"
 	"slices"
 	"strings"
@@ -18,13 +17,10 @@ func lsEntryJSON(name, files string) string {
 	return `{"Name":"` + name + `","Status":"running(1)","ConfigFiles":"` + files + `"}`
 }
 
-// hookedLocal returns a Compose wired to a fake docker that answers the
-// host-wide `ls` with the given payload and nothing else. It also clears
-// COMPOSE_PROJECT_NAME, which ResolveProject reads on the local path — a
-// developer with it exported would otherwise get a different identity than CI.
+// hookedLocal returns a Compose wired to a fake docker that answers every
+// output call with the given payload.
 func hookedLocal(t *testing.T, dir string, ls []byte, lsErr error) (*Compose, func() []string) {
 	t.Helper()
-	t.Setenv("COMPOSE_PROJECT_NAME", "")
 	c := New(dir)
 	c.SetStandalone(false)
 	var lastArgs []string
@@ -41,149 +37,95 @@ func hookedLocal(t *testing.T, dir string, ls []byte, lsErr error) (*Compose, fu
 	return c, func() []string { return lastArgs }
 }
 
-// The unnamed lookup matches on the directory and adopts the row's identity.
-// This is the whole point of resolution: a composer built from a bare directory
-// used to address whatever project compose derived from that directory's name,
-// while the TUI addressed the row's real name.
-func TestResolveProject_AdoptsTheDirectorysProject(t *testing.T) {
-	c, _ := hookedLocal(t, "/srv/app", lsJSON(lsEntryJSON("blue", "/srv/app/blue.yml,/srv/app/extra.yml")), nil)
-	if err := c.ResolveProject(context.Background()); err != nil {
-		t.Fatalf("ResolveProject: %v", err)
+// composeDefaultProjectName must reproduce compose-go's NormalizeProjectName
+// applied to the directory's base name. Everything else keys off it: it is the
+// definition of the project an UNNAMED invocation addresses, and therefore of
+// which named composer shares the dir-only state file.
+func TestComposeDefaultProjectName(t *testing.T) {
+	tests := []struct {
+		dir  string
+		want string
+	}{
+		{"/srv/app", "app"},
+		{"/srv/MyApp", "myapp"},
+		{"/srv/my.app", "myapp"},
+		{"/srv/my app", "myapp"},
+		{"/srv/_app", "app"},
+		{"/srv/-app-", "app-"},
+		{"/srv/app-2", "app-2"},
+		{"/srv/app_2", "app_2"},
+		{"/srv/....", ""},
+		{"/", ""},
+		{"", ""},
 	}
-	if c.ProjectName != "blue" {
-		t.Errorf("ProjectName = %q, want blue", c.ProjectName)
-	}
-	if want := []string{"/srv/app/blue.yml", "/srv/app/extra.yml"}; !slices.Equal(c.ComposeFiles, want) {
-		t.Errorf("ComposeFiles = %v, want %v", c.ComposeFiles, want)
-	}
-	if c.ProjectDir != "/srv/app" {
-		t.Errorf("ProjectDir = %q, want /srv/app", c.ProjectDir)
-	}
-}
-
-// Two projects in one directory are two identities. Picking one would address
-// the wrong container set, so the composer stays directory-addressed and the
-// user must say which with --project-name.
-func TestResolveProject_AmbiguousDirectoryResolvesNothing(t *testing.T) {
-	c, _ := hookedLocal(t, "/srv/app", lsJSON(
-		lsEntryJSON("blue", "/srv/app/docker-compose.yml"),
-		lsEntryJSON("green", "/srv/app/docker-compose.yml"),
-	), nil)
-	if err := c.ResolveProject(context.Background()); err != nil {
-		t.Fatalf("ResolveProject: %v", err)
-	}
-	if c.ProjectName != "" {
-		t.Errorf("ProjectName = %q, want empty", c.ProjectName)
-	}
-	if !c.legacyStateBlocked {
-		t.Error("legacyStateBlocked = false, want true for a shared directory")
-	}
-}
-
-// An explicit --project-name is looked up BY NAME and contributes the project's
-// own file set. Without it `deploy -C /srv/app -p prod` recreated prod from a
-// sibling project's auto-discovered docker-compose.yml.
-func TestResolveProject_NamedLookupCarriesTheFileSet(t *testing.T) {
-	c, _ := hookedLocal(t, "/srv/app", lsJSON(
-		lsEntryJSON("app", "/srv/app/docker-compose.yml"),
-		lsEntryJSON("prod", "/srv/app/prod.yml,/srv/app/prod.override.yml"),
-	), nil)
-	c.ProjectName = "prod"
-	if err := c.ResolveProject(context.Background()); err != nil {
-		t.Fatalf("ResolveProject: %v", err)
-	}
-	if want := []string{"/srv/app/prod.yml", "/srv/app/prod.override.yml"}; !slices.Equal(c.ComposeFiles, want) {
-		t.Errorf("ComposeFiles = %v, want %v", c.ComposeFiles, want)
-	}
-}
-
-// A caller-supplied file set is never overwritten by the lookup.
-func TestResolveProject_KeepsAnExplicitFileSet(t *testing.T) {
-	c, _ := hookedLocal(t, "/srv/app", lsJSON(lsEntryJSON("prod", "/srv/app/prod.yml")), nil)
-	c.ProjectName = "prod"
-	c.ComposeFiles = []string{"/srv/app/caller.yml"}
-	if err := c.ResolveProject(context.Background()); err != nil {
-		t.Fatalf("ResolveProject: %v", err)
-	}
-	if want := []string{"/srv/app/caller.yml"}; !slices.Equal(c.ComposeFiles, want) {
-		t.Errorf("ComposeFiles = %v, want %v", c.ComposeFiles, want)
-	}
-}
-
-// A named project docker does not report is REFUSED. Proceeding would run the
-// pipeline against whatever compose file the directory holds, under the
-// requested label — destructive and silent.
-func TestResolveProject_RefusesAnUnknownName(t *testing.T) {
-	c, _ := hookedLocal(t, "/srv/app", lsJSON(lsEntryJSON("app", "/srv/app/docker-compose.yml")), nil)
-	c.ProjectName = "prod"
-	err := c.ResolveProject(context.Background())
-	if err == nil {
-		t.Fatal("expected a refusal, got nil")
-	}
-	if !errors.Is(err, errProjectNotFound) {
-		t.Errorf("error %v does not wrap errProjectNotFound", err)
-	}
-	if !strings.Contains(err.Error(), `"prod"`) {
-		t.Errorf("error = %q, want it to name the project", err.Error())
-	}
-}
-
-// A listing failure is fatal for an explicit name (we cannot know that
-// project's files) but soft for an unnamed composer, which must keep working on
-// a host whose `docker compose ls` is unusable.
-func TestResolveProject_ListingFailure(t *testing.T) {
-	named, _ := hookedLocal(t, "/srv/app", nil, errors.New("boom"))
-	named.ProjectName = "prod"
-	if err := named.ResolveProject(context.Background()); err == nil {
-		t.Error("named composer: expected an error, got nil")
-	}
-
-	unnamed, _ := hookedLocal(t, "/srv/app", nil, errors.New("boom"))
-	if err := unnamed.ResolveProject(context.Background()); err != nil {
-		t.Errorf("unnamed composer: %v", err)
-	}
-	if unnamed.ProjectName != "" {
-		t.Errorf("ProjectName = %q, want empty", unnamed.ProjectName)
-	}
-}
-
-// COMPOSE_PROJECT_NAME is what the local docker CLI itself would use (the
-// command inherits os.Environ), so resolution must not override it with a
-// directory lookup — and must not refuse a name docker has not created yet.
-func TestResolveProject_HonorsComposeProjectNameEnv(t *testing.T) {
-	c, _ := hookedLocal(t, "/srv/app", lsJSON(lsEntryJSON("green", "/srv/app/docker-compose.yml")), nil)
-	t.Setenv("COMPOSE_PROJECT_NAME", "blue")
-	if err := c.ResolveProject(context.Background()); err != nil {
-		t.Fatalf("ResolveProject: %v", err)
-	}
-	if c.ProjectName != "blue" {
-		t.Errorf("ProjectName = %q, want blue (the environment's project, not the directory's)", c.ProjectName)
-	}
-}
-
-// The lookup costs one `docker compose ls` per composer.
-func TestResolveProject_IsIdempotent(t *testing.T) {
-	t.Setenv("COMPOSE_PROJECT_NAME", "")
-	c := New("/srv/app")
-	c.SetStandalone(false)
-	calls := 0
-	c.SetTestHooks(nil, func(cmd *exec.Cmd) ([]byte, error) {
-		calls++
-		return lsJSON(lsEntryJSON("blue", "/srv/app/docker-compose.yml")), nil
-	})
-	for i := 0; i < 3; i++ {
-		if err := c.ResolveProject(context.Background()); err != nil {
-			t.Fatalf("ResolveProject: %v", err)
+	for _, tt := range tests {
+		if got := composeDefaultProjectName(tt.dir); got != tt.want {
+			t.Errorf("composeDefaultProjectName(%q) = %q, want %q", tt.dir, got, tt.want)
 		}
 	}
-	if calls != 1 {
-		t.Errorf("docker compose ls ran %d times, want 1", calls)
+}
+
+// THE identity rule. A composer naming the directory's DEFAULT project and a
+// composer naming nothing are the same project, so they must fold onto the same
+// canonical name — that is what makes the TUI fast track, a grouped drill-in and
+// a bare CLI verb key one state file with no host lookup. A project that is NOT
+// the directory default keeps its own name, so two `-p` projects in one
+// directory stay apart.
+func TestCanonicalStateName(t *testing.T) {
+	tests := []struct {
+		name string
+		dir  string
+		in   string
+		want string
+	}{
+		{"unnamed stays dir-only", "/srv/app", "", ""},
+		{"the directory default folds onto dir-only", "/srv/app", "app", ""},
+		{"a normalized default folds too", "/srv/My.App", "myapp", ""},
+		{"a different project keeps its name", "/srv/app", "blue", "blue"},
+		{"a second different project keeps its name", "/srv/app", "green", "green"},
+		{"an unnormalized spelling is not the default", "/srv/app", "App", "App"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := canonicalStateName(tt.dir, tt.in); got != tt.want {
+				t.Errorf("canonicalStateName(%q, %q) = %q, want %q", tt.dir, tt.in, got, tt.want)
+			}
+		})
+	}
+}
+
+// The state key must never depend on the environment, on `docker compose ls`,
+// or on anything else a running operation can change — only on the directory
+// and the name the caller supplied.
+func TestStateName_LocalAndRemoteAgree(t *testing.T) {
+	t.Setenv("COMPOSE_PROJECT_NAME", "env-only")
+
+	// A trailing slash and a doubled separator must not change the verdict.
+	for _, dir := range []string{"/srv/app", "/srv/app/", "/srv//app"} {
+		c := New(dir)
+		c.ProjectName = "app"
+		if got := c.stateName(); got != "" {
+			t.Errorf("local stateName(%q, app) = %q, want the dir-only key", dir, got)
+		}
+		r := NewRemote("host", dir)
+		r.ProjectName = "app"
+		if got := r.stateName(); got != "" {
+			t.Errorf("remote stateName(%q, app) = %q, want the dir-only key", dir, got)
+		}
+	}
+
+	c := New("/srv/app")
+	c.ProjectName = "blue"
+	r := NewRemote("host", "/srv/app")
+	r.ProjectName = "blue"
+	if c.stateName() != "blue" || r.stateName() != "blue" {
+		t.Errorf("stateName = %q/%q, want blue/blue", c.stateName(), r.stateName())
 	}
 }
 
 // `docker compose ls` is host-wide discovery: `-p` selects nothing there and
-// `-f` would point compose at a file it must parse. ResolveProject calls it on
-// a composer that already carries both, which is exactly when it matters.
+// `-f` would point compose at a file it must parse. `cdeploy list` and the TUI
+// project loader call it on a composer that may already carry both.
 func TestListProjects_CarriesNoProjectOrFileFlags(t *testing.T) {
 	c, args := hookedLocal(t, "/srv/app", lsJSON(), nil)
 	c.ProjectName = "blue"
@@ -212,117 +154,63 @@ func TestListProjects_CarriesNoProjectOrFileFlags(t *testing.T) {
 	}
 }
 
-// The remote twin resolves the same way, and does NOT consult the local
-// COMPOSE_PROJECT_NAME: ssh does not carry the local environment, so a local
-// value says nothing about which project a remote command addresses.
-func TestRemoteResolveProject(t *testing.T) {
-	t.Setenv("COMPOSE_PROJECT_NAME", "local-only")
-	r := NewRemote("host", "/srv/app/")
-	r.SetStandalone(false)
-	r.SetTestHooks(nil, func(cmd *exec.Cmd) ([]byte, error) {
-		return lsJSON(lsEntryJSON("blue", "/srv/app/blue.yml")), nil
-	})
-	if err := r.ResolveProject(context.Background()); err != nil {
-		t.Fatalf("ResolveProject: %v", err)
-	}
-	if r.ProjectName != "blue" {
-		t.Errorf("ProjectName = %q, want blue", r.ProjectName)
-	}
-	if want := []string{"/srv/app/blue.yml"}; !slices.Equal(r.ComposeFiles, want) {
-		t.Errorf("ComposeFiles = %v, want %v", r.ComposeFiles, want)
-	}
-}
-
-func TestRemoteResolveProject_RefusesAnUnknownName(t *testing.T) {
-	r := NewRemote("host", "/srv/app")
-	r.SetStandalone(false)
-	r.ProjectName = "prod"
-	r.SetTestHooks(nil, func(cmd *exec.Cmd) ([]byte, error) {
-		return lsJSON(lsEntryJSON("app", "/srv/app/docker-compose.yml")), nil
-	})
-	if err := r.ResolveProject(context.Background()); !errors.Is(err, errProjectNotFound) {
-		t.Fatalf("error = %v, want errProjectNotFound", err)
-	}
-}
-
-// resolveIdentity is the pure core both transports share.
-func TestResolveIdentity(t *testing.T) {
-	projects := []Project{
-		{Name: "blue", ConfigDir: "/srv/app", ConfigFiles: []string{"/srv/app/blue.yml"}},
-		{Name: "green", ConfigDir: "/srv/app", ConfigFiles: []string{"/srv/app/green.yml"}},
-		{Name: "solo", ConfigDir: "/srv/solo", ConfigFiles: []string{"/srv/solo/docker-compose.yml"}},
-		{Name: "(unmanaged)", Unmanaged: true},
-		{Name: "labelonly"},
-	}
-
+// A file set docker reported that auto-discovery would find anyway must NOT be
+// pinned: `-f` disables discovery, and the config_files label was stamped when
+// the containers were created, so a docker-compose.override.yml added later
+// would be ignored for the rest of the project's life.
+func TestPinComposeFiles(t *testing.T) {
 	tests := []struct {
-		name          string
-		dir, projName string
-		wantName      string
-		wantOK        bool
-		wantShared    bool
+		name  string
+		dir   string
+		files []string
+		want  []string
 	}{
-		{name: "unique directory", dir: "/srv/solo", wantName: "solo", wantOK: true},
-		{name: "shared directory", dir: "/srv/app", wantOK: false, wantShared: true},
-		{name: "unknown directory", dir: "/srv/none", wantOK: false},
-		{name: "empty directory", dir: "", wantOK: false},
-		{name: "by name in a shared dir", dir: "/srv/app", projName: "green", wantName: "green", wantOK: true, wantShared: true},
-		{name: "by name elsewhere", dir: "/srv/none", projName: "solo", wantName: "solo", wantOK: true},
-		{name: "unknown name", dir: "/srv/solo", projName: "nope", wantOK: false},
-		// The synthetic row stands for containers with no compose project at
-		// all; it must never be resolved as one.
-		{name: "unmanaged is never a match", dir: "", projName: "(unmanaged)", wantOK: false},
-		// A project docker reports with no config_files has no directory to
-		// match on, but is still addressable by name.
-		{name: "label-only project by name", dir: "/srv/solo", projName: "labelonly", wantName: "labelonly", wantOK: true},
+		{"the plain default file auto-discovers", "/srv/app", []string{"/srv/app/docker-compose.yml"}, nil},
+		{"compose.yaml auto-discovers", "/srv/app", []string{"/srv/app/compose.yaml"}, nil},
+		{
+			"a default file plus its override auto-discovers",
+			"/srv/app",
+			[]string{"/srv/app/docker-compose.yml", "/srv/app/docker-compose.override.yml"},
+			nil,
+		},
+		{
+			"a trailing slash on the dir does not defeat the match",
+			"/srv/app/",
+			[]string{"/srv/app/docker-compose.yml"},
+			nil,
+		},
+		{
+			"a hand-picked -f name is pinned",
+			"/srv/app",
+			[]string{"/srv/app/prod.yml"},
+			[]string{"/srv/app/prod.yml"},
+		},
+		{
+			"one non-default file pins the whole set",
+			"/srv/app",
+			[]string{"/srv/app/docker-compose.yml", "/srv/app/extra.yml"},
+			[]string{"/srv/app/docker-compose.yml", "/srv/app/extra.yml"},
+		},
+		{
+			"a default name OUTSIDE the project dir is pinned",
+			"/srv/app",
+			[]string{"/srv/other/docker-compose.yml"},
+			[]string{"/srv/other/docker-compose.yml"},
+		},
+		{"an empty set stays empty", "/srv/app", nil, nil},
+		{
+			"no config dir leaves the set alone",
+			"",
+			[]string{"/srv/app/docker-compose.yml"},
+			[]string{"/srv/app/docker-compose.yml"},
+		},
 	}
-
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			proj, ok, shared := resolveIdentity(projects, tt.dir, tt.projName, func(s string) string { return s })
-			if ok != tt.wantOK {
-				t.Fatalf("ok = %v, want %v", ok, tt.wantOK)
-			}
-			if ok && proj.Name != tt.wantName {
-				t.Errorf("name = %q, want %q", proj.Name, tt.wantName)
-			}
-			if shared != tt.wantShared {
-				t.Errorf("dirShared = %v, want %v", shared, tt.wantShared)
+			got := PinComposeFiles(tt.dir, tt.files)
+			if !slices.Equal(got, tt.want) {
+				t.Errorf("PinComposeFiles(%q, %v) = %v, want %v", tt.dir, tt.files, got, tt.want)
 			}
 		})
-	}
-}
-
-// The dir-only state file was written by a build that addressed whichever
-// project the DIRECTORY resolved to. With several projects living there it
-// names none of them, so the read fallback must not hand its digests to one.
-func TestLegacyStateFallbackBlockedForASharedDirectory(t *testing.T) {
-	c := New("/srv/app")
-	c.ProjectName = "blue"
-	path, err := c.localLegacyStatePath()
-	if err != nil {
-		t.Fatalf("localLegacyStatePath: %v", err)
-	}
-	if path == "" {
-		t.Fatal("an unshared directory must keep its dir-only fallback")
-	}
-
-	c.legacyStateBlocked = true
-	path, err = c.localLegacyStatePath()
-	if err != nil {
-		t.Fatalf("localLegacyStatePath: %v", err)
-	}
-	if path != "" {
-		t.Errorf("legacy path = %q, want empty for a shared directory", path)
-	}
-
-	r := NewRemote("host", "/srv/app")
-	r.ProjectName = "blue"
-	if r.remoteLegacyStatePath() == "" {
-		t.Fatal("an unshared remote directory must keep its dir-only fallback")
-	}
-	r.legacyStateBlocked = true
-	if got := r.remoteLegacyStatePath(); got != "" {
-		t.Errorf("remote legacy path = %q, want empty for a shared directory", got)
 	}
 }

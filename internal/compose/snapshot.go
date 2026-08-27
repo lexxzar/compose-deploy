@@ -348,7 +348,7 @@ func (c *Compose) SnapshotServices(ctx context.Context, services []string) (Snap
 	snap := &Snapshot{
 		Schema:      snapshotSchemaVersion,
 		ProjectDir:  localProjectDir(c.ProjectDir),
-		ProjectName: c.ProjectName,
+		ProjectName: c.stateName(),
 		Services:    map[string]SnapshotEntry{},
 	}
 	recordedAt := snapshotClock().Format(time.RFC3339)
@@ -512,27 +512,12 @@ func sortedStringKeys(m map[string]string) []string {
 
 // localStatePath returns the absolute path of this project's state file under
 // $HOME/.cdeploy/state/. The key is derived from the normalized project dir and
-// the project name, so `-C ./app` and its absolute spelling share one file while
-// two `-p` projects in one directory do not.
+// the CANONICAL project name (see canonicalStateName), so `-C ./app` and its
+// absolute spelling share one file, a composer naming the directory's default
+// project shares that same file with an unnamed one, and two `-p` projects in
+// one directory do not.
 func (c *Compose) localStatePath() (string, error) {
-	return localStateFile(snapshotKey(localProjectDir(c.ProjectDir), c.ProjectName))
-}
-
-// localLegacyStatePath is the DIR-ONLY path this project's state used before the
-// name entered the key. It is a READ fallback only — writes always go to
-// localStatePath — so an existing state file keeps serving a project the TUI now
-// addresses by name, instead of being orphaned by the upgrade. Empty key means
-// the composer is unnamed and the two paths are the same file.
-//
-// It is also empty once ResolveProject has seen SEVERAL projects in this
-// directory: the dir-only file was written for whichever project that directory
-// resolved to, so with more than one living there it names none of them and
-// handing its digests to this one is the wrong-image rollback again.
-func (c *Compose) localLegacyStatePath() (string, error) {
-	if c.ProjectName == "" || c.legacyStateBlocked {
-		return "", nil
-	}
-	return localStateFile(snapshotKey(localProjectDir(c.ProjectDir), ""))
+	return localStateFile(snapshotKey(localProjectDir(c.ProjectDir), c.stateName()))
 }
 
 func localStateFile(key string) (string, error) {
@@ -547,37 +532,18 @@ func localStateFile(key string) (string, error) {
 // returns (nil, nil) — the normal first-deploy case, distinguishable from a
 // parse/schema error (which is returned as a typed error via parseSnapshot).
 //
-// A named project whose own file does not exist falls back to the dir-only path
-// (see localLegacyStatePath). That file is accepted only when it records no
-// project name or this one — a file that names a DIFFERENT project is refused,
-// because restoring another project's digests is exactly the wrong-image
-// deployment the named key exists to prevent.
+// There is NO second path to try. An earlier design keyed named projects apart
+// from the dir-only file and needed a one-way fallback between the two; folding
+// the directory's DEFAULT project onto the dir-only key (canonicalStateName)
+// makes them the same file instead, which is what a fallback was reaching for
+// and is bidirectional by construction.
 func (c *Compose) ReadSnapshot(ctx context.Context) (*Snapshot, error) {
-	snap, err := c.readPrimarySnapshot()
-	if err != nil || snap != nil {
-		return snap, err
-	}
-	legacy, err := c.localLegacyStatePath()
-	if err != nil || legacy == "" {
-		return nil, err
-	}
-	snap, err = readSnapshotFile(legacy)
-	if err != nil || snap == nil {
-		return nil, err
-	}
-	if err := checkSnapshotProject(snap, c.ProjectName); err != nil {
-		return nil, err
-	}
-	return snap, nil
+	return c.readPrimarySnapshot()
 }
 
-// readPrimarySnapshot reads ONLY this project's own state file, with no dir-only
-// fallback. WriteSnapshot merges against this rather than ReadSnapshot on
-// purpose: the fallback file was written for whatever project the DIRECTORY
-// resolves to, so merging it forward would persist another project's entries
-// into a named project's history — the wrong-image rollback in slow motion. A
-// rollback may still READ it (it is the only history that project has until its
-// first named deploy); nothing writes it back.
+// readPrimarySnapshot reads this project's state file and refuses one recorded
+// for a different project. WriteSnapshot merges against it, so the refusal is
+// also what stops another project's entries from being persisted forward.
 func (c *Compose) readPrimarySnapshot() (*Snapshot, error) {
 	path, err := c.localStatePath()
 	if err != nil {
@@ -587,7 +553,7 @@ func (c *Compose) readPrimarySnapshot() (*Snapshot, error) {
 	if err != nil || snap == nil {
 		return nil, err
 	}
-	if err := checkSnapshotProject(snap, c.ProjectName); err != nil {
+	if err := checkSnapshotProject(snap, c.stateName()); err != nil {
 		return nil, err
 	}
 	return snap, nil
@@ -683,6 +649,10 @@ func (c *Compose) WriteSnapshot(ctx context.Context, fresh *Snapshot) error {
 		return fmt.Errorf("refusing to overwrite snapshot state: %w", err)
 	}
 	merged := mergeSnapshot(existing, fresh)
+	// The stamp is re-derived from the composer, never trusted from fresh, so
+	// the recorded name and the key it was written under cannot disagree —
+	// checkSnapshotProject is only a real guard while that holds.
+	merged.ProjectName = c.stateName()
 	return writeSnapshotFile(path, merged)
 }
 

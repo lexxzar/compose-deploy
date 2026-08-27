@@ -668,13 +668,8 @@ func runList(ctx context.Context, jsonOutput, showStats, showUpdates bool) error
 
 		// Single-project mode: -C explicitly specified. Update check is opt-in
 		// via --updates because each service costs one SSH round-trip to
-		// buildx/manifest-inspect. The identity resolve is scoped to this
-		// branch: multi-project discovery already names every composer from its
-		// own row and must not pay a second host-wide `ls`.
+		// buildx/manifest-inspect.
 		if projDir != "" {
-			if err := rc.ResolveProject(ctx); err != nil {
-				return err
-			}
 			return listSingleProject(ctx, rc, jsonOutput, showStats, showUpdates)
 		}
 
@@ -692,7 +687,7 @@ func runList(ctx context.Context, jsonOutput, showStats, showUpdates bool) error
 		factory := func(proj compose.Project) runner.Composer {
 			rc2 := listNewRemote(server.Host, proj.ConfigDir)
 			rc2.ProjectName = proj.Name
-			rc2.ComposeFiles = proj.ConfigFiles
+			rc2.ComposeFiles = compose.PinComposeFiles(proj.ConfigDir, proj.ConfigFiles)
 			rc2.SSHExtraArgs = rc.SSHExtraArgs
 			rc2.SetStandalone(rc.Standalone)
 			return rc2
@@ -755,7 +750,7 @@ func runList(ctx context.Context, jsonOutput, showStats, showUpdates bool) error
 	factory := func(proj compose.Project) runner.Composer {
 		lc := listNewLocal(proj.ConfigDir)
 		lc.ProjectName = proj.Name
-		lc.ComposeFiles = proj.ConfigFiles
+		lc.ComposeFiles = compose.PinComposeFiles(proj.ConfigDir, proj.ConfigFiles)
 		lc.SetStandalone(c.Standalone)
 		return lc
 	}

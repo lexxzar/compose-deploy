@@ -1366,9 +1366,13 @@ func TestSnapshotKeyEmptyNameIsTheLegacyDirOnlyHash(t *testing.T) {
 	}
 }
 
-// A state file written before the name entered the key must not be orphaned by
-// the upgrade: a NAMED composer whose own file does not exist yet still reads it.
-func TestReadSnapshotFallsBackToTheLegacyDirOnlyFile(t *testing.T) {
+// A state file written by an older cdeploy — dir-only key, no project_name —
+// must stay readable. Every release keyed it from the directory alone, so the
+// composers that must still find it are the unnamed one (every CLI verb without
+// `-p`, the TUI fast track) and the one naming the DIRECTORY'S OWN project (a
+// grouped drill-in row). Both fold onto the same key, so neither needs a
+// fallback path.
+func TestReadSnapshotReadsTheLegacyDirOnlyFile(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)
 
@@ -1383,13 +1387,25 @@ func TestReadSnapshotFallsBackToTheLegacyDirOnlyFile(t *testing.T) {
 		t.Fatalf("WriteFile: %v", err)
 	}
 
-	c := &Compose{ProjectDir: "/proj", ProjectName: "blue"}
-	got, err := c.ReadSnapshot(context.Background())
-	if err != nil {
-		t.Fatalf("ReadSnapshot: %v", err)
+	for _, name := range []string{"", "proj"} {
+		c := &Compose{ProjectDir: "/proj", ProjectName: name}
+		got, err := c.ReadSnapshot(context.Background())
+		if err != nil {
+			t.Fatalf("ReadSnapshot(name=%q): %v", name, err)
+		}
+		if got == nil || got.Services["web"].Digest != "sha256:old" {
+			t.Fatalf("the existing dir-only state file was orphaned for name %q: %+v", name, got)
+		}
 	}
-	if got == nil || got.Services["web"].Digest != "sha256:old" {
-		t.Fatalf("the existing dir-only state file was orphaned: %+v", got)
+
+	// A project that is NOT the directory's own must NOT inherit it.
+	other := &Compose{ProjectDir: "/proj", ProjectName: "blue"}
+	got, err := other.ReadSnapshot(context.Background())
+	if err != nil {
+		t.Fatalf("ReadSnapshot(blue): %v", err)
+	}
+	if got != nil {
+		t.Fatalf("a -p project read the directory's own state file: %+v", got)
 	}
 }
 

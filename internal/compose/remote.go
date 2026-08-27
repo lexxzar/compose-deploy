@@ -163,11 +163,6 @@ type RemoteCompose struct {
 
 	detected bool // true after Detect() or SetStandalone() has been called
 
-	// projectResolved / legacyStateBlocked mirror the Compose fields of the
-	// same name — see Compose.ResolveProject.
-	projectResolved    bool
-	legacyStateBlocked bool
-
 	// testing hooks; nil = use real exec
 	runCmd    func(*exec.Cmd) error
 	outputCmd func(*exec.Cmd) ([]byte, error)
@@ -375,7 +370,8 @@ func (r *RemoteCompose) remoteCommand(ctx context.Context, args ...string) *exec
 
 // remoteHostCommand is the remote twin of Compose.hostCommand: a compose
 // invocation carrying NO `-f` and NO `-p` flags, for the host-wide `ls` that
-// ResolveProject runs on a composer which may already carry both.
+// `cdeploy list` and the TUI project loader run on a composer which may already
+// carry both.
 func (r *RemoteCompose) remoteHostCommand(ctx context.Context, args ...string) *exec.Cmd {
 	return r.buildRemoteCommand(ctx, "", args)
 }
@@ -958,7 +954,7 @@ func (r *RemoteCompose) SnapshotServices(ctx context.Context, services []string)
 	snap := &Snapshot{
 		Schema:      snapshotSchemaVersion,
 		ProjectDir:  remoteProjectDir(r.ProjectDir),
-		ProjectName: r.ProjectName,
+		ProjectName: r.stateName(),
 		Services:    map[string]SnapshotEntry{},
 	}
 	recordedAt := snapshotClock().Format(time.RFC3339)
@@ -1058,21 +1054,11 @@ func (r *RemoteCompose) inspectContainerImageIDs(ctx context.Context, containerI
 // it in DOUBLE quotes) so the remote shell resolves the docker host's home
 // directory — the state must live on the HOST so CI deploys and laptop
 // rollbacks share one authoritative history. The key is derived from the
-// POSIX-normalized project dir so `-C ./app` and its absolute spelling collapse
-// to one file.
+// POSIX-normalized project dir and the CANONICAL project name (see
+// canonicalStateName) so `-C ./app` and its absolute spelling collapse to one
+// file, and so does a composer naming the directory's default project.
 func (r *RemoteCompose) remoteStatePath() string {
-	return "$HOME/" + stateFileRelPath(remoteProjectDir(r.ProjectDir), r.ProjectName)
-}
-
-// remoteLegacyStatePath is the DIR-ONLY remote path this project's state used
-// before the name entered the key, or "" when the composer is unnamed and the
-// two paths are the same file, or when ResolveProject found several projects in
-// this directory. READ fallback only — see Compose.localLegacyStatePath.
-func (r *RemoteCompose) remoteLegacyStatePath() string {
-	if r.ProjectName == "" || r.legacyStateBlocked {
-		return ""
-	}
-	return "$HOME/" + stateFileRelPath(remoteProjectDir(r.ProjectDir), "")
+	return "$HOME/" + stateFileRelPath(remoteProjectDir(r.ProjectDir), r.stateName())
 }
 
 // writeRemoteFile writes data to a file on the remote host atomically (temp
@@ -1126,44 +1112,30 @@ func (r *RemoteCompose) writeRemoteFile(ctx context.Context, path string, data [
 // A non-empty payload is parsed strictly via parseSnapshot (schema/JSON errors
 // are returned typed, distinguishable from not-found).
 //
-// A NAMED project's read falls back to the dir-only path in the SAME round trip
-// (`elif`), so an existing state file keeps serving a project the TUI now
-// addresses by name. The fallback payload is accepted only when it records no
-// project name or this one. An unnamed composer emits the single-file form, byte
-// for byte as before.
+// There is NO second path to try: canonicalStateName folds the directory's
+// DEFAULT project onto the dir-only key, so an unnamed composer and one naming
+// that project read the same remote file. The single-file command string is
+// byte-identical to the one every release has sent.
 func (r *RemoteCompose) ReadSnapshot(ctx context.Context) (*Snapshot, error) {
-	snap, err := r.readRemoteSnapshot(ctx, r.remoteStatePath(), r.remoteLegacyStatePath())
-	if err != nil || snap == nil {
-		return nil, err
-	}
-	if err := checkSnapshotProject(snap, r.ProjectName); err != nil {
-		return nil, err
-	}
-	return snap, nil
+	return r.readPrimarySnapshot(ctx)
 }
 
-// readPrimarySnapshot reads ONLY this project's own remote state file, with no
-// dir-only fallback. See Compose.readPrimarySnapshot for why the write-merge
-// must not import the fallback file's entries.
+// readPrimarySnapshot reads this project's remote state file and refuses one
+// recorded for a different project — which is also what stops WriteSnapshot's
+// merge from persisting another project's entries forward.
 func (r *RemoteCompose) readPrimarySnapshot(ctx context.Context) (*Snapshot, error) {
-	snap, err := r.readRemoteSnapshot(ctx, r.remoteStatePath(), "")
+	snap, err := r.readRemoteSnapshot(ctx, r.remoteStatePath())
 	if err != nil || snap == nil {
 		return nil, err
 	}
-	if err := checkSnapshotProject(snap, r.ProjectName); err != nil {
+	if err := checkSnapshotProject(snap, r.stateName()); err != nil {
 		return nil, err
 	}
 	return snap, nil
 }
 
-func (r *RemoteCompose) readRemoteSnapshot(ctx context.Context, statePath, legacyPath string) (*Snapshot, error) {
+func (r *RemoteCompose) readRemoteSnapshot(ctx context.Context, statePath string) (*Snapshot, error) {
 	remoteCmd := fmt.Sprintf(`f="%s"; if [ -f "$f" ]; then cat "$f"; fi`, statePath)
-	if legacyPath != "" {
-		remoteCmd = fmt.Sprintf(
-			`f="%s"; g="%s"; if [ -f "$f" ]; then cat "$f"; elif [ -f "$g" ]; then cat "$g"; fi`,
-			statePath, legacyPath,
-		)
-	}
 	sshArgv := r.sshArgs(
 		[]string{"-S", r.SocketPath, "-o", "ControlMaster=no"},
 		remoteCmd,
@@ -1210,6 +1182,9 @@ func (r *RemoteCompose) WriteSnapshot(ctx context.Context, fresh *Snapshot) erro
 		return fmt.Errorf("refusing to overwrite snapshot state: %w", err)
 	}
 	merged := mergeSnapshot(existing, fresh)
+	// Re-derived from the composer, never trusted from fresh — see
+	// Compose.WriteSnapshot.
+	merged.ProjectName = r.stateName()
 	data, err := json.MarshalIndent(merged, "", "  ")
 	if err != nil {
 		return fmt.Errorf("marshaling snapshot: %w", err)
