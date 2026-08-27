@@ -138,7 +138,7 @@ func TestHelpGroups_NamesEveryBoundKey(t *testing.T) {
 	bound := map[screen][]string{
 		screenSelectServer: {"q", "ctrl+c", "up", "k", "down", "j", "enter", "s"},
 		// The named variant is the DRILLED one (see the helpKeyTokens call
-		// below), so the grouped-only fold keys — z, Z, ← and → — are not in
+		// below), so the grouped-only fold keys — Z, ← and → — are not in
 		// this set; TestHelpGroups_GroupedNamesTheSameKeys pins those.
 		screenSelectContainers: {
 			"q", "ctrl+c", "esc", "enter", "up", "k", "down", "j", " ", "a",
@@ -702,7 +702,10 @@ func TestViewHelp_NarrowTerminalKeepsActionKeys(t *testing.T) {
 		"deploy", "restart", "stop", "logs",
 	}
 	// Below 65 columns the overlay stacks to one column, which is where the
-	// budget bites; 24 is the classic short terminal.
+	// budget bites; 24 is the classic short terminal. Drilled variant only —
+	// the grouped table carries two more action rows, so every threshold there
+	// sits two notches higher (TestViewHelp_InspectSurvivesTheFirstTruncation
+	// pins both).
 	for _, w := range []int{30, 40, 50, 59} {
 		m := Model{screen: screenSelectContainers, width: w, height: 24, drilledFromHost: true, helpOpen: true}
 		view := ansi.Strip(m.View())
@@ -716,36 +719,66 @@ func TestViewHelp_NarrowTerminalKeepsActionKeys(t *testing.T) {
 
 // TestViewHelp_InspectSurvivesTheFirstTruncation pins i's POSITION inside
 // inspectGroup, which TestViewHelp_NarrowTerminalKeepsActionKeys cannot: that
-// test samples height 24, where all 19 action rows still fit, so appending i
-// last would pass it. INSPECT is the last action group singleColumnOrder emits,
-// so its trailing entries are the first keys the budget sacrifices — and i
-// lives nowhere but the overlay. The re-measured single-column table (widths
-// 30-64, identical across them): height >= 24 keeps everything, 23 loses
-// `U check updates`, 22 loses `x exec` too, 21 loses `c config` too, 20 loses
-// `i inspect` too, 19 loses `l logs` too.
+// test samples height 24, where the drilled variant's 19 action rows still fit,
+// so appending i last would pass it. INSPECT is the last action group
+// singleColumnOrder emits, so its trailing entries are the first keys the budget
+// sacrifices — and i lives nowhere but the overlay.
+//
+// The thresholds are VARIANT-DEPENDENT and both are pinned. The grouped SELECT
+// group carries two rows the drilled one does not (`← →`, `Z`), and
+// singleColumnOrder emits SELECT before INSPECT, so every grouped threshold
+// sits two notches higher. Re-measured single-column tables (widths 30-59,
+// identical across them; the layout goes two-column at 65 drilled / 77 grouped):
+//
+//	drilled: >= 24 keeps everything, 23 loses `U check updates`, 22 loses
+//	         `x exec` too, 21 loses `c config` too, 20 loses `i inspect` too,
+//	         19 loses `l logs` too.
+//	grouped: >= 26 keeps everything, 25 loses `U`, 24 loses `x`, 23 loses `c`,
+//	         22 loses `i`, 21 loses `l`.
 func TestViewHelp_InspectSurvivesTheFirstTruncation(t *testing.T) {
-	for _, w := range []int{30, 40, 50, 59} {
-		// 23 is one below the height that fits every action row, so it is
-		// exactly the first notch where something must go.
-		m := Model{screen: screenSelectContainers, width: w, height: 23, drilledFromHost: true, helpOpen: true}
-		view := ansi.Strip(m.View())
-		if !strings.Contains(view, "inspect") {
-			t.Errorf("width %d: i was the first key sacrificed; move it up inside inspectGroup:\n%s", w, view)
-		}
-	}
-	// The full-fit height, so a future row added to any action group shows up
-	// here as the threshold moving rather than as a silent loss — and i's
-	// POSITION, as an ordering against the key the budget sacrifices first.
-	// Asserting `check updates` is ABSENT at height 23 instead would pin the
-	// whole overlay's first sacrifice, so any future row in any action group
-	// would fail this test with a message about inspect.
-	m := Model{screen: screenSelectContainers, width: 50, height: 24, drilledFromHost: true, helpOpen: true}
-	view := ansi.Strip(m.View())
-	if !strings.Contains(view, "check updates") {
-		t.Fatalf("height 24 no longer fits every action row:\n%s", view)
-	}
-	if at, uAt := strings.Index(view, "inspect"), strings.Index(view, "check updates"); at > uAt {
-		t.Errorf("inspect renders below check updates, so it goes first under the budget:\n%s", view)
+	for _, tc := range []struct {
+		name              string
+		grouped           bool
+		fullFit, firstCut int
+	}{
+		{name: "drilled", fullFit: 24, firstCut: 23},
+		{name: "grouped", grouped: true, fullFit: 26, firstCut: 25},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			for _, w := range []int{30, 40, 50, 59} {
+				// firstCut is one below the height that fits every action row,
+				// so it is exactly the first notch where something must go.
+				m := Model{screen: screenSelectContainers, width: w, height: tc.firstCut,
+					grouped: tc.grouped, drilledFromHost: true, helpOpen: true}
+				view := ansi.Strip(m.View())
+				if !strings.Contains(view, "inspect") {
+					t.Errorf("width %d: i was the first key sacrificed; move it up inside inspectGroup:\n%s", w, view)
+				}
+			}
+			// The full-fit height, so a future row added to any action group
+			// shows up here as the threshold moving rather than as a silent
+			// loss — and i's POSITION, as an ordering against the key the
+			// budget sacrifices first. Asserting `check updates` is ABSENT at
+			// firstCut instead would pin the whole overlay's first sacrifice,
+			// so any future row in any action group would fail this test with
+			// a message about inspect.
+			m := Model{screen: screenSelectContainers, width: 50, height: tc.fullFit,
+				grouped: tc.grouped, drilledFromHost: true, helpOpen: true}
+			view := ansi.Strip(m.View())
+			if !strings.Contains(view, "check updates") {
+				t.Fatalf("height %d no longer fits every action row:\n%s", tc.fullFit, view)
+			}
+			// One below it must lose exactly that key, or the threshold moved
+			// up as well as down and the table above is stale.
+			cut := Model{screen: screenSelectContainers, width: 50, height: tc.firstCut,
+				grouped: tc.grouped, drilledFromHost: true, helpOpen: true}
+			if strings.Contains(ansi.Strip(cut.View()), "check updates") {
+				t.Errorf("height %d still fits every action row; the truncation threshold moved", tc.firstCut)
+			}
+			if at, uAt := strings.Index(view, "inspect"), strings.Index(view, "check updates"); at > uAt {
+				t.Errorf("inspect renders below check updates, so it goes first under the budget:\n%s", view)
+			}
+		})
 	}
 }
 
@@ -1517,29 +1550,56 @@ func TestHelpOverlay_YieldsToQuitPrompt(t *testing.T) {
 // `d` case. The keys that matter most are the ones that would change m.screen
 // from under the overlay (l/c/x/i), start work (U), open an input (/), or
 // mutate the selection (space/enter/a).
+//
+// The grouped variant carries the fold keys on top. They are inert on the
+// drilled fixture — one group draws no header — so only a grouped model can
+// pin them, and they are exactly the "state changed behind the overlay" this
+// test is about: a fold hides rows AND re-aims the cursor.
 func TestHelpOverlay_SwallowsEveryActionKey(t *testing.T) {
-	containerKeys := []string{"l", "c", "x", "i", "/", "U", "r", "s", "R", "a", " ", "j", "k", "n", "N", "enter"}
-	for _, key := range containerKeys {
-		m := helpContainerModel()
-		m.selected[m.svcKeyAt(0)] = true
-		m.svcCursor = 1
-		m.helpOpen = true
+	shared := []string{"l", "c", "x", "i", "/", "U", "r", "s", "R", "a", " ", "j", "k", "n", "N", "enter"}
+	for _, tc := range []struct {
+		name  string
+		build func() Model
+		keys  []string
+	}{
+		{name: "drilled", build: helpContainerModel, keys: shared},
+		{
+			name: "grouped",
+			build: func() Model {
+				return groupedScreenModel(svcGroupOf("web", "api", "nginx"), svcGroupOf("db", "postgres"))
+			},
+			keys: append(append([]string{}, shared...), "Z", "left", "right"),
+		},
+	} {
+		for _, key := range tc.keys {
+			m := tc.build()
+			// Row 1 is a service under the first group in both fixtures, so
+			// one cursor position and one selection serve both.
+			m.selected[m.svcKeyAt(1)] = true
+			m.svcCursor = 1
+			m.helpOpen = true
+			rows := len(m.svcEntries)
 
-		updated, cmd := m.Update(keyMsgFor(key))
-		um := updated.(Model)
+			updated, cmd := m.Update(keyMsgFor(key))
+			um := updated.(Model)
 
-		if !um.helpOpen {
-			t.Errorf("%q: helpOpen = false, want true (the key must be swallowed, not acted on)", key)
-		}
-		if um.screen != screenSelectContainers {
-			t.Errorf("%q: screen changed to %d behind the overlay", key, um.screen)
-		}
-		if um.confirming || um.searching || um.svcCursor != 1 || len(um.selected) != 1 {
-			t.Errorf("%q: state changed behind the overlay (confirming=%v searching=%v cursor=%d selected=%v)",
-				key, um.confirming, um.searching, um.svcCursor, um.selected)
-		}
-		if cmd != nil {
-			t.Errorf("%q: swallowed key returned a command", key)
+			if !um.helpOpen {
+				t.Errorf("%s %q: helpOpen = false, want true (the key must be swallowed, not acted on)", tc.name, key)
+			}
+			if um.screen != screenSelectContainers {
+				t.Errorf("%s %q: screen changed to %d behind the overlay", tc.name, key, um.screen)
+			}
+			if um.confirming || um.searching || um.svcCursor != 1 || len(um.selected) != 1 {
+				t.Errorf("%s %q: state changed behind the overlay (confirming=%v searching=%v cursor=%d selected=%v)",
+					tc.name, key, um.confirming, um.searching, um.svcCursor, um.selected)
+			}
+			if foldedCount(um) != 0 || len(um.svcEntries) != rows {
+				t.Errorf("%s %q: fold state changed behind the overlay (%d folded, %d rows, want 0/%d)",
+					tc.name, key, foldedCount(um), len(um.svcEntries), rows)
+			}
+			if cmd != nil {
+				t.Errorf("%s %q: swallowed key returned a command", tc.name, key)
+			}
 		}
 	}
 
@@ -1695,12 +1755,12 @@ func TestHelpGroups_GroupedSelectNamesFold(t *testing.T) {
 
 // The grouped variant must name every key the writable table names — that half
 // rides the drift pin already checked against handleKey — plus exactly the fold
-// keys the grouped host view binds and the drilled screen does not. Those four
+// keys the grouped host view binds and the drilled screen does not. Those three
 // are the one hand-maintained list here; both directions run against it, so a
 // grouped-only key added to the table without a binding (or bound without a
 // row) still fails.
 func TestHelpGroups_GroupedNamesTheSameKeys(t *testing.T) {
-	groupedOnly := map[string]bool{"z": true, "Z": true, "left": true, "right": true}
+	groupedOnly := map[string]bool{"Z": true, "left": true, "right": true}
 	for _, canGoBack := range []bool{true, false} {
 		drilled := helpKeyTokensCtx(screenSelectContainers, helpContext{canGoBack: canGoBack})
 		grouped := helpKeyTokensCtx(screenSelectContainers, helpContext{canGoBack: canGoBack, grouped: true})

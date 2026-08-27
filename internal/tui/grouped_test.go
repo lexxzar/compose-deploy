@@ -372,12 +372,20 @@ func (m *mockGrouper) GroupHostStats(ctx context.Context, entries compose.HostEn
 // the whole host view silently rendered no status.
 var _ HostGrouper = (*compose.HostContainers)(nil)
 
+// groupedTestModel is the grouped screen the user has ALREADY landed on: it
+// sets screen/grouped by hand rather than running a transition, so it disarms
+// the landing fold NewModel's own grouped branch armed. Every test built on it
+// reads rows by index and wants them all on screen. The fold itself is pinned
+// by the two landing paths that own it — groupedLanding (the
+// enterGroupedContainers arm) and TestGroupedLanding_NewModelLandsFolded (the
+// NewModel arm).
 func groupedTestModel(g *mockGrouper, projects []compose.Project) Model {
 	m := NewModel(nil, io.Discard, func(compose.Project) runner.Composer { return g }, nil, nil)
 	installFakeTick(&m)
 	m.projectLoader = func(ctx context.Context) ([]compose.Project, error) { return projects, nil }
 	m.screen = screenSelectContainers
 	m.grouped = true
+	m.groupFoldPending = false
 	return m
 }
 
@@ -1605,18 +1613,193 @@ func TestGroupedLanding_DrillOutRefolds(t *testing.T) {
 	}
 }
 
-// z folds from a SERVICE row, which is the whole point: space folds only from
+// The primary launch path arms the fold WITHOUT enterGroupedContainers: a bare
+// `cdeploy` in a directory with no compose file and no ~/.cdeploy/servers.yml
+// lands on the grouped host view straight out of NewModel, which is a field
+// assignment rather than a transition. Every other landing test drives the
+// helper, so this is the one that covers the case the feature targets.
+func TestGroupedLanding_NewModelLandsFolded(t *testing.T) {
+	g, projects := groupedFixture()
+	m := NewModel(nil, io.Discard, func(compose.Project) runner.Composer { return g }, nil, nil)
+	installFakeTick(&m)
+	m.projectLoader = func(ctx context.Context) ([]compose.Project, error) { return projects, nil }
+
+	if m.screen != screenSelectContainers || !m.grouped {
+		t.Fatalf("precondition: NewModel landed on screen %d (grouped=%v), want the grouped host view",
+			m.screen, m.grouped)
+	}
+	if !m.groupFoldPending {
+		t.Fatal("NewModel's grouped branch did not arm the landing fold")
+	}
+
+	// Init()'s own batch, not loadGroups directly: the arm is worth nothing
+	// unless the payload that consumes it is the one Init dispatches.
+	init := m.Init()()
+	batch, ok := init.(tea.BatchMsg)
+	if !ok {
+		t.Fatalf("Init() produced %T, want tea.BatchMsg", init)
+	}
+	landed := false
+	for _, cmd := range batch {
+		msg := cmd()
+		if _, isServices := msg.(servicesMsg); !isServices {
+			continue
+		}
+		updated, _ := m.Update(msg)
+		m = updated.(Model)
+		landed = true
+	}
+	if !landed {
+		t.Fatal("Init() dispatched no servicesMsg; loadGroups left its batch")
+	}
+
+	if len(m.svcGroups) != 3 {
+		t.Fatalf("landed with %d groups, want 3", len(m.svcGroups))
+	}
+	if got := foldedCount(m); got != 3 {
+		t.Errorf("%d of 3 groups folded on the NewModel landing path", got)
+	}
+	if got := len(m.svcEntries); got != 3 {
+		t.Errorf("row count = %d, want 3 (one header per folded group)", got)
+	}
+}
+
+// An EMPTY payload must NOT spend the one-shot. buildSvcGroups always returns a
+// non-nil slice, so zero groups is a real answer — a docker host with nothing
+// up, or a remote box whose containers start a few seconds after the connect —
+// and the user saw no rows to fold. The first payload that brings rows is the
+// landing.
+func TestGroupedLanding_EmptyPayloadKeepsTheOneShot(t *testing.T) {
+	g := &mockGrouper{groupedStatus: map[string]map[string]runner.ServiceStatus{}}
+	var projects []compose.Project
+	m := groupedTestModel(g, projects)
+	m = groupedLanding(t, m)
+
+	if len(m.svcGroups) != 0 {
+		t.Fatalf("precondition: landed with %d groups, want an empty host", len(m.svcGroups))
+	}
+	if !m.groupFoldPending {
+		t.Fatal("a payload with no rows in it spent the landing fold")
+	}
+
+	// The containers come up. THIS is the frame the user first sees rows in.
+	g.groupedStatus["blog"] = map[string]runner.ServiceStatus{"web": {Running: true}}
+	g.groupedStatus["shop"] = map[string]runner.ServiceStatus{"api": {Running: true}}
+	m.projectLoader = func(ctx context.Context) ([]compose.Project, error) {
+		return []compose.Project{{Name: "blog", ConfigDir: "/srv/blog"}, {Name: "shop", ConfigDir: "/srv/shop"}}, nil
+	}
+	updated, _ := m.Update(m.loadGroups()())
+	m = updated.(Model)
+
+	if got := foldedCount(m); got != 2 {
+		t.Errorf("%d of 2 groups folded once the host gained rows", got)
+	}
+	if m.groupFoldPending {
+		t.Error("the payload that folded did not spend the one-shot")
+	}
+}
+
+// groupFoldPending is departure-site state like every other mutable Model
+// field: the invariant has to be LOCAL to the four sites the cleanup discipline
+// names, not emergent from what svcGroups happens to hold. enterGroupedContainers
+// is the exception — it is the landing body, so it ARMS.
+func TestGroupFoldPending_SettledAtEveryNavigationSite(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		run  func(t *testing.T) Model
+		want bool
+	}{
+		{
+			name: "drill in",
+			run: func(t *testing.T) Model {
+				m, _ := drillTestModel(t)
+				m.groupFoldPending = true // a landing payload still in flight
+				m.svcCursor = 2           // the shop header
+				updated, _ := m.Update(keyMsgFor("enter"))
+				m = updated.(Model)
+				if m.grouped {
+					t.Fatal("precondition: enter did not drill in")
+				}
+				return m
+			},
+		},
+		{
+			name: "back to the server screen",
+			run: func(t *testing.T) Model {
+				g, projects := groupedFixture()
+				m := groupedTestModel(g, projects)
+				m.groupFoldPending = true
+				m.backToServerScreen()
+				return m
+			},
+		},
+		{
+			name: "connect failure",
+			run: func(t *testing.T) Model {
+				g, projects := groupedFixture()
+				m := groupedTestModel(g, projects)
+				m.groupFoldPending = true
+				updated, _ := m.Update(connectResultMsg{err: errors.New("ssh: connect refused")})
+				return updated.(Model)
+			},
+		},
+		{
+			name: "entryLocal fast track",
+			run: func(t *testing.T) Model {
+				mc := &mockComposer{services: []string{"api", "web"}}
+				m := NewModel(mc, io.Discard, mockFactory(mc), testServers, mockConnectCb(mc))
+				installFakeTick(&m)
+				m.screen = screenSelectServer
+				for i, e := range m.serverEntries {
+					if e.kind == entryLocal {
+						m.serverCursor = i
+					}
+				}
+				m.groupFoldPending = true
+				updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+				m = updated.(Model)
+				if m.grouped {
+					t.Fatal("precondition: a local composer must fast-track to the drilled screen")
+				}
+				return m
+			},
+		},
+		{
+			name: "drill out",
+			want: true,
+			run: func(t *testing.T) Model {
+				m, _ := drillTestModel(t)
+				m.svcCursor = 2 // the shop header
+				updated, _ := m.Update(keyMsgFor("enter"))
+				m = updated.(Model)
+				if m.grouped {
+					t.Fatal("precondition: enter did not drill in")
+				}
+				updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyEsc})
+				return updated.(Model)
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := tc.run(t).groupFoldPending; got != tc.want {
+				t.Errorf("groupFoldPending = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
+// ← folds from a SERVICE row, which is the whole point: space folds only from
 // the header, twenty rows above. The cursor lands on the header, because the
 // row it sat on is gone.
-func TestGroupedFold_ZFoldsFromAServiceRow(t *testing.T) {
+func TestGroupedFold_LeftFoldsFromAServiceRow(t *testing.T) {
 	m := groupedScreenModel(svcGroupOf("web", "api", "nginx"), svcGroupOf("db", "postgres"))
 	m.selected[svcKey("web", "nginx")] = true
 	m.svcCursor = 2 // the "nginx" row, inside the web group
 
-	m = pressGroupKey(m, "z")
+	m = pressGroupKey(m, "left")
 
 	if !m.svcGroups[0].folded {
-		t.Fatal("z on a service row did not fold its group")
+		t.Fatal("left on a service row did not fold its group")
 	}
 	if m.svcCursor != 0 {
 		t.Errorf("svcCursor = %d, want 0 (the folded group's own header)", m.svcCursor)
@@ -1625,9 +1808,12 @@ func TestGroupedFold_ZFoldsFromAServiceRow(t *testing.T) {
 		t.Error("folding dropped the selection; it hides rows, not services")
 	}
 
-	m = pressGroupKey(m, "z")
+	m = pressGroupKey(m, "right")
 	if m.svcGroups[0].folded {
-		t.Error("a second z did not unfold the group")
+		t.Error("right did not reopen the group")
+	}
+	if !m.selected[svcKey("web", "nginx")] {
+		t.Error("unfolding dropped the selection")
 	}
 }
 
@@ -1653,7 +1839,8 @@ func TestGroupedFold_ZAllTogglesEveryGroup(t *testing.T) {
 	}
 }
 
-// ← and → are directional and idempotent, unlike z.
+// ← and → are directional and idempotent: a held key settles rather than
+// oscillating, which is why they and not a toggle own the single-group job.
 func TestGroupedFold_ArrowsAreDirectional(t *testing.T) {
 	m := groupedScreenModel(svcGroupOf("web", "api", "nginx"), svcGroupOf("db", "postgres"))
 	m.svcCursor = 2 // the "nginx" row
@@ -1688,10 +1875,38 @@ func TestGroupedFold_ArrowsAreDirectional(t *testing.T) {
 	}
 }
 
+// z was the toggle the arrows replaced. It must now reach the row list as an
+// ordinary unbound rune — the `?` overlay names it nowhere, and a key that
+// reshapes the list while being advertised nowhere is the no-op rule in
+// reverse.
+func TestGroupedFold_ZIsNoLongerBound(t *testing.T) {
+	// Both directions: a z re-added to the arrow case label inherits whichever
+	// branch the directional expression falls into, so only asserting one of
+	// them leaves the other rebindable in silence.
+	open := groupedScreenModel(svcGroupOf("web", "api", "nginx"), svcGroupOf("db", "postgres"))
+	open.svcCursor = 2 // the "nginx" row, inside the open web group
+	open = pressGroupKey(open, "z")
+	if foldedCount(open) != 0 || len(open.svcEntries) != 5 {
+		t.Errorf("z folds: %d groups folded, %d rows", foldedCount(open), len(open.svcEntries))
+	}
+	if open.svcCursor != 2 {
+		t.Errorf("z moved the cursor to row %d", open.svcCursor)
+	}
+
+	folded := groupedScreenModel(svcGroupOf("web", "api", "nginx"), svcGroupOf("db", "postgres"))
+	folded.svcGroups[0].folded = true
+	folded.setGroups(folded.svcGroups)
+	folded.svcCursor = 0 // the folded web header
+	folded = pressGroupKey(folded, "z")
+	if !folded.svcGroups[0].folded {
+		t.Error("z unfolds")
+	}
+}
+
 // The fold keys are grouped-only and write-only: the drilled screen has one
 // group and no header to fold, and a read-only host must advertise no no-op.
 func TestGroupedFold_KeysAreInertDrilledAndReadOnly(t *testing.T) {
-	keys := []string{"z", "Z", "left", "right"}
+	keys := []string{"Z", "left", "right"}
 
 	for _, key := range keys {
 		m := singleGroupModel([]string{"api", "web"})
@@ -1720,7 +1935,7 @@ func TestGroupedFold_KeysAreInertDrilledAndReadOnly(t *testing.T) {
 // A fold renumbers every row, and searchMatches holds ROW indices — the new
 // keys owe the same re-derive the space path already does.
 func TestGroupedFold_KeysRecomputeSearchMatches(t *testing.T) {
-	for _, key := range []string{"z", "Z", "left"} {
+	for _, key := range []string{"Z", "left"} {
 		m := groupedScreenModel(svcGroupOf("web", "api", "nginx"), svcGroupOf("db", "api-db"))
 		m.searchQuery = "api"
 		m.searchMatches = computeMatches(m.svcEntries, m.searchQuery)
@@ -1745,7 +1960,7 @@ func TestGroupedFold_KeysRecomputeSearchMatches(t *testing.T) {
 // header on screen: closing the SECOND project from one of its rows must leave
 // the cursor on that project, or every fold jumps to the top of the host.
 func TestGroupedFold_AimsAtTheCursorsOwnGroupHeader(t *testing.T) {
-	for _, key := range []string{"z", "left", "Z"} {
+	for _, key := range []string{"left", "Z"} {
 		m := groupedScreenModel(svcGroupOf("web", "api", "nginx"), svcGroupOf("db", "postgres", "redis"))
 		m.svcCursor = 5 // "redis", the last row of the SECOND group
 
@@ -1781,7 +1996,7 @@ func TestGroupedFold_ReclampsTheScrollWindow(t *testing.T) {
 		return m
 	}
 
-	for _, key := range []string{"z", "Z", "left"} {
+	for _, key := range []string{"Z", "left"} {
 		m := build()
 		if m.svcOffset == 0 {
 			t.Fatalf("%q: precondition: the list must scroll at this height", key)
@@ -1803,26 +2018,52 @@ func TestGroupedFold_ReclampsTheScrollWindow(t *testing.T) {
 	}
 }
 
-// The typing intercept sits ABOVE the key switch, so z and Z are literal runes
-// while the search bar is open — a query naming zookeeper has to be typable.
+// The typing intercept sits ABOVE the key switch, so Z is a literal rune while
+// the search bar is open — a query naming Zabbix has to be typable. The arrows
+// reach the text input instead of the fold path, so they too must leave the
+// rows alone.
 func TestGroupedFold_KeysAreLiteralWhileSearching(t *testing.T) {
-	for _, key := range []string{"z", "Z"} {
-		m := groupedScreenModel(svcGroupOf("web", "api", "nginx"), svcGroupOf("db", "zookeeper"))
+	searchModel := func() Model {
+		m := groupedScreenModel(svcGroupOf("web", "api", "nginx"), svcGroupOf("db", "zabbix"))
 		m.searchInput = textinput.New()
 		m.searchInput.Focus()
 		m.searching = true
+		return m
+	}
 
-		m = pressGroupKey(m, key)
+	m := pressGroupKey(searchModel(), "Z")
+	if m.searchQuery != "Z" {
+		t.Errorf("searchQuery = %q, want the keystroke in the bar", m.searchQuery)
+	}
+	if foldedCount(m) != 0 {
+		t.Error("Z folded a group instead of typing")
+	}
+	if !m.searching {
+		t.Error("Z closed the search bar")
+	}
 
-		if m.searchQuery != key {
-			t.Errorf("%q: searchQuery = %q, want the keystroke in the bar", key, m.searchQuery)
-		}
-		if foldedCount(m) != 0 {
-			t.Errorf("%q folded a group instead of typing", key)
-		}
-		if !m.searching {
-			t.Errorf("%q closed the search bar", key)
-		}
+	// Each arrow is driven against the state it would actually change: left
+	// with the cursor inside an OPEN group, right with it on a FOLDED header.
+	m = searchModel()
+	m.svcCursor = 1 // "api", inside the open web group
+	m = pressGroupKey(m, "left")
+	if m.svcGroups[0].folded {
+		t.Error("left folded a group while the search bar was open")
+	}
+	if !m.searching {
+		t.Error("left closed the search bar")
+	}
+
+	m = searchModel()
+	m.svcGroups[1].folded = true
+	m.setGroups(m.svcGroups)
+	m.svcCursor = len(m.svcEntries) - 1 // the folded db header
+	m = pressGroupKey(m, "right")
+	if !m.svcGroups[1].folded {
+		t.Error("right unfolded a group while the search bar was open")
+	}
+	if !m.searching {
+		t.Error("right closed the search bar")
 	}
 }
 
@@ -1830,12 +2071,12 @@ func TestGroupedFold_KeysAreLiteralWhileSearching(t *testing.T) {
 // goes inert — the fold keys included, or the user reshapes a list that is not
 // on screen and cannot see what changed.
 func TestGroupedFold_KeysInertOnTheErrorScreen(t *testing.T) {
-	for _, key := range []string{"z", "Z", "left", "right"} {
+	for _, key := range []string{"Z", "left", "right"} {
 		m := groupedScreenModel(svcGroupOf("web", "api", "nginx"), svcGroupOf("db", "postgres"))
 		m.svcGroups[1].folded = true
 		m.setGroups(m.svcGroups)
 		m.svcErr = errors.New("docker daemon gone")
-		m.svcCursor = 3 // the folded db header: z and right would open it, Z would close web
+		m.svcCursor = 3 // the folded db header: right would open it, Z would close web
 
 		m = pressGroupKey(m, key)
 
@@ -1850,7 +2091,7 @@ func TestGroupedFold_KeysInertOnTheErrorScreen(t *testing.T) {
 // a batch that enter resolves AGAIN from the cursor, and a fold re-aims the
 // cursor at a group header — so folding behind the prompt edits its target.
 func TestGroupedFold_KeysInertWhileAConfirmationIsArmed(t *testing.T) {
-	for _, key := range []string{"z", "Z", "left", "right"} {
+	for _, key := range []string{"Z", "left", "right"} {
 		m := groupedOpModel(t)
 		m.width, m.height = 100, 24
 		m.svcCursor = 3 // shop/api, a service row inside the second group
@@ -2332,6 +2573,7 @@ func drillTestModel(t *testing.T) (Model, *drillFactory) {
 	m.projectLoader = func(ctx context.Context) ([]compose.Project, error) { return projects, nil }
 	m.screen = screenSelectContainers
 	m.grouped = true
+	m.groupFoldPending = false // already landed; see groupedTestModel
 	m.width, m.height = 120, 40
 	updated, _ := m.Update(m.loadGroups()())
 	m = updated.(Model)

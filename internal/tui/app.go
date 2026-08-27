@@ -385,13 +385,18 @@ type Model struct {
 	// autoUpdatesAllowed all branch on it.
 	grouped bool
 
-	// groupFoldPending arms the one-shot "land folded" fold. Every landing
-	// site goes through enterGroupedContainers, which sets it; the FIRST
-	// grouped payload that installs rows consumes it and clears it again.
-	// The one-shot is the whole point: that same branch is the 5-second
+	// groupFoldPending arms the one-shot "land folded" fold. There are exactly
+	// TWO arming sites and neither implies the other: enterGroupedContainers
+	// (connect success, entryLocal with no local composer, drill-out) and
+	// NewModel's own grouped branch, which is a plain field assignment rather
+	// than a transition — a bare `cdeploy` in a directory with no compose file
+	// and no servers.yml never runs the helper at all.
+	//
+	// The FIRST grouped payload that installs ROWS consumes it and clears it
+	// again. The one-shot is the whole point: that same branch is the 5-second
 	// reload, which must preserve the folds the user opened, so a flat "fold
 	// on a grouped payload" would re-fold the screen every tick. Drill-out
-	// lands through the same body and re-folds on purpose.
+	// lands through enterGroupedContainers and re-folds on purpose.
 	groupFoldPending bool
 
 	// svcStatus and stats are keyed by the QUALIFIED key svcKey produces, not
@@ -998,6 +1003,12 @@ func NewModel(composer runner.Composer, logWriter io.Writer, factory ComposerFac
 		// screen.
 		m.screen = screenSelectContainers
 		m.grouped = true
+		// The second arming site for the landing fold. This branch is NOT
+		// enterGroupedContainers — NewModel is not a transition and must not
+		// clear composers, bump sessions or return a Cmd — so the flag is set
+		// here by hand. Init() dispatches loadGroups and the payload consumes
+		// it. See groupFoldPending.
+		m.groupFoldPending = true
 		m.statsRequested = true
 		// Init() will fire loadGroups; its servicesMsg either clears the flag or
 		// re-arms it for the stats half it chains.
@@ -1646,6 +1657,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			// The failed connect leaves the user on the server screen, so the
 			// grouped host view a previous server populated must go with it.
 			m.grouped = false
+			m.groupFoldPending = false
 			m.clearContainerScreen()
 			m.clearSearch()
 			m.clearWaitState()
@@ -2288,6 +2300,11 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 				m.rollbackTargets = nil
 				m.rollbackProj = compose.Project{}
 				m.rollbackCleanup = nil
+				// Cleared here, in the common block, for the same reason
+				// updatesErr is: the drilled fast track below must not carry an
+				// armed landing fold, and the grouped branch after it re-arms
+				// through enterGroupedContainers.
+				m.groupFoldPending = false
 				m.clearSearch()
 				m.clearWaitState()
 				if m.localComposer != nil {
@@ -2571,7 +2588,7 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			if key := m.svcKeyAt(m.svcCursor); key != "" {
 				m.selected[key] = !m.selected[key]
 			}
-		case "z", "left", "right":
+		case "left", "right":
 			// The fold keys act on the cursor's GROUP, from a service row as
 			// well as from its header — space folds only from the header, and
 			// twenty rows into a project that means scrolling back up to close
@@ -2586,15 +2603,9 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 				m.fixSvcOffset()
 				return m, nil
 			}
-			// z toggles; the arrows are directional.
-			folded := !m.svcGroups[gi].folded
-			switch key {
-			case "left":
-				folded = true
-			case "right":
-				folded = false
-			}
-			m.foldGroupAt(gi, folded)
+			// Directional, not a toggle: left only ever folds, right only ever
+			// unfolds, so a held key settles instead of oscillating.
+			m.foldGroupAt(gi, key == "left")
 			return m, nil
 		case "Z":
 			if m.readOnly() || !m.grouped {
@@ -6265,6 +6276,11 @@ func (m *Model) drillIntoGroup(gi int) tea.Cmd {
 		return nil
 	}
 	m.grouped = false
+	// Disarm the landing fold: the drilled screen has no group to fold, and a
+	// flag left armed here would be spent by whichever grouped payload arrived
+	// next instead of by the drill-out that re-arms it. Every departure site
+	// clears it; enterGroupedContainers is the one that sets it.
+	m.groupFoldPending = false
 	// The grouped view is the parent screen from here on: canGoBack and the
 	// footer's back label both read drilledFromHost on the drilled screen.
 	m.drilledFromHost = true
@@ -6308,6 +6324,7 @@ func (m *Model) backToServerScreen() tea.Cmd {
 	disconnectFn := m.disconnectFunc
 	m.screen = screenSelectServer
 	m.grouped = false
+	m.groupFoldPending = false
 	m.serverName = ""
 	m.serverHost = ""
 	m.serverColor = ""
@@ -6455,16 +6472,24 @@ func (m *Model) clampSvcCursor() {
 }
 
 // applyPendingGroupFold folds every group once per landing on the grouped host
-// view, then clears the flag whether or not it folded — a host that later gains
-// a second project must not fold under an ordinary 5-second reload.
+// view. Only a payload the user actually SAW rows from spends the one-shot,
+// and the two nearly-identical cases below are the reason that distinction
+// matters:
 //
-// A LONE group is left open on purpose: folding it leaves one header row and
-// nothing else on screen, which is a worse first frame than the rows it hides.
+//   - a payload carrying ONE group clears the flag. The lone group is left open
+//     on purpose (folding it leaves one header and nothing else on screen), and
+//     the landing frame the user saw was that group's rows — so a host that
+//     later gains a second project must not fold under an ordinary reload.
+//   - a payload carrying ZERO groups keeps the flag armed. buildSvcGroups
+//     always returns a non-nil slice, so an empty one is a real answer — a
+//     docker host with nothing up, or a remote box whose containers start a few
+//     seconds after the connect. The user saw no rows, so the landing has not
+//     happened yet; the first payload that brings rows still folds them.
 //
 // setGroups already built the entries from the unfolded state, so the fold has
 // to rebuild them again.
 func (m *Model) applyPendingGroupFold() {
-	if !m.groupFoldPending {
+	if !m.groupFoldPending || len(m.svcGroups) == 0 {
 		return
 	}
 	m.groupFoldPending = false
@@ -6478,8 +6503,8 @@ func (m *Model) applyPendingGroupFold() {
 }
 
 // foldGroupAt sets one group's fold state and settles what the rebuild
-// invalidates. Every fold key goes through it — space on a header, z, ← and →
-// — so the five-step sequence has one home.
+// invalidates. Every fold key goes through it — space on a header, ← and → —
+// so the five-step sequence has one home.
 //
 // A fold that changes nothing settles nothing: ← and → are directional, so
 // they land on an already-folded (already-open) group routinely, and re-aiming
