@@ -135,7 +135,7 @@ Remote server configuration (~/.cdeploy/servers.yml):
 						if err := rc.Detect(ctx); err != nil {
 							return nil, err
 						}
-						return projectsWithUnmanaged(ctx, rc, compose.NewRemoteHostContainers(rc))
+						return rc.ListProjects(ctx)
 					}
 					return connectCmd, remoteFactory, loader, rc.Close
 				}
@@ -146,7 +146,7 @@ Remote server configuration (~/.cdeploy/servers.yml):
 				if err := detectLocal(ctx); err != nil {
 					return nil, err
 				}
-				return projectsWithUnmanaged(ctx, localDetector, compose.NewLocalHostContainers(localDetector))
+				return localDetector.ListProjects(ctx)
 			}
 
 			logger, err := logging.NewLogger(logDir)
@@ -198,25 +198,11 @@ func Execute() error {
 	return NewRootCmd().Execute()
 }
 
-// projectLister is the ListProjects half of a composer, the only method
-// projectsWithUnmanaged needs. Both *compose.Compose and *compose.RemoteCompose
-// satisfy it.
-type projectLister interface {
-	ListProjects(ctx context.Context) ([]compose.Project, error)
-}
-
-// projectsWithUnmanaged is the body both TUI ProjectLoader literals share:
-// list the compose projects, then append the synthetic "(unmanaged)" row when
-// the host has containers carrying no compose project label. It lives at
-// package level because cmd/root_test.go cannot execute the root command
-// (the TUI needs a TTY), so a closure body would have no test seam.
-func projectsWithUnmanaged(ctx context.Context, lister projectLister, hc *compose.HostContainers) ([]compose.Project, error) {
-	projects, err := lister.ListProjects(ctx)
-	if err != nil {
-		return nil, err
-	}
-	return compose.WithUnmanagedRow(ctx, hc, projects), nil
-}
+// The TUI ProjectLoader is plain ListProjects on both paths. The synthetic
+// "(unmanaged)" group is NOT appended here: buildSvcGroups derives it from the
+// host-wide status map the grouped loader already fetched, so asking the host
+// to count unmanaged containers separately would be a second `docker ps` per
+// refresh for an answer the first one already carries.
 
 // localComposerFor is the local tui.ComposerFactory body. The synthetic
 // unmanaged row has no compose file and no ConfigDir, so it gets the read-only

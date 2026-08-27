@@ -10,7 +10,6 @@ import (
 	"regexp"
 	"sort"
 	"strings"
-	"time"
 
 	"github.com/lexxzar/compose-deploy/internal/runner"
 )
@@ -27,6 +26,11 @@ type hostPsEntry struct {
 	Labels    string `json:"Labels"`    // comma-joined k=v
 	CreatedAt string `json:"CreatedAt"` // "2006-01-02 15:04:05 -0700 MST"
 }
+
+// UnmanagedProjectName is the name of the synthetic project group that stands
+// for the host containers carrying no compose project label. The parentheses
+// mark it as not a real project name — compose rejects them in a real one.
+const UnmanagedProjectName = "(unmanaged)"
 
 // composeProjectLabel is the label key that marks a container as belonging to a
 // Docker Compose project. The trailing "=" keeps it from matching the sibling keys
@@ -94,11 +98,16 @@ func labelValue(labels, key string) (string, bool) {
 }
 
 // isComposeManaged reports whether the comma-joined label string carries a
-// com.docker.compose.project key. It reads labelValue so the token-start rule
-// lives in one place.
+// com.docker.compose.project key with a NON-EMPTY value. It reads labelValue so
+// the token-start rule lives in one place.
+//
+// The non-empty term is load-bearing: hostGroupKey routes an empty value to the
+// unmanaged bucket, so a bare `com.docker.compose.project=` would otherwise be
+// grouped as unmanaged by one side and excluded from unmanagedEntries by the
+// other — a row that renders under (unmanaged) yet cannot be inspected.
 func isComposeManaged(labels string) bool {
-	_, ok := labelValue(labels, composeProjectLabel)
-	return ok
+	p, ok := labelValue(labels, composeProjectLabel)
+	return ok && p != ""
 }
 
 // parseHealthFromStatus extracts the health value from a host-level Status string.
@@ -344,15 +353,23 @@ func (h *HostContainers) compareImageDigest(ctx context.Context, image string) (
 // break the legacy hosts this template form exists to support.
 var hostPsArgs = []string{"ps", "-a", "--size=false", "--format", "{{json .}}"}
 
-// unmanagedEntries lists the host containers that carry no compose project
-// label. Entries whose first name is empty are dropped — an unnamed row could
-// not be addressed by any of the read methods.
-func (h *HostContainers) unmanagedEntries(ctx context.Context) ([]hostPsEntry, error) {
+// hostEntries is the ONE `docker ps` this file makes. Every read method goes
+// through it, so a caller that wants both the status map and the stats map pays
+// one listing rather than one per map — the whole point of the grouped host
+// view is that its cost does not scale with the number of projects.
+func (h *HostContainers) hostEntries(ctx context.Context) ([]hostPsEntry, error) {
 	out, err := h.docker.run(ctx, hostPsArgs...)
 	if err != nil {
 		return nil, fmt.Errorf("listing host containers: %w", err)
 	}
-	entries, err := parseHostContainers(out)
+	return parseHostContainers(out)
+}
+
+// unmanagedEntries lists the host containers that carry no compose project
+// label. Entries whose first name is empty are dropped — an unnamed row could
+// not be addressed by any of the read methods.
+func (h *HostContainers) unmanagedEntries(ctx context.Context) ([]hostPsEntry, error) {
+	entries, err := h.hostEntries(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -393,53 +410,63 @@ func hostContainerRunning(e hostPsEntry) bool {
 	return strings.HasPrefix(strings.TrimSpace(e.Status), "Up ")
 }
 
-// ContainerStatus maps each unmanaged container name to its status. There is no
-// replica aggregation here — a host container is its own row — so the fields map
-// one-to-one from the ps entry.
+// ContainerStatus maps each unmanaged container name to its status. It is the
+// unmanaged slice of the grouped map, projected out of the same grouper the
+// host view uses — every entry it sees is unmanaged, so hostGroupKey files them
+// all under UnmanagedProjectName and the replica merge is a no-op (docker
+// container names are unique, so each row is its own service).
+//
+// Writing the field mapping a second time here is what let the two sides
+// disagree about a degenerate empty project label; one grouper is the fix.
+// Unlike ContainerStats there is NO early return on an empty entry list, and
+// none may be added: the grouper yields an empty map for free.
 func (h *HostContainers) ContainerStatus(ctx context.Context) (map[string]runner.ServiceStatus, error) {
 	entries, err := h.unmanagedEntries(ctx)
 	if err != nil {
 		return nil, err
 	}
-	status := make(map[string]runner.ServiceStatus, len(entries))
-	for _, e := range entries {
-		st := runner.ServiceStatus{
-			Running: hostContainerRunning(e),
-			Health:  parseHealthFromStatus(e.Status),
-			Uptime:  formatUptime(e.Status),
-		}
-		if t, ok := parseCreatedAt(e.CreatedAt); ok {
-			st.Created = t.Format("2006-01-02 15:04")
-		}
-		if e.Ports != "" {
-			st.Ports = dedupAndSortPorts(parsePortsString(e.Ports))
-		}
-		status[hostContainerName(e.Names)] = st
+	status := groupHostContainers(entries)[UnmanagedProjectName]
+	if status == nil {
+		status = make(map[string]runner.ServiceStatus)
 	}
 	return status, nil
 }
 
-// GroupedStatus returns every container on the host grouped by compose project:
-// the outer key is the project name, the inner key the service name. Containers
-// with no compose project label are collected under UnmanagedProjectName.
+// GroupedHostSnapshot is one host-wide read of the docker host: every
+// container's status grouped by compose project (the outer key is the project
+// name, the inner key the service name), the same shape for CPU/memory, and the
+// stats half's own error.
 //
-// It is ONE host-wide `docker ps` call regardless of how many projects the host
-// runs, which is what makes the grouped TUI screen affordable over SSH — a
-// per-project `docker compose ps` would be one round-trip per project.
+// StatsErr is carried separately from the call's error because the two halves
+// carry different weight on screen: without status there is no list at all,
+// while missing CPU/Mem cells are a soft warning beside live rows. One call
+// serving both must not collapse that distinction.
+type GroupedHostSnapshot struct {
+	Status   map[string]map[string]runner.ServiceStatus
+	Stats    map[string]map[string]runner.ServiceStats
+	StatsErr error
+}
+
+// GroupedHost returns the whole grouped host view in ONE `docker ps` plus ONE
+// `docker stats`, regardless of how many projects the host runs. That fixed
+// cost is what makes the grouped TUI screen affordable over SSH: a per-project
+// `docker compose ps` would be one round-trip per project, and asking for
+// status and stats separately would list the containers twice per refresh.
 //
-// The gap this trades for that price: a service declared in a compose file but
+// Containers with no compose project label are collected under
+// UnmanagedProjectName.
+//
+// The gap this trades for the price: a service declared in a compose file but
 // never created has no container, so it has no row here. Drilling into a single
 // project goes through ListServices and shows it.
-func (h *HostContainers) GroupedStatus(ctx context.Context) (map[string]map[string]runner.ServiceStatus, error) {
-	out, err := h.docker.run(ctx, hostPsArgs...)
+func (h *HostContainers) GroupedHost(ctx context.Context) (GroupedHostSnapshot, error) {
+	entries, err := h.hostEntries(ctx)
 	if err != nil {
-		return nil, fmt.Errorf("listing host containers: %w", err)
+		return GroupedHostSnapshot{}, err
 	}
-	entries, err := parseHostContainers(out)
-	if err != nil {
-		return nil, err
-	}
-	return groupHostContainers(entries), nil
+	snap := GroupedHostSnapshot{Status: groupHostContainers(entries)}
+	snap.Stats, snap.StatsErr = h.groupedStats(ctx, entries)
+	return snap, nil
 }
 
 // hostGroupKey resolves the project and service a ps entry belongs to. A
@@ -460,56 +487,27 @@ func hostGroupKey(e hostPsEntry) (proj, svc string) {
 	return p, s
 }
 
-// hostSvcAgg accumulates the replicas of one service. The rules mirror
-// parseContainerStatus exactly — Running is an OR, Health takes the worst case,
-// Created the oldest replica and Uptime the longest-running one — so a scaled
-// service reads the same in the grouped host view as in the per-project one.
-type hostSvcAgg struct {
-	st                 runner.ServiceStatus
-	oldestCreated      time.Time
-	oldestCreatedValid bool
-	longestUpDur       time.Duration
-	longestFromRunning bool
-	ports              []runner.Port
+// hostPorts extracts one host ps entry's published ports. Host-level `docker ps`
+// has no structured Publishers field, so the text form is the only source.
+func hostPorts(e hostPsEntry) []runner.Port {
+	if e.Ports == "" {
+		return nil
+	}
+	return parsePortsString(e.Ports)
 }
 
-func (a *hostSvcAgg) merge(e hostPsEntry) {
-	running := hostContainerRunning(e)
-	a.st.Running = a.st.Running || running
-	if h := parseHealthFromStatus(e.Status); healthPriority(h) > healthPriority(a.st.Health) {
-		a.st.Health = h
-	}
-	if t, ok := parseCreatedAt(e.CreatedAt); ok && (!a.oldestCreatedValid || t.Before(a.oldestCreated)) {
-		a.oldestCreated, a.oldestCreatedValid = t, true
-	}
-	uptime := formatUptime(e.Status)
-	switch {
-	case running && uptime != "":
-		if d := parseUptimeDuration(uptime); !a.longestFromRunning || d > a.longestUpDur {
-			a.longestUpDur, a.st.Uptime, a.longestFromRunning = d, uptime, true
-		}
-	case uptime == "restarting" && a.st.Uptime == "":
-		a.st.Uptime = uptime
-	}
-	if e.Ports != "" {
-		a.ports = append(a.ports, parsePortsString(e.Ports)...)
-	}
-}
-
-func (a *hostSvcAgg) status() runner.ServiceStatus {
-	st := a.st
-	if a.oldestCreatedValid {
-		st.Created = a.oldestCreated.Format("2006-01-02 15:04")
-	}
-	st.Ports = dedupAndSortPorts(a.ports)
-	return st
+// mergeHostEntry folds one host ps entry into the shared replica aggregator.
+// Health comes out of the Status annotation here, because host-level `docker ps`
+// reports no Health field of its own.
+func mergeHostEntry(a *svcAgg, e hostPsEntry) {
+	a.merge(hostContainerRunning(e), parseHealthFromStatus(e.Status), e.CreatedAt, e.Status, hostPorts(e))
 }
 
 // groupHostContainers folds ps entries into the project → service → status map.
 // An entry that resolves to no service name is dropped: it could not be
 // addressed by any read method.
 func groupHostContainers(entries []hostPsEntry) map[string]map[string]runner.ServiceStatus {
-	agg := make(map[string]map[string]*hostSvcAgg)
+	agg := make(map[string]map[string]*svcAgg)
 	for _, e := range entries {
 		proj, svc := hostGroupKey(e)
 		if svc == "" {
@@ -517,15 +515,15 @@ func groupHostContainers(entries []hostPsEntry) map[string]map[string]runner.Ser
 		}
 		group := agg[proj]
 		if group == nil {
-			group = make(map[string]*hostSvcAgg)
+			group = make(map[string]*svcAgg)
 			agg[proj] = group
 		}
 		a := group[svc]
 		if a == nil {
-			a = &hostSvcAgg{}
+			a = &svcAgg{}
 			group[svc] = a
 		}
-		a.merge(e)
+		mergeHostEntry(a, e)
 	}
 	if len(agg) == 0 {
 		return nil
@@ -550,14 +548,63 @@ func groupHostContainers(entries []hostPsEntry) map[string]map[string]runner.Ser
 // AllContainerStats keeps the keyword; that is pre-existing and untouched here.
 var hostStatsArgs = []string{"stats", "--no-stream", "--format", "{{json .}}"}
 
+// groupedStats joins already-listed ps entries against ONE host-wide
+// `docker stats`, grouped by compose project exactly as groupHostContainers
+// groups status. The entries are passed in rather than re-listed: the caller
+// already paid for them, and a second `docker ps` per refresh is a full SSH
+// round-trip for a byte-identical answer.
+//
+// The early return before the stats call is load-bearing: the join against an
+// empty pair list is guaranteed empty, and `docker stats --no-stream` is a
+// ~1.5s host-wide call (a full SSH round-trip remotely) that the 5s refresh
+// tick would otherwise pay for ever on an empty host.
+func (h *HostContainers) groupedStats(ctx context.Context, entries []hostPsEntry) (map[string]map[string]runner.ServiceStats, error) {
+	pairs := make(map[string][]psIDService)
+	for _, e := range entries {
+		if e.ID == "" {
+			continue
+		}
+		proj, svc := hostGroupKey(e)
+		if svc == "" {
+			continue
+		}
+		pairs[proj] = append(pairs[proj], psIDService{ID: shortContainerID(e.ID), Service: svc})
+	}
+	if len(pairs) == 0 {
+		return nil, nil
+	}
+	statsOut, err := h.docker.run(ctx, hostStatsArgs...)
+	if err != nil {
+		return nil, fmt.Errorf("fetching host container stats: %w", err)
+	}
+	all, err := parseStatsOutput(statsOut)
+	if err != nil {
+		return nil, err
+	}
+	grouped := make(map[string]map[string]runner.ServiceStats, len(pairs))
+	for proj, ps := range pairs {
+		// A project whose containers are all stopped is absent from the stats
+		// output, so it contributes no map at all rather than an empty one —
+		// the same "only running containers appear" rule ContainerStats keeps.
+		if g := aggregateStatsByService(ps, all); len(g) > 0 {
+			grouped[proj] = g
+		}
+	}
+	if len(grouped) == 0 {
+		return nil, nil
+	}
+	return grouped, nil
+}
+
 // ContainerStats returns CPU and memory usage for each unmanaged container,
-// keyed by container name.
+// keyed by container name. Like ContainerStatus it is the unmanaged slice of
+// the grouped result, so the ID→service join and the aggregation live in one
+// place.
 //
 // It goes through the dockerRunner seam directly rather than through
 // AllContainerStats / AllContainerStatsRemote: those take a concrete *Compose
 // or *RemoteCompose, which a seam-held HostContainers cannot supply without a
-// type switch that would defeat the seam. Only the two-line argv build is
-// duplicated; the pure parser and the join helper are reused.
+// type switch that would defeat the seam.
 //
 // A container that `docker ps` reports but `docker stats` omits (stopped, or
 // stopped between the two calls) is silently skipped, matching
@@ -567,30 +614,14 @@ func (h *HostContainers) ContainerStats(ctx context.Context) (map[string]runner.
 	if err != nil {
 		return nil, err
 	}
-	// The join against an empty pair list is guaranteed empty, and
-	// `docker stats --no-stream` is a ~1.5s host-wide call (a full SSH
-	// round-trip remotely) that the 5s refresh tick would otherwise pay
-	// forever. The guard buys that saved call — ContainerStatus needs no
-	// counterpart, because its loop already yields an empty map for free.
 	if len(entries) == 0 {
 		return nil, nil
 	}
-	out, err := h.docker.run(ctx, hostStatsArgs...)
-	if err != nil {
-		return nil, fmt.Errorf("fetching host container stats: %w", err)
-	}
-	all, err := parseStatsOutput(out)
+	grouped, err := h.groupedStats(ctx, entries)
 	if err != nil {
 		return nil, err
 	}
-	pairs := make([]psIDService, 0, len(entries))
-	for _, e := range entries {
-		if e.ID == "" {
-			continue
-		}
-		pairs = append(pairs, psIDService{ID: shortContainerID(e.ID), Service: hostContainerName(e.Names)})
-	}
-	return aggregateStatsByService(pairs, all), nil
+	return grouped[UnmanagedProjectName], nil
 }
 
 // Logs streams the logs of one host container to w. It goes through the
@@ -656,65 +687,4 @@ func (h *HostContainers) Inspect(ctx context.Context, name string) ([]byte, erro
 		return nil, fmt.Errorf("inspecting container %s: %w", id, err)
 	}
 	return raw, nil
-}
-
-// GroupedStats returns CPU and memory usage for every container on the host,
-// grouped by compose project exactly as GroupedStatus groups status: the outer
-// key is the project name, the inner key the service name, and containers with
-// no compose project label land under UnmanagedProjectName.
-//
-// It is the stats half of the grouped host view and costs the same two
-// host-wide calls the per-project path already pays (`docker ps` for the
-// ID→service pairs, `docker stats --no-stream` for the numbers) regardless of
-// how many projects the host runs — the point of the grouped screen is that
-// neither call scales with project count.
-//
-// The early return before the stats call mirrors ContainerStats: the join
-// against an empty pair list is guaranteed empty, and `docker stats` is a
-// ~1.5s host-wide call (a full SSH round-trip remotely) that the 5s refresh
-// tick would otherwise pay forever on an empty host.
-func (h *HostContainers) GroupedStats(ctx context.Context) (map[string]map[string]runner.ServiceStats, error) {
-	out, err := h.docker.run(ctx, hostPsArgs...)
-	if err != nil {
-		return nil, fmt.Errorf("listing host containers: %w", err)
-	}
-	entries, err := parseHostContainers(out)
-	if err != nil {
-		return nil, err
-	}
-	pairs := make(map[string][]psIDService)
-	for _, e := range entries {
-		if e.ID == "" {
-			continue
-		}
-		proj, svc := hostGroupKey(e)
-		if svc == "" {
-			continue
-		}
-		pairs[proj] = append(pairs[proj], psIDService{ID: shortContainerID(e.ID), Service: svc})
-	}
-	if len(pairs) == 0 {
-		return nil, nil
-	}
-	statsOut, err := h.docker.run(ctx, hostStatsArgs...)
-	if err != nil {
-		return nil, fmt.Errorf("fetching host container stats: %w", err)
-	}
-	all, err := parseStatsOutput(statsOut)
-	if err != nil {
-		return nil, err
-	}
-	grouped := make(map[string]map[string]runner.ServiceStats, len(pairs))
-	for proj, ps := range pairs {
-		// A project whose containers are all stopped is absent from the stats
-		// output, so it contributes no map at all rather than an empty one —
-		// the same "only running containers appear" rule ContainerStats keeps.
-		if g := aggregateStatsByService(ps, all); len(g) > 0 {
-			grouped[proj] = g
-		}
-	}
-	if len(grouped) == 0 {
-		return nil, nil
-	}
-	return grouped, nil
 }

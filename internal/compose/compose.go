@@ -863,81 +863,33 @@ func parseContainerStatus(data []byte) (map[string]runner.ServiceStatus, error) 
 		}
 	}
 
-	// Track aggregation state for scaled services.
-	type svcAgg struct {
-		oldestCreated      time.Time     // oldest CreatedAt across all replicas
-		oldestCreatedValid bool          //
-		longestUpDur       time.Duration // longest actual uptime among running replicas
-		longestUpStr       string        // uptime string of the longest-running replica
-		longestFromRunning bool          // true if longestUpStr came from a running replica
-		ports              []runner.Port // accumulated published ports across all replicas (deduped/sorted later)
-	}
+	// Scaled services aggregate through the shared svcAgg, the single home of
+	// the replica merge rules (see svcagg.go) — the host-wide grouper feeds the
+	// same type, so the two views cannot drift.
 	agg := make(map[string]*svcAgg)
-
-	status := make(map[string]runner.ServiceStatus)
+	order := make([]string, 0, len(entries))
 	for _, entry := range entries {
 		if entry.Service == "" {
 			continue
 		}
-		prev := status[entry.Service]
-		prev.Running = prev.Running || entry.State == "running"
-		if healthPriority(entry.Health) > healthPriority(prev.Health) {
-			prev.Health = entry.Health
-		}
-
-		// Initialize aggregation tracking for this service.
 		a := agg[entry.Service]
 		if a == nil {
 			a = &svcAgg{}
 			agg[entry.Service] = a
+			order = append(order, entry.Service)
 		}
-
-		// Parse CreatedAt for this replica.
-		entryCreated, entryValid := parseCreatedAt(entry.CreatedAt)
-		entryUptime := formatUptime(entry.Status)
-
-		// Track oldest CreatedAt across all replicas (for the Created column).
-		if entryValid {
-			if !a.oldestCreatedValid || entryCreated.Before(a.oldestCreated) {
-				a.oldestCreated = entryCreated
-				a.oldestCreatedValid = true
-			}
+		// Prefer the structured Publishers field (Compose v2); fall back to the
+		// Ports text string when Publishers is empty.
+		ports := extractPorts(entry)
+		if len(ports) == 0 && entry.Ports != "" {
+			ports = parsePortsString(entry.Ports)
 		}
-
-		// Track longest-running replica (for the Uptime column).
-		// Use entry.State to determine running status rather than parsing Status text.
-		// Running replicas always take priority over restarting ones.
-		if entry.State == "running" && entryUptime != "" {
-			dur := parseUptimeDuration(entryUptime)
-			if !a.longestFromRunning || dur > a.longestUpDur {
-				a.longestUpDur = dur
-				a.longestUpStr = entryUptime
-				a.longestFromRunning = true
-			}
-		} else if entryUptime == "restarting" && a.longestUpStr == "" {
-			a.longestUpStr = entryUptime
-		}
-
-		// Accumulate ports for this replica. Prefer the structured Publishers field
-		// (Compose v2); fall back to the Ports text string when Publishers is empty.
-		if replicaPorts := extractPorts(entry); len(replicaPorts) > 0 {
-			a.ports = append(a.ports, replicaPorts...)
-		} else if entry.Ports != "" {
-			a.ports = append(a.ports, parsePortsString(entry.Ports)...)
-		}
-
-		status[entry.Service] = prev
+		a.merge(entry.State == "running", entry.Health, entry.CreatedAt, entry.Status, ports)
 	}
 
-	// Apply aggregated Created, Uptime, and Ports to final status.
-	for svc, a := range agg {
-		st := status[svc]
-		if a.oldestCreatedValid {
-			st.Created = a.oldestCreated.Format("2006-01-02 15:04")
-		}
-		st.Uptime = a.longestUpStr
-		st.Ports = dedupAndSortPorts(a.ports)
-		status[svc] = st
+	status := make(map[string]runner.ServiceStatus, len(agg))
+	for _, svc := range order {
+		status[svc] = agg[svc].status()
 	}
 
 	return status, nil

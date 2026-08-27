@@ -339,12 +339,13 @@ func TestServicesMsg_SortsServicesCaseInsensitive(t *testing.T) {
 	m = updated.(Model)
 
 	want := []string{"Alpha", "beta", "zebra"}
-	if len(m.services) != len(want) {
-		t.Fatalf("got %d services, want %d", len(m.services), len(want))
+	got := modelServices(m)
+	if len(got) != len(want) {
+		t.Fatalf("got %d services, want %d", len(got), len(want))
 	}
 	for i, svc := range want {
-		if m.services[i] != svc {
-			t.Fatalf("service[%d] = %q, want %q", i, m.services[i], svc)
+		if got[i] != svc {
+			t.Fatalf("service[%d] = %q, want %q", i, got[i], svc)
 		}
 	}
 }
@@ -379,7 +380,7 @@ func TestSelectContainers_SelectAll(t *testing.T) {
 	// Select all
 	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'a'}})
 	m = updated.(Model)
-	for i := range m.services {
+	for i := range modelServices(m) {
 		if !m.selected[m.svcKeyAt(i)] {
 			t.Errorf("item %d should be selected after 'a'", i)
 		}
@@ -388,7 +389,7 @@ func TestSelectContainers_SelectAll(t *testing.T) {
 	// Deselect all
 	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'a'}})
 	m = updated.(Model)
-	for i := range m.services {
+	for i := range modelServices(m) {
 		if m.selected[m.svcKeyAt(i)] {
 			t.Errorf("item %d should be deselected after second 'a'", i)
 		}
@@ -434,7 +435,7 @@ func TestSelectContainers_EscDrillsOutToGroupedView(t *testing.T) {
 	if m.composer != nil {
 		t.Error("the drilled project's composer must be dropped on drill-out")
 	}
-	if len(m.services) != 0 || m.svcGroups != nil || m.svcEntries != nil {
+	if m.svcGroups != nil || m.svcEntries != nil {
 		t.Error("row state should be cleared on drill-out")
 	}
 	if m.svcStatus != nil {
@@ -632,13 +633,20 @@ func TestClearSearch(t *testing.T) {
 	}
 }
 
+// progressStep builds the stepState shape enterProgress produces for a
+// single-batch run: the drawn label IS the runner step name when there is only
+// one project. enterProgress is the only production producer and always sets
+// both fields, so a hand-built fixture has to as well.
+func progressStep(name, status string) stepState {
+	return stepState{name: name, label: name, status: status}
+}
+
 func TestHandleStepEvent_Done(t *testing.T) {
 	m := Model{
-		screen: screenProgress,
-		steps: []stepState{
-			{name: runner.StepStopping, status: runner.StatusRunning},
-		},
-		eventCh: make(chan runner.StepEvent),
+		screen:         screenProgress,
+		steps:          []stepState{progressStep(runner.StepStopping, runner.StatusRunning)},
+		batchStepCount: 1,
+		eventCh:        make(chan runner.StepEvent),
 	}
 
 	updated, _ := m.handleStepEvent(runner.StepEvent{
@@ -653,10 +661,9 @@ func TestHandleStepEvent_Done(t *testing.T) {
 
 func TestHandleStepEvent_Failed(t *testing.T) {
 	m := Model{
-		screen: screenProgress,
-		steps: []stepState{
-			{name: runner.StepStopping, status: runner.StatusRunning},
-		},
+		screen:         screenProgress,
+		steps:          []stepState{progressStep(runner.StepStopping, runner.StatusRunning)},
+		batchStepCount: 1,
 	}
 
 	updated, _ := m.handleStepEvent(runner.StepEvent{
@@ -689,9 +696,10 @@ func TestView_AllScreens(t *testing.T) {
 	m.screen = screenProgress
 	m.pendingOp = runner.Restart
 	m.steps = []stepState{
-		{name: "Stopping", status: runner.StatusDone},
-		{name: "Starting", status: runner.StatusRunning},
+		progressStep("Stopping", runner.StatusDone),
+		progressStep("Starting", runner.StatusRunning),
 	}
+	m.batchStepCount = len(m.steps)
 	v = m.View()
 	if v == "" {
 		t.Error("viewProgress returned empty")
@@ -796,7 +804,8 @@ func TestBreadcrumb_WithProjectName(t *testing.T) {
 	m.screen = screenProgress
 	m.selected[m.svcKeyAt(0)] = true
 	m.pendingOp = runner.Restart
-	m.steps = []stepState{{name: "Stopping", status: runner.StatusRunning}}
+	m.steps = []stepState{progressStep("Stopping", runner.StatusRunning)}
+	m.batchStepCount = len(m.steps)
 	v = m.View()
 	if !strings.Contains(v, "cdeploy > api-proxy") {
 		t.Errorf("progress breadcrumb should contain project name, got: %q", v)
@@ -843,7 +852,7 @@ func TestSetSingleGroup(t *testing.T) {
 		if len(m.svcGroups) != 1 {
 			t.Fatalf("svcGroups has %d groups, want 1", len(m.svcGroups))
 		}
-		if m.services == nil {
+		if m.svcGroups == nil {
 			t.Error("services must stay non-nil, or the screen renders its loading state")
 		}
 		if len(m.svcEntries) != 0 {
@@ -856,8 +865,8 @@ func TestSetSingleGroup(t *testing.T) {
 		m.setSingleGroup([]string{"api"})
 		m.setSingleGroup(nil)
 
-		if m.services != nil || m.svcGroups != nil || m.svcEntries != nil {
-			t.Errorf("services=%v groups=%v entries=%v, want all nil", m.services, m.svcGroups, m.svcEntries)
+		if m.svcGroups != nil || m.svcEntries != nil {
+			t.Errorf("groups=%v entries=%v, want both nil", m.svcGroups, m.svcEntries)
 		}
 	})
 
@@ -877,8 +886,8 @@ func TestClearSvcGroups(t *testing.T) {
 	m.setSingleGroup([]string{"api", "db"})
 	m.clearSvcGroups()
 
-	if m.services != nil || m.svcGroups != nil || m.svcEntries != nil {
-		t.Errorf("services=%v groups=%v entries=%v, want all nil", m.services, m.svcGroups, m.svcEntries)
+	if m.svcGroups != nil || m.svcEntries != nil {
+		t.Errorf("groups=%v entries=%v, want both nil", m.svcGroups, m.svcEntries)
 	}
 }
 
@@ -915,8 +924,8 @@ func TestEscFromContainerScreen_ClearsSvcGroups(t *testing.T) {
 	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyEsc})
 	m = updated.(Model)
 
-	if m.services != nil || m.svcGroups != nil || m.svcEntries != nil {
-		t.Errorf("services=%v groups=%v entries=%v, want all nil after esc", m.services, m.svcGroups, m.svcEntries)
+	if m.svcGroups != nil || m.svcEntries != nil {
+		t.Errorf("groups=%v entries=%v, want both nil after esc", m.svcGroups, m.svcEntries)
 	}
 }
 
@@ -934,15 +943,16 @@ func TestViewSelectContainers_SingleGroupHasNoHeaderOrIndent(t *testing.T) {
 		"web": {},
 	})
 
-	if len(m.svcEntries) != len(m.services) {
-		t.Fatalf("svcEntries has %d rows, want %d (a single group emits no header)", len(m.svcEntries), len(m.services))
+	flat := modelServices(m)
+	if len(m.svcEntries) != len(flat) {
+		t.Fatalf("svcEntries has %d rows, want %d (a single group emits no header)", len(m.svcEntries), len(flat))
 	}
 	for i, e := range m.svcEntries {
 		if e.kind != entrySvcService {
 			t.Errorf("entry %d kind = %v, want a service row", i, e.kind)
 		}
-		if e.name != m.services[i] {
-			t.Errorf("entry %d name = %q, want %q (entries must stay index-parallel)", i, e.name, m.services[i])
+		if e.name != flat[i] {
+			t.Errorf("entry %d name = %q, want %q (entries must stay index-parallel)", i, e.name, flat[i])
 		}
 	}
 
@@ -954,7 +964,7 @@ func TestViewSelectContainers_SingleGroupHasNoHeaderOrIndent(t *testing.T) {
 	}
 
 	rowRe := regexp.MustCompile(`^[> ] \[[ x]\]`)
-	for _, name := range m.services {
+	for _, name := range modelServices(m) {
 		var row string
 		for _, line := range strings.Split(out, "\n") {
 			if strings.Contains(line, name) && strings.Contains(line, "[") {
@@ -1121,6 +1131,8 @@ func TestEscFromProgress_InvalidatesUpdateCache_OnDeploy(t *testing.T) {
 	m.done = true
 	m.pendingOp = runner.Deploy
 	m.composer = mc
+	// enterProgress always installs a batch sequence; the invalidation walks it.
+	m.batches = []opBatch{{proj: m.currentProject()}}
 	installFakeTick(&m)
 	// Prime the cache with a fresh entry for the current context.
 	key := m.updatesCacheKey()
@@ -1152,6 +1164,7 @@ func TestEscFromProgress_InvalidatesUpdateCache_OnRestart(t *testing.T) {
 	m.done = true
 	m.pendingOp = runner.Restart
 	m.composer = mc
+	m.batches = []opBatch{{proj: m.currentProject()}}
 	installFakeTick(&m)
 	key := m.updatesCacheKey()
 	avail := true
@@ -5078,11 +5091,12 @@ func TestViewProgress_Running(t *testing.T) {
 		screen:    screenProgress,
 		pendingOp: runner.Deploy,
 		steps: []stepState{
-			{name: "Stop", status: runner.StatusDone},
-			{name: "Pull", status: runner.StatusRunning},
-			{name: "Create", status: ""},
+			progressStep("Stop", runner.StatusDone),
+			progressStep("Pull", runner.StatusRunning),
+			progressStep("Create", ""),
 		},
-		width: 80,
+		batchStepCount: 3,
+		width:          80,
 	}
 
 	view := m.viewProgress()
@@ -5096,11 +5110,12 @@ func TestViewProgress_AllDone(t *testing.T) {
 		screen:    screenProgress,
 		pendingOp: runner.Restart,
 		steps: []stepState{
-			{name: "Stop", status: runner.StatusDone},
-			{name: "Start", status: runner.StatusDone},
+			progressStep("Stop", runner.StatusDone),
+			progressStep("Start", runner.StatusDone),
 		},
-		done:  true,
-		width: 80,
+		batchStepCount: 2,
+		done:           true,
+		width:          80,
 	}
 
 	view := m.viewProgress()
@@ -5114,13 +5129,14 @@ func TestViewProgress_Failed(t *testing.T) {
 		screen:    screenProgress,
 		pendingOp: runner.Deploy,
 		steps: []stepState{
-			{name: "Stop", status: runner.StatusDone},
-			{name: "Pull", status: runner.StatusFailed},
+			progressStep("Stop", runner.StatusDone),
+			progressStep("Pull", runner.StatusFailed),
 		},
-		done:       true,
-		failed:     true,
-		logContent: "pull failed",
-		width:      80,
+		batchStepCount: 2,
+		done:           true,
+		failed:         true,
+		logContent:     "pull failed",
+		width:          80,
 	}
 
 	view := m.viewProgress()
@@ -6094,7 +6110,7 @@ func TestHasStatusColumns(t *testing.T) {
 		t.Error("hasStatusColumns() = false, want true with Uptime set")
 	}
 
-	// Status for service NOT in m.services should be ignored
+	// Status for a service that has no row should be ignored
 	m.setSingleGroup([]string{"b"})
 	m.svcStatus = qStatus(m, map[string]runner.ServiceStatus{
 		"a": {Created: "2024-01-15 09:30", Uptime: "3h"},
@@ -8166,8 +8182,8 @@ func TestQBackNavigation_ContainerScreen(t *testing.T) {
 	if um.composer != nil {
 		t.Error("composer should be cleared after back nav")
 	}
-	if um.services != nil {
-		t.Error("services should be cleared after back nav")
+	if um.svcGroups != nil {
+		t.Error("the rows should be cleared after back nav")
 	}
 }
 
@@ -9462,8 +9478,8 @@ func TestServicesMsg_currentSessionAccepted(t *testing.T) {
 	})
 	model := result.(Model)
 
-	if len(model.services) != 1 || model.services[0] != "web" {
-		t.Errorf("services = %v, want [web]", model.services)
+	if got := modelServices(model); len(got) != 1 || got[0] != "web" {
+		t.Errorf("services = %v, want [web]", got)
 	}
 	if !model.svcStatus[qk(model, "web")].Running {
 		t.Error("svcStatus not applied for current-session msg")
@@ -9488,8 +9504,8 @@ func TestServicesMsg_staleSessionIgnored(t *testing.T) {
 	})
 	model := result.(Model)
 
-	if len(model.services) != 1 || model.services[0] != "new-svc" {
-		t.Errorf("stale servicesMsg clobbered services: got %v, want [new-svc]", model.services)
+	if got := modelServices(model); len(got) != 1 || got[0] != "new-svc" {
+		t.Errorf("stale servicesMsg clobbered services: got %v, want [new-svc]", got)
 	}
 	if _, ok := model.svcStatus[qk(model, "stale-svc")]; ok {
 		t.Error("stale servicesMsg clobbered svcStatus")
@@ -9511,8 +9527,8 @@ func TestServicesMsg_offScreenIgnored(t *testing.T) {
 	})
 	model := result.(Model)
 
-	if len(model.services) != 1 || model.services[0] != "existing" {
-		t.Errorf("servicesMsg applied while off-screen: got %v, want [existing]", model.services)
+	if got := modelServices(model); len(got) != 1 || got[0] != "existing" {
+		t.Errorf("servicesMsg applied while off-screen: got %v, want [existing]", got)
 	}
 }
 
@@ -12202,6 +12218,7 @@ func TestUpdateDetails_FireOnTheGlyphTriggers(t *testing.T) {
 		m.screen = screenProgress
 		m.done = true
 		m.pendingOp = runner.Deploy
+		m.batches = []opBatch{{proj: m.currentProject()}}
 		key := m.updatesCacheKey()
 		m.updateCache = primed(m)
 
@@ -12570,7 +12587,7 @@ func TestViewSelectContainers_UpdateAlignment_PreservesColumns(t *testing.T) {
 	ansi := regexp.MustCompile(`\x1b\[[0-9;]*m`)
 	for _, line := range lines {
 		clean := ansi.ReplaceAllString(line, "")
-		for _, svc := range m.services {
+		for _, svc := range modelServices(m) {
 			if !strings.Contains(clean, svc) || !strings.Contains(clean, "2024-01-15") {
 				continue
 			}
@@ -12670,7 +12687,7 @@ func TestViewSelectContainers_NoGlyph_ReservationAlwaysApplied(t *testing.T) {
 	cols := map[string]int{}
 	for _, line := range strings.Split(v, "\n") {
 		clean := ansi.ReplaceAllString(line, "")
-		for _, svc := range m.services {
+		for _, svc := range modelServices(m) {
 			if !strings.Contains(clean, svc) || !strings.Contains(clean, "2024-01-15") {
 				continue
 			}
@@ -12694,7 +12711,7 @@ func TestViewSelectContainers_NoGlyph_ReservationAlwaysApplied(t *testing.T) {
 	cols2 := map[string]int{}
 	for _, line := range strings.Split(v2, "\n") {
 		clean := ansi.ReplaceAllString(line, "")
-		for _, svc := range m.services {
+		for _, svc := range modelServices(m) {
 			if !strings.Contains(clean, svc) || !strings.Contains(clean, "2024-01-15") {
 				continue
 			}
@@ -12712,7 +12729,7 @@ func TestViewSelectContainers_NoGlyph_ReservationAlwaysApplied(t *testing.T) {
 // in m.svcStatus (e.g. transient race between `compose config` listing and
 // `compose config --services` at fetch time, or a verdict referring to a
 // stale service after project switch), hydrateUpdates MUST NOT synthesise a
-// phantom svcStatus entry. The renderer iterates m.services not the status
+// phantom svcStatus entry. The renderer iterates the rows, not the status
 // map so today it'd be invisible, but a phantom would leak across project
 // switches and surface in any future map-key iterator.
 func TestHydrateUpdates_SkipsUnknownServices(t *testing.T) {
@@ -14094,7 +14111,7 @@ func TestUpperNTypedIntoSearchInput(t *testing.T) {
 // TestSearchClearedOnEntryLocal: selecting the "Local" entry on the server screen
 // swaps m.composer AND reloads the service list, so a committed search from a
 // previous session must be cleared (stale indices would point into a replaced
-// m.services). This exercises the entryLocal clearSearch() site.
+// the row list). This exercises the entryLocal clearSearch() site.
 func TestSearchClearedOnEntryLocal(t *testing.T) {
 	mc := &mockComposer{services: []string{"api", "web", "web-worker"}}
 	m := NewModel(nil, io.Discard, mockFactory(mc), testServers, mockConnectCb(mc))
@@ -14489,7 +14506,7 @@ func TestPipelineDone_EmptyTargetsFallsBackToServices(t *testing.T) {
 	if !m.waiting {
 		t.Fatal("waiting should start with a services fallback target set")
 	}
-	// The fallback target set must be exactly m.services, in order.
+	// The fallback target set must be exactly the drilled group, in order.
 	want := []string{"web", "db"}
 	if len(m.waitState.Services) != len(want) {
 		t.Fatalf("waitState.Services = %v, want %v", m.waitState.Services, want)
@@ -15570,6 +15587,7 @@ func TestEscFromProgress_RollbackInvalidatesUpdateCache(t *testing.T) {
 		pendingOp:   runner.Rollback,
 		composer:    &mockComposer{},
 		ctx:         context.Background(),
+		batches:     []opBatch{{}},
 		updateCache: map[string]updateEntry{"|": {results: map[string]bool{"web": true}}},
 	}
 	if _, ok := m.updateCache[m.updatesCacheKey()]; !ok {
@@ -15906,7 +15924,7 @@ func TestReadOnly_GatedKeyReclampsOffset(t *testing.T) {
 			m.height = 24
 			// The x-on-stopped warning is the state this reproduces from.
 			m.warning = "Container is not running"
-			m.svcCursor = len(m.services) - 1
+			m.svcCursor = len(m.svcEntries) - 1
 			m.fixSvcOffset()
 			if m.svcOffset == 0 {
 				t.Fatal("precondition: the list must scroll at this height")
@@ -15918,7 +15936,7 @@ func TestReadOnly_GatedKeyReclampsOffset(t *testing.T) {
 			if got.warning != "" {
 				t.Fatalf("precondition: the dispatch must clear the warning, got %q", got.warning)
 			}
-			want := len(got.services) - got.svcVisibleCount()
+			want := len(got.svcEntries) - got.svcVisibleCount()
 			if got.svcOffset != want {
 				t.Errorf("svcOffset = %d, want %d; the gated key left a blank row at the bottom", got.svcOffset, want)
 			}
@@ -16189,7 +16207,7 @@ func TestReadOnly_CaptionAlignment(t *testing.T) {
 				if !strings.Contains(plain, "●") {
 					continue
 				}
-				for _, svc := range m.services {
+				for _, svc := range modelServices(m) {
 					if strings.Contains(plain, svc) {
 						rows[svc] = plain
 					}
@@ -16198,8 +16216,8 @@ func TestReadOnly_CaptionAlignment(t *testing.T) {
 			if caption == "" {
 				t.Fatalf("no captions row rendered:\n%s", view)
 			}
-			if len(rows) != len(m.services) {
-				t.Fatalf("found %d data rows, want %d:\n%s", len(rows), len(m.services), view)
+			if len(rows) != len(modelServices(m)) {
+				t.Fatalf("found %d data rows, want %d:\n%s", len(rows), len(modelServices(m)), view)
 			}
 
 			want := ansi.StringWidth(caption[:strings.Index(caption, "Service")])
@@ -17887,11 +17905,19 @@ func groupedModel(groups ...svcGroup) Model {
 	m := Model{selected: make(map[string]bool), screen: screenSelectContainers}
 	m.svcGroups = groups
 	m.svcEntries = rebuildSvcEntries(m.svcGroups)
-	m.services = []string{}
-	for _, g := range groups {
-		m.services = append(m.services, g.services...)
-	}
 	return m
+}
+
+// modelServices flattens the Model's groups back into the plain name list the
+// tests used to read off a m.services field. That field is gone — svcGroups is
+// the single representation — so the flattening lives here, in the one place
+// that still wants a flat list.
+func modelServices(m Model) []string {
+	var out []string
+	for _, g := range m.svcGroups {
+		out = append(out, g.services...)
+	}
+	return out
 }
 
 func svcGroupOf(name string, services ...string) svcGroup {
@@ -18121,20 +18147,23 @@ type mockGrouper struct {
 	statsCalls2   int
 }
 
-func (m *mockGrouper) GroupedStatus(ctx context.Context) (map[string]map[string]runner.ServiceStatus, error) {
+func (m *mockGrouper) GroupedHost(ctx context.Context) (compose.GroupedHostSnapshot, error) {
 	m.statusCalls2++
-	return m.groupedStatus, m.statusErr2
-}
-
-func (m *mockGrouper) GroupedStats(ctx context.Context) (map[string]map[string]runner.ServiceStats, error) {
+	if m.statusErr2 != nil {
+		return compose.GroupedHostSnapshot{}, m.statusErr2
+	}
 	m.statsCalls2++
-	return m.groupedStats, m.statsErr2
+	return compose.GroupedHostSnapshot{
+		Status:   m.groupedStatus,
+		Stats:    m.groupedStats,
+		StatsErr: m.statsErr2,
+	}, nil
 }
 
 // Compile-time pin, for the same reason the Inspector block above carries one:
-// the grouped screen reaches GroupedStatus/GroupedStats through a runtime type
-// assertion, so a signature drift on the real implementation would leave the
-// suite green while the whole host view silently rendered no status.
+// the grouped screen reaches GroupedHost through a runtime type assertion, so a
+// signature drift on the real implementation would leave the suite green while
+// the whole host view silently rendered no status.
 var _ HostGrouper = (*compose.HostContainers)(nil)
 
 func groupedTestModel(g *mockGrouper, projects []compose.Project) Model {
@@ -18263,8 +18292,8 @@ func TestGroupedServicesMsg_Hydrates(t *testing.T) {
 	if _, ok := m.svcStatus["api"]; ok {
 		t.Error("a bare-name key survived arrival; the handler must qualify")
 	}
-	if len(m.services) != 4 {
-		t.Errorf("services = %v, want the flat list of all four", m.services)
+	if got := modelServices(m); len(got) != 4 {
+		t.Errorf("services = %v, want the flat list of all four", got)
 	}
 }
 
@@ -18344,12 +18373,14 @@ func TestGroupedServicesMsg_ShrinkClampsCursor(t *testing.T) {
 	}
 }
 
+// The grouped fetch carries status AND stats in one message: one host-wide read
+// serves both, so a second Cmd would list the containers twice per refresh.
 func TestGroupedStatsMsg_Hydrates(t *testing.T) {
 	g, projects := groupedFixture()
 	m := groupedTestModel(g, projects)
 	m.refreshInFlight = true
 
-	updated, _ := m.Update(m.refreshGroupedStats()())
+	updated, _ := m.Update(m.loadGroups()())
 	m = updated.(Model)
 
 	if m.statsErr != nil {
@@ -18375,9 +18406,6 @@ func TestGroupedStatsMsg_FailureIsSoft(t *testing.T) {
 	updated, _ := m.Update(m.loadGroups()())
 	m = updated.(Model)
 
-	updated, _ = m.Update(m.refreshGroupedStats()())
-	m = updated.(Model)
-
 	if m.statsErr == nil {
 		t.Fatal("statsErr should carry the stats failure")
 	}
@@ -18389,12 +18417,36 @@ func TestGroupedStatsMsg_FailureIsSoft(t *testing.T) {
 	}
 }
 
-func TestRefreshGroupedStats_NoGrouperIsEmptyNotAnError(t *testing.T) {
+// A factory that produces no HostGrouper (every test mock) must still render
+// the projects the loader found: no host data is not an error.
+func TestLoadGroups_NoGrouperIsEmptyNotAnError(t *testing.T) {
 	mc := &mockComposer{}
 	m := NewModel(nil, io.Discard, mockFactory(mc), nil, nil)
-	msg := m.refreshGroupedStats()().(statsMsg)
-	if msg.err != nil || !msg.groupedPayload || msg.hostStats != nil {
-		t.Errorf("statsMsg = %+v, want an empty grouped payload with no error", msg)
+	m.projectLoader = func(ctx context.Context) ([]compose.Project, error) {
+		return []compose.Project{{Name: "shop", ConfigDir: "/srv/shop"}}, nil
+	}
+	msg := m.loadGroups()().(servicesMsg)
+	if msg.err != nil || !msg.groupedPayload || msg.hostStatus != nil || msg.hostStats != nil {
+		t.Errorf("servicesMsg = %+v, want an empty grouped payload with no error", msg)
+	}
+	if len(msg.projects) != 1 {
+		t.Errorf("projects = %v, want the loader result to survive", msg.projects)
+	}
+}
+
+// statsRefreshCmd is nil in grouped mode: loadGroups already carries the stats
+// half, and a second command would be a second `docker ps`. Every call site
+// batches the pair, and tea.Batch drops a nil, so no site needs a mode branch.
+func TestStatsRefreshCmd_NilInGroupedMode(t *testing.T) {
+	g, projects := groupedFixture()
+	m := groupedTestModel(g, projects)
+	if m.statsRefreshCmd() != nil {
+		t.Error("statsRefreshCmd() must be nil in grouped mode")
+	}
+	m.grouped = false
+	m.composer = &mockComposer{}
+	if m.statsRefreshCmd() == nil {
+		t.Error("statsRefreshCmd() must still fetch in drilled mode")
 	}
 }
 
@@ -18507,7 +18559,6 @@ func TestEnterGroupedContainers_ResetsAndBumpsSessions(t *testing.T) {
 	for name, got := range map[string]bool{
 		"svcGroups":       m.svcGroups != nil,
 		"svcEntries":      m.svcEntries != nil,
-		"services":        m.services != nil,
 		"svcStatus":       m.svcStatus != nil,
 		"stats":           m.stats != nil,
 		"statsErr":        m.statsErr != nil,
@@ -18580,7 +18631,7 @@ func TestConnectError_ClearsGroupedState(t *testing.T) {
 	if m.grouped {
 		t.Error("a failed connect leaves the server screen; grouped must be cleared")
 	}
-	if m.svcGroups != nil || m.svcEntries != nil || m.services != nil {
+	if m.svcGroups != nil || m.svcEntries != nil {
 		t.Error("the grouped rows must not outlive the failed connect")
 	}
 	if m.svcStatus != nil || m.stats != nil || len(m.selected) != 0 {
@@ -18740,15 +18791,16 @@ func TestGroupedScreen_ConfirmPromptClampsToWidth(t *testing.T) {
 // A selection that spans two projects is a two-batch sequence, not a refusal:
 // the progress screen runs one pipeline per project, in screen order.
 func TestGroupedScreen_ArmsCrossProjectSelection(t *testing.T) {
-	base := groupedOpModel(t)
-	base.width = 100
-	base.height = 24
-	base.selected["blog/web"] = true
-	base.selected["shop/api"] = true
-
 	for _, key := range []string{"d", "r", "s"} {
 		t.Run(key, func(t *testing.T) {
-			m := base
+			// Built INSIDE the subtest: a Model copied by value still shares
+			// its selected map, svcGroups and svcEntries, so one subtest that
+			// selected or folded would silently rewrite the next one's fixture.
+			m := groupedOpModel(t)
+			m.width = 100
+			m.height = 24
+			m.selected["blog/web"] = true
+			m.selected["shop/api"] = true
 			updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune(key)})
 			got := updated.(Model)
 			if !got.confirming {
@@ -18993,8 +19045,6 @@ func TestGroupedScreen_RendersWithoutPanicking(t *testing.T) {
 	m.width, m.height = 100, 30
 	updated, _ := m.Update(m.loadGroups()())
 	m = updated.(Model)
-	updated, _ = m.Update(m.refreshGroupedStats()())
-	m = updated.(Model)
 
 	v := m.View()
 	for _, name := range []string{"api", "db", "web", "watchtower"} {
@@ -19016,7 +19066,7 @@ func TestGroupedScreen_EmptyHostLeavesLoadingState(t *testing.T) {
 	updated, _ := m.Update(m.loadGroups()())
 	m = updated.(Model)
 
-	if m.services == nil {
+	if m.svcGroups == nil {
 		t.Fatal("an empty host must still install a non-nil services slice")
 	}
 	if v := m.View(); strings.Contains(v, "Loading services") {
@@ -19609,8 +19659,8 @@ func TestGroupedScreen_EnterDrillsIntoProject(t *testing.T) {
 	if len(m.svcGroups) != 1 || m.svcGroups[0].proj.Name != "shop" {
 		t.Errorf("svcGroups = %+v, want the one drilled group", m.svcGroups)
 	}
-	if !slices.Equal(m.services, []string{"api", "db"}) {
-		t.Errorf("services = %v, want the group's rows painted immediately", m.services)
+	if got := modelServices(m); !slices.Equal(got, []string{"api", "db"}) {
+		t.Errorf("services = %v, want the group's rows painted immediately", got)
 	}
 	if !m.drilledFromHost {
 		t.Error("the drilled screen must report a parent so esc can drill back out")
@@ -19641,7 +19691,7 @@ func TestGroupedScreen_DrillInReloadsThroughTheGroupComposer(t *testing.T) {
 	updated, _ := m.Update(keyMsgFor("enter"))
 	m = updated.(Model)
 
-	msg, ok := m.loadContainerScreenCmd()().(servicesMsg)
+	msg, ok := m.loadServices()().(servicesMsg)
 	if !ok {
 		t.Fatal("the drilled screen must load through loadServices")
 	}
@@ -20545,8 +20595,13 @@ func TestBatchWait_WholeProjectBatchResolvesTargetsViaListServices(t *testing.T)
 		composer:  mc,
 		ctx:       context.Background(),
 		batches:   []opBatch{{proj: compose.Project{Name: "shop", ConfigDir: "/srv/shop"}}},
-		// Host-wide in grouped mode, so it must NEVER seed one project's gate.
-		services: []string{"web", "api", "db", "watchtower"},
+		// Host-wide rows in grouped mode, so they must NEVER seed one
+		// project's gate: drilledServices() answers nil for more than one
+		// group, which is what forces the ListServices round-trip.
+		svcGroups: []svcGroup{
+			svcGroupOf("shop", "api", "db"),
+			svcGroupOf("blog", "web"),
+		},
 	}
 
 	updated, cmd := m.Update(pipelineDoneMsg{})
@@ -21241,5 +21296,667 @@ func TestGroupedInit_FiresNoUpdateScan(t *testing.T) {
 	if scanned.updatesCalls != 0 || g.updatesCalls != 0 {
 		t.Errorf("Init() ran CheckUpdates %d/%d times; grouped mode waits for U",
 			scanned.updatesCalls, g.updatesCalls)
+	}
+}
+
+// --- Review-round regression pins ---
+
+// TestEscCancel_LeavesATerminalState is the hang pin. esc on a running pipeline
+// bumps batchSession, which invalidates the pipelineDoneMsg the closing channel
+// produces — the one message that used to set m.done. Without a terminal state
+// set HERE, a cancel that lands after the last step succeeded leaves
+// done == false && failed == false, and then esc re-cancels, q is a no-op and
+// ctrl+c falls through to the viewport: the TUI has no exit.
+func TestEscCancel_LeavesATerminalState(t *testing.T) {
+	cancelled := false
+	m := Model{
+		screen:         screenProgress,
+		pendingOp:      runner.Deploy,
+		ctx:            context.Background(),
+		batchStepCount: 1,
+		batches:        []opBatch{{proj: compose.Project{Name: "shop", ConfigDir: "/srv/shop"}}},
+		steps:          []stepState{progressStep(runner.StepStopping, runner.StatusRunning)},
+		cancel:         func() { cancelled = true },
+	}
+
+	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyEsc})
+	got := updated.(Model)
+
+	if !cancelled {
+		t.Error("esc must cancel the running batch context")
+	}
+	if !got.failed {
+		t.Fatal("esc-cancel must resolve the screen: done and failed both false is an unescapable state")
+	}
+	// A second esc now navigates back, which is the whole point.
+	back, _ := got.Update(tea.KeyMsg{Type: tea.KeyEsc})
+	if back.(Model).screen != screenSelectContainers {
+		t.Error("the second esc must leave the progress screen")
+	}
+	// And the sequence is still stopped: the stale done message cannot advance.
+	stale, _ := got.Update(pipelineDoneMsg{batchIdx: 0, session: 0})
+	if stale.(Model).batchIdx != 0 {
+		t.Error("a cancelled batch must not advance the sequence")
+	}
+}
+
+// A mid-sequence health gate opens with done AND failed both false, because
+// pipelineDoneMsg sets done only for the LAST batch. q and ctrl+c must still
+// work there — the `?` overlay's WAIT group names both.
+func TestProgressWait_QAndCtrlCAreLiveMidSequence(t *testing.T) {
+	newModel := func() Model {
+		return Model{
+			screen:         screenProgress,
+			pendingOp:      runner.Deploy,
+			ctx:            context.Background(),
+			waiting:        true,
+			batchIdx:       0,
+			batchStepCount: 1,
+			batches: []opBatch{
+				{proj: compose.Project{Name: "blog", ConfigDir: "/srv/blog"}},
+				{proj: compose.Project{Name: "shop", ConfigDir: "/srv/shop"}},
+			},
+			steps: []stepState{
+				progressStep(runner.StepStopping, runner.StatusDone),
+				progressStep(runner.StepStopping, ""),
+			},
+			waitState: runner.NewWaitState([]string{"api"}),
+		}
+	}
+
+	m := newModel()
+	if m.done || m.failed {
+		t.Fatal("precondition: a mid-sequence gate carries neither terminal flag")
+	}
+	if m.progressPhase() != progressWaiting {
+		t.Fatal("precondition: the phase must resolve to waiting")
+	}
+
+	// q rewrites to esc, which skips the gate and releases the next batch.
+	skipped, cmd := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("q")})
+	got := skipped.(Model)
+	if got.waiting {
+		t.Error("q must skip the health wait, not be swallowed")
+	}
+	if cmd == nil {
+		t.Fatal("skipping a mid-sequence gate must release the next batch")
+	}
+	if _, ok := cmd().(batchDoneMsg); !ok {
+		t.Errorf("cmd produced %T, want batchDoneMsg", cmd())
+	}
+
+	// ctrl+c quits (no remote connection here, so tryQuit returns tea.Quit).
+	_, qcmd := newModel().Update(tea.KeyMsg{Type: tea.KeyCtrlC})
+	if qcmd == nil {
+		t.Fatal("ctrl+c must quit from an open health gate")
+	}
+	if _, ok := qcmd().(tea.QuitMsg); !ok {
+		t.Errorf("ctrl+c produced %T, want tea.QuitMsg", qcmd())
+	}
+}
+
+// A running pipeline still swallows both keys — that half must not regress.
+func TestProgressRunning_QAndCtrlCStayInert(t *testing.T) {
+	m := Model{
+		screen:         screenProgress,
+		pendingOp:      runner.Deploy,
+		ctx:            context.Background(),
+		batchStepCount: 1,
+		batches:        []opBatch{{proj: compose.Project{Name: "shop"}}},
+		steps:          []stepState{progressStep(runner.StepStopping, runner.StatusRunning)},
+	}
+	for _, k := range []tea.KeyMsg{
+		{Type: tea.KeyRunes, Runes: []rune("q")},
+		{Type: tea.KeyCtrlC},
+	} {
+		got, cmd := m.Update(k)
+		if got.(Model).screen != screenProgress || cmd != nil {
+			t.Errorf("%v must be a no-op while a pipeline runs", k)
+		}
+	}
+}
+
+// TestProgressWindow_KeepsTheRunningBatchOnScreen pins the windowing rule: a
+// multi-batch plan emits more step rows than a short terminal holds, and
+// bubbletea keeps only the LAST m.height lines, so an unwindowed render drops
+// the title and the batch that is actually running.
+func TestProgressWindow_KeepsTheRunningBatchOnScreen(t *testing.T) {
+	batches := make([]opBatch, 0, 5)
+	var steps []stepState
+	for _, name := range []string{"p0", "p1", "p2", "p3", "p4"} {
+		batches = append(batches, opBatch{proj: compose.Project{Name: name, ConfigDir: "/srv/" + name}})
+		for _, step := range runner.Steps(runner.Deploy) {
+			steps = append(steps, stepState{name: step, label: name + ": " + step})
+		}
+	}
+	m := Model{
+		screen:         screenProgress,
+		pendingOp:      runner.Deploy,
+		ctx:            context.Background(),
+		batches:        batches,
+		batchStepCount: len(runner.Steps(runner.Deploy)),
+		batchIdx:       4, // the LAST project is running
+		steps:          steps,
+		width:          100,
+		height:         24,
+	}
+
+	out := ansi.Strip(m.viewProgress())
+	lines := strings.Split(strings.TrimRight(out, "\n"), "\n")
+	if len(lines) > m.height {
+		t.Errorf("viewProgress rendered %d lines into a %d-row terminal:\n%s", len(lines), m.height, out)
+	}
+	if !strings.Contains(lines[0], "Deploy") {
+		t.Errorf("the title must survive the window, first line = %q", lines[0])
+	}
+	if !strings.Contains(out, "p4: ") {
+		t.Errorf("the running batch must stay on screen:\n%s", out)
+	}
+	if !strings.Contains(out, "more") {
+		t.Errorf("a windowed list must say how much is hidden:\n%s", out)
+	}
+}
+
+// With room to spare, nothing is windowed and no marker is drawn.
+func TestProgressWindow_NoMarkersWhenEverythingFits(t *testing.T) {
+	m := Model{
+		screen:         screenProgress,
+		pendingOp:      runner.Restart,
+		ctx:            context.Background(),
+		batches:        []opBatch{{proj: compose.Project{Name: "shop"}}},
+		batchStepCount: 2,
+		steps: []stepState{
+			progressStep("Stop", runner.StatusDone),
+			progressStep("Start", runner.StatusDone),
+		},
+		done:   true,
+		width:  100,
+		height: 40,
+	}
+	if out := ansi.Strip(m.viewProgress()); strings.Contains(out, "more") {
+		t.Errorf("nothing should be hidden at height 40:\n%s", out)
+	}
+}
+
+func TestProgressStepWindow(t *testing.T) {
+	tests := []struct {
+		name                string
+		total, rows, lo, hi int
+		wantStart, wantEnd  int
+	}{
+		{"everything fits", 10, 10, 0, 5, 0, 10},
+		{"budget larger than the plan", 4, 9, 0, 4, 0, 4},
+		{"zero budget renders everything", 4, 0, 0, 4, 0, 4},
+		{"first batch anchors at the top", 25, 10, 0, 5, 0, 10},
+		{"last batch scrolls into view", 25, 10, 20, 25, 15, 25},
+		{"a batch taller than the budget shows its head", 25, 3, 20, 25, 20, 23},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			start, end := progressStepWindow(tt.total, tt.rows, tt.lo, tt.hi)
+			if start != tt.wantStart || end != tt.wantEnd {
+				t.Errorf("progressStepWindow(%d,%d,%d,%d) = (%d,%d), want (%d,%d)",
+					tt.total, tt.rows, tt.lo, tt.hi, start, end, tt.wantStart, tt.wantEnd)
+			}
+		})
+	}
+}
+
+// A sequence where batch 0 deployed and batch 1 failed DID change batch 0's
+// image freshness. Keying the invalidation off m.done — which only the LAST
+// batch sets — left those glyphs stale for the full 10-minute TTL.
+func TestEscFromProgress_InvalidatesTheBatchesThatFinished(t *testing.T) {
+	blog := compose.Project{Name: "blog", ConfigDir: "/srv/blog"}
+	shop := compose.Project{Name: "shop", ConfigDir: "/srv/shop"}
+	mc := &mockComposer{}
+	m := NewModel(nil, io.Discard, mockFactory(mc), nil, nil)
+	installFakeTick(&m)
+	m.screen = screenProgress
+	m.composer = mc
+	m.pendingOp = runner.Deploy
+	m.batches = []opBatch{{proj: blog}, {proj: shop}}
+	m.batchIdx = 1
+	m.failed = true // batch 1 failed; batch 0 finished
+	m.updateCache = map[string]updateEntry{
+		m.projUpdatesCacheKey(blog): {fetchedAt: time.Now(), results: map[string]bool{"web": true}},
+		m.projUpdatesCacheKey(shop): {fetchedAt: time.Now(), results: map[string]bool{"api": true}},
+	}
+
+	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyEsc})
+	got := updated.(Model)
+
+	if _, present := got.updateCache[got.projUpdatesCacheKey(blog)]; present {
+		t.Error("the batch that finished must have its verdicts invalidated")
+	}
+	if _, present := got.updateCache[got.projUpdatesCacheKey(shop)]; !present {
+		t.Error("the batch that FAILED must keep its cache: a failed deploy changed nothing")
+	}
+}
+
+// A grouped R must build its batch from the project captured at press time.
+// m.currentProject() is the ZERO project in grouped mode, so the batch carried
+// no name and the post-success invalidation deleted "|<server>" instead of the
+// rolled-back project's key.
+func TestGroupedRollback_BatchCarriesTheCapturedProject(t *testing.T) {
+	rc := &mockRollbackComposer{mockComposer: mockComposer{services: []string{"api", "db"}}}
+	m := groupedScreenModel(
+		svcGroup{proj: compose.Project{Name: "blog", ConfigDir: "/srv/blog"}, services: []string{"web"}},
+		svcGroup{proj: compose.Project{Name: "shop", ConfigDir: "/srv/shop"}, services: []string{"api", "db"}},
+	)
+	m.ctx = context.Background()
+	m.composerFactory = func(compose.Project) runner.Composer { return rc }
+	m.svcCursor = 3 // shop/api
+	m.selected[svcKey("shop", "api")] = true
+
+	updated, cmd := m.Update(keyMsgFor("R"))
+	m = updated.(Model)
+	if m.rollbackProj.Name != "shop" || m.rollbackProj.ConfigDir != "/srv/shop" {
+		t.Fatalf("rollbackProj = %+v, want the shop project captured at press time", m.rollbackProj)
+	}
+	if cmd == nil {
+		t.Fatal("R must fetch the snapshot")
+	}
+	if m.composer != runner.Composer(rc) {
+		t.Error("R must bind the captured project's composer")
+	}
+
+	// Arm the prompt the way rollbackSnapshotMsg does, then confirm.
+	m.rollbackSnapshot = &compose.Snapshot{Services: map[string]compose.SnapshotEntry{"api": {}}}
+	m.pendingOp = runner.Rollback
+	m.confirming = true
+	running, _ := m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	got := running.(Model)
+	if len(got.batches) != 1 || got.batches[0].proj.Name != "shop" {
+		t.Fatalf("batches = %+v, want one shop batch", got.batches)
+	}
+	if got.projUpdatesCacheKey(got.batches[0].proj) != "/srv/shop|" {
+		t.Errorf("batch cache key = %q, want the shop project's own key",
+			got.projUpdatesCacheKey(got.batches[0].proj))
+	}
+}
+
+// buildSvcGroups synthesises a group with NO ConfigDir when `docker compose ls`
+// and `docker ps` disagree. compose.New("") leaves cmd.Dir unset, so every
+// operation on such a group would run against cdeploy's own working directory.
+func TestGroupedScreen_RefusesAProjectWithNoComposeDir(t *testing.T) {
+	newModel := func() Model {
+		m := groupedScreenModel(
+			svcGroupOf("ghost", "api"), // no ConfigDir
+			unmanagedGroupOf("watchtower"),
+		)
+		m.composerFactory = func(compose.Project) runner.Composer { return &mockComposer{} }
+		m.svcCursor = 1 // the ghost/api service row
+		return m
+	}
+
+	for _, key := range []string{"d", "r", "s"} {
+		m := newModel()
+		updated, _ := m.Update(keyMsgFor(key))
+		got := updated.(Model)
+		if got.confirming {
+			t.Errorf("%q armed an operation on a project with no compose directory", key)
+		}
+		if got.warning != warnNoComposeDir {
+			t.Errorf("%q warning = %q, want %q", key, got.warning, warnNoComposeDir)
+		}
+	}
+
+	// enter on its header must not drill in either.
+	m := newModel()
+	m.svcCursor = 0
+	updated, cmd := m.Update(keyMsgFor("enter"))
+	got := updated.(Model)
+	if !got.grouped || cmd != nil {
+		t.Error("enter must refuse to drill into a project with no compose directory")
+	}
+	if got.warning != warnNoComposeDir {
+		t.Errorf("drill warning = %q, want %q", got.warning, warnNoComposeDir)
+	}
+
+	// And the bind itself refuses, which is what covers l/x/i/c too.
+	m = newModel()
+	if m.bindProjComposer(compose.Project{Name: "ghost"}) {
+		t.Error("bindProjComposer must refuse a grouped project with no compose directory")
+	}
+	if m.composer != nil {
+		t.Error("a refused bind must leave no composer behind")
+	}
+}
+
+// The refusal is GROUPED-only: the drilled local fast track legitimately runs
+// with an empty ConfigDir, because compose finds the file in the working
+// directory the user launched cdeploy in.
+func TestOperableProject_DrilledEmptyDirIsFine(t *testing.T) {
+	m := Model{}
+	if !m.operableProject(compose.Project{}) {
+		t.Error("drilled mode must accept an empty ConfigDir")
+	}
+	m.grouped = true
+	if m.operableProject(compose.Project{Name: "ghost"}) {
+		t.Error("grouped mode must refuse an empty ConfigDir")
+	}
+	if !m.operableProject(compose.Project{Name: compose.UnmanagedProjectName, Unmanaged: true}) {
+		t.Error("the unmanaged bucket needs no directory")
+	}
+}
+
+// Two dirless groups must not share one update-cache slot, and neither may
+// collide with the local fast track's bare "|".
+func TestProjUpdatesCacheKey_DirlessProjectsStayDistinct(t *testing.T) {
+	m := Model{}
+	a := m.projUpdatesCacheKey(compose.Project{Name: "ghost"})
+	b := m.projUpdatesCacheKey(compose.Project{Name: "phantom"})
+	if a == b {
+		t.Errorf("two dirless projects share the key %q", a)
+	}
+	if a == m.projUpdatesCacheKey(compose.Project{}) {
+		t.Errorf("a dirless project collides with the local fast-track slot %q", a)
+	}
+	// The unmanaged prefix rule is unchanged.
+	un := m.projUpdatesCacheKey(compose.Project{Name: compose.UnmanagedProjectName, Unmanaged: true})
+	if un != "unmanaged||" {
+		t.Errorf("unmanaged key = %q, want %q", un, "unmanaged||")
+	}
+	// updatesCacheKey is projUpdatesCacheKey applied to the current project.
+	if m.updatesCacheKey() != m.projUpdatesCacheKey(m.currentProject()) {
+		t.Error("the two key producers must agree by construction")
+	}
+}
+
+// A host whose only group is the unmanaged bucket has no write key that can do
+// anything, so it must get the read-only help table and footer rather than
+// advertise three no-ops.
+func TestGroupedScreen_UnmanagedOnlyHostIsReadOnly(t *testing.T) {
+	m := groupedScreenModel(unmanagedGroupOf("watchtower", "portainer"))
+	if !m.readOnly() {
+		t.Fatal("an unmanaged-only grouped host must read as read-only")
+	}
+	line1, line2 := m.containerHelpLines()
+	for _, tok := range []string{"d deploy", "r restart", "space", "enter drill in"} {
+		if strings.Contains(line1+line2, tok) {
+			t.Errorf("the footer advertises %q, which refuses on this host: %q / %q", tok, line1, line2)
+		}
+	}
+	// A host with a compose project alongside it stays writable.
+	mixed := groupedScreenModel(svcGroupOf("shop", "api"), unmanagedGroupOf("watchtower"))
+	if mixed.readOnly() {
+		t.Error("a host with a compose project must stay writable")
+	}
+	// An empty/loading host is not read-only either.
+	if (Model{grouped: true}).readOnly() {
+		t.Error("a host with no groups yet must not flip to read-only")
+	}
+}
+
+// A folded group hides its ROWS, and search jumps between rows — so a match
+// inside one has to open it, or `/db` reports "(no match)" for a service that
+// is plainly on the host.
+func TestSearch_UnfoldsAGroupHoldingAMatch(t *testing.T) {
+	m := groupedScreenModel(
+		svcGroupOf("blog", "web"),
+		svcGroupOf("shop", "api", "db"),
+	)
+	m.svcGroups[1].folded = true
+	m.svcEntries = rebuildSvcEntries(m.svcGroups)
+	m.searchInput = textinput.New()
+	m.searchInput.Focus()
+	m.searching = true
+
+	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("db")})
+	got := updated.(Model)
+
+	if got.svcGroups[1].folded {
+		t.Error("the group holding the match must be unfolded")
+	}
+	if len(got.searchMatches) != 1 {
+		t.Fatalf("searchMatches = %v, want the one db row", got.searchMatches)
+	}
+	if name := got.svcEntries[got.searchMatches[0]].name; name != "db" {
+		t.Errorf("matched row = %q, want db", name)
+	}
+	if got.svcCursor != got.searchMatches[0] {
+		t.Error("the cursor must jump to the match it just revealed")
+	}
+}
+
+// U is the only trigger in grouped mode, so a cached failure's warning has to
+// age out on its own or it outlives the failure for the rest of the visit.
+func TestGroupedUpdatesErr_ExpiresWithItsCacheEntry(t *testing.T) {
+	m := groupedScreenModel(svcGroupOf("shop", "api"))
+	key := m.projUpdatesCacheKey(m.svcGroups[0].proj)
+	m.updatesErr = "registry unreachable"
+
+	m.updateCache = map[string]updateEntry{key: {fetchedAt: time.Now(), err: true, errMsg: "registry unreachable"}}
+	m.expireGroupedUpdatesErr()
+	if m.updatesErr == "" {
+		t.Error("a FRESH failure entry must keep its warning")
+	}
+
+	m.updateCache[key] = updateEntry{fetchedAt: time.Now().Add(-2 * updatesErrorTTL), err: true}
+	m.expireGroupedUpdatesErr()
+	if m.updatesErr != "" {
+		t.Errorf("updatesErr = %q, want it cleared once the entry expired", m.updatesErr)
+	}
+}
+
+// A grouped reload can add or drop rows, which renumbers every entry index —
+// so a committed search must be re-derived, or n/N cycles stale rows.
+func TestGroupedReload_RederivesCommittedSearchMatches(t *testing.T) {
+	g, projects := groupedFixture()
+	m := groupedTestModel(g, projects)
+	updated, _ := m.Update(m.loadGroups()())
+	m = updated.(Model)
+	m.searchQuery = "web"
+	m.searchMatches = computeMatches(m.svcEntries, m.searchQuery)
+	if len(m.searchMatches) != 1 {
+		t.Fatalf("precondition: matches = %v", m.searchMatches)
+	}
+	before := m.searchMatches[0]
+
+	// A project appears above blog, shifting every row index down.
+	g.groupedStatus["aaa"] = map[string]runner.ServiceStatus{"svc": {Running: true}}
+	m.projectLoader = func(ctx context.Context) ([]compose.Project, error) {
+		return append([]compose.Project{{Name: "aaa", ConfigDir: "/srv/aaa"}}, projects...), nil
+	}
+	updated, _ = m.Update(m.loadGroups()())
+	m = updated.(Model)
+
+	if len(m.searchMatches) != 1 {
+		t.Fatalf("matches = %v, want the one web row after the reload", m.searchMatches)
+	}
+	if m.searchMatches[0] == before {
+		t.Error("the reload renumbered the rows; searchMatches must be re-derived")
+	}
+	if name := m.svcEntries[m.searchMatches[0]].name; name != "web" {
+		t.Errorf("match points at %q, want web", name)
+	}
+}
+
+// startBatch's bind-failure path: a factory that cannot produce a composer for
+// batch i must fail the sequence and mark the rest skipped, never advance it.
+func TestStartBatch_BindFailureStopsTheSequence(t *testing.T) {
+	m := Model{
+		screen:    screenSelectContainers,
+		grouped:   true,
+		ctx:       context.Background(),
+		pendingOp: runner.Deploy,
+		logWriter: io.Discard,
+		composerFactory: func(p compose.Project) runner.Composer {
+			if p.Name == "shop" {
+				return nil // the factory refuses the second project
+			}
+			return &mockComposer{}
+		},
+	}
+	batches := []opBatch{
+		{proj: compose.Project{Name: "blog", ConfigDir: "/srv/blog"}},
+		{proj: compose.Project{Name: "shop", ConfigDir: "/srv/shop"}},
+	}
+	updated, _ := m.enterProgress(batches)
+	got := updated.(Model)
+	got.batchIdx = 1
+	cmd := got.startBatch()
+
+	if cmd != nil {
+		t.Error("a failed bind must launch no pipeline")
+	}
+	if !got.failed {
+		t.Fatal("a failed bind must fail the operation")
+	}
+	stepsPerBatch := len(runner.Steps(runner.Deploy))
+	for i := stepsPerBatch; i < len(got.steps); i++ {
+		if got.steps[i].status != statusSkipped {
+			t.Fatalf("step %d status = %q, want skipped", i, got.steps[i].status)
+		}
+	}
+}
+
+// The confirming enter refuses when the first batch cannot bind: the prompt is
+// dropped and the user stays on the container screen, with the reason named.
+func TestConfirmEnter_BindFailureCancelsThePrompt(t *testing.T) {
+	m := groupedScreenModel(svcGroupOf("shop", "api"))
+	m.composerFactory = func(compose.Project) runner.Composer { return nil }
+	m.svcCursor = 0
+	m.pendingOp = runner.Deploy
+	m.confirming = true
+
+	updated, cmd := m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	got := updated.(Model)
+
+	if got.confirming {
+		t.Error("a prompt that cannot bind must not stay armed")
+	}
+	if got.screen != screenSelectContainers || cmd != nil {
+		t.Error("a refused confirmation must not navigate")
+	}
+}
+
+// The composer-binding refusal guards: each one makes an action key silently
+// inert, so each needs a pin of its own.
+func TestBindComposerGuards(t *testing.T) {
+	t.Run("bindProjComposer with no factory", func(t *testing.T) {
+		m := Model{grouped: true}
+		if m.bindProjComposer(compose.Project{Name: "shop", ConfigDir: "/srv/shop"}) {
+			t.Error("no factory must refuse")
+		}
+	})
+	t.Run("bindProjComposer when the factory returns nil", func(t *testing.T) {
+		m := Model{grouped: true, composerFactory: func(compose.Project) runner.Composer { return nil }}
+		if m.bindProjComposer(compose.Project{Name: "shop", ConfigDir: "/srv/shop"}) {
+			t.Error("a nil composer must refuse")
+		}
+		if m.composer != nil {
+			t.Error("a refused bind must leave no composer behind")
+		}
+	})
+	t.Run("bindCursorComposer off every row", func(t *testing.T) {
+		m := Model{grouped: true, composerFactory: func(compose.Project) runner.Composer { return &mockComposer{} }}
+		if m.bindCursorComposer() {
+			t.Error("a cursor on no row must refuse")
+		}
+	})
+	t.Run("bindCursorComposer is a pass-through when drilled", func(t *testing.T) {
+		m := Model{}
+		if !m.bindCursorComposer() {
+			t.Error("drilled mode already owns its composer")
+		}
+	})
+	t.Run("drillIntoGroup out of range", func(t *testing.T) {
+		m := groupedScreenModel(svcGroupOf("shop", "api"))
+		m.composerFactory = func(compose.Project) runner.Composer { return &mockComposer{} }
+		if cmd := m.drillIntoGroup(-1); cmd != nil {
+			t.Error("a negative index must refuse")
+		}
+		if cmd := m.drillIntoGroup(9); cmd != nil {
+			t.Error("an out-of-range index must refuse")
+		}
+		if !m.grouped {
+			t.Error("a refused drill must not change mode")
+		}
+	})
+	t.Run("drillIntoGroup with no factory", func(t *testing.T) {
+		m := groupedScreenModel(svcGroupOf("shop", "api"))
+		m.svcGroups[0].proj.ConfigDir = "/srv/shop"
+		if cmd := m.drillIntoGroup(0); cmd != nil {
+			t.Error("no factory must refuse")
+		}
+	})
+	t.Run("drillIntoGroup when the factory returns nil", func(t *testing.T) {
+		m := groupedScreenModel(svcGroupOf("shop", "api"))
+		m.svcGroups[0].proj.ConfigDir = "/srv/shop"
+		m.composerFactory = func(compose.Project) runner.Composer { return nil }
+		if cmd := m.drillIntoGroup(0); cmd != nil {
+			t.Error("a nil composer must refuse")
+		}
+		if !m.grouped || m.composer != nil {
+			t.Error("a refused drill must leave the grouped screen untouched")
+		}
+	})
+}
+
+// setGroups(nil) is "still loading" — the nil-vs-empty distinction the screen's
+// loading state reads. An EMPTY but non-nil slice is a real, empty host.
+func TestSetGroups_NilIsLoadingEmptyIsAHost(t *testing.T) {
+	m := groupedScreenModel(svcGroupOf("shop", "api"))
+	m.setGroups(nil)
+	if m.svcGroups != nil || m.svcEntries != nil {
+		t.Fatalf("setGroups(nil) must clear the rows, got %v / %v", m.svcGroups, m.svcEntries)
+	}
+	if out := m.viewSelectContainers(); !strings.Contains(out, "Loading services") {
+		t.Errorf("a nil group slice must render the loading state:\n%s", out)
+	}
+
+	m.setGroups([]svcGroup{})
+	if m.svcGroups == nil {
+		t.Fatal("an empty but non-nil slice is a real host, not a loading state")
+	}
+	if out := m.viewSelectContainers(); strings.Contains(out, "Loading services") {
+		t.Errorf("an empty host must not claim to still be loading:\n%s", out)
+	}
+}
+
+// The out-of-range row-model guards return "" rather than panicking, which is
+// the whole reason they exist.
+func TestRowModel_OutOfRangeGuards(t *testing.T) {
+	m := groupedScreenModel(svcGroupOf("shop", "api"), svcGroupOf("blog", "web"))
+	for _, gi := range []int{-1, 2, 99} {
+		if got := m.groupProjName(gi); got != "" {
+			t.Errorf("groupProjName(%d) = %q, want empty", gi, got)
+		}
+	}
+	for _, i := range []int{-1, len(m.svcEntries), 99} {
+		if got := m.svcKeyAt(i); got != "" {
+			t.Errorf("svcKeyAt(%d) = %q, want empty", i, got)
+		}
+	}
+	// A header row carries no service, so it has no key either.
+	if got := m.svcKeyAt(0); got != "" {
+		t.Errorf("svcKeyAt(header) = %q, want empty", got)
+	}
+	if got := m.svcKeyAt(1); got != svcKey("shop", "api") {
+		t.Errorf("svcKeyAt(1) = %q, want the qualified key", got)
+	}
+}
+
+// A long project name plus its aggregates must never wrap: the wrap would cost
+// the list a row svcVisibleCount already spent.
+func TestGroupHeaderRow_IsClampedToWidth(t *testing.T) {
+	long := strings.Repeat("verylongproject", 6)
+	m := groupedScreenModel(svcGroupOf(long, "api"), svcGroupOf("blog", "web"))
+	m.width = 40
+	m.svcStatus = map[string]runner.ServiceStatus{svcKey(long, "api"): {Running: true}}
+
+	found := false
+	for _, l := range strings.Split(ansi.Strip(m.viewSelectContainers()), "\n") {
+		if !strings.Contains(l, "▼") && !strings.Contains(l, "▶") {
+			continue
+		}
+		found = true
+		if ansi.StringWidth(l) > m.width {
+			t.Errorf("header overruns width %d (%d cells): %q", m.width, ansi.StringWidth(l), l)
+		}
+	}
+	if !found {
+		t.Fatal("precondition: the fixture must draw group headers")
 	}
 }

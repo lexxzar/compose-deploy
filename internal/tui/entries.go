@@ -67,13 +67,11 @@ func rebuildSvcEntries(groups []svcGroup) []svcEntry {
 // off it and the renderer takes its 2-cell service indent off the same call, so
 // a host that happens to hold exactly one project renders byte-identically to
 // the drilled screen.
+//
+// Render decisions that must follow the entry model — the service indent, the
+// caption pad, the scroll indicators — read THIS, never m.grouped: grouped mode
+// with a single project emits no headers.
 func groupsHaveHeaders(groups []svcGroup) bool { return len(groups) > 1 }
-
-// hasGroupHeaders reports whether the container screen currently draws group
-// header rows. Render decisions that must follow the entry model — the service
-// indent, the caption pad, the scroll indicators — read it rather than
-// m.grouped: grouped mode with a single project emits no headers.
-func (m Model) hasGroupHeaders() bool { return groupsHaveHeaders(m.svcGroups) }
 
 // groupCounts totals one group's live state for its header row: how many of its
 // services are running, how many report a failing healthcheck, and how many have
@@ -180,6 +178,38 @@ type svcRef struct {
 	groupIdx int
 	name     string
 	key      string
+}
+
+// eachSvcRef visits every service in every group, in group order, and stops as
+// soon as fn returns false. It is svcRefs WITHOUT the slice.
+//
+// The count and boolean helpers run on the hot path — fixSvcOffset calls
+// hasStatusColumns on every keystroke, and the render pass asks for the
+// selection count and the select-all state — so materialising the whole list to
+// answer "how many" or "any?" is the one allocation those callers do not need.
+// svcRefs stays for the render pass, which genuinely wants the list.
+//
+// Fold state is deliberately ignored here too: folding hides ROWS, never
+// services.
+func (m Model) eachSvcRef(fn func(svcRef) bool) {
+	for gi, g := range m.svcGroups {
+		for _, name := range g.services {
+			if !fn(svcRef{groupIdx: gi, name: name, key: svcKey(g.proj.Name, name)}) {
+				return
+			}
+		}
+	}
+}
+
+// eachSelectableRef is eachSvcRef minus the unmanaged bucket — the same
+// predicate selectableRefs applies, without the two slices it builds.
+func (m Model) eachSelectableRef(fn func(svcRef) bool) {
+	m.eachSvcRef(func(r svcRef) bool {
+		if m.groupUnmanaged(r.groupIdx) {
+			return true
+		}
+		return fn(r)
+	})
 }
 
 // svcRefs enumerates every service in every group, in group order. Fold state

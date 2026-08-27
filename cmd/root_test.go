@@ -1,9 +1,6 @@
 package cmd
 
 import (
-	"context"
-	"errors"
-	"os/exec"
 	"strings"
 	"testing"
 
@@ -209,69 +206,6 @@ func TestLogsCmd_RejectsMultipleArgs(t *testing.T) {
 // --- TUI wiring helpers (the closures in NewRootCmd's RunE have no test seam:
 // the root command needs a TTY and is never executed, so the branch bodies live
 // at package level and are pinned here). ---
-
-// fakeProjectLister is the ListProjects half of a composer.
-type fakeProjectLister struct {
-	projects []compose.Project
-	err      error
-}
-
-func (f fakeProjectLister) ListProjects(ctx context.Context) ([]compose.Project, error) {
-	return f.projects, f.err
-}
-
-// hostPsForWiring is one compose-managed and two hand-started containers, in the
-// NDJSON shape `docker ps -a --format '{{json .}}'` emits.
-const hostPsForWiring = `{"ID":"aaa111222333","Names":"web","Image":"nginx:1.27","State":"running","Status":"Up 3 hours","Labels":"com.docker.compose.project=my-app"}
-{"ID":"bbb444555666","Names":"watchtower","Image":"containrrr/watchtower","State":"running","Status":"Up 2 days","Labels":""}
-{"ID":"ccc777888999","Names":"pg-scratch","Image":"postgres:16","State":"exited","Status":"Exited (0) 4 hours ago","Labels":""}`
-
-func TestProjectsWithUnmanaged_AppendsRow(t *testing.T) {
-	c := compose.New(t.TempDir())
-	c.SetTestHooks(nil, func(*exec.Cmd) ([]byte, error) { return []byte(hostPsForWiring), nil })
-
-	lister := fakeProjectLister{projects: []compose.Project{{Name: "my-app", ConfigDir: "/srv/my-app"}}}
-	got, err := projectsWithUnmanaged(context.Background(), lister, compose.NewLocalHostContainers(c))
-	if err != nil {
-		t.Fatalf("projectsWithUnmanaged() error = %v", err)
-	}
-	if len(got) != 2 {
-		t.Fatalf("got %d projects, want 2: %+v", len(got), got)
-	}
-	if got[0].Name != "my-app" {
-		t.Errorf("first row = %q, want the compose project", got[0].Name)
-	}
-	last := got[len(got)-1]
-	if last.Name != compose.UnmanagedProjectName || !last.Unmanaged {
-		t.Fatalf("last row = %+v, want the synthetic unmanaged row", last)
-	}
-	if last.ConfigDir != "" {
-		t.Errorf("unmanaged row ConfigDir = %q, want empty", last.ConfigDir)
-	}
-}
-
-func TestProjectsWithUnmanaged_NoRowWhenHostIsClean(t *testing.T) {
-	c := compose.New(t.TempDir())
-	c.SetTestHooks(nil, func(*exec.Cmd) ([]byte, error) {
-		return []byte(`{"ID":"aaa111222333","Names":"web","Image":"nginx","State":"running","Status":"Up 1 hour","Labels":"com.docker.compose.project=my-app"}`), nil
-	})
-
-	lister := fakeProjectLister{projects: []compose.Project{{Name: "my-app"}}}
-	got, err := projectsWithUnmanaged(context.Background(), lister, compose.NewLocalHostContainers(c))
-	if err != nil {
-		t.Fatalf("projectsWithUnmanaged() error = %v", err)
-	}
-	if len(got) != 1 {
-		t.Fatalf("got %d projects, want only the compose project: %+v", len(got), got)
-	}
-}
-
-func TestProjectsWithUnmanaged_ListErrorPropagates(t *testing.T) {
-	lister := fakeProjectLister{err: errors.New("docker compose ls failed")}
-	if _, err := projectsWithUnmanaged(context.Background(), lister, nil); err == nil {
-		t.Fatal("expected the ListProjects error to propagate")
-	}
-}
 
 func TestLocalComposerFor(t *testing.T) {
 	detector := compose.New(t.TempDir())

@@ -5,6 +5,7 @@ import (
 	"io"
 	"slices"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -278,13 +279,26 @@ func TestQualifiedKeys_DuplicateServiceNamesStayDistinct(t *testing.T) {
 
 // recordingComposer captures the container slice every pipeline step receives,
 // so a test can assert what actually crossed the tui → runner boundary.
+//
+// The pipeline runs on its own goroutine, so every access is behind mu: the
+// test goroutine reads the slice while runner.Run is still appending to it.
 type recordingComposer struct {
 	mockComposer
+	mu            sync.Mutex
 	gotContainers [][]string
 }
 
 func (c *recordingComposer) record(containers []string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
 	c.gotContainers = append(c.gotContainers, append([]string(nil), containers...))
+}
+
+// calls returns a snapshot of what the pipeline has recorded so far.
+func (c *recordingComposer) calls() [][]string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return append([][]string(nil), c.gotContainers...)
 }
 
 func (c *recordingComposer) Stop(ctx context.Context, containers []string, w io.Writer) error {
@@ -356,15 +370,17 @@ func TestQualifiedKeys_NeverCrossIntoRunner(t *testing.T) {
 		cmd()
 	}
 	deadline := time.After(2 * time.Second)
-	for len(rc.gotContainers) < len(runner.Steps(runner.Deploy)) {
+	calls := rc.calls()
+	for len(calls) < len(runner.Steps(runner.Deploy)) {
 		select {
 		case <-deadline:
-			t.Fatalf("pipeline did not finish: %v", rc.gotContainers)
+			t.Fatalf("pipeline did not finish: %v", calls)
 		default:
 			time.Sleep(time.Millisecond)
 		}
+		calls = rc.calls()
 	}
-	for _, call := range rc.gotContainers {
+	for _, call := range calls {
 		for _, name := range call {
 			if strings.Contains(name, svcKeySep) {
 				t.Errorf("a qualified key reached the composer: %q", name)
@@ -529,8 +545,8 @@ func TestGroupsHaveHeaders(t *testing.T) {
 				t.Errorf("groupsHaveHeaders = %v, want %v", got, tt.want)
 			}
 			m := Model{svcGroups: tt.groups}
-			if got := m.hasGroupHeaders(); got != tt.want {
-				t.Errorf("hasGroupHeaders = %v, want %v", got, tt.want)
+			if got := groupsHaveHeaders(m.svcGroups); got != tt.want {
+				t.Errorf("groupsHaveHeaders = %v, want %v", got, tt.want)
 			}
 			// The rule and the entry model may never disagree.
 			hasHeader := false
@@ -559,7 +575,7 @@ func TestGroupCounts(t *testing.T) {
 		// one, so a folded header can only report what a scan established.
 		svcKey("web", "cache"): {Health: "starting"},
 		// "gone" has no entry at all — the host reports only containers that
-		// exist, and an absent one must inflate any of the totals.
+		// exist, and an absent one must NOT inflate any of the totals.
 		svcKey("db", "api"): {Running: true, UpdateAvailable: &yes},
 	}
 	up, unhealthy, updates := groupCounts(g, status)

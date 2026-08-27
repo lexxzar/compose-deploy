@@ -48,11 +48,24 @@ func TestContainerFooterReservation(t *testing.T) {
 		return m
 	}
 
+	// Count rendered rows by LINE SHAPE — never by "is this name anywhere in
+	// the output". A committed search puts the cursor's match into
+	// searchBarLine as "↳ <name>", so a name-presence count would count a row
+	// that is scrolled out of the window, which is exactly the off-by-one this
+	// whole sweep exists to catch. A data row carries the status dot and a
+	// service name; a group header carries the dot but a project name, and the
+	// fold marker rules it out.
 	countServiceRows := func(out string) int {
 		n := 0
-		for _, s := range svcs {
-			if strings.Contains(out, s) {
-				n++
+		for _, l := range strings.Split(ansi.Strip(out), "\n") {
+			if !strings.Contains(l, "●") || strings.Contains(l, "▼") || strings.Contains(l, "▶") {
+				continue
+			}
+			for _, s := range svcs {
+				if strings.Contains(l, s) {
+					n++
+					break
+				}
 			}
 		}
 		return n
@@ -858,18 +871,30 @@ func TestContainerFooterReservation_Grouped(t *testing.T) {
 		m.selected = map[string]bool{}
 		m.svcGroups = append([]svcGroup(nil), groups...)
 		m.svcEntries = rebuildSvcEntries(m.svcGroups)
-		m.services = svcs
 		m.height = 24
 		m.width = width
 		m.servers = []config.Server{{Name: "prod", Host: "prod.example"}}
 		return m
 	}
 
+	// Count rendered rows by LINE SHAPE — never by "is this name anywhere in
+	// the output". A committed search puts the cursor's match into
+	// searchBarLine as "↳ <name>", so a name-presence count would count a row
+	// that is scrolled out of the window, which is exactly the off-by-one this
+	// whole sweep exists to catch. A data row carries the status dot and a
+	// service name; a group header carries the dot but a project name, and the
+	// fold marker rules it out.
 	countServiceRows := func(out string) int {
 		n := 0
-		for _, s := range svcs {
-			if strings.Contains(out, s) {
-				n++
+		for _, l := range strings.Split(ansi.Strip(out), "\n") {
+			if !strings.Contains(l, "●") || strings.Contains(l, "▼") || strings.Contains(l, "▶") {
+				continue
+			}
+			for _, s := range svcs {
+				if strings.Contains(l, s) {
+					n++
+					break
+				}
 			}
 		}
 		return n
