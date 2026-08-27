@@ -20446,6 +20446,14 @@ func (c *batchComposer) Start(_ context.Context, containers []string, _ io.Write
 // invoking waitForEvent, so exactly one reader exists.
 func drainBatch(t *testing.T, m Model) Model {
 	t.Helper()
+	return resolveWaitPhase(t, drainPipeline(t, m), true)
+}
+
+// drainPipeline runs ONLY the pipeline half of a batch, stopping at the health
+// gate it arms. Tests that drive the gate by hand (esc-skip, an unhealthy
+// verdict) start from here.
+func drainPipeline(t *testing.T, m Model) Model {
+	t.Helper()
 	ch := m.eventCh
 	if ch == nil {
 		t.Fatal("no batch is running: eventCh is nil")
@@ -20471,6 +20479,37 @@ func drainBatch(t *testing.T, m Model) Model {
 	}
 	updated, _ := m.Update(pipelineDoneMsg{batchIdx: idx, session: session})
 	return updated.(Model)
+}
+
+// resolveWaitPhase stands in for the bubbletea loop across ONE batch's health
+// gate: it answers the poll with a status map that reports every waited service
+// healthy (or unhealthy, when healthy is false) and then delivers the
+// batchDoneMsg the resolution produced, which is what starts the next batch.
+// A batch with no gate (StopOnly, or a wait already skipped) passes through.
+func resolveWaitPhase(t *testing.T, m Model, healthy bool) Model {
+	t.Helper()
+	if !m.waiting {
+		return m
+	}
+	status := map[string]runner.ServiceStatus{}
+	for _, svc := range m.waitState.Services {
+		status[svc] = runner.ServiceStatus{Running: true, Health: "healthy"}
+		if !healthy {
+			status[svc] = runner.ServiceStatus{Running: true, Health: "unhealthy"}
+		}
+	}
+	updated, cmd := m.Update(waitStatusMsg{status: status, session: m.waitSession})
+	m = updated.(Model)
+	if cmd == nil {
+		return m
+	}
+	msg := cmd()
+	done, ok := msg.(batchDoneMsg)
+	if !ok {
+		t.Fatalf("wait resolution produced %T, want batchDoneMsg", msg)
+	}
+	next, _ := m.Update(done)
+	return next.(Model)
 }
 
 // twoBatchModel arms a cross-project Deploy over blog/web + shop/api and
@@ -20805,5 +20844,396 @@ func TestBatchSequence_ProgressTitleNamesEveryBatch(t *testing.T) {
 	m, _ := twoBatchModel(t, &log, nil)
 	if view := m.viewProgress(); !strings.Contains(view, "blog (web) → shop (api)") {
 		t.Errorf("title must name both batches, got:\n%s", view)
+	}
+}
+
+// --- Task 11: per-batch wait phase ------------------------------------------
+
+// Every batch has its OWN health gate, seeded from that batch's own services in
+// bare form. Batch i+1 must not start until batch i is healthy.
+func TestBatchWait_EachBatchWaitsOnItsOwnServices(t *testing.T) {
+	var log []string
+	m, made := twoBatchModel(t, &log, nil)
+
+	m = drainPipeline(t, m)
+	if !m.waiting {
+		t.Fatal("batch 0's pipeline must arm a health gate before the next batch starts")
+	}
+	if m.batchIdx != 0 {
+		t.Errorf("batchIdx = %d, want 0 — the gate, not the pipeline, releases the next batch", m.batchIdx)
+	}
+	if !slices.Equal(m.waitState.Services, []string{"web"}) {
+		t.Errorf("waitState.Services = %v, want [web] — batch 0's own services", m.waitState.Services)
+	}
+	if m.waitDeadline.IsZero() {
+		t.Error("waitDeadline must be set for a mid-sequence gate too")
+	}
+	if _, ok := made["shop"]; ok {
+		t.Error("the next batch's composer must not be built while the gate is still open")
+	}
+	if m.done {
+		t.Error("done must not be set while a batch is still to run")
+	}
+
+	m = resolveWaitPhase(t, m, true)
+	if m.batchIdx != 1 {
+		t.Fatalf("batchIdx = %d, want 1 — a passing gate releases the next batch", m.batchIdx)
+	}
+	if m.waiting || len(m.waitState.Services) != 0 {
+		t.Errorf("the finished batch's verdicts must be dropped before the next one arms its own: waiting=%v services=%v", m.waiting, m.waitState.Services)
+	}
+	if _, ok := made["shop"]; !ok {
+		t.Error("batch 1 must start once batch 0's gate passed")
+	}
+
+	m = drainBatch(t, m)
+	if !slices.Equal(m.waitState.Services, []string{"api"}) {
+		t.Errorf("waitState.Services = %v, want [api] — batch 1's own services", m.waitState.Services)
+	}
+	if !m.done {
+		t.Error("done must be set once the last batch finishes")
+	}
+}
+
+// An unhealthy batch stops the sequence exactly as a failed pipeline step does:
+// the batches behind it never run and say "(skipped)" on screen.
+func TestBatchWait_FailureStopsSequence(t *testing.T) {
+	var log []string
+	m, made := twoBatchModel(t, &log, nil)
+
+	perBatch := len(runner.Steps(runner.Deploy))
+	m = drainPipeline(t, m)
+	m = resolveWaitPhase(t, m, false)
+
+	if !m.failed {
+		t.Fatal("an unhealthy mid-sequence batch must mark the operation failed")
+	}
+	if m.batchIdx != 0 {
+		t.Errorf("batchIdx = %d, want 0 — a failed gate must not advance", m.batchIdx)
+	}
+	if m.done {
+		t.Error("done must never be set when the sequence stopped early")
+	}
+	if _, ok := made["shop"]; ok {
+		t.Error("the second batch must never start behind a failed gate")
+	}
+	for i := perBatch; i < len(m.steps); i++ {
+		if m.steps[i].status != statusSkipped {
+			t.Errorf("steps[%d] status = %q, want %q", i, m.steps[i].status, statusSkipped)
+		}
+	}
+	if view := m.viewProgress(); !strings.Contains(view, "(skipped)") {
+		t.Errorf("the progress screen must name the skipped rows, got:\n%s", view)
+	}
+	// The verdicts stay on screen so the user can see WHICH service failed.
+	if m.waitState.Verdicts["web"].OK() {
+		t.Error("the failing verdict must survive for rendering")
+	}
+	want := []string{"blog:Stopping(web)", "blog:Removing(web)", "blog:Pulling(web)", "blog:Creating(web)", "blog:Starting(web)"}
+	if !slices.Equal(log, want) {
+		t.Errorf("pipeline calls = %v, want only batch 0's", log)
+	}
+}
+
+// The LAST batch's failing gate is NOT a failed operation — that is what the
+// single-project screen has always drawn (red verdicts plus the rollback hint).
+func TestBatchWait_LastBatchFailureKeepsDoneState(t *testing.T) {
+	var log []string
+	m, _ := twoBatchModel(t, &log, nil)
+	m = drainBatch(t, m)    // batch 0 through its gate
+	m = drainPipeline(t, m) // batch 1's pipeline
+	m = resolveWaitPhase(t, m, false)
+
+	if m.failed {
+		t.Error("a failing gate on the LAST batch must not mark the operation failed")
+	}
+	if !m.done {
+		t.Error("the last batch's pipeline resolves the operation regardless of its verdicts")
+	}
+	if view := m.viewProgress(); !strings.Contains(view, "press R on the services screen to roll back") {
+		t.Errorf("the rollback hint must still render, got:\n%s", view)
+	}
+}
+
+// A whole-project batch carries an EMPTY target slice (the runner reads it as
+// "all services"), which the reducer cannot evaluate — ListServices names them.
+func TestBatchWait_WholeProjectBatchResolvesTargetsViaListServices(t *testing.T) {
+	mc := &mockComposer{services: []string{"api", "db"}}
+	m := Model{
+		screen:    screenProgress,
+		grouped:   true,
+		pendingOp: runner.Deploy,
+		composer:  mc,
+		ctx:       context.Background(),
+		batches:   []opBatch{{proj: compose.Project{Name: "shop", ConfigDir: "/srv/shop"}}},
+		// Host-wide in grouped mode, so it must NEVER seed one project's gate.
+		services: []string{"web", "api", "db", "watchtower"},
+	}
+
+	updated, cmd := m.Update(pipelineDoneMsg{})
+	m = updated.(Model)
+	if !m.waiting {
+		t.Fatal("a whole-project batch must still open a health gate")
+	}
+	if len(m.waitState.Services) != 0 {
+		t.Errorf("waitState.Services = %v, want empty until ListServices answers", m.waitState.Services)
+	}
+	if cmd == nil {
+		t.Fatal("expected a target-resolution cmd")
+	}
+	targets, ok := cmd().(waitTargetsMsg)
+	if !ok {
+		t.Fatalf("cmd produced %T, want waitTargetsMsg", cmd())
+	}
+	if !slices.Equal(targets.targets, []string{"api", "db"}) {
+		t.Errorf("targets = %v, want the batch composer's own service list", targets.targets)
+	}
+
+	seeded, cmd := m.Update(targets)
+	m = seeded.(Model)
+	if !slices.Equal(m.waitState.Services, []string{"api", "db"}) {
+		t.Errorf("waitState.Services = %v, want [api db]", m.waitState.Services)
+	}
+	if cmd == nil {
+		t.Error("expected the first poll to be dispatched once the targets landed")
+	}
+}
+
+// A resolution that fails (or names nothing) skips the gate rather than
+// stalling the sequence on it.
+func TestBatchWait_UnresolvableTargetsSkipTheGate(t *testing.T) {
+	tests := []struct {
+		name string
+		msg  waitTargetsMsg
+	}{
+		{"list error", waitTargetsMsg{err: errors.New("boom")}},
+		{"no services", waitTargetsMsg{}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			m := Model{
+				screen:      screenProgress,
+				grouped:     true,
+				pendingOp:   runner.Deploy,
+				waiting:     true,
+				waitSession: 3,
+				batches:     []opBatch{{proj: compose.Project{Name: "shop"}}},
+			}
+			tt.msg.session = 3
+			updated, cmd := m.Update(tt.msg)
+			got := updated.(Model)
+			if got.waiting {
+				t.Error("an unresolvable target set must close the gate")
+			}
+			if got.failed {
+				t.Error("failing to NAME the services is not a health failure")
+			}
+			if cmd != nil {
+				t.Error("a single-batch sequence has nothing left to release")
+			}
+		})
+	}
+}
+
+// A stale waitTargetsMsg (skipped gate, departed screen, superseded session)
+// must not seed a reducer that has moved on.
+func TestBatchWait_StaleTargetsRejected(t *testing.T) {
+	base := Model{screen: screenProgress, pendingOp: runner.Deploy, waiting: true, waitSession: 4}
+	cases := []struct {
+		name string
+		m    Model
+		msg  waitTargetsMsg
+	}{
+		{"stale session", base, waitTargetsMsg{targets: []string{"web"}, session: 3}},
+		{"gate already skipped", func() Model { m := base; m.waiting = false; return m }(), waitTargetsMsg{targets: []string{"web"}, session: 4}},
+		{"off screen", func() Model { m := base; m.screen = screenSelectContainers; return m }(), waitTargetsMsg{targets: []string{"web"}, session: 4}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			updated, cmd := tc.m.Update(tc.msg)
+			if got := updated.(Model); len(got.waitState.Services) != 0 {
+				t.Errorf("waitState seeded from a stale message: %v", got.waitState.Services)
+			}
+			if cmd != nil {
+				t.Error("a stale message must produce no command")
+			}
+		})
+	}
+}
+
+// esc on the health gate means "don't wait", not "stop": mid-sequence it
+// releases the next batch.
+func TestBatchWait_EscSkipReleasesTheNextBatch(t *testing.T) {
+	var log []string
+	m, made := twoBatchModel(t, &log, nil)
+	m = drainPipeline(t, m)
+	if !m.waiting {
+		t.Fatal("precondition: batch 0 must be waiting")
+	}
+
+	skipped, cmd := m.Update(tea.KeyMsg{Type: tea.KeyEsc})
+	m = skipped.(Model)
+	if m.waiting {
+		t.Error("esc must close the gate")
+	}
+	if m.screen != screenProgress {
+		t.Errorf("screen = %d, want screenProgress — esc on the gate is a skip, not a back-nav", m.screen)
+	}
+	if cmd == nil {
+		t.Fatal("a skipped mid-sequence gate must release the next batch")
+	}
+	done, ok := cmd().(batchDoneMsg)
+	if !ok {
+		t.Fatalf("esc produced %T, want batchDoneMsg", cmd())
+	}
+	advanced, _ := m.Update(done)
+	m = advanced.(Model)
+	if m.batchIdx != 1 {
+		t.Errorf("batchIdx = %d, want 1", m.batchIdx)
+	}
+	if _, ok := made["shop"]; !ok {
+		t.Error("batch 1 must start after the skip")
+	}
+}
+
+// esc on the LAST batch's gate is a plain skip — there is nothing to release,
+// and a second esc still leaves the screen.
+func TestBatchWait_EscSkipOnLastBatchReleasesNothing(t *testing.T) {
+	var log []string
+	m, _ := twoBatchModel(t, &log, nil)
+	m = drainBatch(t, m)
+	m = drainPipeline(t, m)
+	if !m.waiting || !m.done {
+		t.Fatalf("precondition: last batch waiting=%v done=%v", m.waiting, m.done)
+	}
+
+	skipped, cmd := m.Update(tea.KeyMsg{Type: tea.KeyEsc})
+	m = skipped.(Model)
+	if cmd != nil {
+		t.Error("the last batch's skipped gate has no successor to release")
+	}
+	if m.screen != screenProgress {
+		t.Errorf("screen = %d, want screenProgress on the first esc", m.screen)
+	}
+	back, _ := m.Update(tea.KeyMsg{Type: tea.KeyEsc})
+	if got := back.(Model); got.screen != screenSelectContainers {
+		t.Errorf("screen = %d, want the container screen on the second esc", got.screen)
+	}
+}
+
+// A batchDoneMsg is gated on screen, sequence and index — a message from a
+// cancelled or already-advanced sequence can never start a successor.
+func TestBatchWait_StaleBatchDoneRejected(t *testing.T) {
+	var log []string
+	m, made := twoBatchModel(t, &log, nil)
+	m = drainPipeline(t, m)
+	idx, session := m.batchIdx, m.batchSession
+
+	cancelled, _ := m.Update(tea.KeyMsg{Type: tea.KeyEsc}) // skips the gate
+	m = cancelled.(Model)
+	cancelled, _ = m.Update(tea.KeyMsg{Type: tea.KeyEsc}) // cancels the sequence
+	m = cancelled.(Model)
+	if m.batchSession == session {
+		t.Fatal("precondition: the cancel must bump batchSession")
+	}
+
+	stale, cmd := m.Update(batchDoneMsg{batchIdx: idx, session: session})
+	m = stale.(Model)
+	if m.batchIdx != 0 {
+		t.Errorf("batchIdx = %d, want 0 — a cancelled sequence must not advance", m.batchIdx)
+	}
+	if cmd != nil {
+		t.Error("a stale batchDoneMsg must produce no command")
+	}
+	if _, ok := made["shop"]; ok {
+		t.Error("the second batch must never start after a cancel")
+	}
+
+	// Wrong index and off-screen delivery are dropped too.
+	fresh, cmd := m.Update(batchDoneMsg{batchIdx: 5, session: m.batchSession})
+	if got := fresh.(Model); got.batchIdx != 0 {
+		t.Errorf("batchIdx = %d, want 0 for a wrong-index message", got.batchIdx)
+	}
+	if cmd != nil {
+		t.Error("a wrong-index batchDoneMsg must produce no command")
+	}
+	m.screen = screenSelectContainers
+	offScreen, cmd := m.Update(batchDoneMsg{batchIdx: 0, session: m.batchSession})
+	if got := offScreen.(Model); got.batchIdx != 0 {
+		t.Errorf("batchIdx = %d, want 0 off screen", got.batchIdx)
+	}
+	if cmd != nil {
+		t.Error("an off-screen batchDoneMsg must produce no command")
+	}
+}
+
+// StopOnly never opens a health gate, in a sequence as in a single batch: the
+// pipeline itself releases the next batch.
+func TestBatchWait_StopOnlyAdvancesWithoutAGate(t *testing.T) {
+	m := Model{
+		screen:    screenProgress,
+		grouped:   true,
+		pendingOp: runner.StopOnly,
+		batches: []opBatch{
+			{proj: compose.Project{Name: "blog"}, services: []string{"web"}},
+			{proj: compose.Project{Name: "shop"}, services: []string{"api"}},
+		},
+		opContainers: []string{"web"},
+	}
+
+	updated, cmd := m.Update(pipelineDoneMsg{})
+	m = updated.(Model)
+	if m.waiting {
+		t.Error("StopOnly must never enter the health-wait phase")
+	}
+	if m.done {
+		t.Error("done must not be set while a batch is still to run")
+	}
+	if cmd == nil {
+		t.Fatal("StopOnly must still release the next batch")
+	}
+	if _, ok := cmd().(batchDoneMsg); !ok {
+		t.Fatalf("cmd produced %T, want batchDoneMsg", cmd())
+	}
+}
+
+// Leaving screenProgress runs the rollback-prep cleanup and drops BOTH the wait
+// sub-state and the batch bookkeeping — on the main goroutine, never deferred.
+func TestBatchWait_DepartureRunsCleanupAndClearsWait(t *testing.T) {
+	var log []string
+	m, _ := twoBatchModel(t, &log, nil)
+	m = drainBatch(t, m)
+	m = drainPipeline(t, m) // last batch waiting
+
+	cleaned := 0
+	m.rollbackCleanup = func() { cleaned++ }
+	waitSession, batchSession := m.waitSession, m.batchSession
+
+	back, _ := m.Update(tea.KeyMsg{Type: tea.KeyEsc}) // skip the gate
+	m = back.(Model)
+	back, _ = m.Update(tea.KeyMsg{Type: tea.KeyEsc}) // leave the screen
+	m = back.(Model)
+
+	if m.screen != screenSelectContainers {
+		t.Fatalf("screen = %d, want screenSelectContainers", m.screen)
+	}
+	if cleaned != 1 {
+		t.Errorf("rollback cleanup ran %d times, want exactly 1", cleaned)
+	}
+	if m.rollbackCleanup != nil {
+		t.Error("the cleanup must be cleared so a later departure cannot double-invoke it")
+	}
+	if m.waiting || len(m.waitState.Services) != 0 || !m.waitDeadline.IsZero() || m.opContainers != nil {
+		t.Errorf("wait state survived the departure: waiting=%v state=%v deadline=%v targets=%v",
+			m.waiting, m.waitState.Services, m.waitDeadline, m.opContainers)
+	}
+	if m.waitSession == waitSession {
+		t.Error("the departure must bump waitSession so a straggling poll is dropped")
+	}
+	if m.batches != nil || m.batchIdx != 0 || m.batchStepCount != 0 {
+		t.Errorf("batch state survived the departure: %+v idx=%d count=%d", m.batches, m.batchIdx, m.batchStepCount)
+	}
+	if m.batchSession == batchSession {
+		t.Error("the departure must bump batchSession")
 	}
 }

@@ -722,6 +722,29 @@ type pipelineDoneMsg struct {
 	session  uint64
 }
 
+// batchDoneMsg reports that one batch is finished for good — pipeline AND
+// health wait. It is what releases the next batch, so it carries the same
+// identity pair pipelineDoneMsg does: a message from a cancelled or superseded
+// sequence can never start a successor. The split matters because a batch's
+// pipeline closing its channel no longer means the batch is over: the health
+// gate of batch i runs before batch i+1 starts, so a project that came up
+// unhealthy stops the sequence instead of dragging the next one down with it.
+type batchDoneMsg struct {
+	batchIdx int
+	session  uint64
+}
+
+// waitTargetsMsg carries the resolved service set for a whole-project batch —
+// one whose target slice is empty, which the runner reads as ALL services.
+// The wait reducer needs those names spelled out, and only ListServices can
+// name them (the host-wide `docker ps` behind the grouped view cannot see a
+// service that was never created). session mirrors waitTickMsg.
+type waitTargetsMsg struct {
+	targets []string
+	err     error
+	session uint64
+}
+
 // waitTickMsg fires after runner.DefaultWaitPoll to schedule the next health
 // poll. session is captured at scheduling time and compared against
 // m.waitSession in the handler so a tick left over from a skipped/departed wait
@@ -1640,44 +1663,59 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if m.failed {
 			return m, nil
 		}
-		if m.batchIdx+1 < len(m.batches) {
-			// This batch's pipeline has closed its channel, so its context is
-			// finished — cancel it to release it before the next batch takes
-			// over m.cancel, which esc reads.
-			if m.cancel != nil {
-				m.cancel()
-			}
-			m.batchIdx++
-			// Hoisted: startBatch mutates the receiver.
-			cmd := m.startBatch()
-			return m, cmd
+		// The LAST batch's pipeline resolves the whole operation. Every other
+		// one leaves it running, so the footer keeps saying "esc cancel".
+		if m.batchIdx+1 >= len(m.batches) {
+			m.done = true
 		}
-		m.done = true
 		// StopOnly has no health phase; a failed pipeline never reaches here.
-		// Deploy/Restart/Rollback enter the waiting sub-state and start the
-		// health-poll loop with the first poll firing immediately (containers
-		// were just (re)started).
+		// Deploy/Restart/Rollback enter the waiting sub-state first, and it is
+		// the wait — not the pipeline — that releases the next batch.
 		if m.pendingOp == runner.StopOnly {
+			return m, m.batchFinished()
+		}
+		// Hoisted: startWaitPhase mutates the receiver.
+		cmd := m.startWaitPhase()
+		return m, cmd
+
+	case batchDoneMsg:
+		// Same three gates pipelineDoneMsg carries: the screen, the sequence
+		// and the batch index. A batch whose wait resolved after an esc-cancel
+		// must not start the successor of a sequence that is over.
+		if m.screen != screenProgress || msg.session != m.batchSession || msg.batchIdx != m.batchIdx {
 			return m, nil
 		}
-		targets := m.opContainers
-		if len(targets) == 0 && !m.grouped {
-			targets = m.services
+		if m.failed || m.batchIdx+1 >= len(m.batches) {
+			return m, nil
 		}
-		if len(targets) == 0 {
-			// Drilled mode with no services, or a grouped whole-project batch
-			// whose empty target set means ALL services. m.services is
-			// host-wide in grouped mode, so it is NOT the fallback there — it
-			// would seed the wait with other projects' services, which this
-			// composer can never report healthy. Resolving the whole-project
-			// set needs a ListServices call, which the per-batch wait phase
-			// owns.
-			return m, nil // nothing to wait on
+		// This batch's pipeline has closed its channel and its health gate is
+		// over, so its context is finished — cancel it to release it before the
+		// next batch takes over m.cancel, which esc reads.
+		if m.cancel != nil {
+			m.cancel()
 		}
-		m.waiting = true
-		m.waitSession++
-		m.waitState = runner.NewWaitState(targets)
-		m.waitDeadline = time.Now().Add(runner.DefaultWaitTimeout)
+		// Drop the finished batch's verdicts before the next one arms its own.
+		// clearWaitState also nils opContainers, which startBatch re-sets from
+		// the batch it launches — so the order here is load-bearing.
+		m.clearWaitState()
+		m.batchIdx++
+		// Hoisted: startBatch mutates the receiver.
+		cmd := m.startBatch()
+		return m, cmd
+
+	case waitTargetsMsg:
+		if m.screen != screenProgress || !m.waiting || msg.session != m.waitSession {
+			return m, nil
+		}
+		if msg.err != nil || len(msg.targets) == 0 {
+			// The pipeline ran, but the batch's service set could not be
+			// named, so there is nothing for the reducer to evaluate. Skip the
+			// health gate rather than stall the sequence on it — in the TUI the
+			// wait is advisory (esc skips it by hand for the same reason).
+			m.clearWaitState()
+			return m, m.batchFinished()
+		}
+		m.waitState = runner.NewWaitState(msg.targets)
 		return m, m.pollWaitStatus()
 
 	case waitTickMsg:
@@ -1703,7 +1741,9 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if elapsed >= runner.DefaultWaitTimeout {
 				m.sweepWaitTimeout()
 				m.waiting = false
-				return m, nil
+				// Hoisted: waitPhaseResolved mutates the receiver.
+				cmd := m.waitPhaseResolved()
+				return m, cmd
 			}
 			return m, m.waitTick()
 		}
@@ -1713,7 +1753,9 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			// Wait resolved: stop polling but KEEP waitState so the verdict
 			// lines (and the rollback hint on a failed deploy) stay rendered.
 			m.waiting = false
-			return m, nil
+			// Hoisted: waitPhaseResolved mutates the receiver.
+			cmd := m.waitPhaseResolved()
+			return m, cmd
 		}
 		return m, m.waitTick()
 
@@ -3112,8 +3154,12 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 				// waitSession so any in-flight poll/tick is discarded. The user
 				// stays on the progress screen in the plain done state; a second
 				// esc falls through to the back-nav cleanup below.
+				//
+				// Mid-sequence the skip releases the next batch: esc on the
+				// health gate means "don't wait", not "stop" — stopping is what
+				// esc does while a pipeline is running, one sub-state earlier.
 				m.clearWaitState()
-				return m, nil
+				return m, m.batchFinished()
 			}
 			if m.done || m.failed {
 				// Invalidate the update-availability cache for the current
@@ -3563,6 +3609,98 @@ func (m Model) waitForEvent() tea.Cmd {
 			return pipelineDoneMsg{batchIdx: idx, session: session}
 		}
 		return stepEventMsg(event)
+	}
+}
+
+// startWaitPhase arms the health gate for the batch whose pipeline just
+// finished. Every batch of a sequence runs its own, against its own composer:
+// batch i must be healthy before batch i+1 touches anything, which is what
+// makes a two-project deploy stop at the project that came up broken.
+//
+// The target set is the batch's own service slice, in BARE form — qualified
+// keys never reach the reducer. An EMPTY slice is the runner's "all services",
+// which the reducer cannot evaluate, so it is resolved:
+//   - drilled mode falls back to m.services, this project's own service list;
+//   - grouped mode must NOT, because m.services is host-wide there — seeding
+//     one project's composer with another project's services is a guaranteed
+//     timeout — so it asks the batch's composer via ListServices.
+func (m *Model) startWaitPhase() tea.Cmd {
+	targets := m.opContainers
+	if len(targets) == 0 && !m.grouped {
+		targets = m.services
+	}
+	if len(targets) == 0 && m.composer == nil {
+		return m.batchFinished() // nothing to wait on, and nothing to ask
+	}
+	m.waiting = true
+	m.waitSession++
+	m.waitDeadline = time.Now().Add(runner.DefaultWaitTimeout)
+	if len(targets) == 0 {
+		// The reducer stays empty until waitTargetsMsg names the services; the
+		// screen shows the "Waiting for health" header with no rows meanwhile.
+		m.waitState = runner.WaitState{}
+		return m.resolveWaitTargets()
+	}
+	m.waitState = runner.NewWaitState(targets)
+	return m.pollWaitStatus()
+}
+
+// waitPhaseResolved decides what a finished health gate means for the sequence.
+// A passing gate releases the next batch; a failing one stops the sequence
+// exactly as a failed pipeline step does, so the batches behind it say
+// "(skipped)" rather than sitting at ○.
+//
+// The LAST batch takes neither branch: its verdicts simply stay on screen, with
+// m.done already set, which is what the single-project screen has always drawn
+// — a failed wait there is a red verdict list plus the rollback hint, not a
+// failed operation.
+func (m *Model) waitPhaseResolved() tea.Cmd {
+	if m.batchIdx+1 >= len(m.batches) {
+		return nil
+	}
+	if m.waitFailed() {
+		m.failed = true
+		m.markBatchesSkipped(m.batchIdx + 1)
+		return nil
+	}
+	return m.batchDone()
+}
+
+// batchFinished ends the batch at m.batchIdx when no health gate ran (StopOnly,
+// or a target set that could not be resolved). The last batch has nothing left
+// to release, so it returns nil.
+func (m Model) batchFinished() tea.Cmd {
+	if m.batchIdx+1 >= len(m.batches) {
+		return nil
+	}
+	return m.batchDone()
+}
+
+// batchDone returns the Cmd that reports the current batch finished. The
+// identity is captured HERE, not read in the handler: an esc-cancel between the
+// dispatch and the delivery bumps batchSession, and that is exactly what the
+// gate must see.
+func (m Model) batchDone() tea.Cmd {
+	idx, session := m.batchIdx, m.batchSession
+	return func() tea.Msg {
+		return batchDoneMsg{batchIdx: idx, session: session}
+	}
+}
+
+// resolveWaitTargets returns a Cmd that names a whole-project batch's services
+// via ListServices, so the wait reducer has a target set to seed from. Bounded
+// by the same wall-clock deadline the polls use, for the same reason: a hung
+// daemon must not leave the sequence waiting forever.
+func (m Model) resolveWaitTargets() tea.Cmd {
+	c := m.composer
+	ctx := m.ctx
+	deadline := m.waitDeadline
+	session := m.waitSession
+	return func() tea.Msg {
+		listCtx, cancel := context.WithDeadline(ctx, deadline)
+		defer cancel()
+		svcs, err := c.ListServices(listCtx)
+		return waitTargetsMsg{targets: svcs, err: err, session: session}
 	}
 }
 

@@ -258,12 +258,21 @@ Confirmed design decisions (brainstormed and validated; do not re-litigate):
 **Files:**
 - Modify: `internal/tui/app.go`
 - Modify: `internal/tui/app_test.go`
+- Modify: `internal/tui/help.go` (➕ one doc comment only — `progressPhase`'s "waiting implies done" rationale stopped being true, see the deviations)
 
-- [ ] on batch i's `pipelineDoneMsg`, run the existing wait sub-state seeded with `NewWaitState(batch services — bare names, empty resolved via ListServices)` against batch i's composer; wait success emits `batchDoneMsg{batchIdx, batchSession}` which starts batch i+1
-- [ ] `batchDoneMsg` handler gated on screen + session + index; wait failure/timeout of batch i stops the sequence (same skipped rendering); StopOnly never waits (unchanged guard)
-- [ ] `runRollbackCleanup` and departure-site cleanup (`clearWaitState`, `waiting`, `waitDeadline`, batch fields) run when LEAVING `screenProgress`, per the wait-snapshots-rollback rules — never goroutine-deferred
-- [ ] write tests: per-batch wait seeding, wait failure stops sequence, stale `batchDoneMsg` rejected, cleanup on esc-from-progress
-- [ ] run tests - must pass before task 12
+⚠️ Deviations:
+- **A failing gate stops the sequence only when a batch is still to come.** `waitPhaseResolved()` sets `m.failed` + `markBatchesSkipped` for a mid-sequence batch, but the LAST batch takes neither branch — today's single-project screen renders a failed wait as red verdicts plus the rollback hint over a `done` operation, not as a failed op, and `TestBatchWait_LastBatchFailureKeepsDoneState` pins that it still does.
+- **`esc` on a mid-sequence gate RELEASES the next batch.** The three-phase esc contract already says the gate's `esc` means "skip the wait" while the pipeline's `esc` means "cancel" — so a skip must not strand the sequence with no terminal state and no way out. `batchFinished()` is the shared release path for every no-gate case (`StopOnly`, an unresolvable target set, the skip).
+- **An unresolvable target set skips the gate rather than failing it.** A `ListServices` error names no health verdict, so it is not a health failure; the gate closes and the sequence continues. In the TUI the wait is advisory (esc skips it by hand for the same reason).
+- **`waitTargetsMsg` is a second message, not a widened `waitStatusMsg`.** The reducer needs the names seeded BEFORE the first poll is evaluated, and `m.waitState` stays empty (header, no rows) for the one frame in between.
+- **`batchSession` still bumps at invalidation sites only**, so a zero-valued `batchDoneMsg{}` resolves against a fresh sequence exactly as `pipelineDoneMsg{}` does — same rule Task 10 set.
+- ➕ `drainBatch` split into `drainPipeline` + `resolveWaitPhase`: a batch's pipeline closing its channel no longer ends the batch, so the existing Task-10 sequence tests drive the gate too.
+
+- [x] on batch i's `pipelineDoneMsg`, run the existing wait sub-state seeded with `NewWaitState(batch services — bare names, empty resolved via ListServices)` against batch i's composer; wait success emits `batchDoneMsg{batchIdx, batchSession}` which starts batch i+1
+- [x] `batchDoneMsg` handler gated on screen + session + index; wait failure/timeout of batch i stops the sequence (same skipped rendering); StopOnly never waits (unchanged guard)
+- [x] `runRollbackCleanup` and departure-site cleanup (`clearWaitState`, `waiting`, `waitDeadline`, batch fields) run when LEAVING `screenProgress`, per the wait-snapshots-rollback rules — never goroutine-deferred
+- [x] write tests: per-batch wait seeding, wait failure stops sequence, stale `batchDoneMsg` rejected, cleanup on esc-from-progress
+- [x] run tests - must pass before task 12
 
 ### Task 12: Updates in grouped mode (phase 4)
 
@@ -305,6 +314,8 @@ Confirmed design decisions (brainstormed and validated; do not re-litigate):
 ### Task 15: [Final] Update documentation
 - [ ] create `docs/architecture/tui-multi-project.md` with the rationale and test pins (entry model, qualified keys + boundary rule, batch sequencing + message identity, grouped-mode update rules, action-time composer binding)
 - [ ] update `CLAUDE.md`: TUI state machine (screen count, deleted picker), container-screen paragraphs, session-counter site lists (including the inverted `connectResultMsg` success-path rule), ephemeral-on-departure count, "Adding a New TUI Screen" counts
+  - ➕ the `?`-overlay paragraph states `progressPhase()` resolves `waiting` first "since it implies `done`" — Task 11 made a mid-sequence gate open with `done` FALSE, so the ordering rule stays but its reason must be restated (a gate can be open with `done` set, with `failed` set, or with neither)
+  - ➕ the wait-phase paragraph must say the gate is PER BATCH: `pipelineDoneMsg` opens it, `batchDoneMsg` (not `pipelineDoneMsg`) releases the next batch, a whole-project batch resolves its targets through `waitTargetsMsg`/`ListServices`, and a failing gate stops the sequence only when a batch is still to come
 - [ ] move this plan to `docs/plans/completed/`
 
 ## Post-Completion

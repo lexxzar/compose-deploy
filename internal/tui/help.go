@@ -50,8 +50,10 @@ func (m Model) helpGroups() []helpGroup {
 }
 
 // progressPhase names the three key regimes of screenProgress. The predicate
-// order below mirrors viewProgress's footer switch (waiting first, because
-// waiting implies done), so the overlay and the footer cannot disagree about
+// order below mirrors viewProgress's footer switch — waiting FIRST, because a
+// health gate can be open with done already set (the last batch) or with
+// neither set (a mid-sequence batch), and only the waiting-first order names
+// esc correctly in both. So the overlay and the footer cannot disagree about
 // which keys are live.
 type progressPhase int
 
