@@ -551,24 +551,30 @@ func TestGroupCounts(t *testing.T) {
 		proj:     compose.Project{Name: "web"},
 		services: []string{"api", "nginx", "cache", "gone"},
 	}
+	yes, no := true, false
 	status := map[string]runner.ServiceStatus{
-		svcKey("web", "api"):   {Running: true},
-		svcKey("web", "nginx"): {Running: true, Health: "unhealthy"},
+		svcKey("web", "api"):   {Running: true, UpdateAvailable: &yes},
+		svcKey("web", "nginx"): {Running: true, Health: "unhealthy", UpdateAvailable: &no},
+		// "cache" was never checked: a nil verdict counts exactly like a false
+		// one, so a folded header can only report what a scan established.
 		svcKey("web", "cache"): {Health: "starting"},
 		// "gone" has no entry at all — the host reports only containers that
-		// exist, and an absent one must inflate neither total.
-		svcKey("db", "api"): {Running: true},
+		// exist, and an absent one must inflate any of the totals.
+		svcKey("db", "api"): {Running: true, UpdateAvailable: &yes},
 	}
-	up, unhealthy := groupCounts(g, status)
+	up, unhealthy, updates := groupCounts(g, status)
 	if up != 2 {
 		t.Errorf("up = %d, want 2", up)
 	}
 	if unhealthy != 1 {
 		t.Errorf("unhealthy = %d, want 1", unhealthy)
 	}
+	if updates != 1 {
+		t.Errorf("updates = %d, want 1 (only web/api has a true verdict)", updates)
+	}
 
-	if up, unhealthy = groupCounts(g, nil); up != 0 || unhealthy != 0 {
-		t.Errorf("groupCounts with no status = (%d, %d), want (0, 0)", up, unhealthy)
+	if up, unhealthy, updates = groupCounts(g, nil); up != 0 || unhealthy != 0 || updates != 0 {
+		t.Errorf("groupCounts with no status = (%d, %d, %d), want (0, 0, 0)", up, unhealthy, updates)
 	}
 }
 

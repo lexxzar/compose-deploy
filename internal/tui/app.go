@@ -671,10 +671,20 @@ type updateEntry struct {
 // updatesMsg carries the result of a refreshUpdates fetch. session is
 // captured at fetch time and compared against m.updatesSession in the
 // handler to drop stale responses from a previous project/server context.
+//
+// forKey is the updateCache key the scan was dispatched under, captured at
+// DISPATCH time and travelling WITH the message — the handler must never
+// re-derive it. In grouped mode U scans the CURSOR row's group, and the cursor
+// is free to move (or fold a group) while the scan runs, so a handler-time
+// re-derive would file one project's verdicts under another project's key: the
+// wrong glyphs would paint and the scanned project would look unchecked. The
+// same capture also keeps the drilled path honest, where the key is stable and
+// the session gate already covers the context change.
 type updatesMsg struct {
 	results map[string]bool
 	err     error
 	session uint64
+	forKey  string
 }
 
 // updateDetailsMsg carries the inspect screen's extra IMAGE rows, fetched by a
@@ -1061,6 +1071,11 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			// every tick. The landing sites clear that state once, on entry.
 			m.setGroups(buildSvcGroups(msg.projects, msg.hostStatus, m.svcGroups))
 			m.svcStatus = flattenQualified(msg.hostStatus)
+			// The fresh status map carries no verdicts, and this branch is the
+			// 5-second refresh as well as the initial load — without the replay
+			// every glyph a U scan painted would vanish on the next tick, and
+			// nothing in grouped mode would fetch it back.
+			m.hydrateGroupedUpdates()
 			m.pruneSelection()
 			m.clampSvcCursor()
 			// searchMatches indexes svcEntries, which the rebuild renumbered.
@@ -1224,7 +1239,10 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// → empty cache → repeat. With a short-TTL failure entry, the
 		// self-heal sees a "fresh" hit and skips the refetch until the
 		// 30s window expires, at which point a retry is appropriate.
-		key := m.updatesCacheKey()
+		// The key travels WITH the message. Re-deriving it here would read
+		// whatever context the Model is in NOW, which in grouped mode is
+		// wherever the cursor has since moved — see updatesMsg.forKey.
+		key := msg.forKey
 		if m.updateCache == nil {
 			m.updateCache = make(map[string]updateEntry)
 		}
@@ -1247,7 +1265,18 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			// loss: the entry written just above keeps details == nil, and
 			// refillUpdateDetailsCmd re-dispatches it at the next arrival or
 			// screen entry.
-			detailsCmd = m.updateDetailsCmd(entry, key)
+			// Grouped mode fetches no detail rows. It holds no composer of
+			// its own, and the one an armed exec prompt may have left bound
+			// belongs to whichever row the cursor was on — not necessarily the
+			// project this scan covered, so a batch built from it would spend
+			// registry round-trips resolving the wrong project's images. The
+			// entry keeps details == nil, which is exactly the state
+			// refillUpdateDetailsCmd fills the moment the user drills into that
+			// project; until then the inspect screen draws the verdict rows and
+			// omits the detail ones, which is that type's documented "unknown".
+			if !m.grouped {
+				detailsCmd = m.updateDetailsCmd(entry, key)
+			}
 		} else {
 			m.updateCache[key] = updateEntry{
 				fetchedAt: time.Now(),
@@ -1284,10 +1313,12 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			// — the soft warning says "data is bad" while the glyphs
 			// say "here's the data." Discarding partial verdicts on
 			// error matches the runner.Composer contract.
-			for svc, st := range m.svcStatus {
-				st.UpdateAvailable = nil
-				m.svcStatus[svc] = st
-			}
+			//
+			// In grouped mode that contract binds ONE project — the scan
+			// covered one group — so the reapply puts the other groups'
+			// cached verdicts straight back; the failed group's entry is an
+			// error entry, so its rows are the ones that end up blank.
+			m.reapplyUpdateVerdicts(nil)
 			// Setting updatesErr adds a soft-warning footer line, which
 			// shrinks svcVisibleCount() by one. If the cursor was sitting
 			// at the previously-last-visible row, it now falls outside the
@@ -1307,11 +1338,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// their stale glyph. Cache-replay paths in servicesMsg/statusMsg
 		// stay purely additive — they're not introducing new data, just
 		// preserving existing verdicts across a status-map overwrite.
-		for svc, st := range m.svcStatus {
-			st.UpdateAvailable = nil
-			m.svcStatus[svc] = st
-		}
-		m.hydrateUpdates(msg.results)
+		m.reapplyUpdateVerdicts(msg.results)
 		// Clearing updatesErr (when previously set) frees a footer line and
 		// grows svcVisibleCount() by one. Run fixSvcOffset unconditionally
 		// — also covers the symmetric off-screen success case, and the
@@ -2581,9 +2608,6 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			// cells just blank until the result arrives. The session is NOT
 			// bumped here because the context (project + server) hasn't
 			// changed; we just want a fresh result for the same session.
-			if m.composer == nil {
-				return m, nil
-			}
 			// Guard against stacking: if a refreshUpdates is already in
 			// flight (e.g. the user mashes U or a previous request hasn't
 			// completed), the previous response will hydrate the same
@@ -2592,7 +2616,36 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			// own m.detailsInFlight guard inside updateDetailsCmd, so the
 			// verdicts stay force-refreshable while the (much longer) detail
 			// batch resolves.
+			//
+			// The guard is checked before the grouped branch binds anything:
+			// a refusal must leave the composer exactly as it found it.
 			if m.updateInFlight {
+				return m, nil
+			}
+			if m.grouped {
+				// U is the ONLY update trigger in grouped mode, and it scans
+				// ONE group — the cursor row's. A host-wide scan would fan out
+				// across every project at once, which is the registry cost
+				// autoUpdatesAllowed refuses to spend automatically; asking for
+				// it by hand does not make it cheaper.
+				//
+				// The composer is bound, read out and unbound in the same
+				// keystroke: grouped mode must never hold one project's
+				// composer while the cursor sits on another's row.
+				g, ok := m.cursorGroup()
+				if !ok || !m.bindProjComposer(g.proj) {
+					m.unbindGroupedComposer()
+					return m, nil
+				}
+				c := m.composer
+				m.unbindGroupedComposer()
+				m.updateInFlight = true
+				// The key belongs to the GROUP, not to the Model — and it is
+				// the same key drilled mode uses for that project, so a scan
+				// started here still counts once the user drills in.
+				return m, m.refreshUpdatesFor(c, m.projUpdatesCacheKey(g.proj))
+			}
+			if m.composer == nil {
 				return m, nil
 			}
 			m.updateInFlight = true
@@ -3971,7 +4024,7 @@ func (m *Model) rebuildInspectSummary() {
 // the whole verdict map untrusted, so there is nothing here worth drawing.
 func (m Model) currentUpdateInfo() inspectUpdateInfo {
 	upd := inspectUpdateInfo{now: time.Now()}
-	entry, ok := m.updateCache[m.updatesCacheKey()]
+	entry, ok := m.updateCache[m.inspectUpdateKey()]
 	if !ok || entry.err {
 		return upd
 	}
@@ -3984,6 +4037,24 @@ func (m Model) currentUpdateInfo() inspectUpdateInfo {
 	// by the renderer, so absent and zero draw the same nothing.
 	upd.detail = entry.details[m.inspectService]
 	return upd
+}
+
+// inspectUpdateKey names the cache entry the inspect screen's update rows come
+// from. Drilled mode has one context and one key. Grouped mode has neither: its
+// project identity is empty, so updatesCacheKey would resolve to "|<server>" and
+// read whichever entry happens to sit there — so the key is taken from the group
+// that owns the CURSOR row, which is the row `i` was pressed on.
+//
+// The cursor cannot move while the inspect screen is up, so reading it here is
+// equivalent to capturing it at entry, without a Model field that every
+// departure site would have to remember to clear.
+func (m Model) inspectUpdateKey() string {
+	if m.grouped {
+		if g, ok := m.cursorGroup(); ok {
+			return m.projUpdatesCacheKey(g.proj)
+		}
+	}
+	return m.updatesCacheKey()
 }
 
 // redrawInspectFromCache redraws the inspect summary from the "⇧" cache when
@@ -4774,12 +4845,22 @@ func (m Model) loadContainerScreenCmd() tea.Cmd {
 // enqueue itself sits behind THIS message's session check; the detail message
 // carries no session of its own (see updateDetailsMsg).
 func (m Model) refreshUpdates() tea.Cmd {
+	return m.refreshUpdatesFor(m.composer, m.updatesCacheKey())
+}
+
+// refreshUpdatesFor is refreshUpdates with the composer and the cache key
+// passed in rather than read off the Model. Grouped mode needs both: it holds
+// no composer between actions, and its cache key belongs to the CURSOR row's
+// group rather than to the Model's own (empty) project identity.
+//
+// Capturing the key here rather than deriving it in the handler is what makes a
+// grouped scan safe against a cursor move — see updatesMsg.forKey.
+func (m Model) refreshUpdatesFor(c runner.Composer, key string) tea.Cmd {
 	ctx := m.ctx
-	c := m.composer
 	session := m.updatesSession
 	return func() tea.Msg {
 		results, err := c.CheckUpdates(ctx, nil)
-		return updatesMsg{results: results, err: err, session: session}
+		return updatesMsg{results: results, err: err, session: session, forKey: key}
 	}
 }
 
@@ -4944,12 +5025,19 @@ func (m Model) projUpdatesCacheKey(proj compose.Project) string {
 // qualified here before the lookup — the skip-unknown-name rule then measures
 // the same key space the map is stored under.
 func (m *Model) hydrateUpdates(results map[string]bool) {
+	m.hydrateUpdatesFor(m.ownerProjName(), results)
+}
+
+// hydrateUpdatesFor is hydrateUpdates with the owning project named rather than
+// inferred. Grouped mode needs it: several projects' verdicts live in svcStatus
+// at once, each under its own cache entry, so the owner comes from the group
+// being replayed instead of from the Model's single project identity.
+func (m *Model) hydrateUpdatesFor(projName string, results map[string]bool) {
 	if m.svcStatus == nil {
 		return
 	}
-	owner := m.ownerProjName()
 	for svc, avail := range results {
-		key := svcKey(owner, svc)
+		key := svcKey(projName, svc)
 		st, ok := m.svcStatus[key]
 		if !ok {
 			continue
@@ -4957,6 +5045,51 @@ func (m *Model) hydrateUpdates(results map[string]bool) {
 		v := avail
 		st.UpdateAvailable = &v
 		m.svcStatus[key] = st
+	}
+}
+
+// reapplyUpdateVerdicts rewrites the whole UpdateAvailable column from scratch:
+// every verdict is cleared first, so one the latest scan no longer reports
+// (build-only this time, a failed lookup, a service dropped from compose) loses
+// its stale glyph rather than lingering.
+//
+// The two modes differ in WHERE the replacement comes from. Drilled mode has one
+// project and one scan, so the message's own results are the whole truth.
+// Grouped mode holds several projects at once and U scans exactly one of them,
+// so the message alone would blank every group it did not cover — the verdicts
+// are re-read from the cache, per group.
+func (m *Model) reapplyUpdateVerdicts(results map[string]bool) {
+	for svc, st := range m.svcStatus {
+		st.UpdateAvailable = nil
+		m.svcStatus[svc] = st
+	}
+	if m.grouped {
+		m.hydrateGroupedUpdates()
+		return
+	}
+	m.hydrateUpdates(results)
+}
+
+// hydrateGroupedUpdates replays the cached verdicts of EVERY visible group into
+// svcStatus. It is the grouped twin of the servicesMsg/statusMsg cache replay
+// and the only hydration path grouped mode has.
+//
+// The cache reads are RAW — deliberately not the TTL-checked updatesCacheLookup.
+// Grouped mode never refetches on its own (U is the only trigger), so a
+// TTL-gated replay would blank the glyph column ten minutes after a scan with
+// nothing queued to bring it back; the age of the check is reported on the
+// inspect screen instead. Error entries are skipped: their results map is nil
+// and their verdicts are untrusted by contract.
+func (m *Model) hydrateGroupedUpdates() {
+	if m.svcStatus == nil || m.updateCache == nil {
+		return
+	}
+	for _, g := range m.svcGroups {
+		entry, ok := m.updateCache[m.projUpdatesCacheKey(g.proj)]
+		if !ok || entry.err {
+			continue
+		}
+		m.hydrateUpdatesFor(g.proj.Name, entry.results)
 	}
 }
 
@@ -6169,7 +6302,7 @@ func (m Model) groupHeaderLine(groupIdx int) string {
 	if len(g.services) == 0 {
 		return line
 	}
-	up, unhealthy := groupCounts(g, m.svcStatus)
+	up, unhealthy, updates := groupCounts(g, m.svcStatus)
 	dot := statusStoppedDot.Render("●")
 	if up > 0 {
 		dot = statusRunningDot.Render("●")
@@ -6177,6 +6310,9 @@ func (m Model) groupHeaderLine(groupIdx int) string {
 	line += fmt.Sprintf("   %s %d up", dot, up)
 	if unhealthy > 0 {
 		line += fmt.Sprintf("  %s %d", healthUnhealthy.Render("✗"), unhealthy)
+	}
+	if updates > 0 {
+		line += fmt.Sprintf("  %s %d", updateGlyphStyle.Render(compose.UpdateGlyph), updates)
 	}
 	return line
 }

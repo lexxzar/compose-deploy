@@ -279,14 +279,22 @@ Confirmed design decisions (brainstormed and validated; do not re-litigate):
 **Files:**
 - Modify: `internal/tui/app.go`
 - Modify: `internal/tui/app_test.go`
+- Modify: `internal/tui/entries.go` + `_test.go` (➕ `groupCounts` gained the header's `⇧ n` total; it is a pure row-model rule, so it lives beside the other row-model code)
 
-- [ ] gate ALL THREE auto-scan entry points on drilled mode: `maybeRefreshUpdatesCmd()`, the `statusMsg` self-heal, and `Init()`'s fast path; `NewModel` keeps `updateInFlight = m.autoUpdatesAllowed()` semantics with the grouped branch
-- [ ] `U` in grouped mode scans the cursor row's group only via that group's composer, writing one cache entry under the group's `updatesCacheKey` (projDir + server, unmanaged prefix rule kept) — shared with drilled mode; `updateInFlight` guard kept
-- [ ] `updatesMsg` gains `forKey` captured at DISPATCH; the cache write and `errMsg` restore key off `forKey`, never a handler-time re-derive (the cursor may have moved)
-- [ ] grouped-mode hydration iterates the cache entries of ALL visible groups (raw map reads), not the single `updatesCacheLookup()`; headers render `⇧ n` aggregated from cached verdicts only
-- [ ] `currentUpdateInfo()` resolves the cursor row's group key so `i` (inspect) from a grouped row reads the right entry; `redrawInspectFromCache()` gating unchanged
-- [ ] write tests: `U` scopes to cursor group, `forKey` write survives a cursor move, cache replay after drill-in, header count aggregation, no auto-scan in grouped mode, inspect-from-grouped-row reads the right entry
-- [ ] run tests - must pass before task 13
+⚠️ Deviations:
+- **The three auto-scan gates were already in place** — Task 6 landed them (its own deviation note says so), so this task pinned them instead of writing them: `TestGroupedMode_AllAutoScanEntryPointsRefuse` covers `maybeRefreshUpdatesCmd` + the `statusMsg` self-heal + `NewModel`'s seed, and `TestGroupedInit_FiresNoUpdateScan` covers `Init()`'s fast path.
+- **Grouped mode fetches NO detail rows**, and the gate is the MODE, not the nil composer. `updateDetailsCmd` reads `m.composer`, which an armed `x` prompt may have left bound to a DIFFERENT project than the scan covered — a batch built from it would resolve the wrong project's images. The entry keeps `details == nil`, which is exactly the state `refillUpdateDetailsCmd` fills on drill-in, so the rows are deferred rather than lost.
+- **`reapplyUpdateVerdicts` replaces the two clear-then-hydrate blocks in the `updatesMsg` handler.** A grouped scan covers ONE group, so the drilled rule ("the message is the whole truth") would blank every group the scan did not cover — including on the error path, where the contract binds only the failed project.
+- **`groupCounts` gained a third return rather than a second helper**: the header's `⇧ n` reads the same tri-state the row glyph draws, so a nil verdict counts as zero and nothing on the header path can trigger a scan.
+- **`inspectUpdateKey()` is read at render time, not captured on entry.** The cursor cannot move while the inspect screen is up, so it is equivalent to a captured field — without adding one more Model field to the departure-site cleanup list.
+
+- [x] gate ALL THREE auto-scan entry points on drilled mode: `maybeRefreshUpdatesCmd()`, the `statusMsg` self-heal, and `Init()`'s fast path; `NewModel` keeps `updateInFlight = m.autoUpdatesAllowed()` semantics with the grouped branch
+- [x] `U` in grouped mode scans the cursor row's group only via that group's composer, writing one cache entry under the group's `updatesCacheKey` (projDir + server, unmanaged prefix rule kept) — shared with drilled mode; `updateInFlight` guard kept
+- [x] `updatesMsg` gains `forKey` captured at DISPATCH; the cache write and `errMsg` restore key off `forKey`, never a handler-time re-derive (the cursor may have moved)
+- [x] grouped-mode hydration iterates the cache entries of ALL visible groups (raw map reads), not the single `updatesCacheLookup()`; headers render `⇧ n` aggregated from cached verdicts only
+- [x] `currentUpdateInfo()` resolves the cursor row's group key so `i` (inspect) from a grouped row reads the right entry; `redrawInspectFromCache()` gating unchanged
+- [x] write tests: `U` scopes to cursor group, `forKey` write survives a cursor move, cache replay after drill-in, header count aggregation, no auto-scan in grouped mode, inspect-from-grouped-row reads the right entry
+- [x] run tests - must pass before task 13
 
 ### Task 13: Delete screenSelectProject (phase 4)
 

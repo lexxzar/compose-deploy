@@ -76,11 +76,17 @@ func groupsHaveHeaders(groups []svcGroup) bool { return len(groups) > 1 }
 func (m Model) hasGroupHeaders() bool { return groupsHaveHeaders(m.svcGroups) }
 
 // groupCounts totals one group's live state for its header row: how many of its
-// services are running, and how many report a failing healthcheck. A service
-// with no status entry counts as neither — the host-wide fetch reports only
-// containers that exist, and a project whose containers were all removed must
-// read "0 up" rather than inflate the total.
-func groupCounts(g svcGroup, status map[string]runner.ServiceStatus) (up, unhealthy int) {
+// services are running, how many report a failing healthcheck, and how many have
+// an image update waiting. A service with no status entry counts as none of the
+// three — the host-wide fetch reports only containers that exist, and a project
+// whose containers were all removed must read "0 up" rather than inflate the
+// total.
+//
+// The update total is read off the same tri-state the row glyph draws, so a
+// folded group can only ever report what a scan has already established: nil
+// (never checked, or checked and failed) counts as zero, exactly like a false
+// verdict. Nothing here triggers a scan.
+func groupCounts(g svcGroup, status map[string]runner.ServiceStatus) (up, unhealthy, updates int) {
 	for _, name := range g.services {
 		st, ok := status[svcKey(g.proj.Name, name)]
 		if !ok {
@@ -92,8 +98,11 @@ func groupCounts(g svcGroup, status map[string]runner.ServiceStatus) (up, unheal
 		if st.Health == "unhealthy" {
 			unhealthy++
 		}
+		if st.UpdateAvailable != nil && *st.UpdateAvailable {
+			updates++
+		}
 	}
-	return up, unhealthy
+	return up, unhealthy, updates
 }
 
 // svcKeySep separates the project half of a qualified key from the service

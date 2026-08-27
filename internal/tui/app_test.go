@@ -10530,7 +10530,7 @@ func TestUpdatesMsg_currentSessionHydrates(t *testing.T) {
 	})
 
 	result, _ := m.Update(updatesMsg{
-		results: map[string]bool{"web": true, "db": false},
+		forKey: m.updatesCacheKey(), results: map[string]bool{"web": true, "db": false},
 		session: 3,
 	})
 	model := result.(Model)
@@ -10567,7 +10567,7 @@ func TestUpdatesMsg_staleSessionIgnored(t *testing.T) {
 	m.svcStatus = qStatus(m, map[string]runner.ServiceStatus{"web": {Running: true}})
 
 	result, _ := m.Update(updatesMsg{
-		results: map[string]bool{"web": true},
+		forKey: m.updatesCacheKey(), results: map[string]bool{"web": true},
 		session: 4, // older context
 	})
 	model := result.(Model)
@@ -10593,7 +10593,7 @@ func TestUpdatesMsg_clearsInFlightOffScreen(t *testing.T) {
 	m.updateInFlight = true
 
 	result, _ := m.Update(updatesMsg{
-		results: map[string]bool{"web": true},
+		forKey: m.updatesCacheKey(), results: map[string]bool{"web": true},
 		session: 5,
 	})
 	model := result.(Model)
@@ -10621,7 +10621,7 @@ func TestUpdatesMsg_errorSetsErrAndClearsInFlight(t *testing.T) {
 	m.updateInFlight = true
 
 	result, _ := m.Update(updatesMsg{
-		err:     errors.New("registry timeout"),
+		forKey: m.updatesCacheKey(), err: errors.New("registry timeout"),
 		session: 1,
 	})
 	model := result.(Model)
@@ -10652,7 +10652,7 @@ func TestUpdatesMsg_staleClearsInFlight(t *testing.T) {
 	m.updateInFlight = true
 
 	result, _ := m.Update(updatesMsg{
-		results: map[string]bool{"web": true},
+		forKey: m.updatesCacheKey(), results: map[string]bool{"web": true},
 		session: 3, // stale
 	})
 	model := result.(Model)
@@ -10793,7 +10793,7 @@ func TestUpdatesMsg_ErrorCachedWithShortTTL(t *testing.T) {
 	m.updateInFlight = true
 
 	result, _ := m.Update(updatesMsg{
-		results: map[string]bool{"web": true}, // partial — should NOT be cached on error
+		forKey: m.updatesCacheKey(), results: map[string]bool{"web": true}, // partial — should NOT be cached on error
 		err:     errors.New("registry boom"),
 		session: m.updatesSession,
 	})
@@ -10840,7 +10840,7 @@ func TestUpdatesMsg_ErrorClearsCachedSuccess(t *testing.T) {
 	}
 
 	result, _ := m.Update(updatesMsg{
-		err:     errors.New("registry boom"),
+		forKey: m.updatesCacheKey(), err: errors.New("registry boom"),
 		session: m.updatesSession,
 	})
 	model := result.(Model)
@@ -10879,7 +10879,7 @@ func TestUpdatesMsg_ErrorClearsGlyphs(t *testing.T) {
 	})
 
 	result, _ := m.Update(updatesMsg{
-		err:     errors.New("registry timeout"),
+		forKey: m.updatesCacheKey(), err: errors.New("registry timeout"),
 		session: m.updatesSession,
 	})
 	model := result.(Model)
@@ -10977,7 +10977,7 @@ func TestUpdatesMsg_FreshResultClearsStaleVerdict(t *testing.T) {
 
 	// New refresh result omits "db" — it should drop back to nil.
 	result, _ := m.Update(updatesMsg{
-		results: map[string]bool{"web": true},
+		forKey: m.updatesCacheKey(), results: map[string]bool{"web": true},
 		session: m.updatesSession,
 	})
 	model := result.(Model)
@@ -11909,7 +11909,7 @@ func TestUpdateDetails_OneBatchAtATime(t *testing.T) {
 	m.screen = screenSelectContainers
 	m.svcStatus = qStatus(m, map[string]runner.ServiceStatus{"web": {Running: true}})
 
-	first, cmd := m.Update(updatesMsg{results: map[string]bool{"web": true}, session: m.updatesSession})
+	first, cmd := m.Update(updatesMsg{forKey: m.updatesCacheKey(), results: map[string]bool{"web": true}, session: m.updatesSession})
 	mo := first.(Model)
 	if cmd == nil {
 		t.Fatal("the first verdicts must enqueue a detail fetch")
@@ -11921,7 +11921,7 @@ func TestUpdateDetails_OneBatchAtATime(t *testing.T) {
 	// The user presses U while the details are still resolving: the verdicts
 	// refresh (that half is guarded by updateInFlight alone), but the handler
 	// must NOT enqueue a second detail batch.
-	second, cmd2 := mo.Update(updatesMsg{results: map[string]bool{"web": true}, session: mo.updatesSession})
+	second, cmd2 := mo.Update(updatesMsg{forKey: mo.updatesCacheKey(), results: map[string]bool{"web": true}, session: mo.updatesSession})
 	so := second.(Model)
 	if cmd2 != nil {
 		t.Errorf("a second detail batch was enqueued while one was in flight: %T", cmd2())
@@ -11980,13 +11980,13 @@ func TestUpdateDetails_RefillTargetsTheNewestEntry(t *testing.T) {
 	m.screen = screenSelectContainers
 	m.svcStatus = qStatus(m, map[string]runner.ServiceStatus{"web": {Running: true}})
 
-	model, cmd := m.Update(updatesMsg{results: map[string]bool{"web": true}, session: m.updatesSession})
+	model, cmd := m.Update(updatesMsg{forKey: m.updatesCacheKey(), results: map[string]bool{"web": true}, session: m.updatesSession})
 	if cmd == nil {
 		t.Fatal("the first verdicts must enqueue a detail fetch")
 	}
 	mo := model.(Model)
 	for range 3 {
-		next, c := mo.Update(updatesMsg{results: map[string]bool{"web": true}, session: mo.updatesSession})
+		next, c := mo.Update(updatesMsg{forKey: mo.updatesCacheKey(), results: map[string]bool{"web": true}, session: mo.updatesSession})
 		if c != nil {
 			t.Fatalf("a second detail batch was enqueued while one was in flight: %T", c())
 		}
@@ -12365,13 +12365,13 @@ func TestUpdateDetails_LostBatchHealsAfterNavigating(t *testing.T) {
 	m.svcStatus = qStatus(m, map[string]runner.ServiceStatus{"web": {Running: true}})
 
 	// Batch B1 goes out for entry E1.
-	first, b1 := m.Update(updatesMsg{results: map[string]bool{"web": true}, session: m.updatesSession})
+	first, b1 := m.Update(updatesMsg{forKey: m.updatesCacheKey(), results: map[string]bool{"web": true}, session: m.updatesSession})
 	mo := first.(Model)
 	if b1 == nil {
 		t.Fatal("the first verdicts must enqueue a detail fetch")
 	}
 	// U mid-scan: E2 replaces E1 and its own batch is refused.
-	second, refused := mo.Update(updatesMsg{results: map[string]bool{"web": true}, session: mo.updatesSession})
+	second, refused := mo.Update(updatesMsg{forKey: mo.updatesCacheKey(), results: map[string]bool{"web": true}, session: mo.updatesSession})
 	if refused != nil {
 		t.Fatalf("precondition: the second batch must be refused, got %T", refused())
 	}
@@ -12443,7 +12443,7 @@ func TestUpdateDetails_FetchCarriesADeadline(t *testing.T) {
 	m.composer = mc
 	m.screen = screenSelectContainers
 
-	_, cmd := m.Update(updatesMsg{results: map[string]bool{"web": true}, session: m.updatesSession})
+	_, cmd := m.Update(updatesMsg{forKey: m.updatesCacheKey(), results: map[string]bool{"web": true}, session: m.updatesSession})
 	if cmd == nil {
 		t.Fatal("the verdicts enqueued no detail fetch")
 	}
@@ -12474,7 +12474,7 @@ func TestUpdatesMsg_StaleSessionDoesNotWriteTheEntry(t *testing.T) {
 	m.updatesSession = 7
 
 	model, cmd := m.Update(updatesMsg{
-		results: map[string]bool{"web": true},
+		forKey: m.updatesCacheKey(), results: map[string]bool{"web": true},
 		session: 6, // a fetch issued before the context changed
 	})
 
@@ -12505,7 +12505,7 @@ func TestUpdatesMsg_RefreshesInspectSummary(t *testing.T) {
 	m.setInspectContent()
 
 	mid, cmd := m.Update(updatesMsg{
-		results: map[string]bool{"web": true},
+		forKey: m.updatesCacheKey(), results: map[string]bool{"web": true},
 		session: m.updatesSession,
 	})
 	model := mid.(Model)
@@ -12561,7 +12561,7 @@ func TestUpdatesMsg_FailurePathClearsInspectRows(t *testing.T) {
 	}
 
 	model := modelOf(m.Update(updatesMsg{
-		err:     errors.New("registry unreachable"),
+		forKey: m.updatesCacheKey(), err: errors.New("registry unreachable"),
 		session: m.updatesSession,
 	}))
 
@@ -12580,7 +12580,7 @@ func TestUpdatesMsg_RawModeKeepsHorizontalScroll(t *testing.T) {
 	raw := inspectScrolledRawModel(t)
 
 	model := modelOf(raw.Update(updatesMsg{
-		results: map[string]bool{"web": true},
+		forKey: raw.updatesCacheKey(), results: map[string]bool{"web": true},
 		session: raw.updatesSession,
 	}))
 
@@ -12604,7 +12604,7 @@ func TestUpdatesMsg_InspectRebuildIsScreenScoped(t *testing.T) {
 	m.inspectSummary = "STALE SUMMARY"
 
 	model := modelOf(m.Update(updatesMsg{
-		results: map[string]bool{"web": true},
+		forKey: m.updatesCacheKey(), results: map[string]bool{"web": true},
 		session: m.updatesSession,
 	}))
 
@@ -13364,7 +13364,7 @@ func TestUpdatesMsg_OffScreenErrorClearsState(t *testing.T) {
 	})
 
 	result, _ := m.Update(updatesMsg{
-		err:     errors.New("registry timeout"),
+		forKey: m.updatesCacheKey(), err: errors.New("registry timeout"),
 		session: 4,
 	})
 	model := result.(Model)
@@ -13499,7 +13499,7 @@ func TestUpdatesMsg_ErrorCacheStoresErrMsg(t *testing.T) {
 	m.updateInFlight = true
 
 	result, _ := m.Update(updatesMsg{
-		err:     errors.New("docker hub timeout"),
+		forKey: m.updatesCacheKey(), err: errors.New("docker hub timeout"),
 		session: m.updatesSession,
 	})
 	model := result.(Model)
@@ -13547,7 +13547,7 @@ func TestUpdatesMsg_OffScreenErrorFixesOffset(t *testing.T) {
 	m.svcOffset = 0
 
 	result, _ := m.Update(updatesMsg{
-		err:     errors.New("registry timeout"),
+		forKey: m.updatesCacheKey(), err: errors.New("registry timeout"),
 		session: 7,
 	})
 	model := result.(Model)
@@ -16812,7 +16812,7 @@ func TestReadOnly_UpdateGlyphHydrates(t *testing.T) {
 	m := newReadOnlyModel(t, mc)
 
 	result, _ := m.Update(updatesMsg{
-		results: map[string]bool{"watchtower": true, "portainer": false},
+		forKey: m.updatesCacheKey(), results: map[string]bool{"watchtower": true, "portainer": false},
 		session: m.updatesSession,
 	})
 	model := result.(Model)
@@ -19529,10 +19529,11 @@ func TestGroupedMode_NoAutomaticUpdateScan(t *testing.T) {
 	if cmd := m.maybeRefreshUpdatesCmd(); cmd != nil {
 		t.Error("maybeRefreshUpdatesCmd must schedule nothing in grouped mode")
 	}
-	// U is the only trigger, and with no composer bound it is inert for now.
+	// U is the only trigger, and it scans the CURSOR row's group — this model
+	// has loaded no rows, so there is no group to scan and the key is inert.
 	updated, cmd := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'U'}})
 	if cmd != nil {
-		t.Error("U must not fan out to the registry with no composer bound")
+		t.Error("U must not fan out to the registry with no group under the cursor")
 	}
 	if got := updated.(Model); got.updateInFlight {
 		t.Error("U must not leave updateInFlight latched")
@@ -21235,5 +21236,432 @@ func TestBatchWait_DepartureRunsCleanupAndClearsWait(t *testing.T) {
 	}
 	if m.batchSession == batchSession {
 		t.Error("the departure must bump batchSession")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Grouped host view (Task 12): updates.
+// ---------------------------------------------------------------------------
+
+// groupedUpdatesModel is groupedOpModel with a factory that hands out a
+// DISTINCT composer per project, so a scan can be attributed to the project it
+// was dispatched for. The row order it produces is the fixture's:
+//
+//	0 blog header   1 blog/web
+//	2 shop header   3 shop/api   4 shop/db
+//	5 (unmanaged) header   6 watchtower
+func groupedUpdatesModel(t *testing.T) (Model, map[string]*mockComposer) {
+	t.Helper()
+	g, projects := groupedFixture()
+	per := map[string]*mockComposer{
+		"blog": {updates: map[string]bool{"web": true}},
+		"shop": {updates: map[string]bool{"api": true, "db": false}},
+	}
+	m := groupedTestModel(g, projects)
+	m.composerFactory = func(p compose.Project) runner.Composer {
+		if p.Unmanaged {
+			return g
+		}
+		if c, ok := per[p.Name]; ok {
+			return c
+		}
+		return nil
+	}
+	updated, _ := m.Update(m.loadGroups()())
+	m = updated.(Model)
+	if got := len(m.svcEntries); got != 7 {
+		t.Fatalf("precondition: %d rows, want 7", got)
+	}
+	return m, per
+}
+
+// pressU drives the U key and runs the Cmd it returns, delivering the resulting
+// updatesMsg. It returns the model after the scan has landed.
+func pressU(t *testing.T, m Model) Model {
+	t.Helper()
+	updated, cmd := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'U'}})
+	m = updated.(Model)
+	if cmd == nil {
+		t.Fatal("U produced no scan command")
+	}
+	if !m.updateInFlight {
+		t.Error("U must raise updateInFlight before the fetch returns")
+	}
+	if m.grouped && m.composer != nil {
+		t.Error("grouped mode must not stay holding the composer U bound")
+	}
+	msg, ok := cmd().(updatesMsg)
+	if !ok {
+		t.Fatalf("U's command produced %T, want updatesMsg", cmd())
+	}
+	updated, _ = m.Update(msg)
+	m = updated.(Model)
+	if m.updateInFlight {
+		t.Error("the arrival must clear updateInFlight")
+	}
+	return m
+}
+
+// U scans ONE group — the cursor row's — through that group's own composer, and
+// files the verdicts under that group's cache key. Every other group is left
+// untouched: no fetch, no cache entry, no glyph.
+func TestGroupedU_ScansCursorGroupOnly(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		cursor int
+	}{
+		{"service row", 3},  // shop/api
+		{"group header", 2}, // the shop header — a header IS its group
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			m, per := groupedUpdatesModel(t)
+			m.svcCursor = tc.cursor
+			m = pressU(t, m)
+
+			if per["shop"].updatesCalls != 1 {
+				t.Errorf("shop CheckUpdates ran %d times, want 1", per["shop"].updatesCalls)
+			}
+			if per["blog"].updatesCalls != 0 {
+				t.Errorf("blog CheckUpdates ran %d times; U must not fan out across the host", per["blog"].updatesCalls)
+			}
+			shopKey := m.projUpdatesCacheKey(compose.Project{Name: "shop", ConfigDir: "/srv/shop"})
+			if _, ok := m.updateCache[shopKey]; !ok {
+				t.Fatalf("no cache entry under %q; cache = %v", shopKey, m.updateCache)
+			}
+			blogKey := m.projUpdatesCacheKey(compose.Project{Name: "blog", ConfigDir: "/srv/blog"})
+			if _, ok := m.updateCache[blogKey]; ok {
+				t.Errorf("a scan of shop wrote an entry under blog's key %q", blogKey)
+			}
+			if st := m.svcStatus[svcKey("shop", "api")]; st.UpdateAvailable == nil || !*st.UpdateAvailable {
+				t.Errorf("shop/api verdict = %v, want true", st.UpdateAvailable)
+			}
+			if st := m.svcStatus[svcKey("shop", "db")]; st.UpdateAvailable == nil || *st.UpdateAvailable {
+				t.Errorf("shop/db verdict = %v, want false", st.UpdateAvailable)
+			}
+			if st := m.svcStatus[svcKey("blog", "web")]; st.UpdateAvailable != nil {
+				t.Errorf("blog/web verdict = %v, want nil (never scanned)", st.UpdateAvailable)
+			}
+		})
+	}
+}
+
+// The unmanaged bucket keeps the "unmanaged|" prefix its key has always
+// carried, so a local host cannot collide it with the fast-track slot.
+func TestGroupedU_UnmanagedGroupKeepsCachePrefix(t *testing.T) {
+	m, _ := groupedUpdatesModel(t)
+	m.svcCursor = 5 // the (unmanaged) header
+
+	updated, cmd := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'U'}})
+	m = updated.(Model)
+	if cmd == nil {
+		t.Fatal("U on the unmanaged group produced no scan command")
+	}
+	msg := cmd().(updatesMsg)
+	if !strings.HasPrefix(msg.forKey, "unmanaged|") {
+		t.Errorf("forKey = %q, want the unmanaged prefix", msg.forKey)
+	}
+}
+
+// The key travels WITH the message. Moving the cursor (or folding a group)
+// while the scan runs must not re-file the verdicts under another project.
+func TestGroupedU_ForKeySurvivesCursorMove(t *testing.T) {
+	m, per := groupedUpdatesModel(t)
+	m.svcCursor = 3 // shop/api
+
+	updated, cmd := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'U'}})
+	m = updated.(Model)
+	msg := cmd().(updatesMsg)
+
+	// The user walks back up to the blog group while the registry is busy.
+	m.svcCursor = 1
+	updated, _ = m.Update(msg)
+	m = updated.(Model)
+
+	shopKey := m.projUpdatesCacheKey(compose.Project{Name: "shop", ConfigDir: "/srv/shop"})
+	if _, ok := m.updateCache[shopKey]; !ok {
+		t.Fatalf("the verdicts were not filed under the scanned project; cache = %v", m.updateCache)
+	}
+	if len(m.updateCache) != 1 {
+		t.Errorf("cache = %v, want exactly the scanned project's entry", m.updateCache)
+	}
+	if st := m.svcStatus[svcKey("blog", "web")]; st.UpdateAvailable != nil {
+		t.Error("the cursor's group must not inherit another group's verdicts")
+	}
+	if per["blog"].updatesCalls != 0 {
+		t.Error("moving the cursor must not trigger a scan of its own")
+	}
+}
+
+// A second group's scan must not blank the first's glyphs — grouped mode holds
+// several projects' verdicts at once, and each scan owns only its own.
+func TestGroupedU_SecondScanKeepsFirstGroupsVerdicts(t *testing.T) {
+	m, _ := groupedUpdatesModel(t)
+	m.svcCursor = 1 // blog/web
+	m = pressU(t, m)
+	m.svcCursor = 3 // shop/api
+	m = pressU(t, m)
+
+	if st := m.svcStatus[svcKey("blog", "web")]; st.UpdateAvailable == nil || !*st.UpdateAvailable {
+		t.Errorf("blog/web verdict = %v after scanning shop, want true", st.UpdateAvailable)
+	}
+	if st := m.svcStatus[svcKey("shop", "api")]; st.UpdateAvailable == nil || !*st.UpdateAvailable {
+		t.Errorf("shop/api verdict = %v, want true", st.UpdateAvailable)
+	}
+}
+
+// A failing scan blanks its OWN group only, and still raises the soft warning.
+func TestGroupedU_FailureBlanksOnlyItsOwnGroup(t *testing.T) {
+	m, per := groupedUpdatesModel(t)
+	m.svcCursor = 1 // blog/web
+	m = pressU(t, m)
+
+	per["shop"].updatesErr = errors.New("registry unreachable")
+	per["shop"].updates = nil
+	m.svcCursor = 3 // shop/api
+	m = pressU(t, m)
+
+	if m.updatesErr == "" {
+		t.Error("a failed scan must raise the soft warning")
+	}
+	if st := m.svcStatus[svcKey("blog", "web")]; st.UpdateAvailable == nil || !*st.UpdateAvailable {
+		t.Errorf("blog/web verdict = %v; one project's failure must not discard another's", st.UpdateAvailable)
+	}
+	if st := m.svcStatus[svcKey("shop", "api")]; st.UpdateAvailable != nil {
+		t.Errorf("shop/api verdict = %v, want nil after its own scan failed", st.UpdateAvailable)
+	}
+}
+
+// The grouped payload is the 5-second refresh as well as the initial load, so
+// it rebuilds svcStatus from scratch. Without the cache replay every glyph U
+// painted would vanish on the next tick, with nothing queued to fetch it back.
+func TestGroupedUpdates_SurviveAPeriodicReload(t *testing.T) {
+	m, _ := groupedUpdatesModel(t)
+	m.svcCursor = 3
+	m = pressU(t, m)
+
+	updated, _ := m.Update(m.loadGroups()())
+	m = updated.(Model)
+
+	if st := m.svcStatus[svcKey("shop", "api")]; st.UpdateAvailable == nil || !*st.UpdateAvailable {
+		t.Errorf("shop/api verdict = %v after a reload, want true", st.UpdateAvailable)
+	}
+}
+
+// The header aggregates the group's cached verdicts, so a FOLDED group still
+// reports how much of it is out of date.
+func TestGroupedHeader_ShowsUpdateCount(t *testing.T) {
+	m, _ := groupedUpdatesModel(t)
+	m.svcCursor = 3
+	m = pressU(t, m)
+
+	shopHeader := m.groupHeaderLine(1)
+	if !strings.Contains(shopHeader, compose.UpdateGlyph+" 1") {
+		t.Errorf("shop header = %q, want the update glyph and a count of 1", shopHeader)
+	}
+	if blogHeader := m.groupHeaderLine(0); strings.Contains(blogHeader, compose.UpdateGlyph) {
+		t.Errorf("blog header = %q; an unscanned group must report no updates", blogHeader)
+	}
+
+	// Fold shop: the rows go, the aggregate stays.
+	m.svcCursor = 2
+	m = pressGroupKey(m, " ")
+	if !m.svcGroups[1].folded {
+		t.Fatal("precondition: space on the shop header did not fold it")
+	}
+	if got := m.groupHeaderLine(1); !strings.Contains(got, compose.UpdateGlyph+" 1") {
+		t.Errorf("folded shop header = %q, want the update count preserved", got)
+	}
+}
+
+// Drilling into a scanned project must REUSE the entry U wrote — the two modes
+// share one key per project, so the drill costs no second registry pass.
+func TestGroupedUpdates_DrillInReplaysCachedEntry(t *testing.T) {
+	m, per := groupedUpdatesModel(t)
+	m.svcCursor = 3 // shop/api
+	m = pressU(t, m)
+	if per["shop"].updatesCalls != 1 {
+		t.Fatalf("precondition: shop scanned %d times, want 1", per["shop"].updatesCalls)
+	}
+	per["shop"].services = []string{"api", "db"}
+	per["shop"].status = map[string]runner.ServiceStatus{"api": {Running: true}, "db": {}}
+
+	m.svcCursor = 2 // the shop header
+	updated, cmd := m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	m = updated.(Model)
+	if m.grouped {
+		t.Fatal("enter on a header must drill in")
+	}
+	if got := m.updatesCacheKey(); got != m.projUpdatesCacheKey(compose.Project{Name: "shop", ConfigDir: "/srv/shop"}) {
+		t.Fatalf("drilled key = %q; the two modes must share one key per project", got)
+	}
+	if _, fresh := m.updatesCacheLookup(); !fresh {
+		t.Fatal("the drilled screen must find the entry the grouped scan wrote")
+	}
+	if cmd != nil {
+		cmd() // loadServices + stats; must not add a CheckUpdates pass
+	}
+	if per["shop"].updatesCalls != 1 {
+		t.Errorf("shop scanned %d times after the drill, want 1 (the cache entry is shared)", per["shop"].updatesCalls)
+	}
+}
+
+// The inspect screen reads the CURSOR row's group entry. Grouped mode has an
+// empty project identity, so updatesCacheKey alone would read whichever entry
+// happened to sit under "|<server>".
+func TestGroupedInspect_ReadsCursorGroupEntry(t *testing.T) {
+	m, _ := groupedUpdatesModel(t)
+	m.svcCursor = 3 // shop/api
+	m = pressU(t, m)
+
+	if got, want := m.inspectUpdateKey(), m.projUpdatesCacheKey(compose.Project{Name: "shop", ConfigDir: "/srv/shop"}); got != want {
+		t.Fatalf("inspectUpdateKey = %q, want %q", got, want)
+	}
+	m.inspectService = "api"
+	upd := m.currentUpdateInfo()
+	if upd.verdict == nil || !*upd.verdict {
+		t.Errorf("currentUpdateInfo verdict = %v, want true", upd.verdict)
+	}
+	if upd.checkedAt.IsZero() {
+		t.Error("currentUpdateInfo must report when the scan ran")
+	}
+
+	// A row in a group nothing has scanned reads back as unknown, not as the
+	// scanned group's answer.
+	m.svcCursor = 1 // blog/web
+	m.inspectService = "web"
+	if upd := m.currentUpdateInfo(); upd.verdict != nil || !upd.checkedAt.IsZero() {
+		t.Errorf("an unscanned group must read as unknown, got %+v", upd)
+	}
+}
+
+// The three automatic entry points stay shut in grouped mode: the screen-entry
+// helper, the statusMsg self-heal and NewModel's in-flight seed.
+func TestGroupedMode_AllAutoScanEntryPointsRefuse(t *testing.T) {
+	m, per := groupedUpdatesModel(t)
+
+	if m.autoUpdatesAllowed() {
+		t.Error("autoUpdatesAllowed must be false in grouped mode")
+	}
+	if cmd := m.maybeRefreshUpdatesCmd(); cmd != nil {
+		t.Error("maybeRefreshUpdatesCmd must schedule nothing in grouped mode")
+	}
+	if m.updateInFlight {
+		t.Error("a grouped model must start with the in-flight guard clear, or the first U is refused")
+	}
+
+	// The statusMsg self-heal: no cache entry, nothing in flight — and still
+	// no fetch, because U is the only trigger here.
+	updated, cmd := m.Update(statusMsg{status: map[string]runner.ServiceStatus{}, session: m.statusSession})
+	m = updated.(Model)
+	if cmd != nil {
+		t.Error("the statusMsg self-heal must not fire in grouped mode")
+	}
+	for name, c := range per {
+		if c.updatesCalls != 0 {
+			t.Errorf("%s CheckUpdates ran %d times with no U press", name, c.updatesCalls)
+		}
+	}
+}
+
+// The in-flight guard is checked BEFORE anything is bound, so a refused U
+// leaves the grouped screen exactly as it found it.
+func TestGroupedU_InFlightGuardBindsNothing(t *testing.T) {
+	m, per := groupedUpdatesModel(t)
+	m.svcCursor = 3
+	m.updateInFlight = true
+
+	updated, cmd := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'U'}})
+	m = updated.(Model)
+	if cmd != nil {
+		t.Error("U must be refused while a scan is in flight")
+	}
+	if m.composer != nil {
+		t.Error("a refused U must not leave a composer bound")
+	}
+	if per["shop"].updatesCalls != 0 {
+		t.Errorf("shop CheckUpdates ran %d times, want 0", per["shop"].updatesCalls)
+	}
+}
+
+// Grouped mode fetches no detail rows: it holds no composer of its own, and one
+// an armed prompt left bound may belong to a different project entirely.
+func TestGroupedU_FetchesNoDetailBatch(t *testing.T) {
+	g, projects := groupedFixture()
+	detail := &mockDetailComposer{
+		mockComposer: mockComposer{updates: map[string]bool{"api": true}},
+		details:      map[string]compose.UpdateDetail{"api": {NewID: "sha256:beef"}},
+	}
+	m := groupedTestModel(g, projects)
+	m.composerFactory = func(p compose.Project) runner.Composer {
+		if p.Unmanaged {
+			return g
+		}
+		return detail
+	}
+	updated, _ := m.Update(m.loadGroups()())
+	m = updated.(Model)
+	m.svcCursor = 3 // shop/api
+
+	updated, cmd := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'U'}})
+	m = updated.(Model)
+	msg := cmd().(updatesMsg)
+	// An exec prompt could have left a composer bound; the gate must be the
+	// MODE, not the nil.
+	m.composer = detail
+	updated, detailsCmd := m.Update(msg)
+	m = updated.(Model)
+
+	if detailsCmd != nil {
+		t.Error("grouped mode must enqueue no detail batch")
+	}
+	if detail.detailsCalls != 0 {
+		t.Errorf("UpdateDetails ran %d times in grouped mode, want 0", detail.detailsCalls)
+	}
+	if m.detailsInFlight {
+		t.Error("no batch was dispatched, so the detail guard must stay clear")
+	}
+	// The entry keeps details == nil, which is exactly the state a drill-in
+	// refills.
+	entry := m.updateCache[msg.forKey]
+	if entry.details != nil {
+		t.Errorf("entry.details = %v, want nil so refillUpdateDetailsCmd can fill it", entry.details)
+	}
+}
+
+// Init()'s standalone-container fast path is the third automatic entry point.
+// A model that lands grouped must never reach it: the grouped branch above it
+// dispatches the host loader and the host stats, and nothing else.
+func TestGroupedInit_FiresNoUpdateScan(t *testing.T) {
+	g, projects := groupedFixture()
+	scanned := &mockComposer{updates: map[string]bool{"api": true}}
+	m := NewModel(nil, io.Discard, func(p compose.Project) runner.Composer {
+		if p.Unmanaged {
+			return g
+		}
+		return scanned
+	}, nil, nil, WithLocalProjectLoader(func(ctx context.Context) ([]compose.Project, error) {
+		return projects, nil
+	}))
+	installFakeTick(&m)
+
+	if !m.grouped {
+		t.Fatal("no cwd compose file and no servers must land on the grouped host view")
+	}
+	if m.updateInFlight {
+		t.Fatal("NewModel must leave the guard clear when it schedules no scan")
+	}
+
+	batch, ok := m.Init()().(tea.BatchMsg)
+	if !ok {
+		t.Fatalf("Init() produced %T, want tea.BatchMsg", m.Init()())
+	}
+	for _, c := range batch {
+		if c != nil {
+			c()
+		}
+	}
+	if scanned.updatesCalls != 0 || g.updatesCalls != 0 {
+		t.Errorf("Init() ran CheckUpdates %d/%d times; grouped mode waits for U",
+			scanned.updatesCalls, g.updatesCalls)
 	}
 }
