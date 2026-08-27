@@ -151,17 +151,18 @@ func findGroup() helpGroup {
 // the description name both. A key bound in a sub-state must name that state,
 // and "a group header" is exactly that state.
 //
-// enter joins the group for the same reason, and belongs HERE rather than as a
-// second row in OPERATE: OPERATE already names enter as the confirmation key,
-// and one key cannot carry two descriptions in one table. The row-kind
-// sub-state it is bound in — a group header — is named in the description, the
-// convention every sub-state binding follows.
+// enter joins the group because it is grouped-mode-only too, and belongs HERE
+// rather than as a second row in OPERATE: OPERATE already names enter as the
+// confirmation key, and one key cannot carry two descriptions in one table. It
+// answers on EVERY row — a header and a service row name the same project — so
+// the description says "the cursor row's project" rather than naming a
+// sub-state it is not restricted to.
 func selectGroup(grouped bool) helpGroup {
 	if grouped {
 		return helpGroup{title: "SELECT", actions: true, entries: []helpEntry{
 			{"space", "toggle a service · fold a group"},
 			{"a", "all"},
-			{"enter", "drill into the project on a group header"},
+			{"enter", "drill into the cursor row's project"},
 		}}
 	}
 	return helpGroup{title: "SELECT", actions: true, entries: []helpEntry{

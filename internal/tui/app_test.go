@@ -3190,8 +3190,8 @@ func TestWaitForEvent_ReturnsStepEventMsg(t *testing.T) {
 	if !ok {
 		t.Fatalf("msg type = %T, want stepEventMsg", msg)
 	}
-	if runner.StepEvent(got) != want {
-		t.Fatalf("step event = %+v, want %+v", runner.StepEvent(got), want)
+	if got.event != want {
+		t.Fatalf("step event = %+v, want %+v", got.event, want)
 	}
 }
 
@@ -18224,6 +18224,11 @@ func TestLoadGroups_MergesLoaderAndHostStatus(t *testing.T) {
 }
 
 func TestLoadGroups_ErrorPaths(t *testing.T) {
+	// EVERY return carries groupedPayload, failures included: the flag is the
+	// message's SHAPE, and in grouped mode this message is the only arrival that
+	// clears refreshInFlight (statsRefreshCmd is nil there). An error return
+	// without it latched the guard and silenced the 5-second refresh for the
+	// rest of the visit.
 	t.Run("no loader", func(t *testing.T) {
 		g, _ := groupedFixture()
 		m := groupedTestModel(g, nil)
@@ -18231,6 +18236,9 @@ func TestLoadGroups_ErrorPaths(t *testing.T) {
 		msg := m.loadGroups()().(servicesMsg)
 		if msg.err == nil {
 			t.Fatal("a missing loader must report an error, not an empty host")
+		}
+		if !msg.groupedPayload {
+			t.Error("a missing loader must still mark the payload grouped, or refreshInFlight latches")
 		}
 	})
 	t.Run("loader failure", func(t *testing.T) {
@@ -18240,8 +18248,14 @@ func TestLoadGroups_ErrorPaths(t *testing.T) {
 			return nil, errors.New("compose ls failed")
 		}
 		msg := m.loadGroups()().(servicesMsg)
-		if msg.err == nil || msg.groupedPayload {
-			t.Fatalf("loader failure = %+v, want an error and no payload", msg)
+		if msg.err == nil {
+			t.Fatalf("loader failure = %+v, want an error", msg)
+		}
+		if !msg.groupedPayload {
+			t.Error("a loader failure must still mark the payload grouped, or refreshInFlight latches")
+		}
+		if len(msg.projects) != 0 || len(msg.hostStatus) != 0 {
+			t.Errorf("loader failure carried data: %+v", msg)
 		}
 	})
 	t.Run("host ps failure", func(t *testing.T) {
@@ -18251,6 +18265,9 @@ func TestLoadGroups_ErrorPaths(t *testing.T) {
 		msg := m.loadGroups()().(servicesMsg)
 		if msg.err == nil {
 			t.Fatal("a host-ps failure must land in svcErr, not be swallowed")
+		}
+		if !msg.groupedPayload {
+			t.Error("a host-ps failure must still mark the payload grouped, or refreshInFlight latches")
 		}
 	})
 	t.Run("factory without a grouper still lists projects", func(t *testing.T) {
@@ -19703,18 +19720,72 @@ func TestGroupedScreen_DrillInReloadsThroughTheGroupComposer(t *testing.T) {
 	}
 }
 
-func TestGroupedScreen_EnterIsInertOffAHeader(t *testing.T) {
-	m, _ := drillTestModel(t)
+// enter answers on a SERVICE row too: a service names its project as
+// unambiguously as a header does, and binding the key to headers alone stranded
+// the single-project host, where no header is emitted at all.
+func TestGroupedScreen_EnterDrillsFromAServiceRow(t *testing.T) {
+	m, f := drillTestModel(t)
 	m.svcCursor = 3 // the shop/api service row
 
 	updated, cmd := m.Update(keyMsgFor("enter"))
 	got := updated.(Model)
 
-	if !got.grouped || got.composer != nil {
-		t.Error("enter on a service row must not drill in")
+	if got.grouped {
+		t.Error("enter on a service row must drill into that row's project")
 	}
-	if cmd != nil {
-		t.Error("enter on a service row must dispatch nothing")
+	if got.composer != runner.Composer(f.made["shop"]) {
+		t.Errorf("composer = %#v, want shop's own composer", got.composer)
+	}
+	if got.projName != "shop" {
+		t.Errorf("projName = %q, want shop", got.projName)
+	}
+	if cmd == nil {
+		t.Error("drill-in must dispatch the drilled reload")
+	}
+}
+
+// A host running exactly ONE compose project emits no header (that degenerate
+// render is what keeps the drilled screen byte-identical), so before enter
+// answered on service rows the drilled screen — with it the never-created
+// services, the automatic update scan and the project breadcrumb — was
+// unreachable on the commonest remote-server shape there is.
+func TestGroupedScreen_SingleProjectHostCanDrillIn(t *testing.T) {
+	g := &mockGrouper{
+		groupedStatus: map[string]map[string]runner.ServiceStatus{
+			"shop": {"api": {Running: true}, "db": {}},
+		},
+	}
+	f := newDrillFactory(g)
+	m := NewModel(nil, io.Discard, f.factory(), nil, nil)
+	installFakeTick(&m)
+	m.projectLoader = func(ctx context.Context) ([]compose.Project, error) {
+		return []compose.Project{{Name: "shop", ConfigDir: "/srv/shop"}}, nil
+	}
+	m.screen = screenSelectContainers
+	m.grouped = true
+	m.width, m.height = 120, 40
+	updated, _ := m.Update(m.loadGroups()())
+	m = updated.(Model)
+
+	for _, e := range m.svcEntries {
+		if e.kind == entrySvcGroupHeader {
+			t.Fatal("a single group must still emit no header row")
+		}
+	}
+	if len(m.svcEntries) != 2 {
+		t.Fatalf("rows = %d, want the two service rows", len(m.svcEntries))
+	}
+
+	updated, _ = m.Update(keyMsgFor("enter"))
+	got := updated.(Model)
+	if got.grouped {
+		t.Fatal("a single-project host must be able to reach the drilled screen")
+	}
+	if got.projName != "shop" || got.composer != runner.Composer(f.made["shop"]) {
+		t.Errorf("drilled into %q with composer %#v, want shop", got.projName, got.composer)
+	}
+	if !got.autoUpdatesAllowed() {
+		t.Error("the drilled screen must restore the automatic update scan")
 	}
 }
 
@@ -20103,7 +20174,7 @@ func drainPipeline(t *testing.T, m Model) Model {
 		t.Fatal("batch pipeline did not finish")
 	}
 	for _, ev := range evs {
-		updated, _ := m.Update(stepEventMsg(ev))
+		updated, _ := m.Update(stepEventMsg{event: ev, batchIdx: idx, session: session})
 		m = updated.(Model)
 	}
 	updated, _ := m.Update(pipelineDoneMsg{batchIdx: idx, session: session})
@@ -21958,5 +22029,347 @@ func TestGroupHeaderRow_IsClampedToWidth(t *testing.T) {
 	}
 	if !found {
 		t.Fatal("precondition: the fixture must draw group headers")
+	}
+}
+
+// --- second-round review pins -------------------------------------------
+
+// In grouped mode the grouped servicesMsg is the ONLY arrival that can clear
+// refreshInFlight: statsRefreshCmd is nil there, so no statsMsg ever comes and
+// no statusMsg either. An error return that dropped groupedPayload latched the
+// guard true and turned every later refreshTickMsg into a pure reschedule, so
+// one transient `docker compose ls` failure froze the host view on its error
+// line for the rest of the visit.
+func TestGroupedFetchError_ClearsRefreshInFlightAndKeepsTicking(t *testing.T) {
+	g, projects := groupedFixture()
+	m := groupedTestModel(g, projects)
+	installFakeTick(&m)
+	m.screen = screenSelectContainers
+	m.grouped = true
+	m.width, m.height = 100, 30
+	m.projectLoader = func(ctx context.Context) ([]compose.Project, error) {
+		return nil, errors.New("compose ls failed")
+	}
+	m.refreshInFlight = true
+
+	updated, _ := m.Update(m.loadGroups()())
+	m = updated.(Model)
+
+	if m.refreshInFlight {
+		t.Fatal("a failed grouped fetch must clear refreshInFlight, or the 5s refresh is silenced forever")
+	}
+	if m.svcErr == nil {
+		t.Error("the failure must still reach svcErr")
+	}
+
+	// And the next tick actually fetches again, which is the self-heal path.
+	_, cmd := m.Update(refreshTickMsg{})
+	if cmd == nil {
+		t.Fatal("the tick must dispatch something")
+	}
+	if _, ok := cmd().(tea.BatchMsg); !ok {
+		t.Error("the tick after a failed fetch must fan out a fresh fetch batch, not just reschedule")
+	}
+}
+
+// The confirmation prompt names a target set derived from the rows, and the
+// confirm resolves that set AGAIN on enter. In grouped mode servicesMsg IS the
+// 5-second refresh, so a reload landing mid-prompt could prune the selection —
+// which partitionSelection then reads as "the cursor's whole group", i.e. every
+// service in the project — or clamp the cursor into a different group.
+func TestGroupedReload_IsDroppedWhileAPromptIsArmed(t *testing.T) {
+	g, projects := groupedFixture()
+	m := groupedTestModel(g, projects)
+	installFakeTick(&m)
+	updated, _ := m.Update(m.loadGroups()())
+	m = updated.(Model)
+	m.composerFactory = func(p compose.Project) runner.Composer {
+		if p.Unmanaged {
+			return g
+		}
+		return &mockComposer{}
+	}
+	m.width, m.height = 100, 30
+	m.svcCursor = 3 // shop/api
+	m.selected[svcKey("shop", "api")] = true
+
+	armed, _ := m.Update(keyMsgFor("d"))
+	m = armed.(Model)
+	if !m.confirming {
+		t.Fatalf("precondition: d must arm the prompt; warning = %q", m.warning)
+	}
+	if got := formatBatchTargets(m.partitionSelection()); got != "shop (api)" {
+		t.Fatalf("precondition: prompt names %q, want shop (api)", got)
+	}
+	m.refreshInFlight = true
+
+	// A reload in which shop lost every container: without the guard this
+	// prunes the selection and the confirm silently deploys the whole project.
+	stripped := map[string]map[string]runner.ServiceStatus{
+		"blog": {"web": {Running: true}},
+	}
+	reloaded, _ := m.Update(servicesMsg{
+		groupedPayload: true,
+		projects:       projects,
+		hostStatus:     stripped,
+		session:        m.statusSession,
+	})
+	m = reloaded.(Model)
+
+	if m.refreshInFlight {
+		t.Fatal("the dropped payload must still clear refreshInFlight — the guard sits AFTER the clear")
+	}
+	if !m.selected[svcKey("shop", "api")] {
+		t.Fatal("a reload under an armed prompt must not prune the selection it names")
+	}
+	if got := formatBatchTargets(m.partitionSelection()); got != "shop (api)" {
+		t.Errorf("prompt target after the reload = %q, want shop (api)", got)
+	}
+	if m.svcCursor != 3 {
+		t.Errorf("svcCursor = %d, want 3 (the reload must not move it under the prompt)", m.svcCursor)
+	}
+}
+
+// handleStepEvent latches m.failed on any StatusFailed. The esc-cancel marks the
+// screen terminal immediately, so the second esc leaves while the cancelled
+// step's failure event is still in flight — and ungated it poisoned the NEXT
+// operation: pipelineDoneMsg returns early on m.failed, so the health gate never
+// opened and no batch past the first ever ran.
+func TestStepEvent_StaleEventNeverLatchesFailed(t *testing.T) {
+	ev := runner.StepEvent{Step: runner.StepPulling, Status: runner.StatusFailed}
+
+	t.Run("off the progress screen", func(t *testing.T) {
+		m := groupedScreenModel(svcGroupOf("shop", "api"))
+		updated, _ := m.Update(stepEventMsg{event: ev})
+		if updated.(Model).failed {
+			t.Error("a step event that lands on the container screen must be dropped")
+		}
+	})
+
+	t.Run("superseded sequence", func(t *testing.T) {
+		m := Model{screen: screenProgress, batchSession: 4, batchStepCount: 1,
+			steps: []stepState{{name: runner.StepPulling}}}
+		updated, _ := m.Update(stepEventMsg{event: ev, session: 3})
+		got := updated.(Model)
+		if got.failed {
+			t.Error("an event from a cancelled sequence must not fail the new one")
+		}
+		if got.steps[0].status != "" {
+			t.Errorf("steps[0] = %q, want untouched", got.steps[0].status)
+		}
+	})
+
+	t.Run("previous batch", func(t *testing.T) {
+		m := Model{screen: screenProgress, batchIdx: 1, batchStepCount: 1,
+			steps: []stepState{{name: runner.StepPulling}, {name: runner.StepPulling}}}
+		updated, _ := m.Update(stepEventMsg{event: ev, batchIdx: 0})
+		if updated.(Model).failed {
+			t.Error("an event from the batch before the one running must be dropped")
+		}
+	})
+
+	t.Run("the current batch is honoured", func(t *testing.T) {
+		m := Model{screen: screenProgress, batchStepCount: 1,
+			steps: []stepState{{name: runner.StepPulling}}}
+		updated, _ := m.Update(stepEventMsg{event: ev})
+		got := updated.(Model)
+		if !got.failed || got.steps[0].status != runner.StatusFailed {
+			t.Errorf("a current event must paint its row and fail the op: failed=%v status=%q",
+				got.failed, got.steps[0].status)
+		}
+	})
+}
+
+// Defence in depth beside the stepEventMsg gate: a Model that reached the
+// progress screen carrying a stale verdict would render "q back" over a live
+// pipeline and stop pipelineDoneMsg from ever opening the health gate.
+func TestEnterProgress_ResetsTheVerdict(t *testing.T) {
+	mc := &mockComposer{services: []string{"web"}}
+	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
+	installFakeTick(&m)
+	m.screen = screenSelectContainers
+	m.setSingleGroup(mc.services)
+	m.pendingOp = runner.StopOnly
+	m.done = true
+	m.failed = true
+
+	updated, _ := m.enterProgress([]opBatch{{proj: m.currentProject(), services: []string{"web"}}})
+	got := updated.(Model)
+	if got.done || got.failed {
+		t.Errorf("enterProgress must start from a clean verdict, got done=%v failed=%v", got.done, got.failed)
+	}
+}
+
+// Every gated container key re-clamps before returning: the dispatch clears
+// m.warning above the switch, and a refusal that puts it back costs
+// svcVisibleCount a row.
+func TestGroupedU_RefusalReclamps(t *testing.T) {
+	m := groupedScreenModel(
+		svcGroupOf("blog", "a", "b", "c", "d"),
+		svcGroup{proj: compose.Project{Name: "ghost"}, services: []string{"api"}}, // no ConfigDir
+	)
+	m.composerFactory = func(compose.Project) runner.Composer { return &mockComposer{} }
+	m.height = 12
+	m.svcCursor = len(m.svcEntries) - 1 // the ghost/api row
+	m.fixSvcOffset()
+
+	updated, _ := m.Update(keyMsgFor("U"))
+	got := updated.(Model)
+
+	if got.warning != warnNoComposeDir {
+		t.Fatalf("warning = %q, want %q", got.warning, warnNoComposeDir)
+	}
+	if got.composer != nil {
+		t.Error("a refused U must leave no composer bound")
+	}
+	visible := got.svcVisibleCount()
+	if got.svcCursor < got.svcOffset || got.svcCursor >= got.svcOffset+visible {
+		t.Errorf("cursor %d outside the window [%d, %d) after the warning line appeared",
+			got.svcCursor, got.svcOffset, got.svcOffset+visible)
+	}
+}
+
+// R binds the composer at press time, but U and every l/x/i refusal unbind it
+// while the snapshot read is still in flight. startBatch deliberately does not
+// rebind for a Rollback, so the prep failed with "rollback is not supported for
+// this connection" — a message naming the wrong cause entirely.
+func TestGroupedRollback_StartBatchRebindsALostComposer(t *testing.T) {
+	rc := &mockRollbackComposer{mockComposer: mockComposer{services: []string{"api"}}}
+	m := groupedScreenModel(
+		svcGroup{proj: compose.Project{Name: "shop", ConfigDir: "/srv/shop"}, services: []string{"api"}},
+		svcGroupOf("blog", "web"),
+	)
+	m.ctx = context.Background()
+	m.composerFactory = func(compose.Project) runner.Composer { return rc }
+	m.svcCursor = 1 // shop/api
+	m.selected[svcKey("shop", "api")] = true
+
+	updated, _ := m.Update(keyMsgFor("R"))
+	m = updated.(Model)
+	if m.rollbackProj.Name != "shop" {
+		t.Fatalf("precondition: rollbackProj = %+v", m.rollbackProj)
+	}
+
+	// U (or an l/x/i refusal) drops the action-time composer while the async
+	// snapshot read is still out.
+	m.unbindGroupedComposer()
+	if m.composer != nil {
+		t.Fatal("precondition: the composer must be unbound")
+	}
+
+	m.rollbackSnapshot = &compose.Snapshot{Services: map[string]compose.SnapshotEntry{"api": {}}}
+	m.rollbackTargets = []string{"api"}
+	m.pendingOp = runner.Rollback
+	m.confirming = true
+	running, cmd := m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	got := running.(Model)
+
+	if got.failed {
+		t.Fatal("the rollback must not fail for want of a composer the batch can name")
+	}
+	if got.composer != runner.Composer(rc) {
+		t.Fatalf("composer = %#v, want the captured project's own", got.composer)
+	}
+	if cmd == nil {
+		t.Fatal("the rollback batch must dispatch its prep")
+	}
+	if rc.prepCalls == 0 {
+		// The prep runs inside the batched cmd; drive it.
+		if batch, ok := cmd().(tea.BatchMsg); ok {
+			for _, c := range batch {
+				if msg, ok := c().(rollbackPreppedMsg); ok && msg.err != nil {
+					t.Fatalf("prep error = %v, want none", msg.err)
+				}
+			}
+		}
+	}
+	if rc.prepCalls != 1 {
+		t.Errorf("PrepareRollback calls = %d, want 1", rc.prepCalls)
+	}
+}
+
+// A mid-sequence batch whose PIPELINE ran to the end pulled its images, so its
+// update verdicts are stale even when its health GATE then failed and m.done was
+// never set. Only a batch with an unreached or failed step keeps its cache.
+func TestEscFromProgress_InvalidatesABatchWhoseGateFailed(t *testing.T) {
+	blog := compose.Project{Name: "blog", ConfigDir: "/srv/blog"}
+	shop := compose.Project{Name: "shop", ConfigDir: "/srv/shop"}
+	perBatch := len(runner.Steps(runner.Deploy))
+
+	newModel := func() Model {
+		mc := &mockComposer{}
+		m := NewModel(nil, io.Discard, mockFactory(mc), nil, nil)
+		installFakeTick(&m)
+		m.screen = screenProgress
+		m.composer = mc
+		m.pendingOp = runner.Deploy
+		m.batches = []opBatch{{proj: blog}, {proj: shop}}
+		m.batchStepCount = perBatch
+		m.batchIdx = 0
+		m.steps = make([]stepState, 2*perBatch)
+		for i := range m.steps {
+			m.steps[i] = stepState{name: runner.Steps(runner.Deploy)[i%perBatch]}
+		}
+		m.updateCache = map[string]updateEntry{
+			m.projUpdatesCacheKey(blog): {fetchedAt: time.Now(), results: map[string]bool{"web": true}},
+			m.projUpdatesCacheKey(shop): {fetchedAt: time.Now(), results: map[string]bool{"api": true}},
+		}
+		return m
+	}
+
+	t.Run("pipeline finished, gate failed", func(t *testing.T) {
+		m := newModel()
+		for i := 0; i < perBatch; i++ {
+			m.steps[i].status = runner.StatusDone
+		}
+		m.failed = true // the gate stopped the sequence
+
+		updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyEsc})
+		got := updated.(Model)
+		if _, present := got.updateCache[got.projUpdatesCacheKey(blog)]; present {
+			t.Error("a batch whose pipeline ran to the end pulled its images; its verdicts are stale")
+		}
+		if _, present := got.updateCache[got.projUpdatesCacheKey(shop)]; !present {
+			t.Error("the batch that never ran must keep its cache")
+		}
+	})
+
+	t.Run("pipeline failed mid-way", func(t *testing.T) {
+		m := newModel()
+		m.steps[0].status = runner.StatusDone
+		m.steps[1].status = runner.StatusFailed
+		m.failed = true
+
+		updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyEsc})
+		got := updated.(Model)
+		if _, present := got.updateCache[got.projUpdatesCacheKey(blog)]; !present {
+			t.Error("a failed pipeline must keep its cache rather than clear user-visible state")
+		}
+	})
+}
+
+// formatBatchTargets grows with every project and service a sequence names, and
+// the step-row budget counts head's newlines — a title the TERMINAL wrapped adds
+// rows strings.Count cannot see, so the window overflowed the screen.
+func TestViewProgress_TitleIsClampedToWidth(t *testing.T) {
+	mc := &mockComposer{}
+	m := NewModel(nil, io.Discard, mockFactory(mc), nil, nil)
+	m.screen = screenProgress
+	m.composer = mc
+	m.pendingOp = runner.Deploy
+	m.width, m.height = 40, 24
+	m.batchStepCount = 1
+	m.steps = []stepState{{name: runner.StepPulling, label: runner.StepPulling}}
+	for i := 0; i < 6; i++ {
+		m.batches = append(m.batches, opBatch{
+			proj:     compose.Project{Name: fmt.Sprintf("project-with-a-long-name-%d", i)},
+			services: []string{"api", "db", "cache"},
+		})
+	}
+
+	for _, line := range strings.Split(ansi.Strip(m.viewProgress()), "\n") {
+		if w := ansi.StringWidth(line); w > m.width {
+			t.Fatalf("line overruns width %d (%d cells): %q", m.width, w, line)
+		}
 	}
 }

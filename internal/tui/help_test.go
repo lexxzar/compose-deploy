@@ -1745,10 +1745,15 @@ func TestHelpGroups_GroupedNamesDrillIn(t *testing.T) {
 	if !ok {
 		t.Fatal("grouped SELECT must name enter as the drill-in key")
 	}
-	for _, want := range []string{"drill", "header"} {
+	// enter answers on EVERY grouped row — a header and a service row name the
+	// same project — so the description must not restrict itself to a row kind.
+	for _, want := range []string{"drill", "project"} {
 		if !strings.Contains(desc, want) {
-			t.Errorf("grouped enter desc = %q, want it to name %q (the row kind it is bound in)", desc, want)
+			t.Errorf("grouped enter desc = %q, want it to name %q", desc, want)
 		}
+	}
+	if strings.Contains(desc, "header") {
+		t.Errorf("grouped enter desc = %q, want no header-only restriction (a service row drills too)", desc)
 	}
 	if _, ok := selectEnterDesc(false); ok {
 		t.Error("the drilled table must not name a drill-in: it has no group headers")

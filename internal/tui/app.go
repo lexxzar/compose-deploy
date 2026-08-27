@@ -430,9 +430,12 @@ type Model struct {
 	// order, and the next starts only when the previous one reports done.
 	//
 	// batchStepCount is the per-batch step count, which turns batchIdx into the
-	// step range that owns an incoming StepEvent. A ZERO value means "one range
-	// covering every step" — that is what keeps a hand-built Model (tests) and
-	// any future single-pipeline caller resolving events exactly as before.
+	// step range that owns an incoming StepEvent. It is MANDATORY: enterProgress
+	// is the only producer of a progress screen and always sets it to
+	// len(runner.Steps(op)), which is never zero. A hand-built Model that fills
+	// `steps` without it resolves no event at all — currentStepRange returns the
+	// empty range [0, 0) — so a fixture must go through enterProgress or set the
+	// count itself.
 	//
 	// batchSession invalidates a pipelineDoneMsg whose sequence is over: esc
 	// cancels the running batch, and the message it already queued must not
@@ -589,7 +592,22 @@ type stepState struct {
 }
 
 // Messages
-type stepEventMsg runner.StepEvent
+
+// stepEventMsg carries one runner.StepEvent plus the identity of the batch that
+// produced it, captured in waitForEvent at the moment the read was scheduled —
+// the same pair pipelineDoneMsg and batchDoneMsg carry, and for the same
+// reason. The channel read blocks, so an event can arrive long after the user
+// left: an esc-cancel marks the screen terminal immediately, and the second esc
+// navigates away while the cancelled step's StatusFailed is still in flight.
+// Ungated, that straggler latched m.failed on whatever screen it landed on and
+// poisoned the NEXT operation started from there — pipelineDoneMsg returns
+// early on m.failed, so the health gate never opened and no batch past the
+// first ever ran.
+type stepEventMsg struct {
+	event    runner.StepEvent
+	batchIdx int
+	session  uint64
+}
 
 // servicesMsg carries a container-screen load in either of the two shapes the
 // screen has. The DRILLED shape (services + status) comes from loadServices and
@@ -937,7 +955,7 @@ func NewModel(composer runner.Composer, logWriter io.Writer, factory ComposerFac
 		m.screen = screenSelectContainers
 		m.grouped = true
 		m.statsRequested = true
-		m.refreshInFlight = true // Init() will fire refreshGroupedStats
+		m.refreshInFlight = true // Init() will fire loadGroups, which carries the stats half
 		// Grouped mode never scans automatically (autoUpdatesAllowed is false
 		// there), so the flag must start clear or the first U would be refused
 		// by a guard with no fetch behind it.
@@ -1071,6 +1089,20 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.refreshInFlight = false
 		}
 		if m.screen != screenSelectContainers || msg.session != m.statusSession {
+			return m, nil
+		}
+		// An armed confirmation prompt names a target set derived from these
+		// very rows — the batch list for d/r/s, the cursor's service for x —
+		// and the confirm resolves that set AGAIN when enter lands. In grouped
+		// mode this message IS the 5-second refresh, so a reload arriving
+		// mid-prompt could prune the selection (turning "web (nginx)" into the
+		// whole project), clamp the cursor into another group, or introduce a
+		// batch armOperation never validated. The tick already refuses to fetch
+		// while m.confirming; this drops the fetch that was already in flight
+		// when the prompt armed, which is the only way one can still land here.
+		// Nothing is lost — the next tick after the prompt closes refetches —
+		// and refreshInFlight was already cleared above.
+		if m.confirming {
 			return m, nil
 		}
 		if msg.err != nil {
@@ -1459,7 +1491,15 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, tea.Batch(m.statusRefreshCmd(), m.statsRefreshCmd(), m.refreshTick())
 
 	case stepEventMsg:
-		return m.handleStepEvent(runner.StepEvent(msg))
+		// Same three gates pipelineDoneMsg and batchDoneMsg carry: the screen,
+		// the sequence and the batch index. A step event from a cancelled or
+		// superseded batch must not paint a row of the sequence running now —
+		// and, above all, must not latch m.failed on a screen that has no
+		// operation at all.
+		if m.screen != screenProgress || msg.session != m.batchSession || msg.batchIdx != m.batchIdx {
+			return m, nil
+		}
+		return m.handleStepEvent(msg.event)
 
 	case preselectedConnectMsg:
 		server := m.servers[m.preselectedServer]
@@ -2319,13 +2359,18 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 				return m, cmd
 			}
 		case "enter":
-			// Drill into the project under the cursor. Only a group header
-			// answers: a header IS a project, and the drilled screen is a
-			// single-project screen. On the drilled screen enter belongs to
-			// the confirmation prompt (handled by the intercept above), so it
-			// is inert here.
+			// Drill into the project the cursor ROW belongs to — a header IS
+			// its group, and a service row names the same group just as
+			// unambiguously. Binding this to headers alone stranded the very
+			// common host that runs exactly ONE compose project: a single group
+			// emits no header at all (that is the degenerate render the drilled
+			// screen depends on), so there was no row to drill from and the
+			// screen — with it the never-created services, the automatic update
+			// scan and the project breadcrumb — was unreachable.
+			// On the drilled screen enter belongs to the confirmation prompt
+			// (handled by the intercept above), so it is inert here.
 			entry, ok := m.cursorEntry()
-			if !m.grouped || !ok || entry.kind != entrySvcGroupHeader {
+			if !m.grouped || !ok {
 				m.fixSvcOffset()
 				return m, nil
 			}
@@ -2622,6 +2667,10 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 				g, ok := m.cursorGroup()
 				if !ok || !m.bindProjComposer(g.proj) {
 					m.unbindGroupedComposer()
+					// bindProjComposer names warnNoComposeDir in the warning
+					// slot, and that line costs svcVisibleCount a row — every
+					// other gated container key re-clamps for the same reason.
+					m.fixSvcOffset()
 					return m, nil
 				}
 				c := m.composer
@@ -3230,12 +3279,18 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 					// the LAST batch sets. A sequence where batch 0 deployed and
 					// batch 1 failed did change batch 0's image freshness, and
 					// keying the whole invalidation off m.done left those glyphs
-					// stale for the full 10-minute TTL. Batch m.batchIdx counts
-					// only when it finished — otherwise it is the one that
-					// failed or was cancelled, and a failed deploy must keep its
-					// cache rather than spuriously clear user-visible state.
+					// stale for the full 10-minute TTL.
+					//
+					// The CURRENT batch counts when its own PIPELINE ran to the
+					// end — which is what pulled the images — not when the whole
+					// operation succeeded. A mid-sequence batch whose health
+					// GATE failed pulled its images all the same, so its glyphs
+					// are just as stale; a batch that failed or was cancelled
+					// mid-pipeline has an unreached step and keeps its cache,
+					// which is the "a failed deploy must not clear user-visible
+					// state" rule.
 					last := m.batchIdx
-					if !m.done {
+					if !m.done && !m.currentBatchPipelineRan() {
 						last = m.batchIdx - 1
 					}
 					for i := 0; i <= last && i < len(m.batches); i++ {
@@ -3389,6 +3444,25 @@ func (m Model) currentStepRange() (int, int) {
 	return lo, hi
 }
 
+// currentBatchPipelineRan reports whether the batch now running finished its
+// whole step list successfully. It is what separates "the images were pulled"
+// from "the operation succeeded": a mid-sequence batch that passed every step
+// and then failed its health gate did change image freshness, so its update
+// cache is stale even though m.done was never set. A batch with any step still
+// unreached, running or failed did not, and keeps its cache.
+func (m Model) currentBatchPipelineRan() bool {
+	lo, hi := m.currentStepRange()
+	if hi <= lo {
+		return false
+	}
+	for i := lo; i < hi; i++ {
+		if m.steps[i].status != runner.StatusDone {
+			return false
+		}
+	}
+	return true
+}
+
 // markBatchesSkipped marks every not-yet-started step from batch `from` onward
 // as skipped. Only steps still at their zero status are touched, so a running
 // or finished row keeps the verdict the pipeline gave it.
@@ -3427,6 +3501,13 @@ func (m *Model) enterProgress(batches []opBatch) (tea.Model, tea.Cmd) {
 	op := m.pendingOp
 	m.screen = screenProgress
 	m.rollbackErr = ""
+	// A new sequence starts from a clean verdict. The esc-from-progress
+	// departure already resets both, so this is defence in depth — but it is
+	// the cheap half of the stale-stepEventMsg fix: a Model that reached here
+	// carrying failed = true would render "q back" over a live pipeline and
+	// make pipelineDoneMsg return early, so no batch past the first would run.
+	m.done = false
+	m.failed = false
 	// Leaving screenSelectContainers for an operation: search is ephemeral.
 	m.clearSearch()
 
@@ -3479,7 +3560,15 @@ func (m *Model) startBatch() tea.Cmd {
 	// other op binds the batch's project here, which is what lets the sequence
 	// walk from one project to the next. bindProjComposer is a no-op in drilled
 	// mode, where the screen owns its composer.
-	if op != runner.Rollback && !m.bindProjComposer(b.proj) {
+	//
+	// The one exception is a Rollback that LOST its composer between the R
+	// press and the confirm: U, and every l/x/i refusal, unbind grouped mode's
+	// action-time composer while the snapshot read is still in flight. Rebind
+	// from the batch's own project — which IS m.rollbackProj, captured at
+	// R-press, so nothing can have drifted — rather than let the prep fail with
+	// "rollback is not supported for this connection", which names the wrong
+	// cause entirely.
+	if (op != runner.Rollback || m.composer == nil) && !m.bindProjComposer(b.proj) {
 		m.failed = true
 		m.markBatchesSkipped(m.batchIdx)
 		return nil
@@ -3676,7 +3765,7 @@ func (m Model) waitForEvent() tea.Cmd {
 		if !ok {
 			return pipelineDoneMsg{batchIdx: idx, session: session}
 		}
-		return stepEventMsg(event)
+		return stepEventMsg{event: event, batchIdx: idx, session: session}
 	}
 }
 
@@ -4777,6 +4866,14 @@ func (m Model) hostGrouper() HostGrouper {
 //
 // A factory with no HostGrouper behind it (a test mock) reports no host data
 // rather than an error: the projects the loader found still render.
+//
+// EVERY return — the failures included — carries groupedPayload. The flag is
+// the message's SHAPE, not its success, and in grouped mode this message is the
+// only arrival that clears refreshInFlight (statsRefreshCmd is nil there, so no
+// statsMsg ever comes). An error return that dropped the flag latched the guard
+// true for the rest of the visit and silenced the 5-second refresh, so a single
+// `docker compose ls` hiccup froze the host view on its error line with no
+// self-heal path.
 func (m Model) loadGroups() tea.Cmd {
 	ctx := m.ctx
 	loader := m.projectLoader
@@ -4784,18 +4881,18 @@ func (m Model) loadGroups() tea.Cmd {
 	session := m.statusSession
 	return func() tea.Msg {
 		if loader == nil {
-			return servicesMsg{err: fmt.Errorf("no project loader configured"), session: session}
+			return servicesMsg{groupedPayload: true, err: fmt.Errorf("no project loader configured"), session: session}
 		}
 		projects, err := loader(ctx)
 		if err != nil {
-			return servicesMsg{err: err, session: session}
+			return servicesMsg{groupedPayload: true, err: err, session: session}
 		}
 		if hg == nil {
 			return servicesMsg{groupedPayload: true, projects: projects, session: session}
 		}
 		snap, err := hg.GroupedHost(ctx)
 		if err != nil {
-			return servicesMsg{err: err, session: session}
+			return servicesMsg{groupedPayload: true, err: err, session: session}
 		}
 		return servicesMsg{
 			groupedPayload: true,
@@ -7192,7 +7289,12 @@ func (m Model) viewProgress() string {
 		}
 	}
 
-	head := titleStyle.Render(fmt.Sprintf("%s > %s > %s", m.breadcrumb(), m.pendingOp.String(), target)) + "\n\n"
+	// One physical line, always. formatBatchTargets grows with every project and
+	// service a sequence names, and the row budget below counts head's newlines
+	// — a title the TERMINAL wrapped adds rows strings.Count cannot see, so the
+	// step window would overflow the screen. Clamp the raw text, then style it,
+	// so the escape sequences never enter the width math.
+	head := titleStyle.Render(clampToWidth(fmt.Sprintf("%s > %s > %s", m.breadcrumb(), m.pendingOp.String(), target), m.width)) + "\n\n"
 
 	var tb strings.Builder
 	// Rollback prep failure: shown when PrepareRollback aborted before any

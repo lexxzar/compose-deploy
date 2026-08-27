@@ -293,7 +293,7 @@ func flattenQualified[V any](host map[string]map[string]V) map[string]V {
 }
 
 // buildSvcGroups folds the grouped payload — the project list from the
-// ProjectLoader and the host-wide status map from GroupedStatus — into the row
+// ProjectLoader and the host-wide status map from GroupedHost — into the row
 // model.
 //
 // Project ORDER comes from the loader, not from the status map: the loader
