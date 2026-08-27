@@ -1144,7 +1144,7 @@ func TestHostContainers_ContainerStats_NoneRunning(t *testing.T) {
 }
 
 // TestHostContainers_ContainerStats_SkipsStatsCallWhenEmpty pins the guard that
-// keeps the ~1.5s host-wide `docker stats` (a full SSH round-trip remotely) off
+// keeps the host-wide `docker stats` (a full SSH round-trip remotely) off
 // the 5s refresh tick when the host has no unmanaged containers at all: the
 // join against an empty pair list is guaranteed empty.
 func TestHostContainers_ContainerStats_SkipsStatsCallWhenEmpty(t *testing.T) {
@@ -1668,7 +1668,7 @@ func TestHostContainers_GroupedStatus(t *testing.T) {
 
 	// ONE host-wide call, regardless of how many projects the host runs, and
 	// it is the ps: the status half must NOT pay for `docker stats`, which is
-	// a ~2s call the rows would otherwise wait behind on every refresh.
+	// the slow half the rows would otherwise wait behind on every refresh.
 	if len(f.runCalls) != 1 {
 		t.Fatalf("run calls = %v, want the ps alone", f.runCalls)
 	}
@@ -1720,23 +1720,52 @@ func TestHostContainers_GroupHostStats_ReusesTheListing(t *testing.T) {
 	}
 }
 
-// TestHostContainers_GroupHostStats_ZeroHandleMakesNoCall pins the zero value
-// of the handle: the TUI reaches it on every path where the status half never
-// listed anything, and `docker stats --no-stream` is far too expensive to run
-// for a join that is empty by construction.
-func TestHostContainers_GroupHostStats_ZeroHandleMakesNoCall(t *testing.T) {
+// TestHostContainers_GroupHostStats_ZeroHandleIsRefused pins the zero value of
+// the handle. Any package can write HostEntries{}, so answering it the way an
+// empty host is answered — (nil, nil), no docker call — makes a listing that was
+// dropped somewhere between the two halves indistinguishable from a host that
+// runs nothing: blank CPU/Mem cells, no error, nothing to notice. The stamp is
+// what separates them, and it fails loudly.
+func TestHostContainers_GroupHostStats_ZeroHandleIsRefused(t *testing.T) {
 	f := &fakeDockerRunner{runFunc: hostRunFunc(hostPsGrouped, hostStatsGrouped, nil)}
 	h := &HostContainers{docker: f}
 
 	got, err := h.GroupHostStats(context.Background(), HostEntries{})
+	if !errors.Is(err, errUnlistedHostEntries) {
+		t.Fatalf("GroupHostStats() error = %v, want errUnlistedHostEntries", err)
+	}
+	if got != nil {
+		t.Errorf("GroupHostStats() = %v, want nil for an unstamped handle", got)
+	}
+	if len(f.runCalls) != 0 {
+		t.Errorf("an unstamped handle reached docker: %v", f.runCalls)
+	}
+}
+
+// An EMPTY host is the other side of that line: GroupHostStatus stamps a handle
+// even when it lists nothing, so the stats half accepts it, answers an empty
+// join and still reaches docker not at all — `docker stats --no-stream` is far
+// too expensive to run for a join that is empty by construction.
+func TestHostContainers_GroupHostStats_EmptyStampedHandleMakesNoCall(t *testing.T) {
+	f := &fakeDockerRunner{runFunc: hostRunFunc("", hostStatsGrouped, nil)}
+	h := &HostContainers{docker: f}
+
+	snap, err := h.GroupHostStatus(context.Background())
+	if err != nil {
+		t.Fatalf("GroupHostStatus() error = %v", err)
+	}
+	if !snap.Entries.Listed() {
+		t.Fatal("an empty host must still yield a stamped handle")
+	}
+	got, err := h.GroupHostStats(context.Background(), snap.Entries)
 	if err != nil {
 		t.Fatalf("GroupHostStats() error = %v", err)
 	}
 	if got != nil {
 		t.Errorf("GroupHostStats() = %v, want nil for an empty listing", got)
 	}
-	if len(f.runCalls) != 0 {
-		t.Errorf("an empty listing reached docker: %v", f.runCalls)
+	if len(f.runCalls) != 1 {
+		t.Errorf("run calls = %v, want the ps call only", f.runCalls)
 	}
 }
 
@@ -2020,7 +2049,7 @@ func TestHostContainers_GroupedStats(t *testing.T) {
 }
 
 // TestHostContainers_GroupedStats_EmptyHostSkipsStatsCall mirrors the guard
-// ContainerStats carries: `docker stats --no-stream` is a ~1.5s host-wide call
+// ContainerStats carries: `docker stats --no-stream` is an expensive host-wide call
 // that the 5s grouped refresh would otherwise pay forever on an empty host.
 func TestHostContainers_GroupedStats_EmptyHostSkipsStatsCall(t *testing.T) {
 	f := &fakeDockerRunner{runOut: []byte("")}

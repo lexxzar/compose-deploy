@@ -6134,7 +6134,7 @@ func TestHasStatusColumns(t *testing.T) {
 // TestHasStatusColumns_StatsRequested verifies that statsRequested short-circuits
 // hasStatusColumns to true even when no per-service data has arrived yet. This
 // keeps the CPU/Mem column captions visible from the first frame instead of
-// popping in when the ~1.5s host-wide docker stats call returns.
+// popping in when the host-wide docker stats call returns.
 func TestHasStatusColumns_StatsRequested(t *testing.T) {
 	mc := &mockComposer{}
 	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
@@ -9811,7 +9811,7 @@ func TestContainerScreen_blankCellsForStoppedService(t *testing.T) {
 
 func TestContainerScreen_StatsCaptionsReservedBeforeData(t *testing.T) {
 	// Once stats have been requested, CPU/Mem captions are reserved from the
-	// first frame so they don't pop in when the ~1.5s docker stats call returns.
+	// first frame so they don't pop in when the docker stats call returns.
 	// Cells stay blank for services without data yet.
 	mc := &mockComposer{services: []string{"web"}}
 	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)

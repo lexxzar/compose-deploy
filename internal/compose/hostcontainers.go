@@ -431,25 +431,37 @@ func (h *HostContainers) ContainerStatus(ctx context.Context) (map[string]runner
 	return status, nil
 }
 
-// HostEntries is an opaque handle to ONE `docker ps` listing. GroupHostStatus
-// returns it and GroupHostStats consumes it, which is what keeps the two halves
-// of the grouped host view at one listing between them while leaving them two
-// separate calls: the caller can paint the rows the status half produced and
-// fetch CPU/memory afterwards, instead of blocking the first frame on the
-// ~2s host-wide `docker stats --no-stream`.
+// HostEntries is an opaque handle to ONE `docker ps` listing, stamped by
+// GroupHostStatus and consumed by GroupHostStats. Its contents are unexported,
+// so no caller outside this package can read, filter or re-order the listing
+// between the two calls.
 //
-// It is opaque on purpose — no caller outside this package can build or read
-// one, so the listing cannot be forged, filtered or re-ordered between the two
-// calls. The zero value is an empty listing, which GroupHostStats answers
-// without touching docker.
+// The ZERO value is NOT an empty host — it is no listing at all, and
+// GroupHostStats refuses it. Any package can write HostEntries{}, so the stamp
+// is what tells a dropped listing apart from a host that genuinely runs
+// nothing: without it both answer (nil, nil) and the screen renders blank
+// CPU/Mem cells with nothing red anywhere. An empty host still gets a stamped
+// handle, and still reaches docker not at all.
 type HostEntries struct {
+	listed  bool
 	entries []hostPsEntry
 }
 
-// GroupedHostSnapshot is the STATUS half of one host-wide read: every
-// container's state grouped by compose project (the outer key is the project
-// name, the inner key the service name), plus the listing it was folded from so
-// the stats half can join against the same containers.
+// Listed reports whether GroupHostStatus produced this handle. Callers gate the
+// stats half on it instead of re-deriving the seam: the handle travels with the
+// status payload, so this is what says the listing survived the trip.
+func (e HostEntries) Listed() bool { return e.listed }
+
+// errUnlistedHostEntries is what GroupHostStats answers for a handle
+// GroupHostStatus never stamped. It is a programming fault rather than a host
+// condition — the TUI gates the chained stats fetch on Listed() — so it fails
+// loudly instead of answering an empty join that reads like a quiet host.
+var errUnlistedHostEntries = errors.New("host listing handle did not come from GroupHostStatus")
+
+// GroupedHostSnapshot carries one host-wide read: every container's state
+// grouped by compose project (the outer key is the project name, the inner key
+// the service name), plus the stamped listing it was folded from so the stats
+// half can join against the same containers.
 type GroupedHostSnapshot struct {
 	Status  map[string]map[string]runner.ServiceStatus
 	Entries HostEntries
@@ -461,11 +473,12 @@ type GroupedHostSnapshot struct {
 // would be one round-trip per project.
 //
 // It makes NO stats call. The two halves are two methods over one listing
-// rather than one method doing both, because `docker stats --no-stream` costs
-// ~2s on a real daemon and the rows must not wait for it — folding both into
-// one call put that ~2s in front of the first painted row and in front of every
-// 5-second refresh. GroupHostStats takes the returned handle, so the split
-// costs no second `docker ps`.
+// rather than one method doing both, because the host-wide
+// `docker stats --no-stream` dominates the pair by more than an order of
+// magnitude (measured in docs/architecture/tui-multi-project.md) and folding it
+// in here put that whole cost in front of the first painted row and in front of
+// every refresh. GroupHostStats takes the returned handle, so the split costs
+// no second `docker ps`.
 //
 // Containers with no compose project label are collected under
 // UnmanagedProjectName.
@@ -480,7 +493,7 @@ func (h *HostContainers) GroupHostStatus(ctx context.Context) (GroupedHostSnapsh
 	}
 	return GroupedHostSnapshot{
 		Status:  groupHostContainers(entries),
-		Entries: HostEntries{entries: entries},
+		Entries: HostEntries{listed: true, entries: entries},
 	}, nil
 }
 
@@ -488,11 +501,13 @@ func (h *HostContainers) GroupHostStatus(ctx context.Context) (GroupedHostSnapsh
 // `docker stats`, joined by container ID against the listing GroupHostStatus
 // already made and split per compose project.
 //
-// Its error is the caller's to render softly: a stats outage leaves the rows
-// GroupHostStatus produced intact, so it belongs beside them as a warning
-// rather than replacing the screen.
-func (h *HostContainers) GroupHostStats(ctx context.Context, e HostEntries) (map[string]map[string]runner.ServiceStats, error) {
-	return h.groupedStats(ctx, e.entries)
+// Its error is its own, separate from the status half's: a stats failure leaves
+// the rows GroupHostStatus produced intact.
+func (h *HostContainers) GroupHostStats(ctx context.Context, entries HostEntries) (map[string]map[string]runner.ServiceStats, error) {
+	if !entries.Listed() {
+		return nil, errUnlistedHostEntries
+	}
+	return h.groupedStats(ctx, entries.entries)
 }
 
 // hostGroupKey resolves the project and service a ps entry belongs to. A
@@ -581,9 +596,10 @@ var hostStatsArgs = []string{"stats", "--no-stream", "--format", "{{json .}}"}
 // round-trip for a byte-identical answer.
 //
 // The early return before the stats call is load-bearing: the join against an
-// empty pair list is guaranteed empty, and `docker stats --no-stream` is a
-// ~1.5s host-wide call (a full SSH round-trip remotely) that the 5s refresh
-// tick would otherwise pay for ever on an empty host.
+// empty pair list is guaranteed empty, and `docker stats --no-stream` is the
+// expensive half of the pair (a full SSH round-trip remotely; measured in
+// docs/architecture/tui-multi-project.md) that the 5s refresh tick would
+// otherwise pay for ever on an empty host.
 func (h *HostContainers) groupedStats(ctx context.Context, entries []hostPsEntry) (map[string]map[string]runner.ServiceStats, error) {
 	pairs := make(map[string][]psIDService)
 	for _, e := range entries {
