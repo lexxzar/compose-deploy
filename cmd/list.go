@@ -513,6 +513,15 @@ type bulkStatsAggregator interface {
 func collectMultiProjectStats(ctx context.Context, projects []compose.Project, factory func(dir string) runner.Composer, showStats bool, bulkStats map[string]runner.ServiceStats, checkUpdates bool) []projectServices {
 	var result []projectServices
 	for _, proj := range projects {
+		// An empty ConfigDir means docker reported no compose file for this
+		// project, so there is no directory to run compose in. The factory
+		// would hand back a composer rooted at cdeploy's own cwd, and every
+		// service it then listed would be printed under THIS project's header.
+		// Skipping matches the per-project warn-and-continue rule below.
+		if proj.ConfigDir == "" {
+			fmt.Fprintf(os.Stderr, "warning: skipping project %q: no compose file reported for it\n", proj.Name)
+			continue
+		}
 		c := factory(proj.ConfigDir)
 
 		services, err := c.ListServices(ctx)

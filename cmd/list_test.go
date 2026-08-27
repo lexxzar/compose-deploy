@@ -1775,7 +1775,7 @@ func TestFormatJSON_IncludesPorts(t *testing.T) {
 			{Host: "0.0.0.0", HostPort: 80, ContainerPort: 80, Protocol: "tcp"},
 			{Host: "0.0.0.0", HostPort: 443, ContainerPort: 443, Protocol: "tcp"},
 		}},
-		{Name: "nilports", Running: true},                       // nil slice → omitempty
+		{Name: "nilports", Running: true},                           // nil slice → omitempty
 		{Name: "emptyports", Running: true, Ports: []runner.Port{}}, // explicit empty slice → omitempty too
 	}
 
@@ -2387,6 +2387,37 @@ func TestCollectMultiProjectStats_NotRequestedSkipsStatsCall(t *testing.T) {
 	}
 }
 
+// TestCollectMultiProjectStats_SkipsProjectWithNoConfigDir pins the sibling of
+// the TUI's operableProject guard. docker reports an empty ConfigFiles for any
+// project it discovers from the com.docker.compose.project label alone, and
+// parseProjects keeps that as an empty ConfigDir. The factory would then build
+// a composer rooted at cdeploy's own cwd, and every service it listed would be
+// printed under THIS project's header.
+func TestCollectMultiProjectStats_SkipsProjectWithNoConfigDir(t *testing.T) {
+	mock := &mockComposer{
+		services: []string{"cwd-service"},
+		status:   map[string]runner.ServiceStatus{"cwd-service": {Running: true}},
+	}
+	calls := 0
+	factory := func(_ string) runner.Composer { calls++; return mock }
+	projects := []compose.Project{
+		{Name: "ghost"}, // no ConfigDir
+		{Name: "real", ConfigDir: "/srv/real"},
+	}
+
+	result := collectMultiProjectStats(context.Background(), projects, factory, false, nil, false)
+
+	if calls != 1 {
+		t.Errorf("factory called %d times, want 1 — the dirless project must never get a composer", calls)
+	}
+	if len(result) != 1 {
+		t.Fatalf("got %d projects, want 1: %+v", len(result), result)
+	}
+	if result[0].Name != "real" {
+		t.Errorf("project = %q, want %q", result[0].Name, "real")
+	}
+}
+
 // TestCollectMultiProjectStats_UsesBulkAggregator verifies that when bulkStats
 // is supplied AND the composer implements bulkStatsAggregator, the bulk path
 // runs and the per-project ContainerStats() fallback is NOT invoked. This is
@@ -2509,9 +2540,9 @@ func TestFormatCPUCell_BlankWhenStopped(t *testing.T) {
 func TestFormatMemCell_BlankWhenNil(t *testing.T) {
 	used := int64(100)
 	cases := []serviceStatus{
-		{Name: "a", Running: true},                                          // both nil
-		{Name: "b", Running: true, MemoryUsed: &used},                       // limit nil
-		{Name: "c", Running: false, MemoryUsed: &used, MemoryLimit: &used},  // not running
+		{Name: "a", Running: true},                                         // both nil
+		{Name: "b", Running: true, MemoryUsed: &used},                      // limit nil
+		{Name: "c", Running: false, MemoryUsed: &used, MemoryLimit: &used}, // not running
 	}
 	for _, c := range cases {
 		if got := formatMemCell(c); got != "" {

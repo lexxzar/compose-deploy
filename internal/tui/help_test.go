@@ -1729,13 +1729,14 @@ func TestHelpGroups_GroupedKeepsGroupOrder(t *testing.T) {
 }
 
 // enter carries two meanings on the container screen — confirm a prompt, and
-// drill into a project — so it must not be named twice in one table. The
-// drill-in row belongs to grouped SELECT and the confirm row to OPERATE, and
-// the drilled table must not name a drill-in it has no header rows for.
+// drill into a project — and one key must not occupy two rows of one table. So
+// the GROUPED table folds both onto one SELECT row and OPERATE drops its own,
+// the way inspectGroup's read-only enter already folds them. The drilled table
+// has no drill-in at all, so there OPERATE keeps the only enter row.
 func TestHelpGroups_GroupedNamesDrillIn(t *testing.T) {
-	selectEnterDesc := func(grouped bool) (string, bool) {
+	enterDesc := func(grouped bool, title string) (string, bool) {
 		for _, g := range helpGroupsFor(screenSelectContainers, helpContext{canGoBack: true, grouped: grouped}) {
-			if g.title != "SELECT" {
+			if g.title != title {
 				continue
 			}
 			for _, e := range g.entries {
@@ -1747,13 +1748,15 @@ func TestHelpGroups_GroupedNamesDrillIn(t *testing.T) {
 		return "", false
 	}
 
-	desc, ok := selectEnterDesc(true)
+	desc, ok := enterDesc(true, "SELECT")
 	if !ok {
 		t.Fatal("grouped SELECT must name enter as the drill-in key")
 	}
 	// enter answers on EVERY grouped row — a header and a service row name the
 	// same project — so the description must not restrict itself to a row kind.
-	for _, want := range []string{"drill", "project"} {
+	// It must also still name the confirmation, which is the meaning OPERATE
+	// gave up.
+	for _, want := range []string{"drill", "project", "confirm"} {
 		if !strings.Contains(desc, want) {
 			t.Errorf("grouped enter desc = %q, want it to name %q", desc, want)
 		}
@@ -1761,25 +1764,53 @@ func TestHelpGroups_GroupedNamesDrillIn(t *testing.T) {
 	if strings.Contains(desc, "header") {
 		t.Errorf("grouped enter desc = %q, want no header-only restriction (a service row drills too)", desc)
 	}
-	if _, ok := selectEnterDesc(false); ok {
+	if _, ok := enterDesc(false, "SELECT"); ok {
 		t.Error("the drilled table must not name a drill-in: it has no group headers")
 	}
 
-	// And exactly one OPERATE row keeps naming the confirmation meaning.
-	for _, grouped := range []bool{false, true} {
-		found := 0
-		for _, g := range helpGroupsFor(screenSelectContainers, helpContext{canGoBack: true, grouped: grouped}) {
-			if g.title != "OPERATE" {
-				continue
-			}
-			for _, e := range g.entries {
-				if e.keys == "enter" {
-					found++
+	if _, ok := enterDesc(true, "OPERATE"); ok {
+		t.Error("grouped OPERATE must not name enter: SELECT already carries both meanings")
+	}
+	if desc, ok := enterDesc(false, "OPERATE"); !ok {
+		t.Error("the drilled table's OPERATE must name enter as the confirmation key")
+	} else if !strings.Contains(desc, "confirm") {
+		t.Errorf("drilled OPERATE enter desc = %q, want it to name the confirmation", desc)
+	}
+}
+
+// TestHelpGroups_ContainerNoKeyIsNamedTwice is the general form of the rule
+// above: a reader scanning one rendered container table for a key must find
+// exactly one row for it, or the two descriptions read as a contradiction. It
+// runs all four variants (writable / read-only × grouped / drilled), so a
+// future key folded into a second group fails here rather than only in the
+// overlay a user happens to open.
+//
+// Scoped to the container screen on purpose, and esc is the one exemption:
+// the two-stage esc ladder is a real pair of meanings the reader needs both
+// halves of — `esc  clear an active search` in FIND takes the first press and
+// `q esc  back` in LEAVE the next. screenLogs carries the same pair.
+func TestHelpGroups_ContainerNoKeyIsNamedTwice(t *testing.T) {
+	const ladderKey = "esc" // the documented two-stage esc; see findGroup
+	for _, canGoBack := range []bool{true, false} {
+		for _, readOnly := range []bool{true, false} {
+			for _, grouped := range []bool{true, false} {
+				hc := helpContext{canGoBack: canGoBack, readOnly: readOnly, grouped: grouped}
+				seen := map[string]string{}
+				for _, g := range helpGroupsFor(screenSelectContainers, hc) {
+					for _, e := range g.entries {
+						for _, tok := range strings.Fields(e.keys) {
+							if tok == ladderKey {
+								continue
+							}
+							if prev, dup := seen[tok]; dup {
+								t.Errorf("%+v: key %q named in both %q and %q", hc, tok, prev, g.title)
+								continue
+							}
+							seen[tok] = g.title
+						}
+					}
 				}
 			}
-		}
-		if found != 1 {
-			t.Errorf("grouped=%v: OPERATE names enter %d times, want exactly 1", grouped, found)
 		}
 	}
 }

@@ -2549,10 +2549,14 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			}
 			if _, ok := m.composer.(RollbackPreparer); !ok {
 				m.unbindGroupedComposer()
+				// The dispatch cleared m.warning above, which frees a footer
+				// row — every other gated container key re-clamps for it.
+				m.fixSvcOffset()
 				return m, nil
 			}
 			if !m.hasServices() {
 				m.unbindGroupedComposer()
+				m.fixSvcOffset()
 				return m, nil
 			}
 			if m.selectedCount() == 0 {
@@ -4141,28 +4145,33 @@ func (m *Model) enterExec() (tea.Model, tea.Cmd) {
 	// Every refusal below leaves the user on the grouped screen, so each one
 	// drops the composer x bound at press time — the success path keeps it
 	// until execDoneMsg, which unbinds there.
-	ep, ok := m.composer.(ExecProvider)
-	if !ok {
+	//
+	// A refusal is also a prompt CLOSE that stays on the container screen, so
+	// it owes the same two things the esc branch does: takeSvcReload() settles
+	// a drilled reload the armed prompt dropped (containerFetchBatch, the other
+	// consumer, is only reached by LEAVING the screen — which a refusal does
+	// not do, so the flag would sit set until some later prompt closed), and
+	// fixSvcOffset() re-clamps for the footer row the closing prompt frees.
+	refuse := func() (tea.Model, tea.Cmd) {
 		m.confirming = false
 		m.pendingExec = false
 		m.unbindGroupedComposer()
-		return *m, nil
+		cmd := m.takeSvcReload()
+		m.fixSvcOffset()
+		return *m, cmd
+	}
+	ep, ok := m.composer.(ExecProvider)
+	if !ok {
+		return refuse()
 	}
 	service, ok := m.cursorService()
 	if !ok {
-		m.confirming = false
-		m.pendingExec = false
-		m.unbindGroupedComposer()
-		return *m, nil
+		return refuse()
 	}
 	cmd, err := ep.ExecCommand(m.ctx, service, nil)
 	if err != nil {
 		m.warning = fmt.Sprintf("exec failed: %v", err)
-		m.confirming = false
-		m.pendingExec = false
-		m.unbindGroupedComposer()
-		m.fixSvcOffset()
-		return *m, nil
+		return refuse()
 	}
 	// Leaving screenSelectContainers to exec into a container: search is
 	// ephemeral. Cleared only on the success path (the early-return failure

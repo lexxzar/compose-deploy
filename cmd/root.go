@@ -246,8 +246,17 @@ func remoteComposerFor(proj compose.Project, rc *compose.RemoteCompose, standalo
 //
 // The verdict is COPIED out of the composer under the lock rather than read
 // through the pointer later, so the factory never touches a field Detect writes.
+//
+// TWO mutexes, and the split is load-bearing. probeMu serialises the probe so
+// only one Detect() ever writes Compose.Standalone; mu guards the recorded pair
+// and is NEVER held across the probe. A single mutex would put a subprocess
+// exec — or, remotely, an SSH round-trip under the TUI's deadline-less context
+// — inside the lock verdict() takes, and verdict() runs on the Bubble Tea UI
+// goroutine inside Update: one hung probe (a dead ControlMaster socket falling
+// back to a direct connect) would freeze the whole TUI, ctrl+c included.
 type detectGuard struct {
 	mu         sync.Mutex
+	probeMu    sync.Mutex
 	detected   bool
 	standalone bool
 }
@@ -257,16 +266,25 @@ type detectGuard struct {
 // retries — that is what keeps a TUI started without local Docker usable if
 // Docker appears later in the session.
 func (d *detectGuard) resolve(probe func() error, standalone func() bool) error {
-	d.mu.Lock()
-	defer d.mu.Unlock()
-	if d.detected {
+	if _, detected := d.verdict(); detected {
+		return nil
+	}
+	d.probeMu.Lock()
+	defer d.probeMu.Unlock()
+	// Re-check: a probe that finished while this call waited on probeMu has
+	// already recorded the verdict, and probing again would re-run Detect for
+	// an answer that is already in hand.
+	if _, detected := d.verdict(); detected {
 		return nil
 	}
 	if err := probe(); err != nil {
 		return err
 	}
-	d.standalone = standalone()
+	s := standalone()
+	d.mu.Lock()
+	d.standalone = s
 	d.detected = true
+	d.mu.Unlock()
 	return nil
 }
 

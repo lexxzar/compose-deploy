@@ -4,7 +4,9 @@ import (
 	"errors"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/lexxzar/compose-deploy/internal/compose"
 	"github.com/lexxzar/compose-deploy/internal/tui"
@@ -327,6 +329,78 @@ func TestDetectGuard_FailureRetries(t *testing.T) {
 	}
 	if probes != 1 {
 		t.Errorf("the retry ran the probe %d times, want 1", probes)
+	}
+}
+
+// TestDetectGuard_VerdictNeverBlocksOnAProbe pins the two-mutex split. verdict()
+// runs on the Bubble Tea UI goroutine, inside Update (hostGrouper,
+// bindProjComposer, drillIntoGroup), while resolve() runs a subprocess exec or —
+// remotely — an SSH round-trip under a context with no deadline. One mutex
+// covering both would put that call inside the lock the UI takes, so a hung
+// probe (a dead ControlMaster socket falling back to a direct connect) would
+// freeze the whole TUI, ctrl+c included.
+func TestDetectGuard_VerdictNeverBlocksOnAProbe(t *testing.T) {
+	var d detectGuard
+	probing := make(chan struct{})
+	release := make(chan struct{})
+	probed := make(chan struct{})
+	go func() {
+		defer close(probed)
+		_ = d.resolve(func() error {
+			close(probing)
+			<-release
+			return nil
+		}, func() bool { return true })
+	}()
+	<-probing
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		d.verdict()
+	}()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		close(release)
+		t.Fatal("verdict blocked while a probe was in flight; the probe must not run under the verdict lock")
+	}
+	close(release)
+	<-probed
+
+	if standalone, detected := d.verdict(); !standalone || !detected {
+		t.Errorf("verdict = (%v,%v), want (true,true)", standalone, detected)
+	}
+}
+
+// The probe stays serialised even though it no longer runs under the verdict
+// lock: probeMu plus the re-check behind it is what keeps exactly one Detect()
+// writing Compose.Standalone when several loaders race.
+func TestDetectGuard_ConcurrentResolveProbesOnce(t *testing.T) {
+	var d detectGuard
+	var probes int32
+	var wg sync.WaitGroup
+	start := make(chan struct{})
+	for i := 0; i < 8; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			_ = d.resolve(func() error {
+				atomic.AddInt32(&probes, 1)
+				time.Sleep(10 * time.Millisecond)
+				return nil
+			}, func() bool { return true })
+		}()
+	}
+	close(start)
+	wg.Wait()
+
+	if n := atomic.LoadInt32(&probes); n != 1 {
+		t.Errorf("probe ran %d times, want 1", n)
+	}
+	if standalone, detected := d.verdict(); !standalone || !detected {
+		t.Errorf("verdict = (%v,%v), want (true,true)", standalone, detected)
 	}
 }
 

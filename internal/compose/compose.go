@@ -44,7 +44,10 @@ type Project struct {
 	// "running(3)". It is empty on the Unmanaged row, which no compose command
 	// reports on.
 	Status string
-	// ConfigDir is the directory containing the compose file; empty when Unmanaged.
+	// ConfigDir is the directory containing the compose file. Empty when the
+	// project has none: the Unmanaged row, and any project docker reports with
+	// no config_files label. Empty is the single "no directory behind this
+	// project" sentinel every consumer tests against.
 	ConfigDir string
 	Unmanaged bool
 }
@@ -112,10 +115,20 @@ func parseProjects(data []byte) ([]Project, error) {
 		if i := strings.Index(configFile, ","); i >= 0 {
 			configFile = configFile[:i]
 		}
+		// filepath.Dir("") returns ".", not "" — and docker reports an empty
+		// ConfigFiles for any project it discovers from the
+		// com.docker.compose.project label alone (the sibling config_files
+		// label absent). Passing "." on would make every "no directory"
+		// consumer resolve to cdeploy's own working directory instead of
+		// refusing, so the empty sentinel is preserved here.
+		configDir := ""
+		if configFile != "" {
+			configDir = filepath.Dir(configFile)
+		}
 		projects = append(projects, Project{
 			Name:      e.Name,
 			Status:    e.Status,
-			ConfigDir: filepath.Dir(configFile),
+			ConfigDir: configDir,
 		})
 	}
 

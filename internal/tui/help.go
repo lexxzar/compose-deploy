@@ -168,18 +168,19 @@ func findGroup() helpGroup {
 // the description name both. A key bound in a sub-state must name that state,
 // and "a group header" is exactly that state.
 //
-// enter joins the group because it is grouped-mode-only too, and belongs HERE
-// rather than as a second row in OPERATE: OPERATE already names enter as the
-// confirmation key, and one key cannot carry two descriptions in one table. It
-// answers on EVERY row — a header and a service row name the same project — so
-// the description says "the cursor row's project" rather than naming a
-// sub-state it is not restricted to.
+// enter joins the group in grouped mode and carries BOTH its meanings on that
+// one row, the way inspectGroup's read-only enter does: the drill-in is
+// grouped-mode-only, the confirmation is not, and one key cannot occupy two
+// rows of one table. So OPERATE drops its own enter row while grouped (see
+// helpGroupsFor) and this row names the pair. The drill-in half answers on
+// EVERY row — a header and a service row name the same project — so it names
+// no sub-state it is not restricted to.
 func selectGroup(grouped bool) helpGroup {
 	if grouped {
 		return helpGroup{title: "SELECT", actions: true, entries: []helpEntry{
 			{"space", "toggle a service · fold a group"},
 			{"a", "all"},
-			{"enter", "drill into the cursor row's project"},
+			{"enter", "drill into the project · confirm the prompt"},
 		}}
 	}
 	return helpGroup{title: "SELECT", actions: true, entries: []helpEntry{
@@ -278,6 +279,22 @@ func helpGroupsFor(s screen, hc helpContext) []helpGroup {
 		if hc.readOnly {
 			return readOnlyContainerGroups(canGoBack, hc.grouped)
 		}
+		operate := helpGroup{title: "OPERATE", actions: true, entries: []helpEntry{
+			{"d", "deploy"},
+			{"r", "restart"},
+			{"s", "stop"},
+			{"R", "rollback"},
+		}}
+		// enter is bound only while the confirmation prompt is up, so the
+		// description names that state: the overlay itself can only be opened
+		// from the idle screen, where enter does nothing.
+		//
+		// In GROUPED mode the row moves to SELECT instead, folded into the
+		// drill-in row, because enter carries both meanings there and one key
+		// must not occupy two rows of one table.
+		if !hc.grouped {
+			operate.entries = append(operate.entries, helpEntry{"enter", "confirm the prompt"})
+		}
 		return []helpGroup{
 			{title: "MOVE", entries: []helpEntry{
 				{"↑ k", "up"},
@@ -286,16 +303,7 @@ func helpGroupsFor(s screen, hc helpContext) []helpGroup {
 			findGroup(),
 			selectGroup(hc.grouped),
 			leaveGroup(canGoBack),
-			{title: "OPERATE", actions: true, entries: []helpEntry{
-				{"d", "deploy"},
-				{"r", "restart"},
-				{"s", "stop"},
-				{"R", "rollback"},
-				// enter is bound only while the confirmation prompt is up, so
-				// the description names that state: the overlay itself can only
-				// be opened from the idle screen, where enter does nothing.
-				{"enter", "confirm the prompt"},
-			}},
+			operate,
 			inspectGroup(false, hc.grouped),
 		}
 

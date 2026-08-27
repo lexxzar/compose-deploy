@@ -22304,6 +22304,71 @@ func TestGroupedU_RefusalReclamps(t *testing.T) {
 	}
 }
 
+// R's two CAPABILITY refusals — the composer is not a RollbackPreparer, and the
+// list is empty — are gated keys like every other: the dispatch clears m.warning
+// above the switch, which frees a footer row and grows svcVisibleCount() by one,
+// so a return without fixSvcOffset() leaves a blank row under the last service.
+// The readOnly gate and the three selection refusals already re-clamped; these
+// two did not.
+func TestRollbackKey_CapabilityRefusalReclamps(t *testing.T) {
+	build := func(t *testing.T, n int) Model {
+		t.Helper()
+		var services []string
+		for i := 0; i < n; i++ {
+			services = append(services, fmt.Sprintf("svc-%02d", i))
+		}
+		mc := &mockComposer{services: services} // deliberately NOT a RollbackPreparer
+		m := inspectTestModel(t, mc, services)
+		m.height = 24
+		// The x-on-stopped warning is the state this reproduces from.
+		m.warning = "Container is not running"
+		if n > 0 {
+			m.svcCursor = len(m.svcEntries) - 1
+		}
+		m.fixSvcOffset()
+		return m
+	}
+
+	t.Run("not a RollbackPreparer", func(t *testing.T) {
+		m := build(t, 30)
+		if m.svcOffset == 0 {
+			t.Fatal("precondition: the list must scroll at this height")
+		}
+
+		updated, _ := m.Update(keyMsgFor("R"))
+		got := updated.(Model)
+
+		if got.confirming {
+			t.Fatal("a composer with no rollback capability must not arm the prompt")
+		}
+		if got.warning != "" {
+			t.Fatalf("precondition: the dispatch must clear the warning, got %q", got.warning)
+		}
+		want := len(got.svcEntries) - got.svcVisibleCount()
+		if got.svcOffset != want {
+			t.Errorf("svcOffset = %d, want %d; the refusal left a blank row at the bottom", got.svcOffset, want)
+		}
+	})
+
+	t.Run("empty list", func(t *testing.T) {
+		rc := &mockRollbackComposer{}
+		m := build(t, 0)
+		m.composer = rc
+		m.clearSvcGroups()
+		m.svcOffset = 7 // a stale offset the empty list must clamp away
+
+		updated, _ := m.Update(keyMsgFor("R"))
+		got := updated.(Model)
+
+		if got.confirming {
+			t.Fatal("an empty list must not arm the prompt")
+		}
+		if got.svcOffset != 0 {
+			t.Errorf("svcOffset = %d, want 0; the refusal left the window past the end", got.svcOffset)
+		}
+	})
+}
+
 // R binds the composer at press time, but U and every l/x/i refusal unbind it
 // while the snapshot read is still in flight. startBatch deliberately does not
 // rebind for a Rollback, so the prep failed with "rollback is not supported for
@@ -22583,6 +22648,70 @@ func TestDrilledServicesMsg_ConfirmingReloadIsRedispatched(t *testing.T) {
 	}
 	if len(msg.services) != 3 {
 		t.Errorf("the re-dispatch returned %v, want all three compose services", msg.services)
+	}
+}
+
+// enterExec's refusal paths are prompt CLOSES that stay on the container
+// screen, so they owe what the esc branch owes: takeSvcReload() settles a
+// drilled reload the armed prompt dropped, and fixSvcOffset() re-clamps for the
+// footer row the closing prompt frees. containerFetchBatch — the flag's other
+// consumer — is only reached by LEAVING the screen, which a refusal does not
+// do, so without this the reload sat pending until some later prompt closed.
+func TestEnterExec_RefusalSettlesThePendingReload(t *testing.T) {
+	mc := &mockComposer{services: []string{"api", "web", "worker"}} // NOT an ExecProvider
+	m := drilledConfirmModel(t, mc)
+	m.pendingExec = true
+	m.svcReloadPending = true
+
+	updated, cmd := m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	got := updated.(Model)
+
+	if got.screen != screenSelectContainers {
+		t.Fatalf("screen = %v, want the container screen (the exec was refused)", got.screen)
+	}
+	if got.confirming || got.pendingExec {
+		t.Errorf("the refusal must close the prompt, got confirming=%v pendingExec=%v", got.confirming, got.pendingExec)
+	}
+	if got.svcReloadPending {
+		t.Error("the refusal must consume the pending drilled reload")
+	}
+	if cmd == nil {
+		t.Fatal("the refusal must re-dispatch loadServices")
+	}
+	msg, ok := cmd().(servicesMsg)
+	if !ok {
+		t.Fatalf("cmd produced %T, want servicesMsg", cmd())
+	}
+	if len(msg.services) != 3 {
+		t.Errorf("the re-dispatch returned %v, want all three compose services", msg.services)
+	}
+}
+
+// The same refusal is a gated key for the offset too: the dispatch cleared
+// m.warning above the switch, and closing the prompt frees another footer row.
+func TestEnterExec_RefusalReclampsOffset(t *testing.T) {
+	var services []string
+	for i := 0; i < 30; i++ {
+		services = append(services, fmt.Sprintf("svc-%02d", i))
+	}
+	mc := &mockComposer{services: services} // NOT an ExecProvider
+	m := inspectTestModel(t, mc, services)
+	m.ctx = context.Background()
+	m.height = 24
+	m.confirming = true
+	m.pendingExec = true
+	m.svcCursor = len(m.svcEntries) - 1
+	m.svcOffset = len(m.svcEntries) // a stale offset past the end
+
+	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	got := updated.(Model)
+
+	if got.confirming || got.pendingExec {
+		t.Fatalf("precondition: the refusal must close the prompt, got confirming=%v pendingExec=%v", got.confirming, got.pendingExec)
+	}
+	want := len(got.svcEntries) - got.svcVisibleCount()
+	if got.svcOffset != want {
+		t.Errorf("svcOffset = %d, want %d; the refusal left a blank row at the bottom", got.svcOffset, want)
 	}
 }
 
