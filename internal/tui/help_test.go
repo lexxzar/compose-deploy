@@ -1606,8 +1606,9 @@ func TestHelpGroups_EscClearsQueryBeforeBack(t *testing.T) {
 				t.Errorf("%q: screen = %d, want the container screen (the first press only clears)", key, um.screen)
 			}
 			updated, _ = um.Update(keyMsgFor(key))
-			if got := updated.(Model).screen; got != screenSelectProject {
-				t.Errorf("%q: second press left screen %d, want the project screen", key, got)
+			if got := updated.(Model); got.screen != screenSelectContainers || !got.grouped {
+				t.Errorf("%q: second press left screen %d grouped %v, want the grouped host view",
+					key, got.screen, got.grouped)
 			}
 		}
 	})
@@ -1718,6 +1719,57 @@ func TestHelpGroups_GroupedKeepsGroupOrder(t *testing.T) {
 			if g.title != want[i] {
 				t.Errorf("grouped=%v: group %d is %q, want %q", grouped, i, g.title, want[i])
 			}
+		}
+	}
+}
+
+// enter carries two meanings on the container screen — confirm a prompt, and
+// drill into a project — so it must not be named twice in one table. The
+// drill-in row belongs to grouped SELECT and the confirm row to OPERATE, and
+// the drilled table must not name a drill-in it has no header rows for.
+func TestHelpGroups_GroupedNamesDrillIn(t *testing.T) {
+	selectEnterDesc := func(grouped bool) (string, bool) {
+		for _, g := range helpGroupsFor(screenSelectContainers, helpContext{canGoBack: true, grouped: grouped}) {
+			if g.title != "SELECT" {
+				continue
+			}
+			for _, e := range g.entries {
+				if e.keys == "enter" {
+					return e.desc, true
+				}
+			}
+		}
+		return "", false
+	}
+
+	desc, ok := selectEnterDesc(true)
+	if !ok {
+		t.Fatal("grouped SELECT must name enter as the drill-in key")
+	}
+	for _, want := range []string{"drill", "header"} {
+		if !strings.Contains(desc, want) {
+			t.Errorf("grouped enter desc = %q, want it to name %q (the row kind it is bound in)", desc, want)
+		}
+	}
+	if _, ok := selectEnterDesc(false); ok {
+		t.Error("the drilled table must not name a drill-in: it has no group headers")
+	}
+
+	// And exactly one OPERATE row keeps naming the confirmation meaning.
+	for _, grouped := range []bool{false, true} {
+		found := 0
+		for _, g := range helpGroupsFor(screenSelectContainers, helpContext{canGoBack: true, grouped: grouped}) {
+			if g.title != "OPERATE" {
+				continue
+			}
+			for _, e := range g.entries {
+				if e.keys == "enter" {
+					found++
+				}
+			}
+		}
+		if found != 1 {
+			t.Errorf("grouped=%v: OPERATE names enter %d times, want exactly 1", grouped, found)
 		}
 	}
 }

@@ -190,14 +190,23 @@ Confirmed design decisions (brainstormed and validated; do not re-litigate):
 - Modify: `internal/tui/app.go`
 - Modify: `internal/tui/help.go`
 - Modify: `internal/tui/help_test.go`
+- Modify: `internal/tui/entries.go` + `_test.go` (➕ `cursorGroup()` — the header-accepting twin of `cursorService()` — lives beside the other row-model helpers)
+- Modify: `internal/tui/app_test.go` (➕ the drill/bind pins, and the esc-to-picker fixtures Task 8 rewires)
 
-- [ ] `enter` on a header drills in: `m.svcGroups` = that one group, `m.composer = composerFactory(group.proj)`, reload via `loadServices` (full fidelity), breadcrumb `cdeploy > server > proj`; bump the three session counters
-- [ ] `esc` from drilled mode returns to grouped mode: `m.composer = nil`, reload groups, bump sessions, follow the callback-cleanup discipline; `esc` from grouped mode returns to the server screen
-- [ ] `l`/`x`/`i`/`c` in grouped mode: set `m.composer = composerFactory(cursor group.proj)` at the action key, then call the existing `enter*` helper; every return-to-grouped site clears `m.composer` to nil and dispatches `loadGroups()`; `c` refused on the unmanaged group
-- [ ] `m.clearSearch()` runs on drill-in and drill-out (ephemeral-on-departure list grows by 2)
-- [ ] add `enter  drill into project` to the NAV/SELECT group in `helpGroupsFor` — NOT a second row in OPERATE (which already names `enter confirm the prompt`); group order unchanged; description names the header sub-state
-- [ ] write tests: drill-in/out state and session bumps, action-time bind + return cleanup, search cleared, help pins both directions
-- [ ] run tests - must pass before task 9
+⚠️ Deviations:
+- `readOnly()` gained a `m.grouped` short-circuit. `x` binds the cursor group's composer and KEEPS it across the confirmation prompt, so an unmanaged row would otherwise flip the whole screen to the read-only variant (no checkboxes, 7-cell caption pad, a different footer pair and therefore a different `svcVisibleCount`) for the length of the prompt. This is the plan's own "grouped mode is not globally read-only" rule made load-bearing.
+- `screenSelectProject` is now UNREACHABLE in production — Task 6 predicted exactly this ("Task 8 rewires that esc to drill-out"). `loadProjects`/`projectsMsg`/`viewSelectProject` stay wired and tested until Task 13's deletion sweep; the screen constant carries a comment saying so.
+- Drill-in sets `m.showPicker = true` because that is the predicate `canGoBack()` already reads on the drilled screen. Task 13 removes the field, and the drilled back-rule moves with it.
+- Drill-out reuses `enterGroupedContainers()` whole rather than a second cleanup body: it already owns the composer, project identity, rows, selection, search, wait state and the four session counters, which is exactly what the site owes.
+- `enter` drills in from a group HEADER only, per the plan. On a grouped host with exactly ONE project no header is emitted, so there is no drill-in there — the accepted never-created-services gap in the Solution Overview covers that case.
+
+- [x] `enter` on a header drills in: `m.svcGroups` = that one group, `m.composer = composerFactory(group.proj)`, reload via `loadServices` (full fidelity), breadcrumb `cdeploy > server > proj`; bump the three session counters
+- [x] `esc` from drilled mode returns to grouped mode: `m.composer = nil`, reload groups, bump sessions, follow the callback-cleanup discipline; `esc` from grouped mode returns to the server screen
+- [x] `l`/`x`/`i`/`c` in grouped mode: set `m.composer = composerFactory(cursor group.proj)` at the action key, then call the existing `enter*` helper; every return-to-grouped site clears `m.composer` to nil and dispatches `loadGroups()`; `c` refused on the unmanaged group
+- [x] `m.clearSearch()` runs on drill-in and drill-out (ephemeral-on-departure list grows by 2)
+- [x] add `enter  drill into project` to the NAV/SELECT group in `helpGroupsFor` — NOT a second row in OPERATE (which already names `enter confirm the prompt`); group order unchanged; description names the header sub-state
+- [x] write tests: drill-in/out state and session bumps, action-time bind + return cleanup, search cleared, help pins both directions
+- [x] run tests - must pass before task 9
 
 ### Task 9: Batch partitioning and confirmation (phase 3)
 

@@ -148,13 +148,22 @@ func findGroup() helpGroup {
 // and only the grouped host view has the second row kind — so only there does
 // the description name both. A key bound in a sub-state must name that state,
 // and "a group header" is exactly that state.
+//
+// enter joins the group for the same reason, and belongs HERE rather than as a
+// second row in OPERATE: OPERATE already names enter as the confirmation key,
+// and one key cannot carry two descriptions in one table. The row-kind
+// sub-state it is bound in — a group header — is named in the description, the
+// convention every sub-state binding follows.
 func selectGroup(grouped bool) helpGroup {
-	toggle := helpEntry{"space", "toggle"}
 	if grouped {
-		toggle = helpEntry{"space", "toggle a service · fold a group"}
+		return helpGroup{title: "SELECT", actions: true, entries: []helpEntry{
+			{"space", "toggle a service · fold a group"},
+			{"a", "all"},
+			{"enter", "drill into the project on a group header"},
+		}}
 	}
 	return helpGroup{title: "SELECT", actions: true, entries: []helpEntry{
-		toggle,
+		{"space", "toggle"},
 		{"a", "all"},
 	}}
 }

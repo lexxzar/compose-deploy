@@ -317,3 +317,15 @@ func buildSvcGroups(projects []compose.Project, host map[string]map[string]runne
 	}
 	return groups
 }
+
+// cursorGroup returns the group the cursor row belongs to. Unlike cursorService
+// it accepts a header row: a header IS its group, and the keys that act on a
+// whole project — drill-in, config — are exactly the ones a header row should
+// answer.
+func (m Model) cursorGroup() (svcGroup, bool) {
+	e, ok := m.cursorEntry()
+	if !ok || e.groupIdx < 0 || e.groupIdx >= len(m.svcGroups) {
+		return svcGroup{}, false
+	}
+	return m.svcGroups[e.groupIdx], true
+}

@@ -268,6 +268,10 @@ type screen int
 
 const (
 	screenSelectServer screen = iota
+	// screenSelectProject is UNREACHABLE in production: the grouped host view
+	// replaced it as the "which project?" screen, and drilling in or out is a
+	// state change on the container screen rather than a separate screen. Its
+	// handlers, view and tests stay wired only until the deletion sweep.
 	screenSelectProject
 	screenSelectContainers
 	screenProgress
@@ -1548,6 +1552,9 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if msg.err != nil {
 			m.warning = fmt.Sprintf("exec failed: %v", msg.err)
 		}
+		// x bound the composer at press time and kept it across the prompt;
+		// the exec is over, so grouped mode drops it again.
+		m.unbindGroupedComposer()
 		m.statsSession++
 		m.statusSession++
 		m.updatesSession++
@@ -2071,6 +2078,11 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			case "esc":
 				m.confirming = false
 				m.pendingExec = false
+				// The x prompt is the one confirmation that keeps a bound
+				// composer while the user is still on the container screen.
+				// Cancelling must drop it, or grouped mode would keep serving
+				// one project's composer to the next row's action key.
+				m.unbindGroupedComposer()
 				m.fixSvcOffset()
 				return m, nil
 			}
@@ -2125,17 +2137,17 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.warning = ""
 
 		// Grouped mode spans every project at once, so there is no single
-		// composer to run a pipeline with, open a log stream on or read a
-		// compose file from. These keys are refused rather than left to
-		// dereference a nil composer; Task 7 gives the grouped screen its own
-		// key table and Task 8 binds a composer from the cursor's group.
+		// composer to run a pipeline with. The read keys (l, x, i, c) bind one
+		// from the cursor row's group at press time; the write ops cannot,
+		// because a selection may span projects — they are refused here until
+		// the batch pipeline lands.
 		//
 		// Each refusal re-clamps first: the dispatch cleared m.warning above,
 		// which frees the warning footer line and grows svcVisibleCount() by
 		// one — the same rule the read-only gates follow.
 		if m.grouped {
 			switch key {
-			case "d", "r", "s", "R", "c", "l":
+			case "d", "r", "s", "R":
 				m.fixSvcOffset()
 				return m, nil
 			}
@@ -2162,38 +2174,32 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 				return m, nil
 			}
 			if m.showPicker {
-				m.screen = screenSelectProject
-				m.composer = nil
-				m.statsSession++
-				m.statusSession++
-				m.updatesSession++
-				m.rollbackFetchSession++
-				m.rollbackSnapshot = nil
-				m.rollbackTargets = nil
-				m.refreshInFlight = false
-				m.updateInFlight = false
-				m.updatesErr = ""
-				m.projName = ""
-				m.projDir = ""
-				m.clearSvcGroups()
-				m.svcStatus = nil
-				m.stats = nil
-				m.statsErr = nil
-				m.selected = make(map[string]bool)
-				m.svcCursor = 0
-				m.svcOffset = 0
-				m.svcErr = nil
-				// Leaving screenSelectContainers: search is ephemeral. The
-				// two-stage guard above already cleared any active search before
-				// we reach here, but call clearSearch() unconditionally so the
-				// ephemeral-on-departure invariant holds regardless of entry path.
-				m.clearSearch()
-				m.clearWaitState()
-				if m.projects == nil {
-					return m, m.loadProjects()
-				}
+				// Drill out: the grouped host view is the screen above a
+				// single project now, so esc goes there rather than to a
+				// separate picker. enterGroupedContainers owns the whole
+				// reset — composer, project identity, rows, selection, search,
+				// wait state and the four session counters — which is exactly
+				// the backward-navigation cleanup this site owes.
+				//
+				// Hoisted: pointer receiver, same m as the return.
+				cmd := m.enterGroupedContainers()
+				return m, cmd
+			}
+		case "enter":
+			// Drill into the project under the cursor. Only a group header
+			// answers: a header IS a project, and the drilled screen is a
+			// single-project screen. On the drilled screen enter belongs to
+			// the confirmation prompt (handled by the intercept above), so it
+			// is inert here.
+			entry, ok := m.cursorEntry()
+			if !m.grouped || !ok || entry.kind != entrySvcGroupHeader {
+				m.fixSvcOffset()
 				return m, nil
 			}
+			// Hoisted out of the return: the helper has a pointer receiver and
+			// mutates the same m the return carries.
+			cmd := m.drillIntoGroup(entry.groupIdx)
+			return m, cmd
 		case "up", "k":
 			if m.svcCursor > 0 {
 				m.svcCursor--
@@ -2361,6 +2367,14 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			if len(m.services) == 0 {
 				return m, nil
 			}
+			if _, ok := m.cursorService(); !ok {
+				m.fixSvcOffset()
+				return m, nil
+			}
+			if !m.bindCursorComposer() {
+				m.fixSvcOffset()
+				return m, nil
+			}
 			return m.enterLogs()
 		case "c":
 			// Explicit gate for the same reason as R: HostContainers is not a
@@ -2370,9 +2384,21 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 				m.fixSvcOffset()
 				return m, nil
 			}
+			// The unmanaged bucket is refused before the composer is even
+			// bound: it has no compose file, so binding it would only produce
+			// a composer the assertion below rejects.
+			if g, ok := m.cursorGroup(); m.grouped && (!ok || g.proj.Unmanaged) {
+				m.fixSvcOffset()
+				return m, nil
+			}
+			if !m.bindCursorComposer() {
+				m.fixSvcOffset()
+				return m, nil
+			}
 			if _, ok := m.composer.(ConfigProvider); ok {
 				return m.enterConfig()
 			}
+			m.unbindGroupedComposer()
 		case "i":
 			// Deliberately NOT gated on m.readOnly(): inspect is read-only by
 			// nature and works identically on both container variants, so it is
@@ -2380,22 +2406,43 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			if len(m.services) == 0 {
 				return m, nil
 			}
+			if _, ok := m.cursorService(); !ok {
+				m.fixSvcOffset()
+				return m, nil
+			}
+			if !m.bindCursorComposer() {
+				m.fixSvcOffset()
+				return m, nil
+			}
 			if _, ok := m.composer.(Inspector); !ok {
+				m.unbindGroupedComposer()
 				return m, nil
 			}
 			return m.enterInspect()
 		case "x":
-			if _, ok := m.composer.(ExecProvider); !ok {
+			if len(m.services) == 0 {
 				return m, nil
 			}
-			if len(m.services) == 0 {
+			if _, ok := m.cursorService(); !ok {
+				m.fixSvcOffset()
+				return m, nil
+			}
+			if !m.bindCursorComposer() {
+				m.fixSvcOffset()
+				return m, nil
+			}
+			if _, ok := m.composer.(ExecProvider); !ok {
+				m.unbindGroupedComposer()
 				return m, nil
 			}
 			if st, ok := m.svcStatus[m.svcKeyAt(m.svcCursor)]; !ok || !st.Running {
 				m.warning = "Container is not running"
+				m.unbindGroupedComposer()
 				m.fixSvcOffset()
 				return m, nil
 			}
+			// The composer stays bound across the prompt — enterExec runs on
+			// the confirming `enter`. Cancelling the prompt unbinds it again.
 			m.confirming = true
 			m.pendingExec = true
 			m.fixSvcOffset()
@@ -2570,6 +2617,9 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.clearLogFilter()
 			m.clearLogSearch()
 			m.screen = screenSelectContainers
+			// The composer was bound by the action key that opened this screen
+			// (grouped mode only); returning to the host view drops it again.
+			m.unbindGroupedComposer()
 			m.statsSession++
 			m.statusSession++
 			m.updatesSession++
@@ -2687,6 +2737,15 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.configValid = nil
 			m.configValidMsg = ""
 			m.screen = screenSelectContainers
+			// Unlike the logs/progress returns this site fires no status
+			// refresh of its own (the config screen changes no container
+			// state), so grouped mode asks for the host view explicitly —
+			// the bound composer it drops here was the only thing that could
+			// have answered a per-project refresh.
+			if m.grouped {
+				m.unbindGroupedComposer()
+				return m, m.loadGroups()
+			}
 			return m, nil
 		case "r":
 			m.configShowRes = !m.configShowRes
@@ -2732,6 +2791,10 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			// no container state, so it returns like screenConfig rather than
 			// like screenLogs/screenProgress.
 			m.screen = screenSelectContainers
+			if m.grouped {
+				m.unbindGroupedComposer()
+				return m, m.loadGroups()
+			}
 			return m, nil
 		case "r":
 			// Two-way toggle over two buffers already in hand — no refetch,
@@ -2988,6 +3051,7 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 					}
 				}
 				m.screen = screenSelectContainers
+				m.unbindGroupedComposer()
 				m.confirming = false
 				m.steps = nil
 				m.done = false
@@ -5059,6 +5123,105 @@ func (m *Model) enterGroupedContainers() tea.Cmd {
 	return tea.Batch(m.loadGroups(), m.refreshGroupedStats())
 }
 
+// bindCursorComposer binds the action-time composer for the cursor row's group
+// and reports whether one is now in hand. Grouped mode deliberately holds no
+// composer between actions — that nil is what keeps every capability assert
+// inert — so the read keys (l, x, i, c) bind one at press time. The ROW decides
+// which: two projects on one screen have two different composers, and the
+// model's own project identity is empty in grouped mode.
+//
+// Drilled mode already holds the right composer, so it is a pure pass-through
+// there; every caller can therefore call it unconditionally.
+func (m *Model) bindCursorComposer() bool {
+	if !m.grouped {
+		return true
+	}
+	if m.composerFactory == nil {
+		return false
+	}
+	g, ok := m.cursorGroup()
+	if !ok {
+		return false
+	}
+	c := m.composerFactory(g.proj)
+	if c == nil {
+		return false
+	}
+	m.composer = c
+	return true
+}
+
+// unbindGroupedComposer drops the action-time composer. Every path that binds
+// one and then stays on (or returns to) the grouped screen calls it, so grouped
+// mode is never left holding one project's composer while the cursor sits on
+// another's row. A no-op in drilled mode, where the composer is the screen's
+// own and must survive.
+func (m *Model) unbindGroupedComposer() {
+	if m.grouped {
+		m.composer = nil
+	}
+}
+
+// drillIntoGroup leaves the grouped host view for the single-project screen.
+// The group's own composer replaces the nil grouped mode holds, so the write
+// ops, config and rollback all come back, and loadServices replaces the rows
+// with the full compose service list — including services that were never
+// created, which the host-wide `docker ps` behind the grouped view cannot see.
+//
+// The group's existing rows are installed first so the screen paints the
+// project the user just picked instead of a "Loading services..." frame; the
+// reload overwrites them a moment later. svcStatus and stats are kept for the
+// same reason: their keys are qualified by project, so the drilled group's
+// entries are already correct and the intervening frame carries live data.
+func (m *Model) drillIntoGroup(gi int) tea.Cmd {
+	if gi < 0 || gi >= len(m.svcGroups) || m.composerFactory == nil {
+		return nil
+	}
+	g := m.svcGroups[gi]
+	c := m.composerFactory(g.proj)
+	if c == nil {
+		return nil
+	}
+	m.grouped = false
+	// The grouped view is the parent screen from here on: canGoBack and the
+	// footer's back label both read showPicker on the drilled screen.
+	m.showPicker = true
+	m.composer = c
+	m.projName = g.proj.Name
+	m.projDir = g.proj.ConfigDir
+	m.selected = make(map[string]bool)
+	m.svcCursor = 0
+	m.svcOffset = 0
+	m.confirming = false
+	m.pendingExec = false
+	m.warning = ""
+	m.svcErr = nil
+	m.updatesErr = ""
+	m.rollbackSnapshot = nil
+	m.rollbackTargets = nil
+	// Drilling in is a context change, and search is ephemeral across every one.
+	m.clearSearch()
+	m.clearWaitState()
+	// AFTER the identity above: setSingleGroup derives the group from
+	// currentProject(), which reads projName, projDir and the composer.
+	m.setSingleGroup(g.services)
+	m.statsSession++
+	m.statusSession++
+	m.updatesSession++
+	m.rollbackFetchSession++
+	m.statsRequested = true
+	m.refreshInFlight = true
+	// Reset before the batch below, like every other context-change site: the
+	// session bump invalidated any pending updatesMsg, and a leaked in-flight
+	// flag would refuse the next fetch.
+	m.updateInFlight = false
+	cmds := []tea.Cmd{m.loadContainerScreenCmd(), m.statsRefreshCmd()}
+	if c := m.maybeRefreshUpdatesCmd(); c != nil {
+		cmds = append(cmds, c)
+	}
+	return tea.Batch(cmds...)
+}
+
 // backToServerScreen is the shared esc body for the screens that sit directly
 // under the server picker. It restores the local callbacks, drops the remote
 // connection and clears every piece of downstream state, per the
@@ -5480,6 +5643,15 @@ func (m Model) canGoBack() bool {
 // nothing advertises a no-op. Nil-safe: a Model{} test literal has no composer
 // and is not read-only, matching the compose path.
 func (m Model) readOnly() bool {
+	if m.grouped {
+		// The grouped host view holds no composer of its own — an action key
+		// binds one from the cursor row's group and the return site drops it
+		// again. That binding must not repaint the whole screen: an exec
+		// prompt over an unmanaged row keeps its composer for the length of
+		// the prompt, and reading it here would drop every checkbox and
+		// re-flow the list under the user for those few keystrokes.
+		return false
+	}
 	if m.composer == nil {
 		return false
 	}

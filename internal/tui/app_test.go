@@ -428,53 +428,68 @@ func TestSelectContainers_EnterIgnoredWhenNotConfirming(t *testing.T) {
 	}
 }
 
-func TestSelectContainers_EscGoesBackWhenPickerShown(t *testing.T) {
+// esc out of a drilled project lands on the grouped host view — the screen that
+// sits above a single project now that the picker is gone.
+func TestSelectContainers_EscDrillsOutToGroupedView(t *testing.T) {
 	mc := &mockComposer{services: []string{"nginx"}}
 	m := NewModel(nil, io.Discard, mockFactory(mc), nil, nil)
+	installFakeTick(&m)
 	m.screen = screenSelectContainers
 	m.showPicker = true
 	m.grouped = false // drilled mode: NewModel now starts grouped
+	m.projName = "app"
+	m.projDir = "/app"
 	m.setSingleGroup(mc.services)
 	m.selected[m.svcKeyAt(0)] = true
 	m.composer = mc
-	m.projects = []compose.Project{{Name: "app", ConfigDir: "/app"}}
-	m.projCursor = 0
 
 	updated, cmd := m.Update(tea.KeyMsg{Type: tea.KeyEsc})
 	m = updated.(Model)
 
-	if m.screen != screenSelectProject {
-		t.Errorf("screen = %d, want %d", m.screen, screenSelectProject)
+	if m.screen != screenSelectContainers || !m.grouped {
+		t.Errorf("screen = %d grouped = %v, want the grouped container screen", m.screen, m.grouped)
 	}
-	if len(m.services) != 0 {
-		t.Error("services should be cleared on back")
+	if m.composer != nil {
+		t.Error("the drilled project's composer must be dropped on drill-out")
+	}
+	if len(m.services) != 0 || m.svcGroups != nil || m.svcEntries != nil {
+		t.Error("row state should be cleared on drill-out")
 	}
 	if m.svcStatus != nil {
-		t.Error("svcStatus should be nil after going back")
+		t.Error("svcStatus should be nil after drill-out")
 	}
-	if cmd != nil {
-		t.Error("should not reload projects when already loaded")
+	if len(m.selected) != 0 {
+		t.Error("selection should be dropped on drill-out")
+	}
+	if m.projName != "" || m.projDir != "" {
+		t.Errorf("project identity survived drill-out: %q %q", m.projName, m.projDir)
+	}
+	if cmd == nil {
+		t.Error("drill-out must dispatch the grouped load batch")
 	}
 }
 
-func TestSelectContainers_EscLoadsProjectsWhenNil(t *testing.T) {
+// Drill-out reloads the host view unconditionally: the grouped screen holds no
+// cached project list to fall back on the way the picker did.
+func TestSelectContainers_EscDrillOutBumpsSessions(t *testing.T) {
 	mc := &mockComposer{services: []string{"nginx"}}
 	m := NewModel(nil, io.Discard, mockFactory(mc), nil, nil)
+	installFakeTick(&m)
 	m.screen = screenSelectContainers
 	m.showPicker = true
-	m.grouped = false // drilled mode: NewModel now starts grouped
+	m.grouped = false
 	m.setSingleGroup(mc.services)
 	m.composer = mc
-	// projects is nil (local fast-path skipped project screen)
+	status, stats, updates := m.statusSession, m.statsSession, m.updatesSession
 
 	updated, cmd := m.Update(tea.KeyMsg{Type: tea.KeyEsc})
 	m = updated.(Model)
 
-	if m.screen != screenSelectProject {
-		t.Errorf("screen = %d, want %d", m.screen, screenSelectProject)
+	if m.statusSession == status || m.statsSession == stats || m.updatesSession == updates {
+		t.Error("drill-out is a composer swap: all three session counters must bump")
 	}
 	if cmd == nil {
-		t.Error("should load projects when projects is nil")
+		t.Error("should dispatch the grouped reload")
 	}
 }
 
@@ -8519,8 +8534,8 @@ func TestQBackNavigation_ContainerScreen(t *testing.T) {
 	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'q'}})
 	um := updated.(Model)
 
-	if um.screen != screenSelectProject {
-		t.Errorf("screen = %d, want screenSelectProject", um.screen)
+	if um.screen != screenSelectContainers || !um.grouped {
+		t.Errorf("screen = %d grouped = %v, want the grouped host view", um.screen, um.grouped)
 	}
 	if um.composer != nil {
 		t.Error("composer should be cleared after back nav")
@@ -9412,8 +9427,8 @@ func TestEsc_clearsStats(t *testing.T) {
 	result, _ := m.Update(tea.KeyMsg{Type: tea.KeyEsc})
 	model := result.(Model)
 
-	if model.screen != screenSelectProject {
-		t.Fatalf("screen = %d, want %d", model.screen, screenSelectProject)
+	if model.screen != screenSelectContainers || !model.grouped {
+		t.Fatalf("screen = %d grouped = %v, want the grouped host view", model.screen, model.grouped)
 	}
 	if model.stats != nil {
 		t.Errorf("stats not cleared on esc: got %+v", model.stats)
@@ -13991,11 +14006,11 @@ func TestSearchTwoStageEsc(t *testing.T) {
 		t.Errorf("after 1st esc: searchMatches = %v, want nil", m.searchMatches)
 	}
 
-	// Second esc: no active search → back-nav to project picker.
+	// Second esc: no active search → drill out to the grouped host view.
 	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyEsc})
 	m = updated.(Model)
-	if m.screen != screenSelectProject {
-		t.Errorf("after 2nd esc: screen = %d, want screenSelectProject (back-nav)", m.screen)
+	if m.screen != screenSelectContainers || !m.grouped {
+		t.Errorf("after 2nd esc: screen = %d grouped = %v, want the grouped host view", m.screen, m.grouped)
 	}
 }
 
@@ -14364,10 +14379,10 @@ func TestSearchClearedOnEscToProject(t *testing.T) {
 
 	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyEsc})
 	m = updated.(Model)
-	if m.screen != screenSelectProject {
-		t.Errorf("after 2nd esc: screen = %d, want screenSelectProject", m.screen)
+	if m.screen != screenSelectContainers || !m.grouped {
+		t.Errorf("after 2nd esc: screen = %d grouped = %v, want the grouped host view", m.screen, m.grouped)
 	}
-	assertSearchCleared(t, m, "after esc→project back-nav")
+	assertSearchCleared(t, m, "after esc→grouped drill-out")
 }
 
 // TestSearchClearedOnEscToProjectSingleEsc: even when a committed search is active
@@ -14381,10 +14396,10 @@ func TestSearchClearedOnEscToProjectNoActiveSearch(t *testing.T) {
 	// No active search — first (and only) esc back-navigates directly.
 	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyEsc})
 	m = updated.(Model)
-	if m.screen != screenSelectProject {
-		t.Errorf("screen = %d, want screenSelectProject (direct back-nav)", m.screen)
+	if m.screen != screenSelectContainers || !m.grouped {
+		t.Errorf("screen = %d grouped = %v, want the grouped host view (direct back-nav)", m.screen, m.grouped)
 	}
-	assertSearchCleared(t, m, "after direct esc→project (no active search)")
+	assertSearchCleared(t, m, "after direct esc→grouped (no active search)")
 }
 
 // TestSearchClearedOnEnterLogs: a read-only departure to the logs screen (l key)
@@ -19208,8 +19223,10 @@ func TestGroupedScreen_IsRootWithoutServers(t *testing.T) {
 	}
 }
 
-// Grouped mode has no single composer, so the keys that would need one are
-// refused rather than left to dereference nil.
+// Grouped mode has no single composer, and a selection may span projects, so
+// the write ops are refused rather than left to dereference nil. The READ keys
+// (l, x, i, c) bind one from the cursor row's group instead — see the drill-in
+// tests below.
 func TestGroupedScreen_RefusesComposerBoundKeys(t *testing.T) {
 	g, projects := groupedFixture()
 	base := groupedTestModel(g, projects)
@@ -19217,7 +19234,7 @@ func TestGroupedScreen_RefusesComposerBoundKeys(t *testing.T) {
 	base = updated.(Model)
 	base.svcCursor = 1 // a service row, not a header
 
-	for _, key := range []string{"d", "r", "s", "R", "c", "l"} {
+	for _, key := range []string{"d", "r", "s", "R"} {
 		t.Run(key, func(t *testing.T) {
 			m := base
 			updated, cmd := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune(key)})
@@ -19747,5 +19764,375 @@ func TestContainerFooter_GroupedClampsToWidth(t *testing.T) {
 				t.Errorf("width %d: footer line %q is %d cells wide", width, ansi.Strip(l), w)
 			}
 		}
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Drill-in, drill-out and the action-time composer (Task 8).
+// ---------------------------------------------------------------------------
+
+// capableComposer answers every capability the grouped read keys assert on, so
+// a test that presses l / x / i / c fails on the BINDING rather than on a
+// double that could never have served the key.
+type capableComposer struct {
+	mockComposer
+	proj string
+}
+
+func (c *capableComposer) ConfigFile(context.Context) ([]byte, error) {
+	return []byte("services: {}"), nil
+}
+
+func (c *capableComposer) ConfigResolved(context.Context) ([]byte, error) {
+	return []byte("services: {}"), nil
+}
+
+func (c *capableComposer) EditCommand(context.Context) (*exec.Cmd, error) {
+	return exec.Command("echo", "edit"), nil
+}
+
+func (c *capableComposer) ValidateConfig(context.Context) error { return nil }
+
+func (c *capableComposer) ExecCommand(_ context.Context, service string, _ []string) (*exec.Cmd, error) {
+	return exec.Command("echo", service), nil
+}
+
+func (c *capableComposer) Inspect(context.Context, string) ([]byte, error) {
+	return []byte(inspectFixtureJSON), nil
+}
+
+// drillFactory hands out one capableComposer per project and keeps them, so a
+// test can assert WHICH project's composer a key bound — the whole point of
+// action-time binding is that two rows on one screen bind two different ones.
+// The synthetic unmanaged project keeps returning the grouper, because that is
+// the address hostGrouper() reaches the host-wide seam through.
+type drillFactory struct {
+	grouper *mockGrouper
+	made    map[string]*capableComposer
+}
+
+func newDrillFactory(g *mockGrouper) *drillFactory {
+	return &drillFactory{grouper: g, made: map[string]*capableComposer{}}
+}
+
+func (f *drillFactory) factory() ComposerFactory {
+	return func(p compose.Project) runner.Composer {
+		if p.Unmanaged {
+			return f.grouper
+		}
+		c, ok := f.made[p.Name]
+		if !ok {
+			c = &capableComposer{proj: p.Name}
+			c.services = []string{p.Name + "-api", p.Name + "-db"}
+			f.made[p.Name] = c
+		}
+		return c
+	}
+}
+
+// drillTestModel is a loaded grouped screen over groupedFixture's host. Its row
+// order is fixed and every drill test indexes it directly:
+//
+//	0 ▼ blog · 1 web · 2 ▼ shop · 3 api · 4 db · 5 ▼ (unmanaged) · 6 watchtower
+func drillTestModel(t *testing.T) (Model, *drillFactory) {
+	t.Helper()
+	g, projects := groupedFixture()
+	f := newDrillFactory(g)
+	m := NewModel(nil, io.Discard, f.factory(), nil, nil)
+	installFakeTick(&m)
+	m.projectLoader = func(ctx context.Context) ([]compose.Project, error) { return projects, nil }
+	m.screen = screenSelectContainers
+	m.grouped = true
+	m.width, m.height = 120, 40
+	updated, _ := m.Update(m.loadGroups()())
+	m = updated.(Model)
+	if len(m.svcEntries) != 7 {
+		t.Fatalf("fixture drift: %d rows, want 7", len(m.svcEntries))
+	}
+	return m, f
+}
+
+func TestGroupedScreen_EnterDrillsIntoProject(t *testing.T) {
+	m, f := drillTestModel(t)
+	m.svcCursor = 2 // the shop header
+	m.selected[svcKey("blog", "web")] = true
+	m.searchQuery = "e"
+	m.searchMatches = computeMatches(m.svcEntries, "e")
+	status, stats, updates := m.statusSession, m.statsSession, m.updatesSession
+
+	updated, cmd := m.Update(keyMsgFor("enter"))
+	m = updated.(Model)
+
+	if m.grouped {
+		t.Error("enter on a group header must leave the grouped host view")
+	}
+	if m.screen != screenSelectContainers {
+		t.Errorf("screen = %d, want the container screen (drill-in is not a new screen)", m.screen)
+	}
+	if m.composer != runner.Composer(f.made["shop"]) {
+		t.Errorf("composer = %#v, want shop's own composer", m.composer)
+	}
+	if m.projName != "shop" || m.projDir != "/srv/shop" {
+		t.Errorf("project identity = %q %q, want shop /srv/shop", m.projName, m.projDir)
+	}
+	if !strings.Contains(m.breadcrumb(), "shop") {
+		t.Errorf("breadcrumb = %q, want it to name the drilled project", m.breadcrumb())
+	}
+	if len(m.svcGroups) != 1 || m.svcGroups[0].proj.Name != "shop" {
+		t.Errorf("svcGroups = %+v, want the one drilled group", m.svcGroups)
+	}
+	if !slices.Equal(m.services, []string{"api", "db"}) {
+		t.Errorf("services = %v, want the group's rows painted immediately", m.services)
+	}
+	if !m.showPicker {
+		t.Error("the drilled screen must report a parent so esc can drill back out")
+	}
+	if len(m.selected) != 0 {
+		t.Error("a selection that spanned projects must not survive the drill-in")
+	}
+	if m.searchQuery != "" || m.searchMatches != nil {
+		t.Error("search is ephemeral across a drill-in")
+	}
+	if m.svcCursor != 0 || m.svcOffset != 0 {
+		t.Errorf("cursor/offset = %d/%d, want the drilled list to start at the top", m.svcCursor, m.svcOffset)
+	}
+	if m.statusSession == status || m.statsSession == stats || m.updatesSession == updates {
+		t.Error("drill-in swaps the composer: all three session counters must bump")
+	}
+	if cmd == nil {
+		t.Error("drill-in must dispatch the single-project reload")
+	}
+}
+
+// The drilled reload is loadServices, not the grouped fetch: only it can report
+// a service the compose file declares but the host has never created.
+func TestGroupedScreen_DrillInReloadsThroughTheGroupComposer(t *testing.T) {
+	m, f := drillTestModel(t)
+	m.svcCursor = 2 // the shop header
+
+	updated, _ := m.Update(keyMsgFor("enter"))
+	m = updated.(Model)
+
+	msg, ok := m.loadContainerScreenCmd()().(servicesMsg)
+	if !ok {
+		t.Fatal("the drilled screen must load through loadServices")
+	}
+	if msg.groupedPayload {
+		t.Error("drilled mode must not fetch the host-wide payload")
+	}
+	if !slices.Equal(msg.services, f.made["shop"].services) {
+		t.Errorf("services = %v, want the composer's full list %v", msg.services, f.made["shop"].services)
+	}
+}
+
+func TestGroupedScreen_EnterIsInertOffAHeader(t *testing.T) {
+	m, _ := drillTestModel(t)
+	m.svcCursor = 3 // the shop/api service row
+
+	updated, cmd := m.Update(keyMsgFor("enter"))
+	got := updated.(Model)
+
+	if !got.grouped || got.composer != nil {
+		t.Error("enter on a service row must not drill in")
+	}
+	if cmd != nil {
+		t.Error("enter on a service row must dispatch nothing")
+	}
+}
+
+// On the drilled screen enter belongs to the confirmation prompt; with no
+// prompt up it must stay inert rather than re-entering the project.
+func TestDrilledScreen_EnterIsInert(t *testing.T) {
+	mc := &mockComposer{services: []string{"web"}}
+	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
+	installFakeTick(&m)
+	m.screen = screenSelectContainers
+	m.setSingleGroup(mc.services)
+	m.composer = mc
+
+	updated, cmd := m.Update(keyMsgFor("enter"))
+	got := updated.(Model)
+
+	if got.confirming || got.screen != screenSelectContainers {
+		t.Errorf("enter armed something: confirming=%v screen=%d", got.confirming, got.screen)
+	}
+	if cmd != nil {
+		t.Error("idle enter on the drilled screen must dispatch nothing")
+	}
+}
+
+// Drill-in then drill-out is a round trip: the composer the header bound is
+// dropped and the host view reloads.
+func TestGroupedScreen_DrillRoundTrip(t *testing.T) {
+	m, _ := drillTestModel(t)
+	m.svcCursor = 2 // the shop header
+	updated, _ := m.Update(keyMsgFor("enter"))
+	m = updated.(Model)
+	if m.grouped {
+		t.Fatal("precondition: drill-in should have left grouped mode")
+	}
+
+	updated, cmd := m.Update(tea.KeyMsg{Type: tea.KeyEsc})
+	m = updated.(Model)
+
+	if !m.grouped || m.screen != screenSelectContainers {
+		t.Errorf("esc left screen %d grouped %v, want the grouped host view", m.screen, m.grouped)
+	}
+	if m.composer != nil {
+		t.Error("drill-out must drop the project composer")
+	}
+	if m.projName != "" || m.projDir != "" {
+		t.Error("drill-out must drop the project identity")
+	}
+	if m.showPicker {
+		t.Error("the grouped screen is not reached through a picker")
+	}
+	if cmd == nil {
+		t.Error("drill-out must reload the host view")
+	}
+}
+
+// actionBindCase drives one read key from a grouped row and back again.
+type actionBindCase struct {
+	name       string
+	key        string
+	cursor     int
+	wantProj   string
+	wantScreen screen
+}
+
+func TestGroupedScreen_ReadKeysBindTheCursorGroupComposer(t *testing.T) {
+	cases := []actionBindCase{
+		{"logs", "l", 1, "blog", screenLogs},
+		{"inspect", "i", 3, "shop", screenInspect},
+		{"config", "c", 1, "blog", screenConfig},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			m, f := drillTestModel(t)
+			m.svcCursor = tc.cursor
+
+			updated, cmd := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune(tc.key)})
+			m = updated.(Model)
+
+			if m.screen != tc.wantScreen {
+				t.Fatalf("%q left screen %d, want %d", tc.key, m.screen, tc.wantScreen)
+			}
+			if m.composer != runner.Composer(f.made[tc.wantProj]) {
+				t.Errorf("%q bound %#v, want %s's composer", tc.key, m.composer, tc.wantProj)
+			}
+			if !m.grouped {
+				t.Error("an action key must not leave grouped mode; only enter drills in")
+			}
+			if cmd == nil {
+				t.Errorf("%q should dispatch its fetch", tc.key)
+			}
+
+			updated, cmd = m.Update(tea.KeyMsg{Type: tea.KeyEsc})
+			m = updated.(Model)
+			if m.screen != screenSelectContainers || !m.grouped {
+				t.Fatalf("esc left screen %d grouped %v, want the grouped host view", m.screen, m.grouped)
+			}
+			if m.composer != nil {
+				t.Errorf("%q: the action-time composer survived the return to the host view", tc.key)
+			}
+			if cmd == nil {
+				t.Errorf("%q: returning to the host view must reload it", tc.key)
+			}
+		})
+	}
+}
+
+func TestGroupedScreen_ExecBindsAcrossThePromptAndUnbinds(t *testing.T) {
+	m, f := drillTestModel(t)
+	m.svcCursor = 3 // shop/api, running in the fixture
+
+	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'x'}})
+	m = updated.(Model)
+	if !m.confirming || !m.pendingExec {
+		t.Fatalf("x did not arm the exec prompt: confirming=%v pendingExec=%v", m.confirming, m.pendingExec)
+	}
+	if m.composer != runner.Composer(f.made["shop"]) {
+		t.Errorf("x bound %#v, want shop's composer to survive the prompt", m.composer)
+	}
+
+	// Cancelling the prompt is a return to the idle host view: the composer goes.
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyEsc})
+	m = updated.(Model)
+	if m.confirming || m.pendingExec {
+		t.Error("esc must cancel the exec prompt")
+	}
+	if m.composer != nil {
+		t.Error("cancelling the exec prompt must unbind the composer")
+	}
+
+	// And the completed exec unbinds it too.
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'x'}})
+	m = updated.(Model)
+	updated, _ = m.Update(keyMsgFor("enter"))
+	m = updated.(Model)
+	updated, _ = m.Update(execDoneMsg{})
+	m = updated.(Model)
+	if m.composer != nil {
+		t.Error("execDoneMsg must unbind the action-time composer")
+	}
+}
+
+// The unmanaged bucket has no compose file, so c is refused before a composer
+// is even bound — the key must not advertise a no-op by half-running.
+func TestGroupedScreen_ConfigRefusedOnUnmanagedGroup(t *testing.T) {
+	for _, cursor := range []int{5, 6} { // the unmanaged header and its row
+		m, _ := drillTestModel(t)
+		m.svcCursor = cursor
+
+		updated, cmd := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'c'}})
+		got := updated.(Model)
+
+		if got.screen != screenSelectContainers {
+			t.Errorf("cursor %d: c opened screen %d on the unmanaged group", cursor, got.screen)
+		}
+		if got.composer != nil {
+			t.Errorf("cursor %d: c bound a composer for the unmanaged group", cursor)
+		}
+		if cmd != nil {
+			t.Errorf("cursor %d: c dispatched a command on the unmanaged group", cursor)
+		}
+	}
+}
+
+// A header row names a project, not a service, so the keys that act on ONE
+// container leave it alone — and must not strand a bound composer behind.
+func TestGroupedScreen_ServiceKeysInertOnAHeaderRow(t *testing.T) {
+	for _, key := range []string{"l", "i", "x"} {
+		m, _ := drillTestModel(t)
+		m.svcCursor = 2 // the shop header
+
+		updated, cmd := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune(key)})
+		got := updated.(Model)
+
+		if got.screen != screenSelectContainers || got.confirming {
+			t.Errorf("%q acted on a header row: screen=%d confirming=%v", key, got.screen, got.confirming)
+		}
+		if got.composer != nil {
+			t.Errorf("%q left a composer bound from a header row", key)
+		}
+		if cmd != nil {
+			t.Errorf("%q dispatched a command from a header row", key)
+		}
+	}
+}
+
+// Binding an unmanaged group's read-only composer must not repaint the grouped
+// screen as a read-only one: the binding is transient, the screen is not.
+func TestGroupedScreen_BoundReadOnlyComposerDoesNotFlipTheScreen(t *testing.T) {
+	m, _ := drillTestModel(t)
+	m.composer = &readOnlyMockComposer{}
+
+	if m.readOnly() {
+		t.Error("grouped mode must not read a transiently bound composer as read-only")
+	}
+	line1, _ := m.containerHelpLines()
+	if !strings.Contains(line1, "fold") {
+		t.Errorf("footer = %q, want the grouped pair to survive a bound composer", line1)
 	}
 }

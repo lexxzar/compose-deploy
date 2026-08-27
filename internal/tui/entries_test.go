@@ -600,3 +600,42 @@ func TestSelectableRefs_DropsUnmanaged(t *testing.T) {
 		}
 	}
 }
+
+// cursorGroup answers on a header row, which is exactly what separates it from
+// cursorService: drill-in and config act on a whole project, and a header IS
+// that project.
+func TestCursorGroup(t *testing.T) {
+	m := Model{}
+	m.svcGroups = []svcGroup{
+		{proj: compose.Project{Name: "web"}, services: []string{"api"}},
+		{proj: compose.Project{Name: "db"}, services: []string{"postgres"}},
+	}
+	m.svcEntries = rebuildSvcEntries(m.svcGroups)
+
+	cases := []struct {
+		cursor int
+		want   string
+	}{
+		{0, "web"}, // header
+		{1, "web"}, // service
+		{2, "db"},  // header
+		{3, "db"},  // service
+	}
+	for _, tc := range cases {
+		m.svcCursor = tc.cursor
+		g, ok := m.cursorGroup()
+		if !ok || g.proj.Name != tc.want {
+			t.Errorf("cursor %d: cursorGroup() = %q %v, want %q true", tc.cursor, g.proj.Name, ok, tc.want)
+		}
+	}
+
+	m.svcCursor = 99
+	if _, ok := m.cursorGroup(); ok {
+		t.Error("an out-of-range cursor must report no group, not panic")
+	}
+
+	empty := Model{}
+	if _, ok := empty.cursorGroup(); ok {
+		t.Error("an empty row model must report no group")
+	}
+}
