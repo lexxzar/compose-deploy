@@ -39,7 +39,7 @@ func TestContainerFooterReservation(t *testing.T) {
 		m := Model{}
 		m.screen = screenSelectContainers
 		m.setSingleGroup(svcs)
-		m.selected = map[int]bool{}
+		m.selected = map[string]bool{}
 		m.height = 24
 		m.width = width
 		m.showPicker = true
@@ -81,12 +81,12 @@ func TestContainerFooterReservation(t *testing.T) {
 		{"committed", commitSearch},
 		{"confirming", func(m *Model) {
 			m.confirming = true
-			m.selected = map[int]bool{0: true}
+			m.selected = selectedIdx(*m, 0)
 		}},
 		{"confirming+committed", func(m *Model) {
 			commitSearch(m)
 			m.confirming = true
-			m.selected = map[int]bool{0: true}
+			m.selected = selectedIdx(*m, 0)
 		}},
 	}
 	// A read-only composer reaches the confirm prompt only through the x exec
@@ -229,7 +229,7 @@ func TestContainerView_ExcessLineWidthIsPaddingOnly(t *testing.T) {
 				m := Model{}
 				m.screen = screenSelectContainers
 				m.setSingleGroup(svcs)
-				m.selected = map[int]bool{}
+				m.selected = map[string]bool{}
 				m.height = 24
 				m.width = width
 				m.showPicker = true
@@ -283,7 +283,7 @@ func TestSearchBarLineNeverWraps(t *testing.T) {
 		m := Model{}
 		m.screen = screenSelectContainers
 		m.setSingleGroup(longNames)
-		m.selected = map[int]bool{}
+		m.selected = map[string]bool{}
 		m.height = 24
 		m.width = width
 		m.showPicker = true
@@ -367,7 +367,7 @@ func TestSearchInputWidthPersists(t *testing.T) {
 		m := Model{}
 		m.screen = screenSelectContainers
 		m.setSingleGroup([]string{"web-frontend", "api", "postgres"})
-		m.selected = map[int]bool{}
+		m.selected = map[string]bool{}
 		m.height = 24
 		m.width = 80
 		return m
@@ -424,7 +424,7 @@ func TestSearchInputWidthStableAcrossCounterChange(t *testing.T) {
 		m := Model{}
 		m.screen = screenSelectContainers
 		m.setSingleGroup([]string{"web", "api", "worker"}) // 3 services → stable max counter
-		m.selected = map[int]bool{}
+		m.selected = map[string]bool{}
 		m.height = 24
 		m.width = 22 // narrow: budget arithmetic is load-bearing
 		return m
@@ -486,7 +486,7 @@ func TestSearchInputWidthTracksResize(t *testing.T) {
 	m := Model{}
 	m.screen = screenSelectContainers
 	m.setSingleGroup([]string{"web-frontend", "api", "postgres"})
-	m.selected = map[int]bool{}
+	m.selected = map[string]bool{}
 	m.height = 24
 	m.width = 100
 
@@ -544,7 +544,7 @@ func containerFooterModel(picker bool) Model {
 	m := Model{}
 	m.screen = screenSelectContainers
 	m.setSingleGroup([]string{"web", "db"})
-	m.selected = map[int]bool{}
+	m.selected = map[string]bool{}
 	m.showPicker = picker
 	m.width, m.height = 80, 24
 	return m
@@ -732,7 +732,7 @@ func TestSvcVisibleCount_GainsRowVersusOldFooter(t *testing.T) {
 		m := Model{}
 		m.screen = screenSelectContainers
 		m.setSingleGroup(svcs)
-		m.selected = map[int]bool{}
+		m.selected = map[string]bool{}
 		m.height = 24
 		m.width = width
 		m.showPicker = picker

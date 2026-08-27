@@ -340,11 +340,11 @@ func TestHelpGroups_LeaveGroupMatchesFooter(t *testing.T) {
 func TestViewHelp_ReplacesScreen(t *testing.T) {
 	m := Model{
 		screen:   screenSelectContainers,
-		services: []string{"web-frontend"},
 		width:    120,
 		height:   24,
 		helpOpen: true,
 	}
+	m.setSingleGroup([]string{"web-frontend"})
 	view := m.View()
 	if !strings.Contains(view, "OPERATE") {
 		t.Errorf("overlay should list the OPERATE group, got: %q", view)
@@ -364,16 +364,17 @@ func TestViewHelp_ReplacesScreen(t *testing.T) {
 // open. The composer is readOnlyMockComposer, not the real HostContainers, so
 // no test here shells out to docker.
 func readOnlyOverlayModel(width, height int) Model {
-	return Model{
+	m := Model{
 		screen:     screenSelectContainers,
-		services:   []string{"watchtower", "portainer"},
-		selected:   make(map[int]bool),
+		selected:   make(map[string]bool),
 		showPicker: true,
 		composer:   &readOnlyMockComposer{},
 		width:      width,
 		height:     height,
 		helpOpen:   true,
 	}
+	m.setSingleGroup([]string{"watchtower", "portainer"})
+	return m
 }
 
 // TestViewHelp_ReadOnlyOverlay renders the read-only table end to end: INSPECT
@@ -775,13 +776,14 @@ func TestSplitHelpGroups_SingleGroup(t *testing.T) {
 // feature, so its tests sit beside the renderer's.
 
 func helpContainerModel() Model {
-	return Model{
+	m := Model{
 		screen:   screenSelectContainers,
-		services: []string{"web", "db"},
-		selected: make(map[int]bool),
+		selected: make(map[string]bool),
 		width:    120,
 		height:   24,
 	}
+	m.setSingleGroup([]string{"web", "db"})
+	return m
 }
 
 func pressKey(m Model, r rune) Model {
@@ -832,7 +834,7 @@ func TestHelpOverlay_CloseKeys(t *testing.T) {
 // does not close on, or a stray d would arm a deploy behind it.
 func TestHelpOverlay_SwallowsActionKeys(t *testing.T) {
 	m := helpContainerModel()
-	m.selected[0] = true
+	m.selected[m.svcKeyAt(0)] = true
 	m.helpOpen = true
 
 	um := pressKey(m, 'd')
@@ -1081,7 +1083,7 @@ func TestHelpOverlay_OpensFromEveryScreen(t *testing.T) {
 	}
 
 	for _, tt := range tests {
-		m := Model{screen: tt.s, width: 120, height: 24, selected: map[int]bool{}}
+		m := Model{screen: tt.s, width: 120, height: 24, selected: map[string]bool{}}
 		if tt.setup != nil {
 			tt.setup(&m)
 		}
@@ -1159,7 +1161,7 @@ func TestHelpOverlay_SwallowedAtEveryConfirmPrompt(t *testing.T) {
 
 	for _, tt := range ops {
 		m := helpContainerModel()
-		m.selected[0] = true
+		m.selected[m.svcKeyAt(0)] = true
 		m.confirming = true
 		m.pendingOp = tt.op
 		m.pendingExec = tt.exec
@@ -1223,8 +1225,8 @@ func TestHelpOverlay_OpensOnProgress(t *testing.T) {
 	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
 	installFakeTick(&m)
 	m.screen = screenSelectContainers
-	m.services = mc.services
-	m.selected[0] = true
+	m.setSingleGroup(mc.services)
+	m.selected[m.svcKeyAt(0)] = true
 	m.width, m.height = 120, 24
 
 	m = pressKey(m, 'd')
@@ -1264,8 +1266,8 @@ func TestHelpGroups_ProgressPhases(t *testing.T) {
 	base := func() Model {
 		m := Model{screen: screenProgress, width: 120, height: 24}
 		m.composer = mc
-		m.selected = map[int]bool{}
-		m.services = mc.services
+		m.selected = map[string]bool{}
+		m.setSingleGroup(mc.services)
 		return m
 	}
 
@@ -1426,7 +1428,7 @@ func TestProgressPhases_BehaviourMatchesLabels(t *testing.T) {
 		} {
 			m := Model{screen: screenProgress, width: 120, height: 24, done: true}
 			m.composer = mc
-			m.selected = map[int]bool{}
+			m.selected = map[string]bool{}
 			updated, _ := m.handleKey(key)
 			if got := updated.(Model).screen; got != screenSelectContainers {
 				t.Errorf("%v left screen %d, want the container screen", key, got)
@@ -1451,14 +1453,14 @@ func TestHelpOverlay_ClosedByAsyncRollbackConfirm(t *testing.T) {
 	snap := rollbackTestSnapshot()
 	m := Model{
 		screen:               screenSelectContainers,
-		services:             []string{"web", "db"},
-		selected:             map[int]bool{0: true},
 		rollbackTargets:      []string{"web"},
 		rollbackFetchSession: 1,
 		width:                120,
 		height:               24,
 		helpOpen:             true, // ? pressed while the async fetch is running
 	}
+	m.setSingleGroup([]string{"web", "db"})
+	m.selected = selectedIdx(m, 0)
 
 	updated, _ := m.Update(rollbackSnapshotMsg{snap: snap, live: []string{"web", "db"}, session: 1})
 	um := updated.(Model)
@@ -1504,7 +1506,7 @@ func TestHelpOverlay_SwallowsEveryActionKey(t *testing.T) {
 	containerKeys := []string{"l", "c", "x", "i", "/", "U", "r", "s", "R", "a", " ", "j", "k", "n", "N", "enter"}
 	for _, key := range containerKeys {
 		m := helpContainerModel()
-		m.selected[0] = true
+		m.selected[m.svcKeyAt(0)] = true
 		m.svcCursor = 1
 		m.helpOpen = true
 

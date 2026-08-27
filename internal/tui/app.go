@@ -307,8 +307,13 @@ type Model struct {
 	svcGroups  []svcGroup
 	svcEntries []svcEntry
 
-	svcStatus       map[string]runner.ServiceStatus // service name → status
-	stats           map[string]runner.ServiceStats  // service name → resource usage; populated asynchronously by refreshStats
+	// svcStatus and stats are keyed by the QUALIFIED key svcKey produces, not
+	// by the bare service name a Composer returns: two projects on one host
+	// routinely both own a "db", and a bare key would let one overwrite the
+	// other. The servicesMsg/statusMsg/statsMsg handlers qualify the incoming
+	// map at arrival; nothing qualified travels back out to runner or compose.
+	svcStatus       map[string]runner.ServiceStatus // svcKey → status
+	stats           map[string]runner.ServiceStats  // svcKey → resource usage; populated asynchronously by refreshStats
 	statsErr        error                           // last error from ContainerStats; rendered in the same slot as svcErr (svcErr wins)
 	statsSession    uint64                          // bumped before every refreshStats() and on context change so older in-flight responses are filtered out
 	statusSession   uint64                          // mirror of statsSession for refreshStatus(); without it, periodic-tick statusMsg from project A could overwrite the svcStatus map after the user has navigated to project B
@@ -323,12 +328,12 @@ type Model struct {
 	// = local). projDir is empty for the local-fast-track entry (no project
 	// picker), giving the local-no-picker context a single cache slot of "".
 	updateCache     map[string]updateEntry
-	updatesSession  uint64 // mirror of statsSession — bumped at the 7 context-change sites so a stale CheckUpdates response can't hydrate UpdateAvailable into a different project's svcStatus map
-	updateInFlight  bool   // mirror of refreshInFlight for refreshUpdates — prevents a slow CheckUpdates from stacking on the next screen entry / `U` press
-	detailsInFlight bool   // updateInFlight's twin for the detail phase; a GLOBAL one-batch bound — no context-change site resets it, and its only clear is the unconditional one on every updateDetailsMsg arrival
-	updatesErr      string // last error from CheckUpdates; rendered as soft warning below statsErr (priority: svcErr > statsErr > updatesErr)
-	projDir         string // active project's config dir; used for the updateCache key
-	selected        map[int]bool
+	updatesSession  uint64          // mirror of statsSession — bumped at the 7 context-change sites so a stale CheckUpdates response can't hydrate UpdateAvailable into a different project's svcStatus map
+	updateInFlight  bool            // mirror of refreshInFlight for refreshUpdates — prevents a slow CheckUpdates from stacking on the next screen entry / `U` press
+	detailsInFlight bool            // updateInFlight's twin for the detail phase; a GLOBAL one-batch bound — no context-change site resets it, and its only clear is the unconditional one on every updateDetailsMsg arrival
+	updatesErr      string          // last error from CheckUpdates; rendered as soft warning below statsErr (priority: svcErr > statsErr > updatesErr)
+	projDir         string          // active project's config dir; used for the updateCache key
+	selected        map[string]bool // svcKey → selected; index keys would not survive a fold rebuild, which renumbers every row
 	svcCursor       int
 	svcOffset       int // index of first visible service in scroll window
 	svcErr          error
@@ -732,7 +737,7 @@ func NewModel(composer runner.Composer, logWriter io.Writer, factory ComposerFac
 		servers:         servers,
 		serverEntries:   buildServerEntries(servers),
 		connectCb:       connectCb,
-		selected:        make(map[int]bool),
+		selected:        make(map[string]bool),
 		spinner:         s,
 		ctx:             ctx,
 		ctxCancel:       cancel,
@@ -896,8 +901,11 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		m.svcErr = nil
 		m.setSingleGroup(sortServices(msg.services))
-		m.svcStatus = msg.status
-		m.selected = make(map[int]bool)
+		// Qualify at arrival: the payload carries the bare names the composer
+		// knows, and the group installed a line above is the owner that turns
+		// them into the keys the rest of the Model reads.
+		m.svcStatus = qualifyMap(m.ownerProjName(), msg.status)
+		m.selected = make(map[string]bool)
 		m.svcCursor = 0
 		m.svcOffset = 0
 		// Full reload: searchMatches holds indices into the OLD m.services, so a
@@ -933,7 +941,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 		m.svcErr = nil
-		m.svcStatus = msg.status
+		m.svcStatus = qualifyMap(m.ownerProjName(), msg.status)
 		// Re-apply cached update verdicts (status fetch wipes UpdateAvailable
 		// fields when overwriting the map). Same rationale as servicesMsg.
 		// On a fresh CACHED FAILURE entry (within updatesErrorTTL) restore
@@ -998,7 +1006,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 		m.statsErr = nil
-		m.stats = msg.stats
+		m.stats = qualifyMap(m.ownerProjName(), msg.stats)
 		m.fixSvcOffset()
 		return m, nil
 
@@ -2052,7 +2060,7 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 				m.svcStatus = nil
 				m.stats = nil
 				m.statsErr = nil
-				m.selected = make(map[int]bool)
+				m.selected = make(map[string]bool)
 				m.svcCursor = 0
 				m.svcOffset = 0
 				m.svcErr = nil
@@ -2090,8 +2098,8 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 				m.fixSvcOffset()
 				return m, nil
 			}
-			if len(m.services) > 0 {
-				m.selected[m.svcCursor] = !m.selected[m.svcCursor]
+			if key := m.svcKeyAt(m.svcCursor); key != "" {
+				m.selected[key] = !m.selected[key]
 			}
 		case "a":
 			if m.readOnly() {
@@ -2100,7 +2108,9 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			}
 			allSel := m.allSelected()
 			for i := range m.services {
-				m.selected[i] = !allSel
+				if key := m.svcKeyAt(i); key != "" {
+					m.selected[key] = !allSel
+				}
 			}
 		case "r":
 			if m.readOnly() {
@@ -2239,8 +2249,7 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			if len(m.services) == 0 {
 				return m, nil
 			}
-			svc := m.services[m.svcCursor]
-			if st, ok := m.svcStatus[svc]; !ok || !st.Running {
+			if st, ok := m.svcStatus[m.svcKeyAt(m.svcCursor)]; !ok || !st.Running {
 				m.warning = "Container is not running"
 				m.fixSvcOffset()
 				return m, nil
@@ -4232,18 +4241,24 @@ func (m Model) updatesCacheKey() string {
 // future iterator over svcStatus see a fake service, and (b) leak memory
 // across project switches if the verdict referenced a service that no
 // longer exists in the active project.
+//
+// results arrives from CheckUpdates with BARE names, so each verdict is
+// qualified here before the lookup — the skip-unknown-name rule then measures
+// the same key space the map is stored under.
 func (m *Model) hydrateUpdates(results map[string]bool) {
 	if m.svcStatus == nil {
 		return
 	}
+	owner := m.ownerProjName()
 	for svc, avail := range results {
-		st, ok := m.svcStatus[svc]
+		key := svcKey(owner, svc)
+		st, ok := m.svcStatus[key]
 		if !ok {
 			continue
 		}
 		v := avail
 		st.UpdateAvailable = &v
-		m.svcStatus[svc] = st
+		m.svcStatus[key] = st
 	}
 }
 
@@ -4411,17 +4426,20 @@ func (m Model) allSelected() bool {
 		return false
 	}
 	for i := range m.services {
-		if !m.selected[i] {
+		if !m.selected[m.svcKeyAt(i)] {
 			return false
 		}
 	}
 	return true
 }
 
+// selectedContainers returns the selection as BARE service names. It is the
+// boundary: the qualified keys the Model stores never reach runner or compose,
+// which address services by the name docker compose knows them by.
 func (m Model) selectedContainers() []string {
 	var result []string
 	for i, svc := range m.services {
-		if m.selected[i] {
+		if m.selected[m.svcKeyAt(i)] {
 			result = append(result, svc)
 		}
 	}
@@ -4431,7 +4449,7 @@ func (m Model) selectedContainers() []string {
 func (m Model) selectedCount() int {
 	count := 0
 	for i := range m.services {
-		if m.selected[i] {
+		if m.selected[m.svcKeyAt(i)] {
 			count++
 		}
 	}
@@ -4563,8 +4581,9 @@ func (m Model) hasStatusColumns() bool {
 	if m.statsRequested {
 		return true
 	}
-	for _, svc := range m.services {
-		if st, ok := m.svcStatus[svc]; ok {
+	for i := range m.services {
+		key := m.svcKeyAt(i)
+		if st, ok := m.svcStatus[key]; ok {
 			if st.Created != "" || st.Uptime != "" || len(st.Ports) > 0 {
 				return true
 			}
@@ -4573,8 +4592,8 @@ func (m Model) hasStatusColumns() bool {
 			// column). The Service captions row is governed by the other
 			// columns; if none of those are present, no captions row is shown.
 		}
-		if _, ok := m.stats[svc]; ok {
-			if m.svcStatus[svc].Running {
+		if _, ok := m.stats[key]; ok {
+			if m.svcStatus[key].Running {
 				return true
 			}
 		}
@@ -5164,11 +5183,15 @@ func (m Model) viewSelectContainers() string {
 	portsStr := make(map[string]string, len(m.services))
 	cpuStr := make(map[string]string, len(m.services))
 	memStr := make(map[string]string, len(m.services))
-	for _, svc := range m.services {
+	for i, svc := range m.services {
+		// The three caches key on the QUALIFIED key, like svcStatus and stats:
+		// a bare name would let two projects that both own a "db" read each
+		// other's formatted cells.
+		key := m.svcKeyAt(i)
 		if len(svc) > maxName {
 			maxName = len(svc)
 		}
-		if st, ok := m.svcStatus[svc]; ok {
+		if st, ok := m.svcStatus[key]; ok {
 			if len(st.Created) > maxCreated {
 				maxCreated = len(st.Created)
 			}
@@ -5176,19 +5199,19 @@ func (m Model) viewSelectContainers() string {
 				maxUptime = len(st.Uptime)
 			}
 			s := compose.FormatPorts(st.Ports)
-			portsStr[svc] = s
+			portsStr[key] = s
 			if w := utf8.RuneCountInString(s); w > maxPorts {
 				maxPorts = w
 			}
 		}
-		if stx, ok := m.stats[svc]; ok {
+		if stx, ok := m.stats[key]; ok {
 			// Only running services get stats cells; stopped containers leave blanks.
-			running := m.svcStatus[svc].Running
+			running := m.svcStatus[key].Running
 			if running {
 				cpu := fmt.Sprintf("%.1f%%", stx.CPUPercent)
 				mem := fmt.Sprintf("%s/%s", compose.FormatBytes(stx.MemoryUsed), compose.FormatBytes(stx.MemoryLimit))
-				cpuStr[svc] = cpu
-				memStr[svc] = mem
+				cpuStr[key] = cpu
+				memStr[key] = mem
 				if w := utf8.RuneCountInString(cpu); w > maxCPU {
 					maxCPU = w
 				}
@@ -5294,6 +5317,7 @@ func (m Model) viewSelectContainers() string {
 
 	for i := start; i < end; i++ {
 		svc := m.services[i]
+		key := m.svcKeyAt(i)
 		cursor := "  "
 		if i == m.svcCursor {
 			cursor = "> "
@@ -5304,12 +5328,12 @@ func (m Model) viewSelectContainers() string {
 		checkbox := ""
 		if !readOnly {
 			checkbox = checkboxOff.Render("[ ]")
-			if m.selected[i] {
+			if m.selected[key] {
 				checkbox = checkboxOn.Render("[x]")
 			}
 		}
 
-		st := m.svcStatus[svc]
+		st := m.svcStatus[key]
 		health := healthIndicator(st.Health)
 
 		dot := statusStoppedDot.Render("●")
@@ -5356,13 +5380,13 @@ func (m Model) viewSelectContainers() string {
 			// magnitude of each value is readable at a glance. Mem stays
 			// left-aligned because it's a composite "used/limit" string and
 			// right-aligning the limit looks worse than left-aligning the used.
-			line += fmt.Sprintf("  %*s", maxCPU, cpuStr[svc])
+			line += fmt.Sprintf("  %*s", maxCPU, cpuStr[key])
 		}
 		if maxMem > 0 {
-			line += fmt.Sprintf("  %-*s", maxMem, memStr[svc])
+			line += fmt.Sprintf("  %-*s", maxMem, memStr[key])
 		}
 		if maxPorts > 0 {
-			line += fmt.Sprintf("  %-*s", maxPorts, portsStr[svc])
+			line += fmt.Sprintf("  %-*s", maxPorts, portsStr[key])
 		}
 		b.WriteString(line)
 		b.WriteByte('\n')

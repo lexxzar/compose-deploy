@@ -98,15 +98,18 @@ Confirmed design decisions (brainstormed and validated; do not re-litigate):
 
 **Files:**
 - Modify: `internal/tui/app.go`
+- Modify: `internal/tui/entries.go`
 - Modify: `internal/tui/app_test.go`
+- Modify: `internal/tui/entries_test.go`
 - Modify: `internal/tui/footer_reservation_test.go`
+- Modify: `internal/tui/help_test.go` (➕ Task 2 left `services:`/`selected:` literals here unmigrated)
 
-- [ ] change `m.selected` to `map[string]bool` keyed by `svcKey`; rewrite the `space` handler, the `a` toggle, and `allSelected()` over service entries; update `singleGroupModel`
-- [ ] key `svcStatus`/`svcStats` through `svcKey`; `servicesMsg`/`statusMsg`/`statsMsg` handlers QUALIFY the incoming bare-name maps with the owning group at arrival
-- [ ] `selectedContainers()`, `opContainers`, `rollbackTargets`, and the wait seed keep returning BARE names — qualified keys never cross into `runner`
-- [ ] update `hydrateUpdates` to write verdicts under qualified keys and keep its skip-unknown-name rule
-- [ ] write tests: selection survives a fold rebuild; duplicate service names in two groups stay distinct; a qualified key never reaches `runner.Run`/`NewWaitState` (pin at the boundary)
-- [ ] run tests - must pass before task 4
+- [x] change `m.selected` to `map[string]bool` keyed by `svcKey`; rewrite the `space` handler, the `a` toggle, and `allSelected()` over service entries; update `singleGroupModel`
+- [x] key `svcStatus`/`svcStats` through `svcKey`; `servicesMsg`/`statusMsg`/`statsMsg` handlers QUALIFY the incoming bare-name maps with the owning group at arrival
+- [x] `selectedContainers()`, `opContainers`, `rollbackTargets`, and the wait seed keep returning BARE names — qualified keys never cross into `runner`
+- [x] update `hydrateUpdates` to write verdicts under qualified keys and keep its skip-unknown-name rule
+- [x] write tests: selection survives a fold rebuild; duplicate service names in two groups stay distinct; a qualified key never reaches `runner.Run`/`NewWaitState` (pin at the boundary)
+- [x] run tests - must pass before task 4
 
 ### Task 4: Cursor, offset, and render over entries (phase 1)
 

@@ -72,3 +72,55 @@ const svcKeySep = "/"
 func svcKey(projName, service string) string {
 	return projName + svcKeySep + service
 }
+
+// groupProjName names the group at index gi. An out-of-range index yields the
+// empty string rather than panicking: svcEntries is rebuilt from svcGroups, so
+// the two can only disagree if a caller wrote svcEntries by hand.
+func (m Model) groupProjName(gi int) string {
+	if gi < 0 || gi >= len(m.svcGroups) {
+		return ""
+	}
+	return m.svcGroups[gi].proj.Name
+}
+
+// svcKeyAt returns the qualified key of the row at index i, or "" when the row
+// is a group header or the index is out of range. Callers that key selection,
+// status or stats off a row index must go through it — the owning group, not
+// the model's current project, decides the prefix.
+func (m Model) svcKeyAt(i int) string {
+	if i < 0 || i >= len(m.svcEntries) {
+		return ""
+	}
+	e := m.svcEntries[i]
+	if e.kind != entrySvcService {
+		return ""
+	}
+	return svcKey(m.groupProjName(e.groupIdx), e.name)
+}
+
+// ownerProjName names the group that an incoming bare-name payload belongs to.
+// The composer that produced the payload serves exactly one project, and the
+// drilled path installs exactly one group, so the answer is that group's
+// project; the m.projName fallback covers a payload that lands before
+// setSingleGroup has run.
+func (m Model) ownerProjName() string {
+	if len(m.svcGroups) == 1 {
+		return m.svcGroups[0].proj.Name
+	}
+	return m.projName
+}
+
+// qualifyMap converts a bare-name map, as every Composer method returns one,
+// into the qualified-key form the Model holds. It is the message-boundary
+// conversion: qualified keys live only inside the Model, so nothing qualified
+// may travel back out to runner or compose.
+func qualifyMap[V any](projName string, src map[string]V) map[string]V {
+	if src == nil {
+		return nil
+	}
+	out := make(map[string]V, len(src))
+	for name, v := range src {
+		out[svcKey(projName, name)] = v
+	}
+	return out
+}
