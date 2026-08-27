@@ -27,11 +27,11 @@ import (
 )
 
 // singleGroupModel returns a container-screen Model in the degenerate
-// one-group shape that setSingleGroup installs in production: the index-keyed
-// fields the screen reads (services, selected) plus the derived
-// svcGroups/svcEntries. A single group emits no header rows, so svcEntries is
-// index-parallel to services and every index-keyed assertion in this file
-// keeps the meaning it had before grouping existed.
+// one-group shape that setSingleGroup installs in production: the flat services
+// list plus the derived svcGroups/svcEntries. A single group emits no header
+// rows, so its rows are index-parallel to its services — that property, not a
+// temporary seam, is what keeps every index-keyed assertion in this file
+// meaning what it did before grouping existed.
 func singleGroupModel(services []string) Model {
 	m := Model{selected: make(map[string]bool)}
 	m.setSingleGroup(services)
@@ -594,7 +594,9 @@ func TestComputeMatches(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got := computeMatches(tt.services, tt.query)
+			// A single group emits no header rows, so the entry indices the
+			// helper returns are the service indices the table names.
+			got := computeMatches(rebuildSvcEntries([]svcGroup{{services: tt.services}}), tt.query)
 			if len(got) != len(tt.want) {
 				t.Fatalf("computeMatches(%v, %q) = %v, want %v", tt.services, tt.query, got, tt.want)
 			}
@@ -13748,7 +13750,7 @@ func TestQTypedIntoSearchInput(t *testing.T) {
 func committedSearchModel(services []string, query string) Model {
 	m := containerSearchModel(services)
 	m.searchQuery = query
-	m.searchMatches = computeMatches(services, query)
+	m.searchMatches = computeMatches(m.svcEntries, query)
 	if len(m.searchMatches) > 0 {
 		m.svcCursor = m.searchMatches[0]
 	}
@@ -14240,7 +14242,7 @@ func TestSvcVisibleCount_ConstantAcrossConfirming(t *testing.T) {
 		m.width = 200 // one-line help in both branches
 		m.height = 12
 		m.searchQuery = "w"
-		m.searchMatches = computeMatches(m.services, "w")
+		m.searchMatches = computeMatches(m.svcEntries, "w")
 		m.svcCursor = m.searchMatches[0]
 		return m
 	}
@@ -14285,7 +14287,7 @@ func TestSearchClearedOnServicesReload(t *testing.T) {
 	m.screen = screenSelectContainers
 	m.setSingleGroup(mc.services)
 	m.searchQuery = "w"
-	m.searchMatches = computeMatches(m.services, "w") // [1 2]
+	m.searchMatches = computeMatches(m.svcEntries, "w") // [1 2]
 	m.svcCursor = 1
 	if len(m.searchMatches) != 2 {
 		t.Fatalf("precondition: expected 2 matches, got %v", m.searchMatches)
@@ -14354,7 +14356,7 @@ func TestSearchClearedOnEnterLogs(t *testing.T) {
 	m.width = 80
 	m.height = 24
 	m.searchQuery = "w"
-	m.searchMatches = computeMatches(m.services, "w")
+	m.searchMatches = computeMatches(m.svcEntries, "w")
 	m.svcCursor = m.searchMatches[0]
 
 	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'l'}})
@@ -14379,7 +14381,7 @@ func TestSearchClearedOnEnterProgress(t *testing.T) {
 	m.height = 24
 	m.pendingOp = runner.Restart
 	m.searchQuery = "w"
-	m.searchMatches = computeMatches(m.services, "w")
+	m.searchMatches = computeMatches(m.svcEntries, "w")
 	m.svcCursor = m.searchMatches[0]
 
 	updated, _ := m.enterProgress([]string{"web"})
@@ -14404,7 +14406,7 @@ func TestSearchClearedEnterLogsThenEscBack(t *testing.T) {
 	m.width = 80
 	m.height = 24
 	m.searchQuery = "w"
-	m.searchMatches = computeMatches(m.services, "w")
+	m.searchMatches = computeMatches(m.svcEntries, "w")
 	m.svcCursor = m.searchMatches[0]
 
 	// Enter logs (departure clears search).
@@ -14443,7 +14445,7 @@ func TestSelectedContainersUnaffectedBySearch(t *testing.T) {
 	withSearch := containerSearchModel(services)
 	withSearch.selected = selectedIdx(withSearch, 0, 2)
 	withSearch.searchQuery = "w"
-	withSearch.searchMatches = computeMatches(services, "w")
+	withSearch.searchMatches = computeMatches(withSearch.svcEntries, "w")
 	withSearch.svcCursor = withSearch.searchMatches[0]
 
 	got := withSearch.selectedContainers()
@@ -14701,7 +14703,7 @@ func TestSearchClearedOnEnterConfig(t *testing.T) {
 	m.width = 80
 	m.height = 24
 	m.searchQuery = "w"
-	m.searchMatches = computeMatches(m.services, "w")
+	m.searchMatches = computeMatches(m.svcEntries, "w")
 	m.svcCursor = m.searchMatches[0]
 
 	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'c'}})
@@ -14728,7 +14730,7 @@ func TestSearchClearedOnEnterExec(t *testing.T) {
 	m.height = 24
 	m.svcCursor = 1 // "web"
 	m.searchQuery = "w"
-	m.searchMatches = computeMatches(m.services, "w")
+	m.searchMatches = computeMatches(m.svcEntries, "w")
 
 	updated, _ := m.enterExec()
 	m = updated.(Model)
@@ -18398,5 +18400,229 @@ func TestInspectKey_MissingContainerSurfacesNamedError(t *testing.T) {
 	}
 	if strings.Contains(view, "Loading") {
 		t.Error("a failed fetch must not leave the screen reading as loading")
+	}
+}
+
+// groupedModel installs a multi-group container screen by hand. Task 6 of the
+// multi-project plan brings the grouped loader that builds this shape in
+// production; until then the row model is driven directly, which is also the
+// only way to pin the header rows a single group never emits.
+func groupedModel(groups ...svcGroup) Model {
+	m := Model{selected: make(map[string]bool), screen: screenSelectContainers}
+	m.svcGroups = groups
+	m.svcEntries = rebuildSvcEntries(m.svcGroups)
+	m.services = []string{}
+	for _, g := range groups {
+		m.services = append(m.services, g.services...)
+	}
+	return m
+}
+
+func svcGroupOf(name string, services ...string) svcGroup {
+	return svcGroup{proj: compose.Project{Name: name}, services: services}
+}
+
+// TestSvcCursor_MovesOverHeaderRows pins that the cursor indexes svcEntries,
+// not services: it stops on group headers and its lower bound is the row count,
+// which is larger than the service count as soon as a second group exists.
+func TestSvcCursor_MovesOverHeaderRows(t *testing.T) {
+	m := groupedModel(svcGroupOf("web", "api", "nginx"), svcGroupOf("db", "postgres"))
+
+	wantKinds := []svcEntryKind{
+		entrySvcGroupHeader, entrySvcService, entrySvcService,
+		entrySvcGroupHeader, entrySvcService,
+	}
+	if len(m.svcEntries) != len(wantKinds) {
+		t.Fatalf("svcEntries has %d rows, want %d", len(m.svcEntries), len(wantKinds))
+	}
+	for i, want := range wantKinds {
+		if m.svcEntries[i].kind != want {
+			t.Fatalf("entry %d kind = %v, want %v", i, m.svcEntries[i].kind, want)
+		}
+	}
+
+	// Walk to the bottom: five rows, so four presses land on the last one and a
+	// fifth must not move past it.
+	for i := 0; i < 6; i++ {
+		updated, _ := m.Update(keyMsgFor("j"))
+		m = updated.(Model)
+	}
+	if m.svcCursor != len(m.svcEntries)-1 {
+		t.Errorf("svcCursor = %d, want %d (the cursor must reach the last ROW, headers included)", m.svcCursor, len(m.svcEntries)-1)
+	}
+
+	// Step back onto the second group's header.
+	updated, _ := m.Update(keyMsgFor("k"))
+	m = updated.(Model)
+	if m.svcCursor != 3 {
+		t.Fatalf("svcCursor = %d, want 3 (the second group's header)", m.svcCursor)
+	}
+	if _, ok := m.cursorService(); ok {
+		t.Error("cursorService reported a service while the cursor sits on a header")
+	}
+	if e, ok := m.cursorEntry(); !ok || e.groupIdx != 1 {
+		t.Errorf("cursorEntry = (%+v, %v), want the second group's header", e, ok)
+	}
+
+	m.svcCursor = 1
+	svc, ok := m.cursorService()
+	if !ok || svc != "api" {
+		t.Errorf("cursorService = (%q, %v), want (\"api\", true)", svc, ok)
+	}
+}
+
+// TestSpaceOnHeaderSelectsNothing pins that the selection stays empty when the
+// cursor sits on a header: svcKeyAt answers "" for a header row, and an empty
+// key must never enter the selection map.
+func TestSpaceOnHeaderSelectsNothing(t *testing.T) {
+	m := groupedModel(svcGroupOf("web", "api"), svcGroupOf("db", "postgres"))
+	m.svcCursor = 0 // the "web" header
+
+	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeySpace})
+	m = updated.(Model)
+
+	if len(m.selected) != 0 {
+		t.Errorf("selected = %v, want empty (space on a header selects nothing)", m.selected)
+	}
+	if m.selectedCount() != 0 {
+		t.Errorf("selectedCount = %d, want 0", m.selectedCount())
+	}
+}
+
+// TestComputeMatches_SkipsGroupHeaders pins the two halves of the search rule:
+// the returned indices are ROW indices, and a header never matches even when
+// the project name contains the query.
+func TestComputeMatches_SkipsGroupHeaders(t *testing.T) {
+	entries := rebuildSvcEntries([]svcGroup{
+		{proj: compose.Project{Name: "webproj"}, services: []string{"api", "web"}},
+		{proj: compose.Project{Name: "db"}, services: []string{"web", "cache"}},
+	})
+
+	got := computeMatches(entries, "web")
+	want := []int{2, 4}
+	if !slices.Equal(got, want) {
+		t.Errorf("computeMatches(..., %q) = %v, want %v (row indices of the two web SERVICES)", "web", got, want)
+	}
+
+	if got := computeMatches(entries, "webproj"); got != nil {
+		t.Errorf("computeMatches(..., %q) = %v, want nil (a header must never match)", "webproj", got)
+	}
+
+	// The skip keys on the row KIND, not on a header's name happening to be
+	// empty: a header that carried a name would otherwise become a jump target
+	// with no service behind it.
+	named := []svcEntry{
+		{kind: entrySvcGroupHeader, groupIdx: 0, name: "web"},
+		{kind: entrySvcService, groupIdx: 0, name: "web"},
+	}
+	if got := computeMatches(named, "web"); !slices.Equal(got, []int{1}) {
+		t.Errorf("computeMatches(named header, %q) = %v, want [1]", "web", got)
+	}
+}
+
+// TestSearchJump_LandsOnServiceRow drives the real `/` flow over a grouped list
+// and pins that the cursor lands on the matching service row, not on the header
+// that precedes it.
+func TestSearchJump_LandsOnServiceRow(t *testing.T) {
+	m := groupedModel(svcGroupOf("web", "api"), svcGroupOf("db", "postgres"))
+
+	updated, _ := m.Update(keyMsgFor("/"))
+	m = updated.(Model)
+	if !m.searching {
+		t.Fatal("precondition: search must be open")
+	}
+	for _, r := range "postgres" {
+		updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{r}})
+		m = updated.(Model)
+	}
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	m = updated.(Model)
+
+	if !slices.Equal(m.searchMatches, []int{3}) {
+		t.Fatalf("searchMatches = %v, want [3] (the postgres ROW)", m.searchMatches)
+	}
+	if m.svcCursor != 3 {
+		t.Errorf("svcCursor = %d, want 3", m.svcCursor)
+	}
+	svc, ok := m.cursorService()
+	if !ok || svc != "postgres" {
+		t.Errorf("cursorService = (%q, %v), want (\"postgres\", true) — the jump must not stop on a header", svc, ok)
+	}
+}
+
+// TestFixSvcOffset_CountsHeaderRows is the discriminating pin for the offset
+// math: with two headers the row count exceeds the service count, so an offset
+// clamped against len(services) would refuse to scroll at all.
+func TestFixSvcOffset_CountsHeaderRows(t *testing.T) {
+	m := groupedModel(svcGroupOf("web", "api", "nginx"), svcGroupOf("db", "postgres"))
+	m.width = 120
+	m.height = 9 // 3 header lines + 3 footer lines leaves 3 visible rows
+
+	visible := m.svcVisibleCount()
+	if visible != 3 {
+		t.Fatalf("svcVisibleCount = %d, want 3 (the assertions below assume it)", visible)
+	}
+
+	m.svcCursor = len(m.svcEntries) - 1
+	m.fixSvcOffset()
+
+	wantOffset := len(m.svcEntries) - visible
+	if m.svcOffset != wantOffset {
+		t.Errorf("svcOffset = %d, want %d (the window must scroll over ROWS, headers included)", m.svcOffset, wantOffset)
+	}
+	if m.svcCursor < m.svcOffset || m.svcCursor >= m.svcOffset+visible {
+		t.Errorf("cursor %d outside the window [%d,%d)", m.svcCursor, m.svcOffset, m.svcOffset+visible)
+	}
+
+	m.height = 0
+	if got := m.svcVisibleCount(); got != len(m.svcEntries) {
+		t.Errorf("svcVisibleCount at height 0 = %d, want %d (all ROWS)", got, len(m.svcEntries))
+	}
+}
+
+// TestSelectedContainers_IncludesFoldedGroup pins that folding hides ROWS and
+// nothing else: a service selected before its group folded must still reach the
+// operation, so the selection helpers read svcGroups rather than svcEntries.
+func TestSelectedContainers_IncludesFoldedGroup(t *testing.T) {
+	m := groupedModel(svcGroupOf("web", "api"), svcGroupOf("db", "postgres"))
+	m.selected[svcKey("web", "api")] = true
+	m.selected[svcKey("db", "postgres")] = true
+
+	m.svcGroups[1].folded = true
+	m.svcEntries = rebuildSvcEntries(m.svcGroups)
+
+	if got := m.selectedCount(); got != 2 {
+		t.Errorf("selectedCount = %d, want 2 (a folded group keeps its selection)", got)
+	}
+	want := []string{"api", "postgres"}
+	if got := m.selectedContainers(); !slices.Equal(got, want) {
+		t.Errorf("selectedContainers = %v, want %v (bare names, folded group included)", got, want)
+	}
+	if !m.allSelected() {
+		t.Error("allSelected = false, want true (every service in every group is selected)")
+	}
+}
+
+// TestViewSelectContainers_RendersGroupHeaders pins the grouped render: an open
+// group shows its marker and its services, a folded one shows only its header.
+func TestViewSelectContainers_RendersGroupHeaders(t *testing.T) {
+	m := groupedModel(svcGroupOf("web", "api"), svcGroupOf("db", "postgres"))
+	m.width = 80
+	m.height = 20
+	m.svcGroups[1].folded = true
+	m.svcEntries = rebuildSvcEntries(m.svcGroups)
+
+	out := ansi.Strip(m.viewSelectContainers())
+	if !strings.Contains(out, "▼ web") {
+		t.Errorf("open group header missing from:\n%s", out)
+	}
+	if !strings.Contains(out, "▶ db") {
+		t.Errorf("folded group header missing from:\n%s", out)
+	}
+	if !strings.Contains(out, "api") {
+		t.Errorf("the open group's service is missing from:\n%s", out)
+	}
+	if strings.Contains(out, "postgres") {
+		t.Errorf("a folded group must not render its services:\n%s", out)
 	}
 }

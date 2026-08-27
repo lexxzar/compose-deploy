@@ -300,10 +300,10 @@ type Model struct {
 
 	// Grouped row state. svcGroups is the source of truth and svcEntries is
 	// derived from it by rebuildSvcEntries — never write svcEntries by hand.
-	// Until the grouped host view lands, every entry to the screen installs
-	// exactly ONE group through setSingleGroup. A single group emits no header
-	// rows, so svcEntries stays index-parallel to services and the index-keyed
-	// cursor, offset and selection keep the meaning they had before grouping.
+	// svcEntries is the ROW model: svcCursor, svcOffset, searchMatches and the
+	// renderer all index into it, so the cursor can land on a group header and
+	// a fold changes every row index. Nothing may be keyed on a row index
+	// across a rebuild — that is why selection keys on svcKey.
 	svcGroups  []svcGroup
 	svcEntries []svcEntry
 
@@ -465,7 +465,7 @@ type Model struct {
 	searching     bool            // search bar open, capturing text
 	searchInput   textinput.Model // (re)constructed in the "/" open handler
 	searchQuery   string          // current query; != "" ⇒ highlights + n/N live
-	searchMatches []int           // indices into m.services that match (cached)
+	searchMatches []int           // svcEntries indices of the rows that match (cached); headers never match
 	searchReturn  int             // svcCursor to restore on esc-while-typing
 
 	// Shared
@@ -2019,7 +2019,7 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 				var cmd tea.Cmd
 				m.searchInput, cmd = m.searchInput.Update(msg)
 				m.searchQuery = m.searchInput.Value()
-				m.searchMatches = computeMatches(m.services, m.searchQuery)
+				m.searchMatches = computeMatches(m.svcEntries, m.searchQuery)
 				if len(m.searchMatches) > 0 {
 					m.svcCursor = m.searchMatches[0]
 					m.fixSvcOffset()
@@ -2081,7 +2081,7 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			}
 			m.fixSvcOffset()
 		case "down", "j":
-			if m.svcCursor < len(m.services)-1 {
+			if m.svcCursor < len(m.svcEntries)-1 {
 				m.svcCursor++
 			}
 			m.fixSvcOffset()
@@ -2107,10 +2107,8 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 				return m, nil
 			}
 			allSel := m.allSelected()
-			for i := range m.services {
-				if key := m.svcKeyAt(i); key != "" {
-					m.selected[key] = !allSel
-				}
+			for _, r := range m.svcRefs() {
+				m.selected[r.key] = !allSel
 			}
 		case "r":
 			if m.readOnly() {
@@ -3275,8 +3273,12 @@ func inspectViewportSize(width, height int) (int, int) {
 // cursor. Modelled on enterConfig: bump the session, reset every inspect field,
 // size the viewport, then return the fetch command.
 func (m *Model) enterInspect() (tea.Model, tea.Cmd) {
+	svc, ok := m.cursorService()
+	if !ok {
+		return *m, nil
+	}
 	m.inspectSession++
-	m.inspectService = m.services[m.svcCursor]
+	m.inspectService = svc
 	m.inspectRaw = nil
 	m.inspectSummary = ""
 	m.inspectShowRaw = false
@@ -3306,7 +3308,12 @@ func (m *Model) enterExec() (tea.Model, tea.Cmd) {
 		m.pendingExec = false
 		return *m, nil
 	}
-	service := m.services[m.svcCursor]
+	service, ok := m.cursorService()
+	if !ok {
+		m.confirming = false
+		m.pendingExec = false
+		return *m, nil
+	}
 	cmd, err := ep.ExecCommand(m.ctx, service, nil)
 	if err != nil {
 		m.warning = fmt.Sprintf("exec failed: %v", err)
@@ -3498,7 +3505,10 @@ func (m Model) fetchConfigValidate() tea.Cmd {
 }
 
 func (m *Model) enterLogs() (tea.Model, tea.Cmd) {
-	service := m.services[m.svcCursor]
+	service, ok := m.cursorService()
+	if !ok {
+		return *m, nil
+	}
 	m.logsService = service
 	m.logsDone = false
 	m.logsErr = nil
@@ -4422,11 +4432,12 @@ func (m Model) loadServices() tea.Cmd {
 }
 
 func (m Model) allSelected() bool {
-	if len(m.services) == 0 {
+	refs := m.svcRefs()
+	if len(refs) == 0 {
 		return false
 	}
-	for i := range m.services {
-		if !m.selected[m.svcKeyAt(i)] {
+	for _, r := range refs {
+		if !m.selected[r.key] {
 			return false
 		}
 	}
@@ -4438,9 +4449,9 @@ func (m Model) allSelected() bool {
 // which address services by the name docker compose knows them by.
 func (m Model) selectedContainers() []string {
 	var result []string
-	for i, svc := range m.services {
-		if m.selected[m.svcKeyAt(i)] {
-			result = append(result, svc)
+	for _, r := range m.svcRefs() {
+		if m.selected[r.key] {
+			result = append(result, r.name)
 		}
 	}
 	return result
@@ -4448,8 +4459,8 @@ func (m Model) selectedContainers() []string {
 
 func (m Model) selectedCount() int {
 	count := 0
-	for i := range m.services {
-		if m.selected[m.svcKeyAt(i)] {
+	for _, r := range m.svcRefs() {
+		if m.selected[r.key] {
 			count++
 		}
 	}
@@ -4553,18 +4564,23 @@ func (m Model) searchCounter() string {
 	return fmt.Sprintf("(%d matches)", n)
 }
 
-// computeMatches returns the indices into services whose names contain query as
-// a case-insensitive substring, preserving list order. An empty query returns
+// computeMatches returns the ROW indices of the service entries whose names
+// contain query as a case-insensitive substring, in ascending order (cycleMatch
+// relies on that ordering). Group headers never match: search jumps between
+// services, and a header carries no service to jump to. An empty query returns
 // nil so callers can treat "no query" and "no matches" distinctly. Pure — used
 // by the container-screen search (search & jump).
-func computeMatches(services []string, query string) []int {
+func computeMatches(entries []svcEntry, query string) []int {
 	if query == "" {
 		return nil
 	}
 	q := strings.ToLower(query)
 	var matches []int
-	for i, svc := range services {
-		if strings.Contains(strings.ToLower(svc), q) {
+	for i, e := range entries {
+		if e.kind != entrySvcService {
+			continue
+		}
+		if strings.Contains(strings.ToLower(e.name), q) {
 			matches = append(matches, i)
 		}
 	}
@@ -4581,8 +4597,8 @@ func (m Model) hasStatusColumns() bool {
 	if m.statsRequested {
 		return true
 	}
-	for i := range m.services {
-		key := m.svcKeyAt(i)
+	for _, r := range m.svcRefs() {
+		key := r.key
 		if st, ok := m.svcStatus[key]; ok {
 			if st.Created != "" || st.Uptime != "" || len(st.Ports) > 0 {
 				return true
@@ -4607,10 +4623,12 @@ func (m Model) hasStatusColumns() bool {
 // Footer: 3 lines with a one-line help text, 4 when it wraps to two — the same
 // count in every search state and while confirming (containerFooter decides it).
 // Warning adds 1 extra line; an active stats/updates soft-warning adds 1 more.
-// When m.height is 0 (no WindowSizeMsg received), returns len(m.services) for backward compat.
+// The count is in ROWS (svcEntries), so a group header consumes one just like a
+// service does.
+// When m.height is 0 (no WindowSizeMsg received), returns len(m.svcEntries) for backward compat.
 func (m Model) svcVisibleCount() int {
 	if m.height == 0 {
-		return len(m.services)
+		return len(m.svcEntries)
 	}
 
 	// headerLines: breadcrumb (1) + titleStyle MarginBottom space-line (1) + gap/indicator (1) = 3
@@ -4666,8 +4684,8 @@ func (m Model) svcVisibleCount() int {
 	if visible < 1 {
 		visible = 1
 	}
-	if visible > len(m.services) {
-		visible = len(m.services)
+	if visible > len(m.svcEntries) {
+		visible = len(m.svcEntries)
 	}
 	return visible
 }
@@ -4707,7 +4725,7 @@ func (m *Model) fixSvcOffset() {
 		m.svcOffset = m.svcCursor
 	}
 	// Clamp offset
-	maxOffset := len(m.services) - visible
+	maxOffset := len(m.svcEntries) - visible
 	if maxOffset < 0 {
 		maxOffset = 0
 	}
@@ -5135,6 +5153,20 @@ func (m Model) containerFooter() string {
 	return helpStyle.Render(clampToWidth(line1, m.width) + "\n" + clampToWidth(line2, m.width))
 }
 
+// groupHeaderLine renders the body of a group header row (the cursor prefix is
+// the caller's). The fold marker points down on an open group and right on a
+// folded one, mirroring the convention every tree view uses.
+//
+// A single group emits no header at all (rebuildSvcEntries), so this only ever
+// draws on the grouped host view.
+func (m Model) groupHeaderLine(groupIdx int) string {
+	marker := "▼"
+	if groupIdx >= 0 && groupIdx < len(m.svcGroups) && m.svcGroups[groupIdx].folded {
+		marker = "▶"
+	}
+	return marker + " " + m.groupProjName(groupIdx)
+}
+
 func (m Model) viewSelectContainers() string {
 	var b strings.Builder
 	readOnly := m.readOnly()
@@ -5165,8 +5197,8 @@ func (m Model) viewSelectContainers() string {
 	visible := m.svcVisibleCount()
 	start := m.svcOffset
 	end := start + visible
-	if end > len(m.services) {
-		end = len(m.services)
+	if end > len(m.svcEntries) {
+		end = len(m.svcEntries)
 	}
 
 	// Calculate max widths for alignment (across ALL services, not just visible).
@@ -5180,14 +5212,17 @@ func (m Model) viewSelectContainers() string {
 	maxCPU := 0
 	maxMem := 0
 	maxPorts := 0
-	portsStr := make(map[string]string, len(m.services))
-	cpuStr := make(map[string]string, len(m.services))
-	memStr := make(map[string]string, len(m.services))
-	for i, svc := range m.services {
+	refs := m.svcRefs()
+	portsStr := make(map[string]string, len(refs))
+	cpuStr := make(map[string]string, len(refs))
+	memStr := make(map[string]string, len(refs))
+	// Widths come from EVERY service, folded ones included, so folding a group
+	// never shifts the columns of the groups that stayed open.
+	for _, ref := range refs {
 		// The three caches key on the QUALIFIED key, like svcStatus and stats:
 		// a bare name would let two projects that both own a "db" read each
 		// other's formatted cells.
-		key := m.svcKeyAt(i)
+		key, svc := ref.key, ref.name
 		if len(svc) > maxName {
 			maxName = len(svc)
 		}
@@ -5316,12 +5351,18 @@ func (m Model) viewSelectContainers() string {
 	}
 
 	for i := start; i < end; i++ {
-		svc := m.services[i]
-		key := m.svcKeyAt(i)
+		entry := m.svcEntries[i]
 		cursor := "  "
 		if i == m.svcCursor {
 			cursor = "> "
 		}
+		if entry.kind == entrySvcGroupHeader {
+			b.WriteString(cursor + m.groupHeaderLine(entry.groupIdx))
+			b.WriteByte('\n')
+			continue
+		}
+		svc := entry.name
+		key := m.svcKeyAt(i)
 
 		// Read-only: no checkbox, and the space that follows it in the line format
 		// below keeps the 7-cell caption pad in lockstep.
@@ -5394,7 +5435,7 @@ func (m Model) viewSelectContainers() string {
 
 	// Bottom: scroll-down indicator replaces the blank-line gap before the
 	// help/confirm bar so the total line count stays constant.
-	below := len(m.services) - end
+	below := len(m.svcEntries) - end
 	if below > 0 {
 		b.WriteString(descStyle.Render(fmt.Sprintf("  ▼ %d more", below)))
 		b.WriteString("\n")
@@ -5430,8 +5471,9 @@ func (m Model) viewSelectContainers() string {
 		var prompt string
 		switch {
 		case m.pendingExec:
+			execTarget, _ := m.cursorService()
 			prompt = fmt.Sprintf("  Exec into %s?  enter confirm  •  esc cancel",
-				m.services[m.svcCursor])
+				execTarget)
 		case m.pendingOp == runner.Rollback:
 			// Show the captured target set (what will actually roll back), not the
 			// live selection which the async fetch may have let drift.
@@ -5610,12 +5652,13 @@ func clampToWidth(s string, width int) string {
 // (or out of range). Used by searchBarLine to avoid labelling a non-matching row
 // with the ↳ "jumped to a match" glyph.
 func (m Model) cursorMatchName() (string, bool) {
-	if m.svcCursor < 0 || m.svcCursor >= len(m.services) {
+	svc, ok := m.cursorService()
+	if !ok {
 		return "", false
 	}
 	for _, idx := range m.searchMatches {
 		if idx == m.svcCursor {
-			return m.services[m.svcCursor], true
+			return svc, true
 		}
 	}
 	return "", false

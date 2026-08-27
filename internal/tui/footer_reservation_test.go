@@ -66,7 +66,7 @@ func TestContainerFooterReservation(t *testing.T) {
 	commitSearch := func(m *Model) {
 		m.searchInput = textinput.New()
 		m.searchQuery = "svc1"
-		m.searchMatches = computeMatches(m.services, "svc1")
+		m.searchMatches = computeMatches(m.svcEntries, "svc1")
 		m.svcCursor = m.searchMatches[0]
 	}
 	typeSearch := func(m *Model) {
@@ -209,12 +209,12 @@ func TestContainerView_ExcessLineWidthIsPaddingOnly(t *testing.T) {
 			m.searchInput.Focus()
 			m.searching = true
 			m.searchQuery = "svc1"
-			m.searchMatches = computeMatches(m.services, "svc1")
+			m.searchMatches = computeMatches(m.svcEntries, "svc1")
 			m.svcCursor = m.searchMatches[0]
 		}},
 		{"committed", func(m *Model) {
 			m.searchQuery = "svc1"
-			m.searchMatches = computeMatches(m.services, "svc1")
+			m.searchMatches = computeMatches(m.svcEntries, "svc1")
 			m.svcCursor = m.searchMatches[0]
 		}},
 	}
@@ -302,16 +302,16 @@ func TestSearchBarLineNeverWraps(t *testing.T) {
 			m.searchInput.Focus()
 			m.searching = true
 			m.searchQuery = longQuery
-			m.searchMatches = computeMatches(m.services, longQuery)
+			m.searchMatches = computeMatches(m.svcEntries, longQuery)
 		}},
 		{"committed-on-long-match", func(m *Model) {
 			m.searchQuery = "extremely-long-service"
-			m.searchMatches = computeMatches(m.services, "extremely-long-service")
+			m.searchMatches = computeMatches(m.svcEntries, "extremely-long-service")
 			m.svcCursor = m.searchMatches[0]
 		}},
 		{"committed-off-match", func(m *Model) {
 			m.searchQuery = "extremely-long-service"
-			m.searchMatches = computeMatches(m.services, "extremely-long-service")
+			m.searchMatches = computeMatches(m.svcEntries, "extremely-long-service")
 			m.svcCursor = 2 // "api" is not a match → off-match committed form
 		}},
 		{"typing-no-match", func(m *Model) {
@@ -323,7 +323,7 @@ func TestSearchBarLineNeverWraps(t *testing.T) {
 			m.searchInput.Focus()
 			m.searching = true
 			m.searchQuery = "zzz-no-such-service"
-			m.searchMatches = computeMatches(m.services, "zzz-no-such-service")
+			m.searchMatches = computeMatches(m.svcEntries, "zzz-no-such-service")
 		}},
 	}
 
@@ -529,12 +529,12 @@ var containerFooterSearchStates = []struct {
 		m.searchInput.Focus()
 		m.searching = true
 		m.searchQuery = "web"
-		m.searchMatches = computeMatches(m.services, "web")
+		m.searchMatches = computeMatches(m.svcEntries, "web")
 	}},
 	{"committed", func(m *Model) {
 		m.searchInput = textinput.New()
 		m.searchQuery = "web"
-		m.searchMatches = computeMatches(m.services, "web")
+		m.searchMatches = computeMatches(m.svcEntries, "web")
 	}},
 }
 

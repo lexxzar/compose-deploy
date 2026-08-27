@@ -124,3 +124,48 @@ func qualifyMap[V any](projName string, src map[string]V) map[string]V {
 	}
 	return out
 }
+
+// svcRef is one service the container screen owns: the group it belongs to,
+// the bare name a Composer knows it by, and the qualified key the Model stores
+// it under.
+type svcRef struct {
+	groupIdx int
+	name     string
+	key      string
+}
+
+// svcRefs enumerates every service in every group, in group order. Fold state
+// is deliberately ignored — folding hides ROWS, never services — so selection,
+// counting and column-width helpers go through it instead of over svcEntries,
+// which would drop a folded group's services from the selection.
+func (m Model) svcRefs() []svcRef {
+	var refs []svcRef
+	for gi, g := range m.svcGroups {
+		for _, name := range g.services {
+			refs = append(refs, svcRef{groupIdx: gi, name: name, key: svcKey(g.proj.Name, name)})
+		}
+	}
+	return refs
+}
+
+// cursorEntry returns the row under the cursor. The cursor indexes svcEntries,
+// so it may sit on a group header; callers that need a service must go through
+// cursorService.
+func (m Model) cursorEntry() (svcEntry, bool) {
+	if m.svcCursor < 0 || m.svcCursor >= len(m.svcEntries) {
+		return svcEntry{}, false
+	}
+	return m.svcEntries[m.svcCursor], true
+}
+
+// cursorService returns the service name under the cursor, and false when the
+// cursor sits on a group header or out of range. Every action key that acts on
+// "the service under the cursor" reads it — indexing services by svcCursor is
+// wrong now that headers occupy rows of their own.
+func (m Model) cursorService() (string, bool) {
+	e, ok := m.cursorEntry()
+	if !ok || e.kind != entrySvcService {
+		return "", false
+	}
+	return e.name, true
+}

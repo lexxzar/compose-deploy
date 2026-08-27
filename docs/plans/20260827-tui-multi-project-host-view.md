@@ -115,14 +115,15 @@ Confirmed design decisions (brainstormed and validated; do not re-litigate):
 
 **Files:**
 - Modify: `internal/tui/app.go`
+- Modify: `internal/tui/entries.go` (➕ the row-model helpers `svcRefs`/`cursorEntry`/`cursorService` live beside `svcKeyAt`, not in `app.go`)
 - Modify: `internal/tui/app_test.go`
 - Modify: `internal/tui/footer_reservation_test.go`
 
-- [ ] move `svcCursor`/`svcOffset`/`fixSvcOffset`/`svcVisibleCount` to entry indices; cursor may land on headers; remove the task-2 single-group seam
-- [ ] `viewSelectContainers()` renders entries; with one group the output is byte-identical to today (no headers, no indent)
-- [ ] `computeMatches` matches service entries only and returns ascending entry indices; migrate its call sites in both test files; `/`, `n`, `N`, two-stage `esc` unchanged
-- [ ] write tests: cursor motion over mixed header/service entries; search jump skips headers; offset math with headers present
-- [ ] run FULL suite `go test ./... -count=1` - must pass before task 5 (phase-1 exit gate)
+- [x] move `svcCursor`/`svcOffset`/`fixSvcOffset`/`svcVisibleCount` to entry indices; cursor may land on headers; remove the task-2 single-group seam
+- [x] `viewSelectContainers()` renders entries; with one group the output is byte-identical to today (no headers, no indent)
+- [x] `computeMatches` matches service entries only and returns ascending entry indices; migrate its call sites in both test files; `/`, `n`, `N`, two-stage `esc` unchanged
+- [x] write tests: cursor motion over mixed header/service entries; search jump skips headers; offset math with headers present
+- [x] run FULL suite `go test ./... -count=1` - must pass before task 5 (phase-1 exit gate)
 
 ### Task 5: HostGrouper — host-wide label grouping in compose (phase 2)
 
