@@ -83,8 +83,7 @@ func runLogs(ctx context.Context, service string, follow bool, tail int) error {
 			return fmt.Errorf("no compose file found in %s (use -s to specify a remote server)", dir)
 		}
 		lc := logsNewLocal(dir)
-		lc.ProjectName = projectName
-		if err := lc.Detect(ctx); err != nil {
+		if err := prepareLocalComposer(ctx, lc, projectName); err != nil {
 			return err
 		}
 		c = lc

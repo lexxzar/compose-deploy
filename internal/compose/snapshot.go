@@ -205,7 +205,8 @@ func parseSnapshot(data []byte) (*Snapshot, error) {
 // pull_policy: never is load-bearing for offline rollback (AC4). The rollback
 // pipeline has NO Pull step, but its Create step is the shared
 // `docker compose up --no-start`, whose pull behavior is policy-driven. Because
-// this override is stacked as the SECOND `-f` file, its `pull_policy: never`
+// this override is stacked LAST — after the project's own file set, however
+// many files that is — its `pull_policy: never`
 // wins the compose merge over whatever the MAIN compose file declares (e.g.
 // `pull_policy: always`), so Create never attempts a registry pull — which
 // would fail during a registry outage, exactly the classic rollback trigger.
@@ -522,8 +523,13 @@ func (c *Compose) localStatePath() (string, error) {
 // localStatePath — so an existing state file keeps serving a project the TUI now
 // addresses by name, instead of being orphaned by the upgrade. Empty key means
 // the composer is unnamed and the two paths are the same file.
+//
+// It is also empty once ResolveProject has seen SEVERAL projects in this
+// directory: the dir-only file was written for whichever project that directory
+// resolved to, so with more than one living there it names none of them and
+// handing its digests to this one is the wrong-image rollback again.
 func (c *Compose) localLegacyStatePath() (string, error) {
-	if c.ProjectName == "" {
+	if c.ProjectName == "" || c.legacyStateBlocked {
 		return "", nil
 	}
 	return localStateFile(snapshotKey(localProjectDir(c.ProjectDir), ""))

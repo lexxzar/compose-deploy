@@ -24,6 +24,11 @@ var (
 	identityFile string
 )
 
+// rootNewLocal builds the local composer the TUI fast track starts on.
+// Injectable so tests can attach compose test hooks, mirroring opNewLocal /
+// listNewLocal / execNewLocal / logsNewLocal.
+var rootNewLocal = compose.New
+
 // Build-time metadata. Overridden via -ldflags by GoReleaser; the defaults
 // here are what `go build` from a working tree produces.
 var (
@@ -120,7 +125,8 @@ Remote server configuration (~/.cdeploy/servers.yml):
 					}
 					// Servers available — local Docker not required.
 				} else {
-					c = localDetector
+					standalone, _ := localDetect.verdict()
+					c = fastTrackComposer(cmd.Context(), dir, standalone)
 				}
 			}
 
@@ -208,6 +214,28 @@ Remote server configuration (~/.cdeploy/servers.yml):
 
 func Execute() error {
 	return NewRootCmd().Execute()
+}
+
+// fastTrackComposer builds the composer the TUI starts on when the working
+// directory holds a compose file and the project picker is skipped.
+//
+// It is deliberately NOT the shared localDetector, which stays identity-free so
+// the project loader keeps enumerating every project on the host. This one
+// resolves the directory's canonical project identity — the same name, file set
+// and config directory a picker row would have carried — so the fast track and a
+// grouped drill-in address ONE project and key ONE rollback state file. Without
+// it the same containers were deployed under two identities: `entryLocal` wrote
+// sha256(dir) and `drillIntoGroup` wrote sha256(dir+NUL+name).
+//
+// The resolve error is ignored because it cannot happen here: ResolveProject
+// only refuses a project name the CALLER supplied, and this composer supplies
+// none. A lookup that fails leaves it directory-addressed, exactly as it was
+// before resolution existed.
+func fastTrackComposer(ctx context.Context, dir string, standalone bool) runner.Composer {
+	lc := rootNewLocal(dir)
+	lc.SetStandalone(standalone)
+	_ = lc.ResolveProject(ctx)
+	return lc
 }
 
 // localComposerFor is the local tui.ComposerFactory body. The synthetic

@@ -163,6 +163,11 @@ type RemoteCompose struct {
 
 	detected bool // true after Detect() or SetStandalone() has been called
 
+	// projectResolved / legacyStateBlocked mirror the Compose fields of the
+	// same name — see Compose.ResolveProject.
+	projectResolved    bool
+	legacyStateBlocked bool
+
 	// testing hooks; nil = use real exec
 	runCmd    func(*exec.Cmd) error
 	outputCmd func(*exec.Cmd) ([]byte, error)
@@ -365,6 +370,17 @@ func (r *RemoteCompose) composeFileList() []string {
 // remoteCommand builds an ssh command that runs a docker compose subcommand
 // on the remote host via the ControlMaster socket.
 func (r *RemoteCompose) remoteCommand(ctx context.Context, args ...string) *exec.Cmd {
+	return r.buildRemoteCommand(ctx, r.composeFlags(), args)
+}
+
+// remoteHostCommand is the remote twin of Compose.hostCommand: a compose
+// invocation carrying NO `-f` and NO `-p` flags, for the host-wide `ls` that
+// ResolveProject runs on a composer which may already carry both.
+func (r *RemoteCompose) remoteHostCommand(ctx context.Context, args ...string) *exec.Cmd {
+	return r.buildRemoteCommand(ctx, "", args)
+}
+
+func (r *RemoteCompose) buildRemoteCommand(ctx context.Context, flags string, args []string) *exec.Cmd {
 	var escaped []string
 	for _, a := range args {
 		escaped = append(escaped, shellEscape(a))
@@ -379,7 +395,7 @@ func (r *RemoteCompose) remoteCommand(ctx context.Context, args ...string) *exec
 	// binary, before the subcommand, then the `-p <name>` pair — see
 	// composeFlags.
 	remoteCmd := fmt.Sprintf("CURRENT_UID=$(id -u):$(id -g) %s %s%s",
-		composeBin, r.composeFlags(), strings.Join(escaped, " "))
+		composeBin, flags, strings.Join(escaped, " "))
 
 	if r.ProjectDir != "" {
 		remoteCmd = fmt.Sprintf("cd %s && %s", shellEscape(r.ProjectDir), remoteCmd)
@@ -724,7 +740,7 @@ func (r *RemoteCompose) ValidateConfig(ctx context.Context) error {
 
 // ListProjects returns all Docker Compose projects on the remote host.
 func (r *RemoteCompose) ListProjects(ctx context.Context) ([]Project, error) {
-	cmd := r.remoteCommand(ctx, "ls", "-a", "--format", "json")
+	cmd := r.remoteHostCommand(ctx, "ls", "-a", "--format", "json")
 	var out []byte
 	var err error
 	if r.outputCmd != nil {
@@ -1050,10 +1066,10 @@ func (r *RemoteCompose) remoteStatePath() string {
 
 // remoteLegacyStatePath is the DIR-ONLY remote path this project's state used
 // before the name entered the key, or "" when the composer is unnamed and the
-// two paths are the same file. READ fallback only — see
-// Compose.localLegacyStatePath.
+// two paths are the same file, or when ResolveProject found several projects in
+// this directory. READ fallback only — see Compose.localLegacyStatePath.
 func (r *RemoteCompose) remoteLegacyStatePath() string {
-	if r.ProjectName == "" {
+	if r.ProjectName == "" || r.legacyStateBlocked {
 		return ""
 	}
 	return "$HOME/" + stateFileRelPath(remoteProjectDir(r.ProjectDir), "")
@@ -1241,10 +1257,11 @@ func (r *RemoteCompose) runRemoteDockerCmdStream(ctx context.Context, dockerArgs
 //     remoteRollbackOverridePath) makes the path unique across CLIENTS — the
 //     local PID alone collides when two machines roll back the same project on
 //     the same host.
-//   - the main compose file is discovered via findRemoteComposeFile (a bare
-//     name relative to ProjectDir, which remoteCommand cd's into), placed FIRST
-//     in ExtraComposeFiles so `-f` auto-discovery disabling keeps the right
-//     project.
+//   - the base file set is the project's OWN ComposeFiles when docker reported
+//     them, and only otherwise the findRemoteComposeFile probe (a bare name
+//     relative to ProjectDir, which remoteCommand cd's into). It is placed
+//     FIRST in ExtraComposeFiles, ahead of the override, so `-f`
+//     auto-discovery disabling keeps the right project.
 //
 // cleanup `rm -f`s the remote override file over SSH and RESETS
 // ExtraComposeFiles to nil.

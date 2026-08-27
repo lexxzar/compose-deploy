@@ -668,8 +668,13 @@ func runList(ctx context.Context, jsonOutput, showStats, showUpdates bool) error
 
 		// Single-project mode: -C explicitly specified. Update check is opt-in
 		// via --updates because each service costs one SSH round-trip to
-		// buildx/manifest-inspect.
+		// buildx/manifest-inspect. The identity resolve is scoped to this
+		// branch: multi-project discovery already names every composer from its
+		// own row and must not pay a second host-wide `ls`.
 		if projDir != "" {
+			if err := rc.ResolveProject(ctx); err != nil {
+				return err
+			}
 			return listSingleProject(ctx, rc, jsonOutput, showStats, showUpdates)
 		}
 
@@ -718,17 +723,18 @@ func runList(ctx context.Context, jsonOutput, showStats, showUpdates bool) error
 		}
 	}
 	c := listNewLocal(dir)
-	// Same split as the remote branch: only the single-project path below can
-	// carry a name, and the multi-project factory names each composer itself.
-	c.ProjectName = projectName
 
 	if projectDir != "" {
 		// Single-project mode. Update check is opt-in via --updates because
 		// each service costs one registry round-trip to buildx/manifest-inspect.
+		//
+		// Same split as the remote branch: only this path carries a name and
+		// resolves an identity; the multi-project factory below names each
+		// composer from its own row.
 		if !listHasCompose(dir) {
 			return fmt.Errorf("no compose file found in %s", dir)
 		}
-		if err := c.Detect(ctx); err != nil {
+		if err := prepareLocalComposer(ctx, c, projectName); err != nil {
 			return err
 		}
 		return listSingleProject(ctx, c, jsonOutput, showStats, showUpdates)

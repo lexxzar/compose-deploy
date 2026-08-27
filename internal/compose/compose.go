@@ -87,7 +87,7 @@ func HasComposeFile(dir string) bool {
 // ListProjects returns all Docker Compose projects on the system, including stopped ones.
 // It respects the Standalone field to use the correct binary.
 func (c *Compose) ListProjects(ctx context.Context) ([]Project, error) {
-	cmd := c.command(ctx, "ls", "-a", "--format", "json")
+	cmd := c.hostCommand(ctx, "ls", "-a", "--format", "json")
 	var out []byte
 	var err error
 	if c.outputCmd != nil {
@@ -294,6 +294,19 @@ type Compose struct {
 
 	detected bool // true after Detect() or SetStandalone() has been called
 
+	// projectResolved is true once ResolveProject has completed a lookup, so
+	// the `docker compose ls` it costs is paid once per composer.
+	projectResolved bool
+
+	// legacyStateBlocked is set by ResolveProject when the project directory
+	// holds MORE THAN ONE project. The dir-only state file was written by a
+	// build that addressed whichever project that directory resolved to, so
+	// with several living there it names none of them and must not be read as
+	// this project's history. Default false keeps the fallback for every
+	// composer that never resolved (the TUI's picker rows, which carry their
+	// identity from the row itself).
+	legacyStateBlocked bool
+
 	// testing hooks; nil = use real exec
 	runCmd    func(*exec.Cmd) error
 	outputCmd func(*exec.Cmd) ([]byte, error)
@@ -420,6 +433,20 @@ func withStderr(err error) error {
 
 func (c *Compose) command(ctx context.Context, args ...string) *exec.Cmd {
 	fileArgs := append(composeFileArgs(c.composeFileList()), projectNameArgs(c.ProjectName)...)
+	return c.buildCommand(ctx, fileArgs, args)
+}
+
+// hostCommand builds a compose invocation carrying NO `-f` and NO `-p` flags.
+// `docker compose ls` enumerates every project on the host, so neither flag
+// selects anything there — and `-f` would point compose at a file it must
+// parse, making host-wide discovery fail for a project whose files are not
+// readable from here. ResolveProject calls ListProjects on a composer that may
+// already carry both, which is exactly when the difference matters.
+func (c *Compose) hostCommand(ctx context.Context, args ...string) *exec.Cmd {
+	return c.buildCommand(ctx, nil, args)
+}
+
+func (c *Compose) buildCommand(ctx context.Context, fileArgs, args []string) *exec.Cmd {
 	var cmd *exec.Cmd
 	if c.Standalone {
 		cmd = exec.CommandContext(ctx, "docker-compose", append(fileArgs, args...)...)

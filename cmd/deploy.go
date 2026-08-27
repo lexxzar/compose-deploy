@@ -191,8 +191,7 @@ func runOperationWithPrep(ctx context.Context, op runner.Operation, all bool, co
 			}
 		}
 		lc := opNewLocal(dir)
-		lc.ProjectName = projectName
-		if err := lc.Detect(ctx); err != nil {
+		if err := prepareLocalComposer(ctx, lc, projectName); err != nil {
 			return err
 		}
 		c = lc

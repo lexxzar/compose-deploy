@@ -1505,18 +1505,15 @@ func TestRunOperation_ProjectNameReachesTheComposer(t *testing.T) {
 	projectDir, projectName = t.TempDir(), "blue"
 	logDir = t.TempDir()
 
+	// The named project must be one docker reports: --project-name selects an
+	// existing project, and an unknown one is refused rather than run against
+	// an auto-discovered compose file.
 	var built *compose.Compose
-	opNewLocal = func(dir string) *compose.Compose {
-		built = compose.New(dir)
-		built.SetStandalone(false)
-		built.SetTestHooks(
-			func(cmd *exec.Cmd) error { return nil },
-			func(cmd *exec.Cmd) ([]byte, error) { return []byte(""), nil },
-		)
-		return built
-	}
+	opNewLocal = hookedLocalFactory(lsPayloadFor("blue", projectDir), &built)
 
-	_ = runOperation(context.Background(), runner.StopOnly, true, nil)
+	if err := runOperation(context.Background(), runner.StopOnly, true, nil); err != nil {
+		t.Fatalf("runOperation: %v", err)
+	}
 	if built == nil {
 		t.Fatal("the local composer was never built")
 	}
