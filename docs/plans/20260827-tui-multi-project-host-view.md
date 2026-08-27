@@ -323,11 +323,35 @@ Confirmed design decisions (brainstormed and validated; do not re-litigate):
 - [x] run FULL suite `go test ./... -count=1` - must pass before task 14
 
 ### Task 14: Verify acceptance criteria
-- [ ] verify all Overview requirements: grouped landing, fold, drill, sequential ops, stop-on-failure, single-group `R`, `U` per group, picker gone
-- [ ] verify edge cases: duplicate service names across projects, empty group, unmanaged-only host, single-project host (degenerate render), esc mid-sequence, cursor move during a `U` scan
-- [ ] verify: no automatic update scan fires in grouped mode; the update cache entry is shared between grouped and drilled mode
-- [ ] run full test suite: `go test ./... -count=1`
-- [ ] `go build -o cdeploy .` and `go vet ./...` clean
+
+**Files:**
+- Modify: `internal/tui/app_test.go` (➕ `TestGroupedScreen_UnmanagedOnlyHost` — the one edge case on the list with no end-to-end pin)
+
+⚠️ Deviations / findings:
+- ➕ The unmanaged-only host was covered only by `TestAllSelected_UnmanagedOnlyHostIsFalse` (one predicate). It is now pinned end to end: a lone unmanaged group emits no header, draws no checkbox on any row, `a` selects nothing, and `d`/`r`/`s`/`R`/`c` all refuse without navigating.
+- ⚠️ **Breadcrumb wording differs from Technical Details, deliberately kept.** The plan wrote `cdeploy > server > host` for grouped and `cdeploy > server > proj` for drilled. `breadcrumb()` appends `projName` only when drilled and `viewSelectContainers` adds a fixed `> services` tail, so the two modes ARE distinguishable (`cdeploy > prod > services` vs `cdeploy > prod > shop > services`) — but the grouped tail reads `services`, not `host`. Changing the word now would churn title assertions across the suite for no behavioural gain. `TestGroupedScreen_EnterDrillsIntoProject` pins the drilled half.
+- ⚠️ Pre-existing, NOT introduced here: `go test -race ./internal/tui/` still reports the Task-10 data race in `TestQualifiedKeys_NeverCrossIntoRunner`. The project's documented command, `go test ./...`, is clean.
+
+- [x] verify all Overview requirements: grouped landing, fold, drill, sequential ops, stop-on-failure, single-group `R`, `U` per group, picker gone
+  - grouped landing: `TestNewModel_LandsOnGroupedWhenNoComposer`, `TestInit_LoadsGroupsWhenNoComposer`, `TestConnectSuccess_BumpsTheThreeCountersAndLandsGrouped`
+  - fold: `TestGroupedSpace_OnHeaderFoldsAndUnfolds`, `TestGroupedSpace_OnUnmanagedHeaderFolds`
+  - drill: `TestGroupedScreen_EnterDrillsIntoProject`, `TestGroupedScreen_DrillRoundTrip`, `TestEscChain_DrilledToGroupedToServer`
+  - sequential ops + stop-on-failure: `TestBatchSequence_TwoBatchesRunInOrder`, `TestBatchSequence_FailureStopsSequence`, `TestBatchWait_FailureStopsSequence`; verified in `handleStepEvent` (per-batch step range, never a global name scan) and `markBatchesSkipped`
+  - single-group `R`: `TestGroupedScreen_RollbackRefusesCrossProject`, `TestGroupedScreen_RollbackNonPreparerUnbinds`
+  - `U` per group: `TestGroupedU_ScansCursorGroupOnly`; the `U` handler binds, reads and unbinds the cursor group's composer in one keystroke
+  - picker gone: `grep -rn "screenSelectProject\|viewSelectProject\|projectsMsg\|projectsSession\|projCursor\|showPicker" --include="*.go" .` returns nothing; the screen iota is 8 constants
+- [x] verify edge cases: duplicate service names across projects, empty group, unmanaged-only host, single-project host (degenerate render), esc mid-sequence, cursor move during a `U` scan
+  - duplicate names: `TestQualifiedKeys_DuplicateServiceNamesStayDistinct`
+  - empty group: `TestBuildSvcGroups_EmptyProjectKeepsItsGroup`, `TestGroupHeaderLine_EmptyGroupIsBare`
+  - unmanaged-only host: ➕ `TestGroupedScreen_UnmanagedOnlyHost` (added here), `TestAllSelected_UnmanagedOnlyHostIsFalse`
+  - single-project host: `TestViewSelectContainers_GroupedSingleProjectHasNoIndent`, `TestViewSelectContainers_SingleGroupHasNoHeaderOrIndent`
+  - esc mid-sequence: `TestBatchSequence_EscDoesNotAdvance`, `TestBatchWait_EscSkipReleasesTheNextBatch`, `TestBatchWait_DepartureRunsCleanupAndClearsWait`
+  - cursor move during a `U` scan: `TestGroupedU_ForKeySurvivesCursorMove`
+- [x] verify: no automatic update scan fires in grouped mode; the update cache entry is shared between grouped and drilled mode
+  - `autoUpdatesAllowed()` = `!readOnly() && !grouped`; `maybeRefreshUpdatesCmd` early-returns on `m.grouped`. Pinned by `TestGroupedMode_AllAutoScanEntryPointsRefuse`, `TestGroupedInit_FiresNoUpdateScan`, `TestGroupedMode_NoAutomaticUpdateScan`, `TestGroupedU_FetchesNoDetailBatch`
+  - shared cache: `projUpdatesCacheKey(proj)` composes `proj.ConfigDir + "|" + serverName` — the same string `updatesCacheKey()` produces once drilled into that project. `TestGroupedUpdates_DrillInReplaysCachedEntry`, `TestGroupedU_UnmanagedGroupKeepsCachePrefix`
+- [x] run full test suite: `go test ./... -count=1`
+- [x] `go build -o cdeploy .` and `go vet ./...` clean (`gofmt -l internal/tui/` clean too)
 
 ### Task 15: [Final] Update documentation
 - [ ] create `docs/architecture/tui-multi-project.md` with the rationale and test pins (entry model, qualified keys + boundary rule, batch sequencing + message identity, grouped-mode update rules, action-time composer binding)

@@ -19186,6 +19186,48 @@ func TestAllSelected_UnmanagedOnlyHostIsFalse(t *testing.T) {
 	}
 }
 
+// A host that runs nothing but unmanaged containers is the degenerate grouped
+// render: one group, so no header and no indent, and every row is unselectable.
+// The screen must still draw, and every write key must refuse.
+func TestGroupedScreen_UnmanagedOnlyHost(t *testing.T) {
+	m := groupedScreenModel(unmanagedGroupOf("watchtower", "portainer"))
+	m.svcStatus = map[string]runner.ServiceStatus{
+		svcKey(compose.UnmanagedProjectName, "watchtower"): {Running: true},
+		svcKey(compose.UnmanagedProjectName, "portainer"):  {Running: true},
+	}
+
+	out := ansi.Strip(m.viewSelectContainers())
+	if strings.Contains(out, compose.UnmanagedProjectName) {
+		t.Errorf("a lone group must emit no header:\n%s", out)
+	}
+	rows := 0
+	for _, l := range strings.Split(out, "\n") {
+		if !strings.Contains(l, "watchtower") && !strings.Contains(l, "portainer") {
+			continue
+		}
+		rows++
+		if strings.Contains(l, "[") {
+			t.Errorf("unmanaged row = %q, want no checkbox", l)
+		}
+	}
+	if rows != 2 {
+		t.Fatalf("rendered %d container rows, want 2:\n%s", rows, out)
+	}
+
+	if got := pressGroupKey(m, "a"); got.selectedCount() != 0 {
+		t.Errorf("`a` selected %d rows on an unmanaged-only host", got.selectedCount())
+	}
+	for _, key := range []string{"d", "r", "s", "R", "c"} {
+		got := pressGroupKey(m, key)
+		if got.confirming {
+			t.Errorf("%q armed an operation on an unmanaged-only host", key)
+		}
+		if got.screen != screenSelectContainers {
+			t.Errorf("%q navigated away; screen = %v", key, got.screen)
+		}
+	}
+}
+
 // TestGroupHeaderLine_Aggregates pins the header's live summary: the running
 // count always, the unhealthy count only when something is wrong.
 func TestGroupHeaderLine_Aggregates(t *testing.T) {
