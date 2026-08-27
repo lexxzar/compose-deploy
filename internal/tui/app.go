@@ -296,7 +296,17 @@ type Model struct {
 	projectsSession uint64 // bumped at every transition that swaps the projectLoader (server pick, server disconnect, local fast-track, etc.) so a stale loadProjects from server A can't overwrite server B's list
 
 	// Screen 1: service select
-	services        []string
+	services []string
+
+	// Grouped row state. svcGroups is the source of truth and svcEntries is
+	// derived from it by rebuildSvcEntries — never write svcEntries by hand.
+	// Until the grouped host view lands, every entry to the screen installs
+	// exactly ONE group through setSingleGroup. A single group emits no header
+	// rows, so svcEntries stays index-parallel to services and the index-keyed
+	// cursor, offset and selection keep the meaning they had before grouping.
+	svcGroups  []svcGroup
+	svcEntries []svcEntry
+
 	svcStatus       map[string]runner.ServiceStatus // service name → status
 	stats           map[string]runner.ServiceStats  // service name → resource usage; populated asynchronously by refreshStats
 	statsErr        error                           // last error from ContainerStats; rendered in the same slot as svcErr (svcErr wins)
@@ -885,7 +895,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 		m.svcErr = nil
-		m.services = sortServices(msg.services)
+		m.setSingleGroup(sortServices(msg.services))
 		m.svcStatus = msg.status
 		m.selected = make(map[int]bool)
 		m.svcCursor = 0
@@ -2038,7 +2048,7 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 				m.updatesErr = ""
 				m.projName = ""
 				m.projDir = ""
-				m.services = nil
+				m.clearSvcGroups()
 				m.svcStatus = nil
 				m.stats = nil
 				m.statsErr = nil
@@ -4685,6 +4695,41 @@ func (m *Model) fixSvcOffset() {
 	if m.svcOffset > maxOffset {
 		m.svcOffset = maxOffset
 	}
+}
+
+// currentProject describes the project the container screen is showing. It is
+// the group identity behind the single-group shape: name and config dir come
+// from the picker, and Unmanaged mirrors the composer, so the synthetic
+// unmanaged bucket is recognisable as a group like any other.
+func (m Model) currentProject() compose.Project {
+	return compose.Project{Name: m.projName, ConfigDir: m.projDir, Unmanaged: m.readOnly()}
+}
+
+// setSingleGroup installs services as the one and only group on the container
+// screen. It is the single writer of svcGroups/svcEntries on the drilled path:
+// the services slice must already be sorted, since the row order is the group's
+// order.
+//
+// A nil slice means "no project loaded" (the screen renders its loading state),
+// so it clears the group state instead of installing an empty group. An empty
+// but non-nil slice is a real project that owns no services.
+func (m *Model) setSingleGroup(services []string) {
+	if services == nil {
+		m.clearSvcGroups()
+		return
+	}
+	m.services = services
+	m.svcGroups = []svcGroup{{proj: m.currentProject(), services: services}}
+	m.svcEntries = rebuildSvcEntries(m.svcGroups)
+}
+
+// clearSvcGroups wipes the container screen's row state. Every departure site
+// that drops the service list calls it, so groups and entries can never outlive
+// the services they were derived from.
+func (m *Model) clearSvcGroups() {
+	m.services = nil
+	m.svcGroups = nil
+	m.svcEntries = nil
 }
 
 func sortServices(services []string) []string {

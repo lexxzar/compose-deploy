@@ -26,6 +26,18 @@ import (
 	"github.com/muesli/termenv"
 )
 
+// singleGroupModel returns a container-screen Model in the degenerate
+// one-group shape that setSingleGroup installs in production: the index-keyed
+// fields the screen reads (services, selected) plus the derived
+// svcGroups/svcEntries. A single group emits no header rows, so svcEntries is
+// index-parallel to services and every index-keyed assertion in this file
+// keeps the meaning it had before grouping existed.
+func singleGroupModel(services []string) Model {
+	m := Model{selected: make(map[int]bool)}
+	m.setSingleGroup(services)
+	return m
+}
+
 func mockFactory(mc *mockComposer) ComposerFactory {
 	return func(compose.Project) runner.Composer { return mc }
 }
@@ -319,7 +331,7 @@ func TestSelectContainers_Toggle(t *testing.T) {
 	mc := &mockComposer{services: []string{"nginx", "postgres"}}
 	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
 	m.screen = screenSelectContainers
-	m.services = mc.services
+	m.setSingleGroup(mc.services)
 
 	// Toggle first item
 	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{' '}})
@@ -340,7 +352,7 @@ func TestSelectContainers_SelectAll(t *testing.T) {
 	mc := &mockComposer{services: []string{"nginx", "postgres", "redis"}}
 	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
 	m.screen = screenSelectContainers
-	m.services = mc.services
+	m.setSingleGroup(mc.services)
 
 	// Select all
 	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'a'}})
@@ -365,7 +377,7 @@ func TestSelectContainers_EnterIgnoredWhenNotConfirming(t *testing.T) {
 	mc := &mockComposer{services: []string{"nginx"}}
 	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
 	m.screen = screenSelectContainers
-	m.services = mc.services
+	m.setSingleGroup(mc.services)
 	m.selected[0] = true
 
 	// Enter with selection but not in confirming state should do nothing
@@ -381,7 +393,7 @@ func TestSelectContainers_EscGoesBackWhenPickerShown(t *testing.T) {
 	m := NewModel(nil, io.Discard, mockFactory(mc), nil, nil)
 	m.screen = screenSelectContainers
 	m.showPicker = true
-	m.services = mc.services
+	m.setSingleGroup(mc.services)
 	m.selected[0] = true
 	m.composer = mc
 	m.projects = []compose.Project{{Name: "app", ConfigDir: "/app"}}
@@ -409,7 +421,7 @@ func TestSelectContainers_EscLoadsProjectsWhenNil(t *testing.T) {
 	m := NewModel(nil, io.Discard, mockFactory(mc), nil, nil)
 	m.screen = screenSelectContainers
 	m.showPicker = true
-	m.services = mc.services
+	m.setSingleGroup(mc.services)
 	m.composer = mc
 	// projects is nil (local fast-path skipped project screen)
 
@@ -429,7 +441,7 @@ func TestSelectContainers_EscPreservesCursor(t *testing.T) {
 	m := NewModel(nil, io.Discard, mockFactory(mc), nil, nil)
 	m.screen = screenSelectContainers
 	m.showPicker = true
-	m.services = mc.services
+	m.setSingleGroup(mc.services)
 	m.composer = mc
 	m.projects = []compose.Project{
 		{Name: "alpha", ConfigDir: "/a"},
@@ -450,7 +462,7 @@ func TestSelectContainers_EscDoesNothingWhenPickerSkipped(t *testing.T) {
 	mc := &mockComposer{services: []string{"nginx"}}
 	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
 	m.screen = screenSelectContainers
-	m.services = mc.services
+	m.setSingleGroup(mc.services)
 	m.svcStatus = map[string]runner.ServiceStatus{"nginx": {Running: true}}
 
 	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyEsc})
@@ -476,9 +488,9 @@ func TestSelectContainers_QuitReturnsQuit(t *testing.T) {
 
 func TestSelectedContainers(t *testing.T) {
 	m := Model{
-		services: []string{"nginx", "postgres", "redis"},
 		selected: map[int]bool{0: true, 2: true},
 	}
+	m.setSingleGroup([]string{"nginx", "postgres", "redis"})
 
 	got := m.selectedContainers()
 	if len(got) != 2 || got[0] != "nginx" || got[1] != "redis" {
@@ -488,9 +500,9 @@ func TestSelectedContainers(t *testing.T) {
 
 func TestAllSelected(t *testing.T) {
 	m := Model{
-		services: []string{"a", "b"},
 		selected: map[int]bool{0: true, 1: true},
 	}
+	m.setSingleGroup([]string{"a", "b"})
 	if !m.allSelected() {
 		t.Error("allSelected() = false, want true")
 	}
@@ -646,7 +658,7 @@ func TestView_AllScreens(t *testing.T) {
 
 	// Container select screen (initial screen when composer provided)
 	m.screen = screenSelectContainers
-	m.services = []string{"nginx", "postgres"}
+	m.setSingleGroup([]string{"nginx", "postgres"})
 	m.selected[1] = true
 	v := m.View()
 	if v == "" {
@@ -968,7 +980,7 @@ func TestBreadcrumb_WithProjectName(t *testing.T) {
 
 	// Container select screen
 	m.screen = screenSelectContainers
-	m.services = []string{"nginx"}
+	m.setSingleGroup([]string{"nginx"})
 	v := m.View()
 	if !strings.Contains(v, "cdeploy > api-proxy") {
 		t.Errorf("container select breadcrumb should contain project name, got: %q", v)
@@ -988,11 +1000,168 @@ func TestBreadcrumb_WithProjectName(t *testing.T) {
 func TestBreadcrumb_WithoutProjectName(t *testing.T) {
 	mc := &mockComposer{}
 	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
-	m.services = []string{"nginx"}
+	m.setSingleGroup([]string{"nginx"})
 
 	v := m.View()
 	if !strings.Contains(v, "cdeploy") {
 		t.Error("breadcrumb should contain 'cdeploy'")
+	}
+}
+
+func TestSetSingleGroup(t *testing.T) {
+	t.Run("installs one group and derives the entries", func(t *testing.T) {
+		var m Model
+		m.projName = "web"
+		m.projDir = "/srv/web"
+		m.setSingleGroup([]string{"api", "db"})
+
+		if len(m.svcGroups) != 1 {
+			t.Fatalf("svcGroups has %d groups, want 1", len(m.svcGroups))
+		}
+		g := m.svcGroups[0]
+		if g.proj.Name != "web" || g.proj.ConfigDir != "/srv/web" {
+			t.Errorf("group project = %+v, want the current project", g.proj)
+		}
+		if g.folded {
+			t.Error("a freshly installed group must not be folded")
+		}
+		if len(m.svcEntries) != 2 || m.svcEntries[0].name != "api" || m.svcEntries[1].name != "db" {
+			t.Errorf("svcEntries = %+v, want two service rows in order", m.svcEntries)
+		}
+	})
+
+	t.Run("an empty but non-nil slice is a project with no services", func(t *testing.T) {
+		var m Model
+		m.setSingleGroup([]string{})
+
+		if len(m.svcGroups) != 1 {
+			t.Fatalf("svcGroups has %d groups, want 1", len(m.svcGroups))
+		}
+		if m.services == nil {
+			t.Error("services must stay non-nil, or the screen renders its loading state")
+		}
+		if len(m.svcEntries) != 0 {
+			t.Errorf("svcEntries = %+v, want no rows", m.svcEntries)
+		}
+	})
+
+	t.Run("nil clears the group state", func(t *testing.T) {
+		var m Model
+		m.setSingleGroup([]string{"api"})
+		m.setSingleGroup(nil)
+
+		if m.services != nil || m.svcGroups != nil || m.svcEntries != nil {
+			t.Errorf("services=%v groups=%v entries=%v, want all nil", m.services, m.svcGroups, m.svcEntries)
+		}
+	})
+
+	t.Run("a read-only composer marks the group unmanaged", func(t *testing.T) {
+		var m Model
+		m.composer = &readOnlyMockComposer{}
+		m.setSingleGroup([]string{"portainer"})
+
+		if !m.svcGroups[0].proj.Unmanaged {
+			t.Error("a read-only composer must produce an unmanaged group")
+		}
+	})
+}
+
+func TestClearSvcGroups(t *testing.T) {
+	var m Model
+	m.setSingleGroup([]string{"api", "db"})
+	m.clearSvcGroups()
+
+	if m.services != nil || m.svcGroups != nil || m.svcEntries != nil {
+		t.Errorf("services=%v groups=%v entries=%v, want all nil", m.services, m.svcGroups, m.svcEntries)
+	}
+}
+
+// servicesMsg is the production writer of the single-group shape: the entries
+// must be derived from the SORTED list the handler installs.
+func TestServicesMsg_InstallsSingleGroup(t *testing.T) {
+	mc := &mockComposer{}
+	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
+
+	updated, _ := m.Update(servicesMsg{services: []string{"zebra", "Alpha"}})
+	m = updated.(Model)
+
+	if len(m.svcGroups) != 1 {
+		t.Fatalf("svcGroups has %d groups, want 1", len(m.svcGroups))
+	}
+	want := []string{"Alpha", "zebra"}
+	for i, name := range want {
+		if m.svcEntries[i].name != name {
+			t.Errorf("entry %d = %q, want %q (entries follow the sorted order)", i, m.svcEntries[i].name, name)
+		}
+	}
+}
+
+// Departure-site pin: esc back to the project picker drops the service list, so
+// the derived group state must go with it — a group that outlived its services
+// would feed the next project's screen stale rows.
+func TestEscFromContainerScreen_ClearsSvcGroups(t *testing.T) {
+	mc := &mockComposer{services: []string{"nginx"}}
+	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
+	m.screen = screenSelectContainers
+	m.showPicker = true
+	m.setSingleGroup(mc.services)
+
+	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyEsc})
+	m = updated.(Model)
+
+	if m.services != nil || m.svcGroups != nil || m.svcEntries != nil {
+		t.Errorf("services=%v groups=%v entries=%v, want all nil after esc", m.services, m.svcGroups, m.svcEntries)
+	}
+}
+
+// Phase-1 pin for the grouped entry model: a single group must render exactly
+// the pre-grouping screen. rebuildSvcEntries emits NO header for one group, so
+// svcEntries stays index-parallel to services, and the rows keep the
+// cursor-column + checkbox prefix with no group indent in front of it.
+func TestViewSelectContainers_SingleGroupHasNoHeaderOrIndent(t *testing.T) {
+	m := singleGroupModel([]string{"api", "web"})
+	m.screen = screenSelectContainers
+	m.width = 80
+	m.height = 20
+	m.svcStatus = map[string]runner.ServiceStatus{
+		"api": {Running: true, Uptime: "3h"},
+		"web": {},
+	}
+
+	if len(m.svcEntries) != len(m.services) {
+		t.Fatalf("svcEntries has %d rows, want %d (a single group emits no header)", len(m.svcEntries), len(m.services))
+	}
+	for i, e := range m.svcEntries {
+		if e.kind != entrySvcService {
+			t.Errorf("entry %d kind = %v, want a service row", i, e.kind)
+		}
+		if e.name != m.services[i] {
+			t.Errorf("entry %d name = %q, want %q (entries must stay index-parallel)", i, e.name, m.services[i])
+		}
+	}
+
+	out := ansi.Strip(m.viewSelectContainers())
+	for _, glyph := range []string{"\u25bc", "\u25b6"} {
+		if strings.Contains(out, glyph) {
+			t.Errorf("single group rendered a group header glyph %q:\n%s", glyph, out)
+		}
+	}
+
+	rowRe := regexp.MustCompile(`^[> ] \[[ x]\]`)
+	for _, name := range m.services {
+		var row string
+		for _, line := range strings.Split(out, "\n") {
+			if strings.Contains(line, name) && strings.Contains(line, "[") {
+				row = line
+				break
+			}
+		}
+		if row == "" {
+			t.Fatalf("no row rendered for %q in:\n%s", name, out)
+		}
+		if !rowRe.MatchString(row) {
+			t.Errorf("row for %q = %q, want the un-indented cursor+checkbox prefix", name, row)
+		}
 	}
 }
 
@@ -1008,7 +1177,7 @@ func TestViewSelectContainers_HealthIcons(t *testing.T) {
 	}
 	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
 	m.screen = screenSelectContainers
-	m.services = []string{"api", "db", "web", "worker"}
+	m.setSingleGroup([]string{"api", "db", "web", "worker"})
 	m.svcStatus = mc.status
 
 	v := m.View()
@@ -1037,7 +1206,7 @@ func TestViewSelectContainers_HealthAlignment(t *testing.T) {
 	}
 	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
 	m.screen = screenSelectContainers
-	m.services = mc.services
+	m.setSingleGroup(mc.services)
 	m.svcStatus = mc.status
 
 	v := m.View()
@@ -1072,7 +1241,7 @@ func TestViewSelectContainers_StatusDots(t *testing.T) {
 	}
 	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
 	m.screen = screenSelectContainers
-	m.services = mc.services
+	m.setSingleGroup(mc.services)
 	m.svcStatus = mc.status
 
 	v := m.View()
@@ -1250,7 +1419,7 @@ func TestActionKey_EntersConfirmation(t *testing.T) {
 	mc := &mockComposer{services: []string{"nginx", "postgres"}}
 	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
 	m.screen = screenSelectContainers
-	m.services = mc.services
+	m.setSingleGroup(mc.services)
 	m.selected[0] = true
 
 	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'d'}})
@@ -1268,7 +1437,7 @@ func TestActionKey_IgnoredWithNoSelection(t *testing.T) {
 	mc := &mockComposer{services: []string{"nginx"}}
 	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
 	m.screen = screenSelectContainers
-	m.services = mc.services
+	m.setSingleGroup(mc.services)
 
 	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'d'}})
 	m = updated.(Model)
@@ -1284,7 +1453,7 @@ func TestWarning_ShownWhenNoSelection(t *testing.T) {
 			mc := &mockComposer{services: []string{"nginx", "redis"}}
 			m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
 			m.screen = screenSelectContainers
-			m.services = mc.services
+			m.setSingleGroup(mc.services)
 
 			updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{key}})
 			m = updated.(Model)
@@ -1300,7 +1469,7 @@ func TestWarning_ClearedOnNextKeypress(t *testing.T) {
 	mc := &mockComposer{services: []string{"nginx"}}
 	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
 	m.screen = screenSelectContainers
-	m.services = mc.services
+	m.setSingleGroup(mc.services)
 	m.warning = warnNoSelection
 
 	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'j'}})
@@ -1315,7 +1484,7 @@ func TestConfirmation_EnterProceeds(t *testing.T) {
 	mc := &mockComposer{services: []string{"nginx"}}
 	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
 	m.screen = screenSelectContainers
-	m.services = mc.services
+	m.setSingleGroup(mc.services)
 	m.selected[0] = true
 	m.confirming = true
 	m.pendingOp = runner.Deploy
@@ -1334,7 +1503,7 @@ func TestConfirmation_EscCancels(t *testing.T) {
 	mc := &mockComposer{services: []string{"nginx"}}
 	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
 	m.screen = screenSelectContainers
-	m.services = mc.services
+	m.setSingleGroup(mc.services)
 	m.selected[0] = true
 	m.confirming = true
 	m.pendingOp = runner.Deploy
@@ -1354,7 +1523,7 @@ func TestConfirmation_NavigationLocked(t *testing.T) {
 	mc := &mockComposer{services: []string{"nginx", "postgres"}}
 	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
 	m.screen = screenSelectContainers
-	m.services = mc.services
+	m.setSingleGroup(mc.services)
 	m.selected[0] = true
 	m.confirming = true
 	m.pendingOp = runner.Deploy
@@ -1379,7 +1548,7 @@ func TestConfirmation_QCancelsConfirming(t *testing.T) {
 	mc := &mockComposer{services: []string{"nginx"}}
 	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
 	m.screen = screenSelectContainers
-	m.services = mc.services
+	m.setSingleGroup(mc.services)
 	m.selected[0] = true
 	m.confirming = true
 	m.pendingOp = runner.Deploy
@@ -1398,7 +1567,7 @@ func TestConfirmation_CtrlCStillQuits(t *testing.T) {
 	mc := &mockComposer{services: []string{"nginx"}}
 	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
 	m.screen = screenSelectContainers
-	m.services = mc.services
+	m.setSingleGroup(mc.services)
 	m.selected[0] = true
 	m.confirming = true
 	m.pendingOp = runner.Deploy
@@ -1424,7 +1593,7 @@ func TestConfirmation_AllOperationKeys(t *testing.T) {
 			mc := &mockComposer{services: []string{"nginx"}}
 			m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
 			m.screen = screenSelectContainers
-			m.services = mc.services
+			m.setSingleGroup(mc.services)
 			m.selected[0] = true
 
 			updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{tt.key}})
@@ -1444,7 +1613,7 @@ func TestStatusMsg_ErrorSetsSvcErr(t *testing.T) {
 	mc := &mockComposer{services: []string{"nginx"}}
 	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
 	m.screen = screenSelectContainers
-	m.services = mc.services
+	m.setSingleGroup(mc.services)
 
 	updated, _ := m.Update(statusMsg{err: fmt.Errorf("daemon not running")})
 	m = updated.(Model)
@@ -1461,7 +1630,7 @@ func TestStatusMsg_SuccessClearsSvcErr(t *testing.T) {
 	mc := &mockComposer{services: []string{"nginx"}}
 	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
 	m.screen = screenSelectContainers
-	m.services = mc.services
+	m.setSingleGroup(mc.services)
 	m.svcErr = fmt.Errorf("previous error")
 
 	updated, _ := m.Update(statusMsg{status: map[string]runner.ServiceStatus{"nginx": {Running: true}}})
@@ -1479,7 +1648,7 @@ func TestConfirmation_ViewShowsOperationAndServices(t *testing.T) {
 	mc := &mockComposer{services: []string{"nginx", "postgres"}}
 	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
 	m.screen = screenSelectContainers
-	m.services = mc.services
+	m.setSingleGroup(mc.services)
 	m.selected[0] = true
 	m.selected[1] = true
 	m.confirming = true
@@ -2192,7 +2361,7 @@ func TestLogsKey_TransitionsToScreenLogs(t *testing.T) {
 	mc := &mockComposer{services: []string{"nginx", "postgres"}}
 	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
 	m.screen = screenSelectContainers
-	m.services = mc.services
+	m.setSingleGroup(mc.services)
 	m.svcCursor = 1 // cursor on "postgres"
 	m.width = 80
 	m.height = 24
@@ -2235,7 +2404,7 @@ func TestLogsKey_DoesNothingWhenServicesEmpty(t *testing.T) {
 	mc := &mockComposer{}
 	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
 	m.screen = screenSelectContainers
-	m.services = []string{} // empty
+	m.setSingleGroup([]string{}) // empty
 
 	updated, cmd := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'l'}})
 	m = updated.(Model)
@@ -3054,7 +3223,7 @@ func TestViewSelectContainers_HelpIncludesLogs(t *testing.T) {
 	mc := &mockComposer{services: []string{"nginx"}}
 	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
 	m.screen = screenSelectContainers
-	m.services = mc.services
+	m.setSingleGroup(mc.services)
 	m.width = 200
 
 	v := m.View()
@@ -3119,7 +3288,7 @@ func setupLogsModel() Model {
 	mc := &mockComposer{services: []string{"app"}}
 	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
 	m.screen = screenLogs
-	m.services = mc.services
+	m.setSingleGroup(mc.services)
 	m.composer = mc
 	m.logsService = "app"
 	m.logsRawLines = []string{`app | {"level":"info","msg":"hello"}`}
@@ -3356,7 +3525,7 @@ func TestLogsScreen_EnterLogsDefaultState(t *testing.T) {
 	mc := &mockComposer{services: []string{"app"}}
 	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
 	m.screen = screenSelectContainers
-	m.services = mc.services
+	m.setSingleGroup(mc.services)
 	m.composer = mc
 	m.width = 84
 	m.height = 26
@@ -3545,7 +3714,7 @@ func setupFilterableLogsModel() Model {
 	mc := &mockComposer{services: []string{"app"}}
 	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
 	m.screen = screenLogs
-	m.services = mc.services
+	m.setSingleGroup(mc.services)
 	m.composer = mc
 	m.logsService = "app"
 	m.logsWrap = true
@@ -5123,7 +5292,8 @@ func TestSortServices_TieBreaker(t *testing.T) {
 }
 
 func TestAllSelected_Empty(t *testing.T) {
-	m := Model{services: nil, selected: nil}
+	m := singleGroupModel(nil)
+	m.selected = nil
 	if m.allSelected() {
 		t.Error("allSelected() = true for empty services, want false")
 	}
@@ -5131,9 +5301,9 @@ func TestAllSelected_Empty(t *testing.T) {
 
 func TestAllSelected_AllTrue(t *testing.T) {
 	m := Model{
-		services: []string{"web", "db"},
 		selected: map[int]bool{0: true, 1: true},
 	}
+	m.setSingleGroup([]string{"web", "db"})
 	if !m.allSelected() {
 		t.Error("allSelected() = false, want true")
 	}
@@ -5141,9 +5311,9 @@ func TestAllSelected_AllTrue(t *testing.T) {
 
 func TestAllSelected_SomeFalse(t *testing.T) {
 	m := Model{
-		services: []string{"web", "db", "redis"},
 		selected: map[int]bool{0: true, 1: false, 2: true},
 	}
+	m.setSingleGroup([]string{"web", "db", "redis"})
 	if m.allSelected() {
 		t.Error("allSelected() = true, want false")
 	}
@@ -5367,7 +5537,7 @@ func TestViewSelectContainers_ConfirmState(t *testing.T) {
 	}
 
 	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
-	m.services = []string{"web", "db"}
+	m.setSingleGroup([]string{"web", "db"})
 	m.selected = map[int]bool{0: true, 1: true}
 	m.svcStatus = mc.status
 	m.screen = screenSelectContainers
@@ -5395,7 +5565,7 @@ func TestConfigScreen_CKeyEntersConfig(t *testing.T) {
 		configFile: []byte("services:\n  web:\n    image: nginx\n"),
 	}
 	m := NewModel(mc, io.Discard, mockConfigFactory(mc), nil, nil)
-	m.services = mc.services
+	m.setSingleGroup(mc.services)
 	m.svcStatus = mc.status
 	m.screen = screenSelectContainers
 	m.width = 80
@@ -5421,7 +5591,7 @@ func TestConfigScreen_CKeyIgnoredWithoutConfigProvider(t *testing.T) {
 		status:   map[string]runner.ServiceStatus{"web": {Running: true}},
 	}
 	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
-	m.services = mc.services
+	m.setSingleGroup(mc.services)
 	m.svcStatus = mc.status
 	m.screen = screenSelectContainers
 
@@ -5442,7 +5612,7 @@ func TestConfigScreen_EscCleansUp(t *testing.T) {
 		configFile: []byte("test content"),
 	}
 	m := NewModel(mc, io.Discard, mockConfigFactory(mc), nil, nil)
-	m.services = mc.services
+	m.setSingleGroup(mc.services)
 	m.svcStatus = mc.status
 	m.screen = screenConfig
 	m.configContent = []byte("test")
@@ -6004,7 +6174,7 @@ func TestViewSelectContainers_WithBadge(t *testing.T) {
 		status:   map[string]runner.ServiceStatus{"web": {Running: true}},
 	}
 	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
-	m.services = mc.services
+	m.setSingleGroup(mc.services)
 	m.svcStatus = mc.status
 	m.screen = screenSelectContainers
 	m.width = 120
@@ -6025,7 +6195,7 @@ func TestViewSelectContainers_WithoutServerColorUsesPlainBreadcrumb(t *testing.T
 		status:   map[string]runner.ServiceStatus{"web": {Running: true}},
 	}
 	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
-	m.services = mc.services
+	m.setSingleGroup(mc.services)
 	m.svcStatus = mc.status
 	m.screen = screenSelectContainers
 	m.width = 120
@@ -6046,7 +6216,7 @@ func TestViewSelectContainers_WithoutBadge(t *testing.T) {
 		status:   map[string]runner.ServiceStatus{"web": {Running: true}},
 	}
 	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
-	m.services = mc.services
+	m.setSingleGroup(mc.services)
 	m.svcStatus = mc.status
 	m.screen = screenSelectContainers
 	m.width = 120
@@ -6065,7 +6235,7 @@ func TestViewSelectContainers_WithoutBadge(t *testing.T) {
 func TestSvcVisibleCount_HeightZero(t *testing.T) {
 	mc := &mockComposer{}
 	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
-	m.services = []string{"a", "b", "c", "d", "e"}
+	m.setSingleGroup([]string{"a", "b", "c", "d", "e"})
 	m.height = 0
 
 	got := m.svcVisibleCount()
@@ -6078,7 +6248,7 @@ func TestSvcVisibleCount_NormalHeight(t *testing.T) {
 	mc := &mockComposer{}
 	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
 	m.statsRequested = false // exercise the "no columns" branch
-	m.services = []string{"a", "b", "c", "d", "e", "f", "g", "h", "i", "j"}
+	m.setSingleGroup([]string{"a", "b", "c", "d", "e", "f", "g", "h", "i", "j"})
 	m.width = 200 // wide enough for one-line help
 	m.height = 10
 
@@ -6094,7 +6264,7 @@ func TestSvcVisibleCount_NarrowWidth(t *testing.T) {
 	mc := &mockComposer{}
 	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
 	m.statsRequested = false
-	m.services = []string{"a", "b", "c", "d", "e", "f", "g", "h", "i", "j"}
+	m.setSingleGroup([]string{"a", "b", "c", "d", "e", "f", "g", "h", "i", "j"})
 	m.width = 40 // too narrow for one-line help
 	m.height = 10
 
@@ -6109,7 +6279,7 @@ func TestSvcVisibleCount_Confirming(t *testing.T) {
 	mc := &mockComposer{}
 	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
 	m.statsRequested = false
-	m.services = []string{"a", "b", "c", "d", "e", "f", "g", "h", "i", "j"}
+	m.setSingleGroup([]string{"a", "b", "c", "d", "e", "f", "g", "h", "i", "j"})
 	m.width = 120
 	m.height = 10
 	m.confirming = true
@@ -6125,7 +6295,7 @@ func TestSvcVisibleCount_Warning(t *testing.T) {
 	mc := &mockComposer{}
 	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
 	m.statsRequested = false
-	m.services = []string{"a", "b", "c", "d", "e", "f", "g", "h", "i", "j"}
+	m.setSingleGroup([]string{"a", "b", "c", "d", "e", "f", "g", "h", "i", "j"})
 	m.width = 200
 	m.height = 10
 	m.warning = "something wrong"
@@ -6140,7 +6310,7 @@ func TestSvcVisibleCount_Warning(t *testing.T) {
 func TestSvcVisibleCount_AllFit(t *testing.T) {
 	mc := &mockComposer{}
 	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
-	m.services = []string{"a", "b"}
+	m.setSingleGroup([]string{"a", "b"})
 	m.width = 120
 	m.height = 20
 
@@ -6154,7 +6324,7 @@ func TestSvcVisibleCount_AllFit(t *testing.T) {
 func TestSvcVisibleCount_MinOne(t *testing.T) {
 	mc := &mockComposer{}
 	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
-	m.services = []string{"a", "b", "c"}
+	m.setSingleGroup([]string{"a", "b", "c"})
 	m.width = 120
 	m.height = 5 // header=3, footer=3 → 5-6=-1 → clamped to 1
 
@@ -6167,7 +6337,7 @@ func TestSvcVisibleCount_MinOne(t *testing.T) {
 func TestSvcVisibleCount_WithStatusColumns(t *testing.T) {
 	mc := &mockComposer{}
 	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
-	m.services = []string{"a", "b", "c", "d", "e", "f", "g", "h", "i", "j"}
+	m.setSingleGroup([]string{"a", "b", "c", "d", "e", "f", "g", "h", "i", "j"})
 	m.width = 200
 	m.height = 10
 	m.svcStatus = map[string]runner.ServiceStatus{
@@ -6185,7 +6355,7 @@ func TestHasStatusColumns(t *testing.T) {
 	mc := &mockComposer{}
 	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
 	m.statsRequested = false // exercise the data-driven branch
-	m.services = []string{"a"}
+	m.setSingleGroup([]string{"a"})
 
 	// No status data
 	if m.hasStatusColumns() {
@@ -6217,7 +6387,7 @@ func TestHasStatusColumns(t *testing.T) {
 	}
 
 	// Status for service NOT in m.services should be ignored
-	m.services = []string{"b"}
+	m.setSingleGroup([]string{"b"})
 	m.svcStatus = map[string]runner.ServiceStatus{
 		"a": {Created: "2024-01-15 09:30", Uptime: "3h"},
 	}
@@ -6226,7 +6396,7 @@ func TestHasStatusColumns(t *testing.T) {
 	}
 
 	// Status with only Ports (no Created/Uptime)
-	m.services = []string{"a"}
+	m.setSingleGroup([]string{"a"})
 	m.svcStatus = map[string]runner.ServiceStatus{
 		"a": {Running: true, Ports: []runner.Port{{Host: "0.0.0.0", HostPort: 80, ContainerPort: 80, Protocol: "tcp"}}},
 	}
@@ -6242,7 +6412,7 @@ func TestHasStatusColumns(t *testing.T) {
 func TestHasStatusColumns_StatsRequested(t *testing.T) {
 	mc := &mockComposer{}
 	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
-	m.services = []string{"a"}
+	m.setSingleGroup([]string{"a"})
 	m.statsRequested = true
 	m.svcStatus = nil
 	m.stats = nil
@@ -6272,7 +6442,7 @@ func TestFixSvcOffset_CursorBelowWindow(t *testing.T) {
 	mc := &mockComposer{}
 	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
 	m.statsRequested = false
-	m.services = []string{"a", "b", "c", "d", "e"}
+	m.setSingleGroup([]string{"a", "b", "c", "d", "e"})
 	m.width = 200
 	m.height = 9 // visible = 9-3-3 = 3
 	m.svcCursor = 4
@@ -6289,7 +6459,7 @@ func TestFixSvcOffset_CursorAboveWindow(t *testing.T) {
 	mc := &mockComposer{}
 	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
 	m.statsRequested = false
-	m.services = []string{"a", "b", "c", "d", "e"}
+	m.setSingleGroup([]string{"a", "b", "c", "d", "e"})
 	m.width = 120
 	m.height = 9 // visible = 9-3-3 = 3 (one-line help; reserved bar merges onto MarginTop)
 	m.svcCursor = 1
@@ -6305,7 +6475,7 @@ func TestFixSvcOffset_CursorAboveWindow(t *testing.T) {
 func TestFixSvcOffset_AllItemsFit(t *testing.T) {
 	mc := &mockComposer{}
 	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
-	m.services = []string{"a", "b"}
+	m.setSingleGroup([]string{"a", "b"})
 	m.width = 120
 	m.height = 20 // visible = all
 	m.svcCursor = 1
@@ -6320,7 +6490,7 @@ func TestFixSvcOffset_AllItemsFit(t *testing.T) {
 func TestFixSvcOffset_HeightZeroNoOp(t *testing.T) {
 	mc := &mockComposer{}
 	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
-	m.services = []string{"a", "b", "c"}
+	m.setSingleGroup([]string{"a", "b", "c"})
 	m.height = 0
 	m.svcCursor = 2
 	m.svcOffset = 0
@@ -6336,7 +6506,7 @@ func TestFixSvcOffset_ClampsMaxOffset(t *testing.T) {
 	mc := &mockComposer{}
 	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
 	m.statsRequested = false
-	m.services = []string{"a", "b", "c", "d", "e"}
+	m.setSingleGroup([]string{"a", "b", "c", "d", "e"})
 	m.width = 200
 	m.height = 9 // visible = 9-3-3 = 3
 	m.svcCursor = 4
@@ -6354,7 +6524,7 @@ func TestScrollDown_PastVisibleWindow(t *testing.T) {
 	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
 	m.statsRequested = false // isolate scroll math from the captions row
 	m.screen = screenSelectContainers
-	m.services = mc.services
+	m.setSingleGroup(mc.services)
 	m.width = 200
 	m.height = 9 // visible = 9-3-3 = 3
 
@@ -6382,7 +6552,7 @@ func TestScrollUp_PastTopOfWindow(t *testing.T) {
 	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
 	m.statsRequested = false
 	m.screen = screenSelectContainers
-	m.services = mc.services
+	m.setSingleGroup(mc.services)
 	m.width = 160
 	m.height = 9 // visible = 9-3-3 = 3
 	m.svcCursor = 4
@@ -6406,7 +6576,7 @@ func TestConfirming_CallsFixSvcOffset(t *testing.T) {
 	mc := &mockComposer{services: []string{"a", "b", "c", "d", "e", "f", "g", "h"}}
 	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
 	m.screen = screenSelectContainers
-	m.services = mc.services
+	m.setSingleGroup(mc.services)
 	m.width = 120
 	m.height = 8 // visible normal = confirming (constant with reserved search bar)
 
@@ -6433,7 +6603,7 @@ func TestSelectAll_DoesNotChangeOffset(t *testing.T) {
 	mc := &mockComposer{services: []string{"a", "b", "c", "d", "e"}}
 	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
 	m.screen = screenSelectContainers
-	m.services = mc.services
+	m.setSingleGroup(mc.services)
 	m.width = 160
 	m.height = 9 // visible = 3
 	m.svcCursor = 3
@@ -6451,7 +6621,7 @@ func TestWindowResize_FixesOffset(t *testing.T) {
 	mc := &mockComposer{services: []string{"a", "b", "c", "d", "e"}}
 	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
 	m.screen = screenSelectContainers
-	m.services = mc.services
+	m.setSingleGroup(mc.services)
 	m.width = 160
 	m.height = 20 // all fit
 	m.svcCursor = 4
@@ -6473,7 +6643,7 @@ func TestViewSelectContainers_UpIndicator(t *testing.T) {
 	mc := &mockComposer{services: []string{"a", "b", "c", "d", "e"}}
 	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
 	m.screen = screenSelectContainers
-	m.services = mc.services
+	m.setSingleGroup(mc.services)
 	m.svcStatus = map[string]runner.ServiceStatus{}
 	m.width = 160
 	m.height = 9 // visible = 3
@@ -6491,7 +6661,7 @@ func TestViewSelectContainers_DownIndicator(t *testing.T) {
 	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
 	m.statsRequested = false
 	m.screen = screenSelectContainers
-	m.services = mc.services
+	m.setSingleGroup(mc.services)
 	m.svcStatus = map[string]runner.ServiceStatus{}
 	m.width = 200
 	m.height = 8 // visible = 8-3-3 = 2
@@ -6508,7 +6678,7 @@ func TestViewSelectContainers_NoIndicatorsWhenAllFit(t *testing.T) {
 	mc := &mockComposer{services: []string{"a", "b"}}
 	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
 	m.screen = screenSelectContainers
-	m.services = mc.services
+	m.setSingleGroup(mc.services)
 	m.svcStatus = map[string]runner.ServiceStatus{}
 	m.width = 120
 	m.height = 20 // plenty of room
@@ -6529,7 +6699,7 @@ func TestViewSelectContainers_BothIndicators(t *testing.T) {
 	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
 	m.statsRequested = false
 	m.screen = screenSelectContainers
-	m.services = mc.services
+	m.setSingleGroup(mc.services)
 	m.svcStatus = map[string]runner.ServiceStatus{}
 	m.width = 200
 	m.height = 8 // visible = 8-3-3 = 2
@@ -6549,7 +6719,7 @@ func TestViewSelectContainers_HeightZeroRendersAll(t *testing.T) {
 	mc := &mockComposer{services: []string{"a", "b", "c", "d", "e"}}
 	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
 	m.screen = screenSelectContainers
-	m.services = mc.services
+	m.setSingleGroup(mc.services)
 	m.svcStatus = map[string]runner.ServiceStatus{}
 	m.width = 0
 	m.height = 0
@@ -6570,7 +6740,7 @@ func TestViewSelectContainers_WindowedOnlyShowsVisibleServices(t *testing.T) {
 	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
 	m.statsRequested = false
 	m.screen = screenSelectContainers
-	m.services = mc.services
+	m.setSingleGroup(mc.services)
 	m.svcStatus = map[string]runner.ServiceStatus{}
 	m.width = 200
 	m.height = 9 // visible = 9-3-3 = 3
@@ -6599,7 +6769,7 @@ func TestViewSelectContainers_CreatedAndUptime(t *testing.T) {
 	mc := &mockComposer{services: []string{"web", "db", "cache"}}
 	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
 	m.screen = screenSelectContainers
-	m.services = mc.services
+	m.setSingleGroup(mc.services)
 	m.svcStatus = map[string]runner.ServiceStatus{
 		"web":   {Running: true, Created: "2024-01-15 09:30", Uptime: "3h"},
 		"db":    {Running: true, Created: "2024-01-14 08:00", Uptime: "1d 3h"},
@@ -6634,7 +6804,7 @@ func TestViewSelectContainers_CreatedAndUptimeAlignment(t *testing.T) {
 	mc := &mockComposer{services: []string{"nginx", "postgres-db"}}
 	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
 	m.screen = screenSelectContainers
-	m.services = mc.services
+	m.setSingleGroup(mc.services)
 	m.svcStatus = map[string]runner.ServiceStatus{
 		"nginx":       {Running: true, Created: "2024-01-15 09:30", Uptime: "3h"},
 		"postgres-db": {Running: true, Created: "2024-01-14 08:00", Uptime: "1d 3h"},
@@ -6670,7 +6840,7 @@ func TestViewSelectContainers_Ports(t *testing.T) {
 	mc := &mockComposer{services: []string{"web", "db"}}
 	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
 	m.screen = screenSelectContainers
-	m.services = mc.services
+	m.setSingleGroup(mc.services)
 	m.svcStatus = map[string]runner.ServiceStatus{
 		"web": {Running: true, Ports: []runner.Port{
 			{Host: "0.0.0.0", HostPort: 8080, ContainerPort: 80, Protocol: "tcp"},
@@ -6701,7 +6871,7 @@ func TestViewSelectContainers_PortsAlignment(t *testing.T) {
 	mc := &mockComposer{services: []string{"nginx", "api"}}
 	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
 	m.screen = screenSelectContainers
-	m.services = mc.services
+	m.setSingleGroup(mc.services)
 	m.svcStatus = map[string]runner.ServiceStatus{
 		"nginx": {Running: true, Ports: []runner.Port{
 			{Host: "0.0.0.0", HostPort: 80, ContainerPort: 80, Protocol: "tcp"},
@@ -6765,7 +6935,7 @@ func TestViewSelectContainers_NoPortsColumnWhenAllEmpty(t *testing.T) {
 	mc := &mockComposer{services: []string{"web", "db"}}
 	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
 	m.screen = screenSelectContainers
-	m.services = mc.services
+	m.setSingleGroup(mc.services)
 	m.svcStatus = map[string]runner.ServiceStatus{
 		"web": {Running: true, Created: "2024-01-15 09:30", Uptime: "3h"},
 		"db":  {Running: false, Created: "2024-01-15 09:30"},
@@ -6783,7 +6953,7 @@ func TestViewSelectContainers_NoColumnsWhenNoStatus(t *testing.T) {
 	mc := &mockComposer{services: []string{"web", "db"}}
 	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
 	m.screen = screenSelectContainers
-	m.services = mc.services
+	m.setSingleGroup(mc.services)
 	m.svcStatus = map[string]runner.ServiceStatus{
 		"web": {Running: true},
 		"db":  {Running: false},
@@ -7932,7 +8102,7 @@ func TestQuitConfirmation_RemoteConnection_ShowsPrompt(t *testing.T) {
 	m := NewModel(nil, io.Discard, mockFactory(mc), testServers, mockConnectCb(mc))
 	m.screen = screenSelectContainers
 	m.showPicker = true
-	m.services = mc.services
+	m.setSingleGroup(mc.services)
 	m.selected = make(map[int]bool)
 	m.disconnectFunc = func() error { return nil }
 	m.serverName = "prod"
@@ -7957,7 +8127,7 @@ func TestQuitConfirmation_LocalSession_QuitsImmediately(t *testing.T) {
 	mc := &mockComposer{services: []string{"nginx"}}
 	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
 	m.screen = screenSelectContainers
-	m.services = mc.services
+	m.setSingleGroup(mc.services)
 	m.selected = make(map[int]bool)
 
 	updated, cmd := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'q'}})
@@ -7976,7 +8146,7 @@ func TestQuitConfirmation_NoCancels(t *testing.T) {
 	mc := &mockComposer{services: []string{"nginx"}}
 	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
 	m.screen = screenSelectContainers
-	m.services = mc.services
+	m.setSingleGroup(mc.services)
 	m.selected = make(map[int]bool)
 	m.quitting = true
 	m.disconnectFunc = func() error { return nil }
@@ -8000,7 +8170,7 @@ func TestQuitConfirmation_EscCancels(t *testing.T) {
 	mc := &mockComposer{services: []string{"nginx"}}
 	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
 	m.screen = screenSelectContainers
-	m.services = mc.services
+	m.setSingleGroup(mc.services)
 	m.selected = make(map[int]bool)
 	m.quitting = true
 	m.disconnectFunc = func() error { return nil }
@@ -8021,7 +8191,7 @@ func TestQuitConfirmation_OtherKeysSwallowed(t *testing.T) {
 	mc := &mockComposer{services: []string{"nginx"}}
 	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
 	m.screen = screenSelectContainers
-	m.services = mc.services
+	m.setSingleGroup(mc.services)
 	m.selected = make(map[int]bool)
 	m.quitting = true
 	m.disconnectFunc = func() error { return nil }
@@ -8077,11 +8247,11 @@ func TestCtrlCConfirmation_AllRemoteScreens(t *testing.T) {
 			m.projects = []compose.Project{{Name: "app", ConfigDir: "/app"}}
 		}},
 		{"containers normal", screenSelectContainers, "ctrl+c", func(m *Model) {
-			m.services = []string{"nginx"}
+			m.setSingleGroup([]string{"nginx"})
 			m.selected = make(map[int]bool)
 		}},
 		{"containers confirming", screenSelectContainers, "ctrl+c", func(m *Model) {
-			m.services = []string{"nginx"}
+			m.setSingleGroup([]string{"nginx"})
 			m.selected = map[int]bool{0: true}
 			m.confirming = true
 			m.pendingOp = runner.Deploy
@@ -8146,7 +8316,7 @@ func TestQuitConfirmation_ViewRendersDisconnectPrompt(t *testing.T) {
 	mc := &mockComposer{}
 	m := NewModel(nil, io.Discard, mockFactory(mc), testServers, mockConnectCb(mc))
 	m.screen = screenSelectContainers
-	m.services = []string{"nginx"}
+	m.setSingleGroup([]string{"nginx"})
 	m.selected = make(map[int]bool)
 	m.disconnectFunc = func() error { return nil }
 	m.serverName = "prod-server"
@@ -8190,7 +8360,7 @@ func TestQuitConfirmation_YesReturnsQuitMsg(t *testing.T) {
 	mc := &mockComposer{services: []string{"nginx"}}
 	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
 	m.screen = screenSelectContainers
-	m.services = mc.services
+	m.setSingleGroup(mc.services)
 	m.selected = make(map[int]bool)
 	m.quitting = true
 	m.disconnectFunc = func() error { return nil }
@@ -8212,7 +8382,7 @@ func TestQuitConfirmation_LocalQuitReturnsQuitMsg(t *testing.T) {
 	mc := &mockComposer{services: []string{"nginx"}}
 	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
 	m.screen = screenSelectContainers
-	m.services = mc.services
+	m.setSingleGroup(mc.services)
 	m.selected = make(map[int]bool)
 
 	_, cmd := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'q'}})
@@ -8273,7 +8443,7 @@ func TestQBackNavigation_ContainerScreen(t *testing.T) {
 	m := NewModel(nil, io.Discard, mockFactory(mc), testServers, mockConnectCb(mc))
 	m.screen = screenSelectContainers
 	m.showPicker = true
-	m.services = []string{"nginx"}
+	m.setSingleGroup([]string{"nginx"})
 	m.selected = make(map[int]bool)
 	m.composer = mc
 
@@ -8296,7 +8466,7 @@ func TestQBackNavigation_ContainerScreenCancelsConfirming(t *testing.T) {
 	m := NewModel(nil, io.Discard, mockFactory(mc), testServers, mockConnectCb(mc))
 	m.screen = screenSelectContainers
 	m.showPicker = true
-	m.services = []string{"nginx"}
+	m.setSingleGroup([]string{"nginx"})
 	m.selected = map[int]bool{0: true}
 	m.confirming = true
 	m.pendingOp = runner.Deploy
@@ -8322,7 +8492,7 @@ func TestQBackNavigation_ContainerScreenCancelsPendingExec(t *testing.T) {
 	m := NewModel(nil, io.Discard, mockFactory(mc), testServers, mockConnectCb(mc))
 	m.screen = screenSelectContainers
 	m.showPicker = true
-	m.services = []string{"nginx"}
+	m.setSingleGroup([]string{"nginx"})
 	m.selected = map[int]bool{0: true}
 	m.confirming = true
 	m.pendingExec = true
@@ -8458,7 +8628,7 @@ func TestQBackNavigation_ProgressDoneReturnsToContainers(t *testing.T) {
 			m.screen = screenProgress
 			m.done = tc.done
 			m.failed = tc.fail
-			m.services = []string{"nginx"}
+			m.setSingleGroup([]string{"nginx"})
 			m.selected = make(map[int]bool)
 
 			updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'q'}})
@@ -8560,7 +8730,7 @@ func TestQQuitsAtRoot_ContainerScreenStandalone(t *testing.T) {
 	m.screen = screenSelectContainers
 	m.showPicker = false
 	m.confirming = false
-	m.services = mc.services
+	m.setSingleGroup(mc.services)
 	m.selected = make(map[int]bool)
 
 	_, cmd := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'q'}})
@@ -8619,7 +8789,7 @@ func TestCtrlCStillTriggersDisconnectPrompt(t *testing.T) {
 	m := NewModel(nil, io.Discard, mockFactory(mc), testServers, mockConnectCb(mc))
 	m.screen = screenSelectContainers
 	m.showPicker = true
-	m.services = []string{"nginx"}
+	m.setSingleGroup([]string{"nginx"})
 	m.selected = make(map[int]bool)
 	m.disconnectFunc = func() error { return nil }
 	m.serverName = "prod"
@@ -8640,7 +8810,7 @@ func TestQDuringQuittingPromptStillSwallowed(t *testing.T) {
 	m := NewModel(nil, io.Discard, mockFactory(mc), testServers, mockConnectCb(mc))
 	m.screen = screenSelectContainers
 	m.showPicker = true
-	m.services = []string{"nginx"}
+	m.setSingleGroup([]string{"nginx"})
 	m.selected = make(map[int]bool)
 	m.disconnectFunc = func() error { return nil }
 	m.serverName = "prod"
@@ -8661,7 +8831,7 @@ func TestColumnCaptions_ShownWithStatusData(t *testing.T) {
 	mc := &mockComposer{}
 	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
 	m.screen = screenSelectContainers
-	m.services = []string{"web", "api"}
+	m.setSingleGroup([]string{"web", "api"})
 	m.selected = map[int]bool{}
 	m.svcStatus = map[string]runner.ServiceStatus{
 		"web": {Running: true, Created: "2024-01-15 09:30", Uptime: "3h"},
@@ -8681,7 +8851,7 @@ func TestColumnCaptions_HiddenWithoutStatusData(t *testing.T) {
 	mc := &mockComposer{}
 	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
 	m.screen = screenSelectContainers
-	m.services = []string{"web", "api"}
+	m.setSingleGroup([]string{"web", "api"})
 	m.selected = map[int]bool{}
 	m.svcStatus = map[string]runner.ServiceStatus{
 		"web": {Running: true},
@@ -8701,7 +8871,7 @@ func TestColumnCaptions_Alignment(t *testing.T) {
 	mc := &mockComposer{}
 	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
 	m.screen = screenSelectContainers
-	m.services = []string{"web", "api-service"}
+	m.setSingleGroup([]string{"web", "api-service"})
 	m.selected = map[int]bool{}
 	m.svcStatus = map[string]runner.ServiceStatus{
 		"web":         {Running: true, Created: "2024-01-15 09:30", Uptime: "3h"},
@@ -8755,7 +8925,7 @@ func TestExec_XKeyOnRunningServiceTriggersConfirm(t *testing.T) {
 		},
 	}
 	m := NewModel(mc, io.Discard, mockExecFactory(mc), nil, nil)
-	m.services = mc.services
+	m.setSingleGroup(mc.services)
 	m.svcStatus = mc.status
 	m.screen = screenSelectContainers
 	m.svcCursor = 0 // "web" is running
@@ -8784,7 +8954,7 @@ func TestExec_XKeyOnStoppedServiceShowsWarning(t *testing.T) {
 		},
 	}
 	m := NewModel(mc, io.Discard, mockExecFactory(mc), nil, nil)
-	m.services = mc.services
+	m.setSingleGroup(mc.services)
 	m.svcStatus = mc.status
 	m.screen = screenSelectContainers
 	m.svcCursor = 1 // "db" is stopped
@@ -8812,7 +8982,7 @@ func TestExec_XKeyWithoutExecProviderIsNoOp(t *testing.T) {
 		status:   map[string]runner.ServiceStatus{"web": {Running: true}},
 	}
 	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
-	m.services = mc.services
+	m.setSingleGroup(mc.services)
 	m.svcStatus = mc.status
 	m.screen = screenSelectContainers
 	m.svcCursor = 0
@@ -8841,7 +9011,7 @@ func TestExec_XKeyOnNoServicesIsNoOp(t *testing.T) {
 		},
 	}
 	m := NewModel(mc, io.Discard, mockExecFactory(mc), nil, nil)
-	m.services = mc.services
+	m.setSingleGroup(mc.services)
 	m.svcStatus = mc.status
 	m.screen = screenSelectContainers
 	m.width = 120
@@ -8863,7 +9033,7 @@ func TestExec_ConfirmEnterDispatchesExecProcess(t *testing.T) {
 		},
 	}
 	m := NewModel(mc, io.Discard, mockExecFactory(mc), nil, nil)
-	m.services = mc.services
+	m.setSingleGroup(mc.services)
 	m.svcStatus = mc.status
 	m.screen = screenSelectContainers
 	m.svcCursor = 0
@@ -8887,7 +9057,7 @@ func TestExec_ConfirmEscClearsPendingExec(t *testing.T) {
 		},
 	}
 	m := NewModel(mc, io.Discard, mockExecFactory(mc), nil, nil)
-	m.services = mc.services
+	m.setSingleGroup(mc.services)
 	m.svcStatus = mc.status
 	m.screen = screenSelectContainers
 	m.svcCursor = 0
@@ -8915,7 +9085,7 @@ func TestExec_ExecDoneMsgRefreshesStatus(t *testing.T) {
 		},
 	}
 	m := NewModel(mc, io.Discard, mockExecFactory(mc), nil, nil)
-	m.services = mc.services
+	m.setSingleGroup(mc.services)
 	m.svcStatus = mc.status
 	m.screen = screenSelectContainers
 	m.pendingExec = true
@@ -8943,7 +9113,7 @@ func TestExec_ExecDoneMsgWithErrorStillResetsState(t *testing.T) {
 		},
 	}
 	m := NewModel(mc, io.Discard, mockExecFactory(mc), nil, nil)
-	m.services = mc.services
+	m.setSingleGroup(mc.services)
 	m.svcStatus = mc.status
 	m.screen = screenSelectContainers
 	m.pendingExec = true
@@ -8977,7 +9147,7 @@ func TestExec_ExecDoneMsgStaleMessageGuard(t *testing.T) {
 		},
 	}
 	m := NewModel(mc, io.Discard, mockExecFactory(mc), nil, nil)
-	m.services = mc.services
+	m.setSingleGroup(mc.services)
 	m.svcStatus = mc.status
 	m.screen = screenLogs // not on container screen
 	m.pendingExec = true
@@ -9009,7 +9179,7 @@ func TestExec_ViewShowsExecConfirmation(t *testing.T) {
 		},
 	}
 	m := NewModel(mc, io.Discard, mockExecFactory(mc), nil, nil)
-	m.services = mc.services
+	m.setSingleGroup(mc.services)
 	m.svcStatus = mc.status
 	m.screen = screenSelectContainers
 	m.svcCursor = 0
@@ -9047,7 +9217,7 @@ func TestExec_XKeyOnServiceWithNoStatus(t *testing.T) {
 		},
 	}
 	m := NewModel(mc, io.Discard, mockExecFactory(mc), nil, nil)
-	m.services = mc.services
+	m.setSingleGroup(mc.services)
 	m.svcStatus = mc.status
 	m.screen = screenSelectContainers
 	m.svcCursor = 0
@@ -9165,7 +9335,7 @@ func TestEsc_clearsStats(t *testing.T) {
 	m.screen = screenSelectContainers
 	m.showPicker = true
 	m.projects = []compose.Project{{Name: "proj"}}
-	m.services = []string{"web"}
+	m.setSingleGroup([]string{"web"})
 	m.svcStatus = map[string]runner.ServiceStatus{"web": {Running: true}}
 	m.stats = map[string]runner.ServiceStats{"web": {CPUPercent: 4.2}}
 	m.statsErr = errors.New("stale stats error")
@@ -9706,7 +9876,7 @@ func TestServicesMsg_staleSessionIgnored(t *testing.T) {
 	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
 	m.screen = screenSelectContainers
 	m.statusSession = 9 // current
-	m.services = []string{"new-svc"}
+	m.setSingleGroup([]string{"new-svc"})
 	m.svcStatus = map[string]runner.ServiceStatus{"new-svc": {Running: true}}
 
 	result, _ := m.Update(servicesMsg{
@@ -9730,7 +9900,7 @@ func TestServicesMsg_offScreenIgnored(t *testing.T) {
 	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
 	m.screen = screenProgress
 	m.statusSession = 1
-	m.services = []string{"existing"}
+	m.setSingleGroup([]string{"existing"})
 
 	result, _ := m.Update(servicesMsg{
 		services: []string{"unwanted"},
@@ -9851,7 +10021,7 @@ func TestContainerScreen_rendersStatsColumns(t *testing.T) {
 	mc := &mockComposer{services: []string{"web", "db"}}
 	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
 	m.screen = screenSelectContainers
-	m.services = mc.services
+	m.setSingleGroup(mc.services)
 	m.svcStatus = map[string]runner.ServiceStatus{
 		"web": {Running: true},
 		"db":  {Running: true},
@@ -9905,7 +10075,7 @@ func TestContainerScreen_serviceColumnHasCaption(t *testing.T) {
 	mc := &mockComposer{services: []string{"web", "db"}}
 	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
 	m.screen = screenSelectContainers
-	m.services = mc.services
+	m.setSingleGroup(mc.services)
 	m.svcStatus = map[string]runner.ServiceStatus{
 		"web": {Running: true, Created: "2024-01-15 09:30"},
 		"db":  {Running: true, Created: "2024-01-15 09:30"},
@@ -9941,7 +10111,7 @@ func TestContainerScreen_serviceCaptionWidensShortNames(t *testing.T) {
 	mc := &mockComposer{services: []string{"a", "b"}} // both 1 char, shorter than "Service"
 	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
 	m.screen = screenSelectContainers
-	m.services = mc.services
+	m.setSingleGroup(mc.services)
 	m.svcStatus = map[string]runner.ServiceStatus{
 		"a": {Running: true, Created: "2024-01-15 09:30"},
 		"b": {Running: true, Created: "2024-01-15 09:30"},
@@ -9992,7 +10162,7 @@ func TestContainerScreen_statsColumnWidthsAreStable(t *testing.T) {
 	mc := &mockComposer{services: []string{"small", "big"}}
 	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
 	m.screen = screenSelectContainers
-	m.services = mc.services
+	m.setSingleGroup(mc.services)
 	m.svcStatus = map[string]runner.ServiceStatus{
 		"small": {Running: true},
 		"big":   {Running: true},
@@ -10043,7 +10213,7 @@ func TestContainerScreen_blankCellsForMissingStats(t *testing.T) {
 	mc := &mockComposer{services: []string{"web", "db"}}
 	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
 	m.screen = screenSelectContainers
-	m.services = mc.services
+	m.setSingleGroup(mc.services)
 	m.svcStatus = map[string]runner.ServiceStatus{
 		"web": {Running: true},
 		"db":  {Running: true},
@@ -10088,7 +10258,7 @@ func TestContainerScreen_blankCellsForStoppedService(t *testing.T) {
 	mc := &mockComposer{services: []string{"web", "db"}}
 	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
 	m.screen = screenSelectContainers
-	m.services = mc.services
+	m.setSingleGroup(mc.services)
 	m.svcStatus = map[string]runner.ServiceStatus{
 		"web": {Running: true},
 		"db":  {Running: false},
@@ -10128,7 +10298,7 @@ func TestContainerScreen_StatsCaptionsReservedBeforeData(t *testing.T) {
 	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
 	m.screen = screenSelectContainers
 	m.statsRequested = true
-	m.services = mc.services
+	m.setSingleGroup(mc.services)
 	m.svcStatus = map[string]runner.ServiceStatus{
 		"web": {Running: true},
 	}
@@ -10153,7 +10323,7 @@ func TestContainerScreen_NoStatsCaptionsAbsentWithoutRequest(t *testing.T) {
 	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
 	m.screen = screenSelectContainers
 	m.statsRequested = false
-	m.services = mc.services
+	m.setSingleGroup(mc.services)
 	m.svcStatus = map[string]runner.ServiceStatus{
 		"web": {Running: true},
 	}
@@ -10174,7 +10344,7 @@ func TestContainerScreen_statsErrFallback(t *testing.T) {
 	mc := &mockComposer{services: []string{"web"}}
 	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
 	m.screen = screenSelectContainers
-	m.services = mc.services
+	m.setSingleGroup(mc.services)
 	m.svcStatus = map[string]runner.ServiceStatus{"web": {Running: true}}
 	m.statsErr = errors.New("docker stats failed: timeout")
 	m.width = 200
@@ -10199,7 +10369,7 @@ func TestContainerScreen_svcErrPreferred(t *testing.T) {
 	mc := &mockComposer{services: []string{"web"}}
 	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
 	m.screen = screenSelectContainers
-	m.services = mc.services
+	m.setSingleGroup(mc.services)
 	m.svcStatus = map[string]runner.ServiceStatus{"web": {Running: true}}
 	m.svcErr = errors.New("services load failed")
 	m.statsErr = errors.New("stats fetch failed too")
@@ -10227,7 +10397,7 @@ func TestSvcVisibleCount_withStatsColumns(t *testing.T) {
 	// change the per-row line count beyond the existing Created/Uptime case.
 	mc := &mockComposer{}
 	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
-	m.services = []string{"a", "b", "c", "d", "e", "f", "g", "h", "i", "j"}
+	m.setSingleGroup([]string{"a", "b", "c", "d", "e", "f", "g", "h", "i", "j"})
 	m.width = 200
 	m.height = 10
 	m.svcStatus = map[string]runner.ServiceStatus{
@@ -10248,7 +10418,7 @@ func TestHasStatusColumns_StatsDataAlone(t *testing.T) {
 	// Stats data alone (no Created/Uptime/Ports) should trigger captions row.
 	mc := &mockComposer{}
 	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
-	m.services = []string{"web"}
+	m.setSingleGroup([]string{"web"})
 	m.svcStatus = map[string]runner.ServiceStatus{"web": {Running: true}}
 	m.stats = map[string]runner.ServiceStats{
 		"web": {CPUPercent: 4.2},
@@ -11897,7 +12067,7 @@ func TestUpdateDetails_UStaysLiveDuringTheDetailScan(t *testing.T) {
 	m := NewModel(mc, io.Discard, mockFactory(&mc.mockComposer), nil, nil)
 	m.composer = mc
 	m.screen = screenSelectContainers
-	m.services = []string{"web"}
+	m.setSingleGroup([]string{"web"})
 	m.svcStatus = map[string]runner.ServiceStatus{"web": {Running: true}}
 	m.detailsInFlight = true
 	m.updateInFlight = false
@@ -12832,7 +13002,7 @@ func TestViewSelectContainers_UpdateGlyphRendered(t *testing.T) {
 	mc := &mockComposer{}
 	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
 	m.screen = screenSelectContainers
-	m.services = []string{"web", "db", "cache"}
+	m.setSingleGroup([]string{"web", "db", "cache"})
 	m.svcStatus = map[string]runner.ServiceStatus{
 		"web":   {Running: true, UpdateAvailable: trueP()},
 		"db":    {Running: true, UpdateAvailable: falseP()},
@@ -12865,7 +13035,7 @@ func TestViewSelectContainers_UpdateGlyphOnStoppedService(t *testing.T) {
 	mc := &mockComposer{}
 	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
 	m.screen = screenSelectContainers
-	m.services = []string{"web"}
+	m.setSingleGroup([]string{"web"})
 	m.svcStatus = map[string]runner.ServiceStatus{
 		"web": {Running: false, UpdateAvailable: trueP()},
 	}
@@ -12884,7 +13054,7 @@ func TestViewSelectContainers_UpdateAlignment_PreservesColumns(t *testing.T) {
 	mc := &mockComposer{}
 	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
 	m.screen = screenSelectContainers
-	m.services = []string{"web", "db", "cache"}
+	m.setSingleGroup([]string{"web", "db", "cache"})
 	m.svcStatus = map[string]runner.ServiceStatus{
 		// Created/Uptime are present so the Created column renders, giving us
 		// a stable column to align against.
@@ -12942,7 +13112,7 @@ func TestViewSelectContainers_SoftWarningPriority_StatsBeatsUpdates(t *testing.T
 	mc := &mockComposer{}
 	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
 	m.screen = screenSelectContainers
-	m.services = []string{"web"}
+	m.setSingleGroup([]string{"web"})
 	m.svcStatus = map[string]runner.ServiceStatus{"web": {Running: true}}
 	m.width = 200
 	m.height = 24
@@ -12964,7 +13134,7 @@ func TestViewSelectContainers_SoftWarningPriority_UpdatesAloneShown(t *testing.T
 	mc := &mockComposer{}
 	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
 	m.screen = screenSelectContainers
-	m.services = []string{"web"}
+	m.setSingleGroup([]string{"web"})
 	m.svcStatus = map[string]runner.ServiceStatus{"web": {Running: true}}
 	m.width = 200
 	m.height = 24
@@ -12986,7 +13156,7 @@ func TestViewSelectContainers_NoGlyph_ReservationAlwaysApplied(t *testing.T) {
 	mc := &mockComposer{}
 	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
 	m.screen = screenSelectContainers
-	m.services = []string{"web", "db"}
+	m.setSingleGroup([]string{"web", "db"})
 	m.svcStatus = map[string]runner.ServiceStatus{
 		// All UpdateAvailable=nil → no glyph rendered, but the reservation
 		// must still apply so downstream columns don't shift when a verdict
@@ -13282,7 +13452,7 @@ func TestUpdatesMsg_OffScreenErrorFixesOffset(t *testing.T) {
 	// the last visible row pre-error; post-error it falls outside the new window.
 	m.width = 200
 	m.height = 9
-	m.services = []string{"a", "b", "c", "d", "e"}
+	m.setSingleGroup([]string{"a", "b", "c", "d", "e"})
 	m.svcStatus = map[string]runner.ServiceStatus{
 		"a": {Running: true},
 		"b": {Running: true},
@@ -13313,11 +13483,9 @@ func TestUpdatesMsg_OffScreenErrorFixesOffset(t *testing.T) {
 // Uses a literal (not NewModel) so the "/" handler is responsible for building
 // the textinput, matching the plan's "fresh input on every open" contract.
 func containerSearchModel(services []string) Model {
-	return Model{
-		screen:   screenSelectContainers,
-		services: services,
-		selected: make(map[int]bool),
-	}
+	m := singleGroupModel(services)
+	m.screen = screenSelectContainers
+	return m
 }
 
 func TestSearchOpen(t *testing.T) {
@@ -14045,7 +14213,7 @@ func TestSvcVisibleCount_ConstantAcrossConfirming(t *testing.T) {
 		mc := &mockComposer{}
 		m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
 		m.statsRequested = false
-		m.services = []string{"api", "web", "web-worker", "db", "cache", "queue"}
+		m.setSingleGroup([]string{"api", "web", "web-worker", "db", "cache", "queue"})
 		m.width = 200 // one-line help in both branches
 		m.height = 12
 		m.searchQuery = "w"
@@ -14092,7 +14260,7 @@ func TestSearchClearedOnServicesReload(t *testing.T) {
 	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
 	installFakeTick(&m)
 	m.screen = screenSelectContainers
-	m.services = mc.services
+	m.setSingleGroup(mc.services)
 	m.searchQuery = "w"
 	m.searchMatches = computeMatches(m.services, "w") // [1 2]
 	m.svcCursor = 1
@@ -14158,7 +14326,7 @@ func TestSearchClearedOnEnterLogs(t *testing.T) {
 	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
 	installFakeTick(&m)
 	m.screen = screenSelectContainers
-	m.services = mc.services
+	m.setSingleGroup(mc.services)
 	m.composer = mc
 	m.width = 80
 	m.height = 24
@@ -14182,7 +14350,7 @@ func TestSearchClearedOnEnterProgress(t *testing.T) {
 	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
 	installFakeTick(&m)
 	m.screen = screenSelectContainers
-	m.services = mc.services
+	m.setSingleGroup(mc.services)
 	m.composer = mc
 	m.width = 80
 	m.height = 24
@@ -14208,7 +14376,7 @@ func TestSearchClearedEnterLogsThenEscBack(t *testing.T) {
 	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
 	installFakeTick(&m)
 	m.screen = screenSelectContainers
-	m.services = mc.services
+	m.setSingleGroup(mc.services)
 	m.composer = mc
 	m.width = 80
 	m.height = 24
@@ -14505,7 +14673,7 @@ func TestSearchClearedOnEnterConfig(t *testing.T) {
 	m := NewModel(mc, io.Discard, mockConfigFactory(mc), nil, nil)
 	installFakeTick(&m)
 	m.screen = screenSelectContainers
-	m.services = mc.services
+	m.setSingleGroup(mc.services)
 	m.composer = mc
 	m.width = 80
 	m.height = 24
@@ -14531,7 +14699,7 @@ func TestSearchClearedOnEnterExec(t *testing.T) {
 	m := NewModel(mc, io.Discard, mockExecFactory(mc), nil, nil)
 	installFakeTick(&m)
 	m.screen = screenSelectContainers
-	m.services = mc.services
+	m.setSingleGroup(mc.services)
 	m.composer = mc
 	m.width = 80
 	m.height = 24
@@ -14689,7 +14857,7 @@ func TestEnterProgress_DeploySnapshotsBeforeStop(t *testing.T) {
 	}
 	m := NewModel(mc, io.Discard, mockFactory(&mc.mockComposer), nil, nil)
 	m.screen = screenSelectContainers
-	m.services = mc.services
+	m.setSingleGroup(mc.services)
 	m.composer = mc
 	m.selected[0] = true
 	m.pendingOp = runner.Deploy
@@ -14721,7 +14889,7 @@ func TestEnterProgress_NonSnapshotterMockRunsAsToday(t *testing.T) {
 	mc := &mockComposer{services: []string{"web"}}
 	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
 	m.screen = screenSelectContainers
-	m.services = mc.services
+	m.setSingleGroup(mc.services)
 	m.composer = mc
 	m.selected[0] = true
 	m.pendingOp = runner.Deploy
@@ -14744,11 +14912,11 @@ func TestPipelineDone_StartsWaitAfterDone(t *testing.T) {
 	m := Model{
 		screen:       screenProgress,
 		pendingOp:    runner.Deploy,
-		services:     []string{"web"},
 		opContainers: []string{"web"},
 		composer:     mc,
 		ctx:          context.Background(),
 	}
+	m.setSingleGroup([]string{"web"})
 
 	updated, cmd := m.Update(pipelineDoneMsg{})
 	m = updated.(Model)
@@ -14771,7 +14939,8 @@ func TestPipelineDone_StartsWaitAfterDone(t *testing.T) {
 }
 
 func TestPipelineDone_NoWaitOnFailed(t *testing.T) {
-	m := Model{screen: screenProgress, pendingOp: runner.Deploy, failed: true, services: []string{"web"}, opContainers: []string{"web"}}
+	m := Model{screen: screenProgress, pendingOp: runner.Deploy, failed: true, opContainers: []string{"web"}}
+	m.setSingleGroup([]string{"web"})
 
 	updated, cmd := m.Update(pipelineDoneMsg{})
 	m = updated.(Model)
@@ -14788,7 +14957,8 @@ func TestPipelineDone_NoWaitOnFailed(t *testing.T) {
 }
 
 func TestPipelineDone_StopOnlyNeverWaits(t *testing.T) {
-	m := Model{screen: screenProgress, pendingOp: runner.StopOnly, services: []string{"web"}, opContainers: []string{"web"}}
+	m := Model{screen: screenProgress, pendingOp: runner.StopOnly, opContainers: []string{"web"}}
+	m.setSingleGroup([]string{"web"})
 
 	updated, cmd := m.Update(pipelineDoneMsg{})
 	m = updated.(Model)
@@ -14809,10 +14979,10 @@ func TestPipelineDone_EmptyTargetsFallsBackToServices(t *testing.T) {
 	m := Model{
 		screen:    screenProgress,
 		pendingOp: runner.Restart,
-		services:  []string{"web", "db"},
 		composer:  mc,
 		ctx:       context.Background(),
 	} // opContainers deliberately nil
+	m.setSingleGroup([]string{"web", "db"})
 
 	updated, _ := m.Update(pipelineDoneMsg{})
 	m = updated.(Model)
@@ -15224,10 +15394,10 @@ func TestRollbackKey_NonPreparerIgnored(t *testing.T) {
 	mc := &mockComposer{services: []string{"web"}}
 	m := Model{
 		screen:   screenSelectContainers,
-		services: []string{"web"},
 		composer: mc,
 		selected: map[int]bool{0: true},
 	}
+	m.setSingleGroup([]string{"web"})
 	updated, cmd := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'R'}})
 	m = updated.(Model)
 	if m.confirming {
@@ -15240,7 +15410,8 @@ func TestRollbackKey_NonPreparerIgnored(t *testing.T) {
 
 func TestRollbackKey_EmptyListIgnored(t *testing.T) {
 	mc := &mockRollbackComposer{}
-	m := Model{screen: screenSelectContainers, services: nil, composer: mc, selected: map[int]bool{}}
+	m := Model{screen: screenSelectContainers, composer: mc, selected: map[int]bool{}}
+	m.setSingleGroup(nil)
 	updated, cmd := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'R'}})
 	m = updated.(Model)
 	if cmd != nil || m.warning != "" {
@@ -15250,7 +15421,8 @@ func TestRollbackKey_EmptyListIgnored(t *testing.T) {
 
 func TestRollbackKey_NoSelectionWarns(t *testing.T) {
 	mc := &mockRollbackComposer{mockComposer: mockComposer{services: []string{"web"}}}
-	m := Model{screen: screenSelectContainers, services: []string{"web"}, composer: mc, selected: map[int]bool{}}
+	m := Model{screen: screenSelectContainers, composer: mc, selected: map[int]bool{}}
+	m.setSingleGroup([]string{"web"})
 	updated, cmd := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'R'}})
 	m = updated.(Model)
 	if m.warning != warnNoSelection {
@@ -15266,12 +15438,12 @@ func TestRollbackKey_FiresFetch(t *testing.T) {
 	mc := &mockRollbackComposer{mockComposer: mockComposer{services: []string{"web"}}, snap: snap}
 	m := Model{
 		screen:               screenSelectContainers,
-		services:             []string{"web"},
 		composer:             mc,
 		selected:             map[int]bool{0: true},
 		ctx:                  context.Background(),
 		rollbackFetchSession: 0,
 	}
+	m.setSingleGroup([]string{"web"})
 	updated, cmd := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'R'}})
 	m = updated.(Model)
 	if m.rollbackFetchSession != 1 {
@@ -15299,10 +15471,10 @@ func TestRollbackKey_FiresFetch(t *testing.T) {
 func TestRollbackSnapshotMsg_NoSnapshotWarns(t *testing.T) {
 	m := Model{
 		screen:               screenSelectContainers,
-		services:             []string{"web"},
 		selected:             map[int]bool{0: true},
 		rollbackFetchSession: 3,
 	}
+	m.setSingleGroup([]string{"web"})
 	updated, _ := m.Update(rollbackSnapshotMsg{snap: nil, session: 3})
 	m = updated.(Model)
 	if m.confirming {
@@ -15316,10 +15488,10 @@ func TestRollbackSnapshotMsg_NoSnapshotWarns(t *testing.T) {
 func TestRollbackSnapshotMsg_ReadErrorWarns(t *testing.T) {
 	m := Model{
 		screen:               screenSelectContainers,
-		services:             []string{"web"},
 		selected:             map[int]bool{0: true},
 		rollbackFetchSession: 1,
 	}
+	m.setSingleGroup([]string{"web"})
 	updated, _ := m.Update(rollbackSnapshotMsg{err: errors.New("schema 2 unsupported"), session: 1})
 	m = updated.(Model)
 	if m.confirming {
@@ -15334,11 +15506,11 @@ func TestRollbackSnapshotMsg_TargetedMissingWarns(t *testing.T) {
 	snap := &compose.Snapshot{Schema: 1, Services: map[string]compose.SnapshotEntry{"web": {}}}
 	m := Model{
 		screen:               screenSelectContainers,
-		services:             []string{"web", "db"},
 		selected:             map[int]bool{0: true, 1: true},
 		rollbackTargets:      []string{"web", "db"}, // captured at R-press
 		rollbackFetchSession: 2,
 	}
+	m.setSingleGroup([]string{"web", "db"})
 	updated, _ := m.Update(rollbackSnapshotMsg{snap: snap, session: 2})
 	m = updated.(Model)
 	if m.confirming {
@@ -15359,11 +15531,11 @@ func TestRollbackSnapshotMsg_ComposeRemovedWarns(t *testing.T) {
 	snap := rollbackTestSnapshot()
 	m := Model{
 		screen:               screenSelectContainers,
-		services:             []string{"web", "db"},
 		selected:             map[int]bool{0: true, 1: true}, // both selected
 		rollbackTargets:      []string{"web", "db"},          // captured at R-press
 		rollbackFetchSession: 2,
 	}
+	m.setSingleGroup([]string{"web", "db"})
 	updated, _ := m.Update(rollbackSnapshotMsg{snap: snap, live: []string{"web"}, session: 2})
 	m = updated.(Model)
 	if m.confirming {
@@ -15433,11 +15605,11 @@ func TestRollbackSnapshotMsg_PresentEntersConfirm(t *testing.T) {
 	snap := rollbackTestSnapshot()
 	m := Model{
 		screen:               screenSelectContainers,
-		services:             []string{"web"},
 		selected:             map[int]bool{0: true},
 		rollbackTargets:      []string{"web"}, // captured at R-press
 		rollbackFetchSession: 1,
 	}
+	m.setSingleGroup([]string{"web"})
 	// live includes the selected target, so the live-compose intersection passes.
 	updated, _ := m.Update(rollbackSnapshotMsg{snap: snap, live: []string{"web", "db"}, session: 1})
 	m = updated.(Model)
@@ -15459,10 +15631,10 @@ func TestRollbackSnapshotMsg_StaleSessionRejected(t *testing.T) {
 	snap := rollbackTestSnapshot()
 	m := Model{
 		screen:               screenSelectContainers,
-		services:             []string{"web"},
 		selected:             map[int]bool{0: true},
 		rollbackFetchSession: 5,
 	}
+	m.setSingleGroup([]string{"web"})
 	updated, _ := m.Update(rollbackSnapshotMsg{snap: snap, session: 4}) // stale
 	m = updated.(Model)
 	if m.confirming {
@@ -15488,7 +15660,7 @@ func TestRollbackConfirm_MultiSelectTargetSet(t *testing.T) {
 	mc := &mockRollbackComposer{mockComposer: mockComposer{services: []string{"db", "web"}}, snap: snap}
 	m := NewModel(mc, io.Discard, mockRollbackFactory(mc), nil, nil)
 	m.screen = screenSelectContainers
-	m.services = []string{"db", "web"}
+	m.setSingleGroup([]string{"db", "web"})
 	m.composer = mc
 	m.selected = map[int]bool{0: true, 1: true}
 	m.rollbackSnapshot = snap
@@ -15519,11 +15691,11 @@ func TestRollbackTargets_CapturedAtPressNotAfterFetch(t *testing.T) {
 	mc := &mockRollbackComposer{mockComposer: mockComposer{services: []string{"web", "db"}}, snap: snap}
 	m := Model{
 		screen:   screenSelectContainers,
-		services: []string{"web", "db"},
 		composer: mc,
 		selected: map[int]bool{0: true}, // web only
 		ctx:      context.Background(),
 	}
+	m.setSingleGroup([]string{"web", "db"})
 	// Press R: captures {web}, bumps the fetch session, fires the async fetch.
 	updated, cmd := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'R'}})
 	m = updated.(Model)
@@ -15568,11 +15740,11 @@ func TestRollbackSnapshotMsg_EmptyCapturedRefuses(t *testing.T) {
 	snap := rollbackTestSnapshot()
 	m := Model{
 		screen:               screenSelectContainers,
-		services:             []string{"web", "db"},
 		selected:             map[int]bool{0: true, 1: true},
 		rollbackTargets:      nil, // captured set empty
 		rollbackFetchSession: 2,
 	}
+	m.setSingleGroup([]string{"web", "db"})
 	updated, _ := m.Update(rollbackSnapshotMsg{snap: snap, live: []string{"web", "db"}, session: 2})
 	m = updated.(Model)
 	if m.confirming {
@@ -15927,7 +16099,7 @@ func TestViewProgress_RollbackConfirmShowsAge(t *testing.T) {
 	mc := &mockRollbackComposer{mockComposer: mockComposer{services: []string{"web"}}, snap: snap}
 	m := NewModel(mc, io.Discard, mockRollbackFactory(mc), nil, nil)
 	m.screen = screenSelectContainers
-	m.services = []string{"web"}
+	m.setSingleGroup([]string{"web"})
 	m.composer = mc
 	m.selected = map[int]bool{0: true}
 	m.rollbackSnapshot = snap
@@ -16175,7 +16347,7 @@ func TestReadOnly_GatesWriteKeys_WithCapableComposer(t *testing.T) {
 			mc := &capableReadOnlyComposer{readOnlyMockComposer: *readOnlyTestComposer()}
 			m := NewModel(mc, io.Discard, func(compose.Project) runner.Composer { return mc }, nil, nil)
 			m.screen = screenSelectContainers
-			m.services = append([]string(nil), mc.services...)
+			m.setSingleGroup(append([]string(nil), mc.services...))
 			m.svcStatus = mc.status
 			m.width, m.height = 120, 24
 			m.updateInFlight = false
@@ -16408,7 +16580,7 @@ func TestUpdatesCacheKey_FollowsComposerAcrossNavigation(t *testing.T) {
 func TestUpdatesCache_UnmanagedDoesNotReplayFastTrackVerdicts(t *testing.T) {
 	mc := readOnlyTestComposer()
 	m := newReadOnlyModel(t, mc)
-	m.services = []string{"web"}
+	m.setSingleGroup([]string{"web"})
 	m.svcStatus = map[string]runner.ServiceStatus{"web": {Running: true}}
 	m.updateCache = map[string]updateEntry{
 		// The local-fast-track slot, populated by a previous compose context.
@@ -16499,7 +16671,7 @@ func TestReadOnly_CaptionAlignment(t *testing.T) {
 				wc := &mockComposer{services: []string{"watchtower", "portainer"}, status: status}
 				m = NewModel(wc, io.Discard, mockFactory(wc), nil, nil)
 				m.screen = screenSelectContainers
-				m.services = wc.services
+				m.setSingleGroup(wc.services)
 				m.svcStatus = status
 				m.width, m.height = 120, 24
 			}
@@ -17125,7 +17297,7 @@ func inspectTestModel(t *testing.T, c runner.Composer, services []string) Model 
 	t.Helper()
 	m := NewModel(c, io.Discard, func(compose.Project) runner.Composer { return c }, nil, nil)
 	m.screen = screenSelectContainers
-	m.services = append([]string(nil), services...)
+	m.setSingleGroup(append([]string(nil), services...))
 	m.svcStatus = map[string]runner.ServiceStatus{}
 	for _, s := range services {
 		m.svcStatus[s] = runner.ServiceStatus{Running: true}

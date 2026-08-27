@@ -88,11 +88,11 @@ Confirmed design decisions (brainstormed and validated; do not re-litigate):
 - Modify: `internal/tui/app_test.go`
 - Modify: `internal/tui/footer_reservation_test.go`
 
-- [ ] add `svcGroups []svcGroup` and `svcEntries []svcEntry` Model fields; a single-group seam keeps `m.services`-driven behavior working unchanged for now
-- [ ] add `singleGroupModel(services []string)` test helper that populates BOTH the old fields (`services`, `selected`) and the new ones
-- [ ] migrate the `Model{services: ...}` / `selected: map[int]bool` literals in both test files to the helper, mechanically
-- [ ] write a pin test: one-group `viewSelectContainers()` output has no header rows and no indent
-- [ ] run FULL suite `go test ./... -count=1` - must pass before task 3 (zero visible change)
+- [x] add `svcGroups []svcGroup` and `svcEntries []svcEntry` Model fields; a single-group seam keeps `m.services`-driven behavior working unchanged for now
+- [x] add `singleGroupModel(services []string)` test helper that populates BOTH the old fields (`services`, `selected`) and the new ones
+- [x] migrate the `Model{services: ...}` / `selected: map[int]bool` literals in both test files to the helper, mechanically
+- [x] write a pin test: one-group `viewSelectContainers()` output has no header rows and no indent
+- [x] run FULL suite `go test ./... -count=1` - must pass before task 3 (zero visible change)
 
 ### Task 3: Qualified keys and message-boundary conversion (phase 1)
 

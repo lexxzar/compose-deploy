@@ -38,7 +38,7 @@ func TestContainerFooterReservation(t *testing.T) {
 	newModel := func(width int) Model {
 		m := Model{}
 		m.screen = screenSelectContainers
-		m.services = svcs
+		m.setSingleGroup(svcs)
 		m.selected = map[int]bool{}
 		m.height = 24
 		m.width = width
@@ -228,7 +228,7 @@ func TestContainerView_ExcessLineWidthIsPaddingOnly(t *testing.T) {
 			for _, st := range states {
 				m := Model{}
 				m.screen = screenSelectContainers
-				m.services = svcs
+				m.setSingleGroup(svcs)
 				m.selected = map[int]bool{}
 				m.height = 24
 				m.width = width
@@ -282,7 +282,7 @@ func TestSearchBarLineNeverWraps(t *testing.T) {
 	build := func(width int) Model {
 		m := Model{}
 		m.screen = screenSelectContainers
-		m.services = longNames
+		m.setSingleGroup(longNames)
 		m.selected = map[int]bool{}
 		m.height = 24
 		m.width = width
@@ -366,7 +366,7 @@ func TestSearchInputWidthPersists(t *testing.T) {
 	base := func() Model {
 		m := Model{}
 		m.screen = screenSelectContainers
-		m.services = []string{"web-frontend", "api", "postgres"}
+		m.setSingleGroup([]string{"web-frontend", "api", "postgres"})
 		m.selected = map[int]bool{}
 		m.height = 24
 		m.width = 80
@@ -423,7 +423,7 @@ func TestSearchInputWidthStableAcrossCounterChange(t *testing.T) {
 	base := func() Model {
 		m := Model{}
 		m.screen = screenSelectContainers
-		m.services = []string{"web", "api", "worker"} // 3 services → stable max counter
+		m.setSingleGroup([]string{"web", "api", "worker"}) // 3 services → stable max counter
 		m.selected = map[int]bool{}
 		m.height = 24
 		m.width = 22 // narrow: budget arithmetic is load-bearing
@@ -485,7 +485,7 @@ func TestSearchInputWidthStableAcrossCounterChange(t *testing.T) {
 func TestSearchInputWidthTracksResize(t *testing.T) {
 	m := Model{}
 	m.screen = screenSelectContainers
-	m.services = []string{"web-frontend", "api", "postgres"}
+	m.setSingleGroup([]string{"web-frontend", "api", "postgres"})
 	m.selected = map[int]bool{}
 	m.height = 24
 	m.width = 100
@@ -543,7 +543,7 @@ var containerFooterSearchStates = []struct {
 func containerFooterModel(picker bool) Model {
 	m := Model{}
 	m.screen = screenSelectContainers
-	m.services = []string{"web", "db"}
+	m.setSingleGroup([]string{"web", "db"})
 	m.selected = map[int]bool{}
 	m.showPicker = picker
 	m.width, m.height = 80, 24
@@ -731,7 +731,7 @@ func TestSvcVisibleCount_GainsRowVersusOldFooter(t *testing.T) {
 	build := func(width int, picker bool) Model {
 		m := Model{}
 		m.screen = screenSelectContainers
-		m.services = svcs
+		m.setSingleGroup(svcs)
 		m.selected = map[int]bool{}
 		m.height = 24
 		m.width = width
