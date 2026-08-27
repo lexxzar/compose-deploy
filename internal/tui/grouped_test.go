@@ -12,6 +12,7 @@ import (
 	"fmt"
 	"io"
 	"os/exec"
+	"reflect"
 	"slices"
 	"strings"
 	"sync"
@@ -279,6 +280,12 @@ type mockGrouper struct {
 	// non-blocking double.
 	statsEntered chan struct{}
 	statsGate    chan struct{}
+	// statusEntries is the listing handle the status half hands out;
+	// statsEntries records the one the stats half was handed. compose.HostEntries
+	// is opaque outside its package, so recording it is the only way to tell the
+	// arrival's listing apart from the zero value.
+	statusEntries compose.HostEntries
+	statsEntries  compose.HostEntries
 }
 
 func (m *mockGrouper) GroupHostStatus(ctx context.Context) (compose.GroupedHostSnapshot, error) {
@@ -286,10 +293,11 @@ func (m *mockGrouper) GroupHostStatus(ctx context.Context) (compose.GroupedHostS
 	if m.statusErr2 != nil {
 		return compose.GroupedHostSnapshot{}, m.statusErr2
 	}
-	return compose.GroupedHostSnapshot{Status: m.groupedStatus}, nil
+	return compose.GroupedHostSnapshot{Status: m.groupedStatus, Entries: m.statusEntries}, nil
 }
 
 func (m *mockGrouper) GroupHostStats(ctx context.Context, entries compose.HostEntries) (map[string]map[string]runner.ServiceStats, error) {
+	m.statsEntries = entries
 	if m.statsEntered != nil {
 		close(m.statsEntered)
 	}
@@ -4054,6 +4062,25 @@ func TestUpdateDetailsMsg_RepaintsTheGroupedInspectScreen(t *testing.T) {
 
 // --- grouped fetch: two messages over one listing --------------------------
 
+// mustNotBlock runs fn on its own goroutine and FAILS rather than letting the
+// package hang. The regression this section pins is a seam that folds the stats
+// call back into the status half, and under that shape the status fetch blocks
+// on the gate below — on the test goroutine, before any cleanup exists to
+// release it. Without this the whole package deadlocks until the go test
+// timeout instead of naming the defect. The passing path never waits.
+func mustNotBlock(t *testing.T, what string, fn tea.Cmd) tea.Msg {
+	t.Helper()
+	out := make(chan tea.Msg, 1)
+	go func() { out <- fn() }()
+	select {
+	case msg := <-out:
+		return msg
+	case <-time.After(10 * time.Second):
+		t.Fatalf("%s never returned; the rows must not wait on the stats half", what)
+		return nil
+	}
+}
+
 // The grouped screen's first paint used to sit behind `docker stats
 // --no-stream`, which measured ~2s on a real daemon against ~0.09s for the
 // listing pair that actually produces the rows. The seam is two methods over
@@ -4073,8 +4100,13 @@ func TestGroupedFirstPaint_DoesNotWaitOnStats(t *testing.T) {
 	m.refreshInFlight = true
 
 	// The status half must return on its own; a merged seam would block here.
-	updated, cmd := m.Update(m.loadGroups()())
+	updated, cmd := m.Update(mustNotBlock(t, "loadGroups", m.loadGroups()))
 	m = updated.(Model)
+	// Stated as an assertion too, so the merged seam is named in milliseconds
+	// by whichever of the two trips first.
+	if g.statsCalls2 != 0 {
+		t.Errorf("stats calls during the status half = %d, want none", g.statsCalls2)
+	}
 
 	if len(m.svcGroups) != 3 {
 		t.Fatalf("groups = %d, want the rows painted before the stats half runs", len(m.svcGroups))
@@ -4242,6 +4274,10 @@ func TestGroupedArrival_StaleSessionLeavesTheGuardAlone(t *testing.T) {
 func TestGroupedStatsChain_RidesStatsSession(t *testing.T) {
 	g, projects := groupedFixture()
 	m := groupedTestModel(g, projects)
+	// Desynchronise the two counters. Left at their shared zero, the assertion
+	// below is satisfied by EITHER field, so a chain riding statusSession ships
+	// green — and lands its stats under a session the statsMsg gate rejects.
+	m.statusSession, m.statsSession = 7, 3
 
 	updated, cmd := m.Update(m.loadGroups()())
 	m = updated.(Model)
@@ -4256,7 +4292,7 @@ func TestGroupedStatsChain_RidesStatsSession(t *testing.T) {
 		t.Error("the chained message must carry the grouped shape, or its keys land bare")
 	}
 	if msg.session != m.statsSession {
-		t.Errorf("session = %d, want statsSession %d", msg.session, m.statsSession)
+		t.Errorf("session = %d, want statsSession %d (statusSession is %d)", msg.session, m.statsSession, m.statusSession)
 	}
 
 	m.statsSession++
@@ -4268,5 +4304,123 @@ func TestGroupedStatsChain_RidesStatsSession(t *testing.T) {
 	}
 	if !m.refreshInFlight {
 		t.Error("a stale statsMsg must leave refreshInFlight to its owner")
+	}
+}
+
+// realHostEntries builds a genuine, non-zero compose.HostEntries by driving the
+// real seam over a faked docker. The handle is opaque outside its package, so
+// this is the only way a tui test can hold one that is distinguishable from the
+// zero value — and telling those two apart is the whole point of the pin below.
+func realHostEntries(t *testing.T) compose.HostEntries {
+	t.Helper()
+	c := compose.New("")
+	c.SetTestHooks(nil, func(*exec.Cmd) ([]byte, error) {
+		return []byte(`{"ID":"aaa111222333","Names":"shop-api-1","Image":"shop/api:1","State":"running","Status":"Up 3 hours","Labels":"com.docker.compose.project=shop,com.docker.compose.service=api"}`), nil
+	})
+	snap, err := compose.NewLocalHostContainers(c).GroupHostStatus(context.Background())
+	if err != nil {
+		t.Fatalf("building a host listing: %v", err)
+	}
+	if reflect.DeepEqual(snap.Entries, compose.HostEntries{}) {
+		t.Fatal("precondition: the listing handle must differ from the zero value")
+	}
+	return snap.Entries
+}
+
+// The chained stats fetch must join against the listing the ARRIVAL carried.
+// Handing it a fresh or zero handle costs no test call and raises no error —
+// GroupHostStats answers an empty listing with (nil, nil) — so the grouped
+// screen would simply render blank CPU/Mem cells forever, with nothing red
+// anywhere. Only the handle's identity catches that.
+func TestGroupedStatsChain_ConsumesTheArrivalsListing(t *testing.T) {
+	g, projects := groupedFixture()
+	g.statusEntries = realHostEntries(t)
+	m := groupedTestModel(g, projects)
+
+	msg := m.loadGroups()().(servicesMsg)
+	if !reflect.DeepEqual(msg.hostEntries, g.statusEntries) {
+		t.Fatal("loadGroups dropped the listing its status half returned")
+	}
+	updated, cmd := m.Update(msg)
+	m = updated.(Model)
+	if cmd == nil {
+		t.Fatal("precondition: the arrival must chain the stats half")
+	}
+	cmd()
+
+	if !reflect.DeepEqual(g.statsEntries, g.statusEntries) {
+		t.Error("the stats half joined against a different listing than the arrival carried")
+	}
+}
+
+// The grouped status arrival deliberately leaves m.stats and m.statsErr alone:
+// it is the 5-second refresh as well as the first load, and the chained half it
+// starts takes ~2s to answer. Clearing either would blank the CPU/Mem column —
+// or drop the "stats unavailable" warning — for that whole window, every tick.
+func TestGroupedStatusArrival_KeepsTheStatsCells(t *testing.T) {
+	t.Run("cells survive the next status message", func(t *testing.T) {
+		g, projects := groupedFixture()
+		m := groupedTestModel(g, projects)
+		m = groupedCycle(t, m)
+		if m.stats[svcKey("shop", "api")].CPUPercent != 12.5 {
+			t.Fatalf("precondition: stats = %v, want the first cycle to fill shop/api", m.stats)
+		}
+
+		updated, _ := m.Update(m.loadGroups()())
+		m = updated.(Model)
+
+		if m.stats[svcKey("shop", "api")].CPUPercent != 12.5 {
+			t.Errorf("stats = %v, want the previous cycle's cells until the chained half lands", m.stats)
+		}
+	})
+
+	t.Run("the soft warning survives the next status message", func(t *testing.T) {
+		g, projects := groupedFixture()
+		g.statsErr2 = errors.New("docker stats failed")
+		m := groupedTestModel(g, projects)
+		m = groupedCycle(t, m)
+		if m.statsErr == nil {
+			t.Fatal("precondition: the first cycle must set statsErr")
+		}
+
+		updated, _ := m.Update(m.loadGroups()())
+		m = updated.(Model)
+
+		if m.statsErr == nil {
+			t.Error("statsErr must survive the status arrival; only the chained statsMsg owns it")
+		}
+	})
+}
+
+// The window between the two grouped messages is where the fetch-stacking guard
+// earns its keep: the 5-second tick keeps firing while the ~2s stats half is
+// still out, and an unguarded one would put a second host-wide `docker ps` on
+// the wire for every chain already running. The re-arm beside the chain is what
+// closes it, so this pins the consequence rather than the flag.
+func TestGroupedChainWindow_TickMakesNoSecondFetch(t *testing.T) {
+	g, projects := groupedFixture()
+	m := groupedTestModel(g, projects)
+	m.refreshInFlight = true
+
+	updated, chain := m.Update(m.loadGroups()())
+	m = updated.(Model)
+	if chain == nil {
+		t.Fatal("precondition: the arrival must chain the stats half")
+	}
+	listings := g.statusCalls2
+
+	// The tick lands with the chained half still out.
+	_, cmd := m.Update(refreshTickMsg{})
+	if cmd == nil {
+		t.Fatal("the tick must reschedule itself whatever it decides about fetching")
+	}
+	if batch, isBatch := cmd().(tea.BatchMsg); isBatch {
+		for _, c := range batch {
+			_ = c()
+		}
+	}
+
+	if g.statusCalls2 != listings {
+		t.Errorf("host listings = %d, want no second `docker ps` while the chain is out", g.statusCalls2-listings)
 	}
 }
