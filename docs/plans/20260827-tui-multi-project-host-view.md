@@ -75,11 +75,11 @@ Confirmed design decisions (brainstormed and validated; do not re-litigate):
 - Create: `internal/tui/entries.go`
 - Create: `internal/tui/entries_test.go`
 
-- [ ] add `svcEntryKind` (`entrySvcGroupHeader`, `entrySvcService`), `svcEntry`, `svcGroup` types
-- [ ] implement `rebuildSvcEntries(groups []svcGroup) []svcEntry`: one header per group then its services; a folded group emits only its header; a single group emits NO header
-- [ ] implement `svcKey(projName, service string) string` as the single key producer, with the `/`-separator safety note
-- [ ] write tests: single group no headers, multi-group headers, fold hides services, empty group renders bare header, svcKey distinctness
-- [ ] run tests - must pass before task 2
+- [x] add `svcEntryKind` (`entrySvcGroupHeader`, `entrySvcService`), `svcEntry`, `svcGroup` types
+- [x] implement `rebuildSvcEntries(groups []svcGroup) []svcEntry`: one header per group then its services; a folded group emits only its header; a single group emits NO header
+- [x] implement `svcKey(projName, service string) string` as the single key producer, with the `/`-separator safety note
+- [x] write tests: single group no headers, multi-group headers, fold hides services, empty group renders bare header, svcKey distinctness
+- [x] run tests - must pass before task 2
 
 ### Task 2: Fixture helper and mechanical migration (phase 1)
 
