@@ -303,14 +303,24 @@ Confirmed design decisions (brainstormed and validated; do not re-litigate):
 - Modify: `internal/tui/help.go`
 - Modify: `internal/tui/help_test.go`
 - Modify: `internal/tui/app_test.go`
-- Modify: `cmd/root.go`
+- Modify: `internal/tui/footer_reservation_test.go` (➕ the `showPicker` → `drilledFromHost` rename)
+- Modify: `internal/compose/compose.go` + `unmanagedrow.go` + `unmanagedrow_test.go` (➕ the dead `Project.Desc` field)
+- Modify: `cmd/root_test.go` (➕ `cmd/root.go` needed NO change — see the deviations)
 
-- [ ] remove the screen constant (iota renumbers), its `handleKey`/`View` cases, `viewSelectProject()`, `projectsMsg`/`projectsSession`, and the `projects`/`projCursor`/`projErr`/`showPicker` Model fields (loader logic lives in `loadGroups` since Task 6)
-- [ ] `ProjectLoader` wiring in `cmd/root.go` feeds the grouped loader; delete `WithUnmanagedRow`/picker-row plumbing if no caller remains
-- [ ] sweep: `allScreens` literal, `screenName()`, `helpGroupsFor` (+ its doc comment), `leaveGroup()` doc comment, the `screenSelectProject` row in `TestHelpGroups_NamesEveryBoundKey`'s bound map, `TestHelpGroups_LeaveGroupMatchesFooter`, `TestCtrlCConfirmation_AllRemoteScreens`, `TestHelpOverlay_OpensFromEveryScreen`, `containerKeys` (`TestAllScreens_Complete`'s bound self-adjusts off the last constant — verify only)
-- [ ] remove the now-dead project-screen esc site from the backward-navigation cleanup chain; grouped-screen esc carries its duties (already wired in Task 8)
-- [ ] write/adjust tests for the final esc chain and root-screen `q` semantics
-- [ ] run FULL suite `go test ./... -count=1` - must pass before task 14
+⚠️ Deviations:
+- **`showPicker` was RENAMED to `drilledFromHost`, not deleted.** It is the drilled screen's `canGoBack()` rule, and no predicate derivable from the composer, the factory or the group list can separate the two drilled shapes: one reached by drill-in (parent = the grouped host view) and one launched standalone in a directory holding a compose file (a ROOT, where `q` quits and `esc` does nothing). Deriving it from `len(servers) > 0 || config != nil` breaks the drill-in on a standalone host; making the root non-root turns `q` from "quit" into "drill out" on the primary local flow. The field is now named for what it actually decides and carries that rationale on it.
+- **`WithUnmanagedRow` STAYS** — `projectsWithUnmanaged` still calls it, because the grouped loader gets the synthetic `(unmanaged)` row and its ORDER from the `ProjectLoader`. `cmd/root.go` therefore needed NO change; only `cmd/root_test.go` moved.
+- **`compose.Project.Desc` was deleted** instead: `viewSelectProject` was its only reader, so it became write-only picker-row plumbing. `CountUnmanaged` is still needed (the row is appended only when the count is non-zero).
+- **`m.projectsSession` was deleted with `projectsMsg`.** The counter guarded exactly one message type, and the loader it tracked now feeds `loadGroups`, which is already gated on `statusSession` at the same four swap sites. `TestBackToServerScreen_RestoresLocalCallbacks` moved its assertion to `statusSession`.
+- The `viewSelectContainers` error slot read `showPicker` for its `q back`/`q quit` label; it now reads `canGoBack()`, the shared predicate the footer and the `?` overlay's LEAVE group already use — grouped mode with servers configured previously mislabelled that slot `q quit`.
+- ⚠️ Pre-existing, NOT introduced here: `gofmt -l .` reports `cmd/list_test.go` (comment alignment). It is untouched by this task.
+
+- [x] remove the screen constant (iota renumbers), its `handleKey`/`View` cases, `viewSelectProject()`, `projectsMsg`/`projectsSession`, and the `projects`/`projCursor`/`projErr`/`showPicker` Model fields (loader logic lives in `loadGroups` since Task 6)
+- [x] `ProjectLoader` wiring in `cmd/root.go` feeds the grouped loader; delete `WithUnmanagedRow`/picker-row plumbing if no caller remains
+- [x] sweep: `allScreens` literal, `screenName()`, `helpGroupsFor` (+ its doc comment), `leaveGroup()` doc comment, the `screenSelectProject` row in `TestHelpGroups_NamesEveryBoundKey`'s bound map, `TestHelpGroups_LeaveGroupMatchesFooter`, `TestCtrlCConfirmation_AllRemoteScreens`, `TestHelpOverlay_OpensFromEveryScreen`, `containerKeys` (`TestAllScreens_Complete`'s bound self-adjusts off the last constant — verify only)
+- [x] remove the now-dead project-screen esc site from the backward-navigation cleanup chain; grouped-screen esc carries its duties (already wired in Task 8)
+- [x] write/adjust tests for the final esc chain and root-screen `q` semantics (`TestEscChain_DrilledToGroupedToServer`, `TestRootScreenQ_ContainerModes`)
+- [x] run FULL suite `go test ./... -count=1` - must pass before task 14
 
 ### Task 14: Verify acceptance criteria
 - [ ] verify all Overview requirements: grouped landing, fold, drill, sequential ops, stop-on-failure, single-group `R`, `U` per group, picker gone

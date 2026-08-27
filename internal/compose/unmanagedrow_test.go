@@ -76,10 +76,9 @@ func TestWithUnmanagedRow(t *testing.T) {
 		ps        string
 		runErr    error
 		wantExtra bool
-		wantDesc  string
 	}{
-		{name: "appended when non-zero", ps: hostPsMixed, wantExtra: true, wantDesc: "3 containers"},
-		{name: "singular when one", ps: `{"ID":"bbb444555666","Names":"watchtower","Labels":""}`, wantExtra: true, wantDesc: "1 container"},
+		{name: "appended when non-zero", ps: hostPsMixed, wantExtra: true},
+		{name: "appended when one", ps: `{"ID":"bbb444555666","Names":"watchtower","Labels":""}`, wantExtra: true},
 		{name: "absent when zero", ps: `{"ID":"aaa111222333","Names":"web","Labels":"com.docker.compose.project=my-app"}`},
 		// CountUnmanaged returns (0, err) on every failure, so this case can
 		// only ever exercise the same outcome as "absent when zero". It pins
@@ -107,11 +106,8 @@ func TestWithUnmanagedRow(t *testing.T) {
 			if row.Name != UnmanagedProjectName {
 				t.Errorf("row name = %q, want %q", row.Name, UnmanagedProjectName)
 			}
-			if row.Desc != tt.wantDesc {
-				t.Errorf("row desc = %q, want %q", row.Desc, tt.wantDesc)
-			}
 			if row.Status != "" {
-				t.Errorf("row Status = %q, want empty — the picker text lives in Desc", row.Status)
+				t.Errorf("row Status = %q, want empty — no compose command reports on it", row.Status)
 			}
 			if !row.Unmanaged {
 				t.Error("row Unmanaged = false, want true")

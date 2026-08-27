@@ -209,8 +209,8 @@ func TestNewModel_SkipsPickerWhenComposerProvided(t *testing.T) {
 	if m.screen != screenSelectContainers {
 		t.Errorf("screen = %d, want %d (screenSelectContainers)", m.screen, screenSelectContainers)
 	}
-	if m.showPicker {
-		t.Error("showPicker should be false when composer is provided")
+	if m.drilledFromHost {
+		t.Error("drilledFromHost should be false: a standalone drilled screen is a root")
 	}
 	if m.composer == nil {
 		t.Error("composer should be set")
@@ -227,8 +227,8 @@ func TestNewModel_LandsOnGroupedWhenNoComposer(t *testing.T) {
 	if !m.grouped {
 		t.Error("grouped should be true when no cwd compose file")
 	}
-	if m.showPicker {
-		t.Error("showPicker must stay false: the grouped view replaced the project picker")
+	if m.drilledFromHost {
+		t.Error("drilledFromHost must stay false: the grouped view is the landing screen")
 	}
 	if !m.refreshInFlight {
 		t.Error("refreshInFlight should be armed for the stats fetch Init() fires")
@@ -241,13 +241,13 @@ func TestNewModel_LandsOnGroupedWhenNoComposer(t *testing.T) {
 	}
 }
 
-func TestInit_LoadsProjectsWhenPickerShown(t *testing.T) {
+func TestInit_LoadsGroupsWhenNoComposer(t *testing.T) {
 	mc := &mockComposer{}
 	m := NewModel(nil, io.Discard, mockFactory(mc), nil, nil)
 
 	cmd := m.Init()
 	if cmd == nil {
-		t.Error("Init() should return a command when picker is shown")
+		t.Error("Init() should return a command for the grouped landing screen")
 	}
 }
 
@@ -267,18 +267,17 @@ func TestWithLocalProjectLoader(t *testing.T) {
 		t.Fatal("projectLoader should be set by WithLocalProjectLoader")
 	}
 
-	// Execute the loader via loadProjects
-	cmd := m.loadProjects()
-	msg := cmd()
-	pm := msg.(projectsMsg)
-	if pm.err != nil {
-		t.Fatalf("unexpected error: %v", pm.err)
+	// Execute the loader through the grouped loader, its only consumer now
+	// that the project picker is gone.
+	sm := m.loadGroups()().(servicesMsg)
+	if sm.err != nil {
+		t.Fatalf("unexpected error: %v", sm.err)
 	}
 	if !called {
 		t.Error("local loader should have been called")
 	}
-	if len(pm.projects) != 1 || pm.projects[0].Name != "test" {
-		t.Errorf("projects = %v, want [{test /test}]", pm.projects)
+	if len(sm.projects) != 1 || sm.projects[0].Name != "test" {
+		t.Errorf("projects = %v, want [{test /test}]", sm.projects)
 	}
 }
 
@@ -301,23 +300,6 @@ func TestWithConfig(t *testing.T) {
 	}
 	if len(m.config.Servers) != 1 || m.config.Servers[0].Name != "test" {
 		t.Errorf("config.Servers = %v, want [{test user@host}]", m.config.Servers)
-	}
-}
-
-func TestLoadProjects_NilLoader_ReturnsError(t *testing.T) {
-	mc := &mockComposer{}
-	m := NewModel(nil, io.Discard, mockFactory(mc), nil, nil)
-	// Ensure no loader is set
-	m.projectLoader = nil
-
-	cmd := m.loadProjects()
-	msg := cmd()
-	pm := msg.(projectsMsg)
-	if pm.err == nil {
-		t.Fatal("expected error when no loader configured")
-	}
-	if !strings.Contains(pm.err.Error(), "no project loader") {
-		t.Errorf("error = %q, want it to contain 'no project loader'", pm.err.Error())
 	}
 }
 
@@ -435,7 +417,7 @@ func TestSelectContainers_EscDrillsOutToGroupedView(t *testing.T) {
 	m := NewModel(nil, io.Discard, mockFactory(mc), nil, nil)
 	installFakeTick(&m)
 	m.screen = screenSelectContainers
-	m.showPicker = true
+	m.drilledFromHost = true
 	m.grouped = false // drilled mode: NewModel now starts grouped
 	m.projName = "app"
 	m.projDir = "/app"
@@ -476,7 +458,7 @@ func TestSelectContainers_EscDrillOutBumpsSessions(t *testing.T) {
 	m := NewModel(nil, io.Discard, mockFactory(mc), nil, nil)
 	installFakeTick(&m)
 	m.screen = screenSelectContainers
-	m.showPicker = true
+	m.drilledFromHost = true
 	m.grouped = false
 	m.setSingleGroup(mc.services)
 	m.composer = mc
@@ -493,29 +475,7 @@ func TestSelectContainers_EscDrillOutBumpsSessions(t *testing.T) {
 	}
 }
 
-func TestSelectContainers_EscPreservesCursor(t *testing.T) {
-	mc := &mockComposer{services: []string{"nginx"}}
-	m := NewModel(nil, io.Discard, mockFactory(mc), nil, nil)
-	m.screen = screenSelectContainers
-	m.showPicker = true
-	m.setSingleGroup(mc.services)
-	m.composer = mc
-	m.projects = []compose.Project{
-		{Name: "alpha", ConfigDir: "/a"},
-		{Name: "beta", ConfigDir: "/b"},
-		{Name: "gamma", ConfigDir: "/c"},
-	}
-	m.projCursor = 2 // user had selected "gamma"
-
-	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyEsc})
-	m = updated.(Model)
-
-	if m.projCursor != 2 {
-		t.Errorf("projCursor = %d, want 2 (should preserve position)", m.projCursor)
-	}
-}
-
-func TestSelectContainers_EscDoesNothingWhenPickerSkipped(t *testing.T) {
+func TestSelectContainers_EscDoesNothingWhenStandalone(t *testing.T) {
 	mc := &mockComposer{services: []string{"nginx"}}
 	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
 	m.screen = screenSelectContainers
@@ -529,7 +489,7 @@ func TestSelectContainers_EscDoesNothingWhenPickerSkipped(t *testing.T) {
 		t.Errorf("screen = %d, want %d (should stay on container select)", m.screen, screenSelectContainers)
 	}
 	if m.svcStatus == nil {
-		t.Error("svcStatus should be preserved when picker is skipped")
+		t.Error("svcStatus should be preserved on a root drilled screen")
 	}
 }
 
@@ -738,277 +698,41 @@ func TestView_AllScreens(t *testing.T) {
 	}
 }
 
-// parkOnProjectScreen puts a freshly built Model on the project picker.
-// NewModel no longer lands there — the grouped host view took its place as the
-// screen under the server picker — but screenSelectProject stays wired until
-// its deletion task, so its own tests park the model explicitly instead of
-// relying on the start-screen decision.
-func parkOnProjectScreen(m *Model) {
-	m.screen = screenSelectProject
-	m.grouped = false
-	m.showPicker = true
+// parkOnGroupedScreen puts the model on the grouped host view holding the
+// given projects, with the cursor on the first project's header row. It is the
+// replacement for the project-picker fixtures: drilling into a header is what
+// picking a project used to be.
+func parkOnGroupedScreen(m *Model, projects ...compose.Project) {
+	m.screen = screenSelectContainers
+	m.grouped = true
+	m.composer = nil
+	m.svcGroups = make([]svcGroup, 0, len(projects))
+	for _, p := range projects {
+		m.svcGroups = append(m.svcGroups, svcGroup{proj: p})
+	}
+	m.svcEntries = rebuildSvcEntries(m.svcGroups)
+	m.svcCursor = 0
 }
 
-func TestSelectProject_Navigation(t *testing.T) {
-	mc := &mockComposer{}
-	m := NewModel(nil, io.Discard, mockFactory(mc), nil, nil)
-	parkOnProjectScreen(&m)
-	m.projects = []compose.Project{
-		{Name: "alpha", ConfigDir: "/a"},
-		{Name: "beta", ConfigDir: "/b"},
-		{Name: "gamma", ConfigDir: "/c"},
+// headerIndexFor returns the entry index of group gi's header row.
+func headerIndexFor(t *testing.T, entries []svcEntry, gi int) int {
+	t.Helper()
+	for i, e := range entries {
+		if e.kind == entrySvcGroupHeader && e.groupIdx == gi {
+			return i
+		}
 	}
-
-	// Move down
-	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'j'}})
-	m = updated.(Model)
-	if m.projCursor != 1 {
-		t.Errorf("after j: projCursor = %d, want 1", m.projCursor)
-	}
-
-	// Move down again
-	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'j'}})
-	m = updated.(Model)
-	if m.projCursor != 2 {
-		t.Errorf("after second j: projCursor = %d, want 2", m.projCursor)
-	}
-
-	// Can't go past last item
-	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'j'}})
-	m = updated.(Model)
-	if m.projCursor != 2 {
-		t.Errorf("after third j: projCursor = %d, want 2", m.projCursor)
-	}
-
-	// Move back up
-	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'k'}})
-	m = updated.(Model)
-	if m.projCursor != 1 {
-		t.Errorf("after k: projCursor = %d, want 1", m.projCursor)
-	}
+	t.Fatalf("no header entry for group %d in %+v", gi, entries)
+	return 0
 }
 
-func TestSelectProject_EnterTransitionsToContainers(t *testing.T) {
-	mc := &mockComposer{}
-	m := NewModel(nil, io.Discard, mockFactory(mc), nil, nil)
-	parkOnProjectScreen(&m)
-	m.projects = []compose.Project{
-		{Name: "my-app", ConfigDir: "/work/my-app"},
-	}
-
-	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyEnter})
-	m = updated.(Model)
-
-	if m.screen != screenSelectContainers {
-		t.Errorf("screen = %d, want %d (screenSelectContainers)", m.screen, screenSelectContainers)
-	}
-	if m.projName != "my-app" {
-		t.Errorf("projName = %q, want %q", m.projName, "my-app")
-	}
-	if m.composer == nil {
-		t.Error("composer should be set after project selection")
-	}
-}
-
-func TestSelectProject_EnterWithNoProjects(t *testing.T) {
-	mc := &mockComposer{}
-	m := NewModel(nil, io.Discard, mockFactory(mc), nil, nil)
-	parkOnProjectScreen(&m)
-
-	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyEnter})
-	m = updated.(Model)
-
-	if m.screen != screenSelectProject {
-		t.Errorf("screen = %d, want %d (should stay on project select)", m.screen, screenSelectProject)
-	}
-}
-
-func TestSelectProject_QuitReturnsQuit(t *testing.T) {
-	mc := &mockComposer{}
-	m := NewModel(nil, io.Discard, mockFactory(mc), nil, nil)
-	parkOnProjectScreen(&m)
-
-	_, cmd := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'q'}})
-	if cmd == nil {
-		t.Fatal("expected quit command, got nil")
-	}
-}
-
-func TestProjectsMsg_PopulatesProjects(t *testing.T) {
-	mc := &mockComposer{}
-	m := NewModel(nil, io.Discard, mockFactory(mc), nil, nil)
-	parkOnProjectScreen(&m)
-
-	projects := []compose.Project{
-		{Name: "alpha", ConfigDir: "/a"},
-		{Name: "beta", ConfigDir: "/b"},
-	}
-	updated, _ := m.Update(projectsMsg{projects: projects})
-	m = updated.(Model)
-
-	if len(m.projects) != 2 {
-		t.Fatalf("got %d projects, want 2", len(m.projects))
-	}
-	if m.projCursor != 0 {
-		t.Errorf("projCursor = %d, want 0", m.projCursor)
-	}
-}
-
-func TestProjectsMsg_Error(t *testing.T) {
-	mc := &mockComposer{}
-	m := NewModel(nil, io.Discard, mockFactory(mc), nil, nil)
-	parkOnProjectScreen(&m)
-
-	updated, _ := m.Update(projectsMsg{err: io.ErrUnexpectedEOF})
-	m = updated.(Model)
-
-	if m.projErr == nil {
-		t.Error("projErr should be set")
-	}
-}
-
-func TestViewSelectProject_WithProjects(t *testing.T) {
-	mc := &mockComposer{}
-	m := NewModel(nil, io.Discard, mockFactory(mc), nil, nil)
-	parkOnProjectScreen(&m)
-	m.projects = []compose.Project{
-		{Name: "api-proxy", ConfigDir: "/Work/docker/api-proxy"},
-		{Name: "forms-app", ConfigDir: "/Work/docker/forms-app"},
-	}
-
-	v := m.View()
-	if !strings.Contains(v, "select project") {
-		t.Error("view should contain 'select project'")
-	}
-	if !strings.Contains(v, "api-proxy") {
-		t.Error("view should contain 'api-proxy'")
-	}
-	if !strings.Contains(v, "forms-app") {
-		t.Error("view should contain 'forms-app'")
-	}
-}
-
-func TestViewSelectProject_Loading(t *testing.T) {
-	mc := &mockComposer{}
-	m := NewModel(nil, io.Discard, mockFactory(mc), nil, nil)
-	parkOnProjectScreen(&m)
-
-	v := m.View()
-	if !strings.Contains(v, "Loading projects") {
-		t.Error("view should show loading state")
-	}
-}
-
-func TestViewSelectProject_Error(t *testing.T) {
-	mc := &mockComposer{}
-	m := NewModel(nil, io.Discard, mockFactory(mc), nil, nil)
-	parkOnProjectScreen(&m)
-	m.projErr = fmt.Errorf("connection refused")
-
-	v := m.View()
-	if !strings.Contains(v, "Error") {
-		t.Error("view should show error state")
-	}
-	if !strings.Contains(v, "connection refused") {
-		t.Error("view should show error message")
-	}
-	if strings.Contains(v, "esc back") {
-		t.Error("local-only error should not show 'esc back'")
-	}
-}
-
-func TestViewSelectProject_ErrorWithPicker(t *testing.T) {
-	mc := &mockComposer{}
-	m := NewModel(nil, io.Discard, mockFactory(mc), testServers, nil)
-	m.screen = screenSelectProject
-	m.showPicker = true
-	m.projErr = fmt.Errorf("connection refused")
-
-	v := m.View()
-	if !strings.Contains(v, "q back") {
-		t.Error("error state should show 'q back' when server picker is available")
-	}
-}
-
-func TestViewSelectProject_Empty(t *testing.T) {
-	mc := &mockComposer{}
-	m := NewModel(nil, io.Discard, mockFactory(mc), nil, nil)
-	parkOnProjectScreen(&m)
-	m.projects = []compose.Project{}
-
-	v := m.View()
-	if !strings.Contains(v, "No Docker Compose projects found") {
-		t.Error("view should show empty state message")
-	}
-	if strings.Contains(v, "esc back") {
-		t.Error("local-only empty should not show 'esc back'")
-	}
-}
-
-func TestViewSelectProject_EmptyWithPicker(t *testing.T) {
-	mc := &mockComposer{}
-	m := NewModel(nil, io.Discard, mockFactory(mc), testServers, nil)
-	m.screen = screenSelectProject
-	m.showPicker = true
-	m.projects = []compose.Project{}
-
-	v := m.View()
-	if !strings.Contains(v, "q back") {
-		t.Error("empty state should show 'q back' when server picker is available")
-	}
-}
-
-func TestViewSelectProject_UnmanagedRow(t *testing.T) {
-	mc := &mockComposer{}
-	m := NewModel(nil, io.Discard, mockFactory(mc), nil, nil)
-	parkOnProjectScreen(&m)
-	m.projects = []compose.Project{
-		{Name: "my-app", Status: "running(3)", ConfigDir: "/srv/my-app"},
-		{Name: compose.UnmanagedProjectName, Desc: "3 containers", Unmanaged: true},
-	}
-
-	v := m.View()
-	if !strings.Contains(v, compose.UnmanagedProjectName) {
-		t.Errorf("view should show %q:\n%s", compose.UnmanagedProjectName, v)
-	}
-	if !strings.Contains(v, "3 containers") {
-		t.Errorf("unmanaged row should show its count in the description column:\n%s", v)
-	}
-	if !strings.Contains(v, shortenPath("/srv/my-app")) {
-		t.Errorf("compose row should still show its config dir:\n%s", v)
-	}
-}
-
-func TestViewSelectProject_UnmanagedRowIsLast(t *testing.T) {
-	mc := &mockComposer{}
-	m := NewModel(nil, io.Discard, mockFactory(mc), nil, nil)
-	parkOnProjectScreen(&m)
-	m.projects = []compose.Project{
-		{Name: "zebra", Status: "running(1)", ConfigDir: "/srv/zebra"},
-		{Name: compose.UnmanagedProjectName, Desc: "1 container", Unmanaged: true},
-	}
-
-	v := m.View()
-	// strings.Index returns -1 for an absent needle, and -1 is less than every
-	// valid index — so both rows must be proven present before the comparison
-	// means anything.
-	composeIdx := strings.Index(v, "zebra")
-	unmanagedIdx := strings.Index(v, compose.UnmanagedProjectName)
-	if composeIdx < 0 {
-		t.Fatalf("compose row missing from the render:\n%s", v)
-	}
-	if unmanagedIdx < 0 {
-		t.Fatalf("unmanaged row missing from the render:\n%s", v)
-	}
-	if composeIdx > unmanagedIdx {
-		t.Errorf("unmanaged row should render last:\n%s", v)
-	}
-}
-
+// TestComposerFactory_ReceivesWholeProject pins that drill-in hands the factory
+// the WHOLE compose.Project — the Unmanaged flag included, since that is the
+// branch that picks the read-only host composer.
 func TestComposerFactory_ReceivesWholeProject(t *testing.T) {
 	projects := []compose.Project{
 		{Name: "my-app", Status: "running(3)", ConfigDir: "/srv/my-app"},
-		{Name: compose.UnmanagedProjectName, Desc: "3 containers", Unmanaged: true},
+		{Name: compose.UnmanagedProjectName, Unmanaged: true},
 	}
 
 	tests := []struct {
@@ -1030,9 +754,11 @@ func TestComposerFactory_ReceivesWholeProject(t *testing.T) {
 				return mc
 			}
 			m := NewModel(nil, io.Discard, factory, nil, nil)
-			m.screen = screenSelectProject
-			m.projects = projects
-			m.projCursor = tt.cursor
+			m.screen = screenSelectContainers
+			m.grouped = true
+			m.svcGroups = []svcGroup{{proj: projects[0]}, {proj: projects[1]}}
+			m.svcEntries = rebuildSvcEntries(m.svcGroups)
+			m.svcCursor = headerIndexFor(t, m.svcEntries, tt.cursor)
 
 			updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyEnter})
 			m = updated.(Model)
@@ -1176,14 +902,14 @@ func TestServicesMsg_InstallsSingleGroup(t *testing.T) {
 	}
 }
 
-// Departure-site pin: esc back to the project picker drops the service list, so
+// Departure-site pin: esc back to the grouped host view drops the service list, so
 // the derived group state must go with it — a group that outlived its services
 // would feed the next project's screen stale rows.
 func TestEscFromContainerScreen_ClearsSvcGroups(t *testing.T) {
 	mc := &mockComposer{services: []string{"nginx"}}
 	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
 	m.screen = screenSelectContainers
-	m.showPicker = true
+	m.drilledFromHost = true
 	m.setSingleGroup(mc.services)
 
 	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyEsc})
@@ -1366,7 +1092,7 @@ func TestEscFromProgress_GoesToContainers(t *testing.T) {
 	m := NewModel(nil, io.Discard, mockFactory(mc), nil, nil)
 	m.screen = screenProgress
 	m.done = true
-	m.showPicker = true
+	m.drilledFromHost = true
 	m.projName = "my-app"
 	m.composer = mc
 
@@ -1887,8 +1613,8 @@ func TestServerScreen_LocalSelection(t *testing.T) {
 	if m.projectLoader == nil {
 		t.Error("projectLoader should be restored to localProjectLoader for local")
 	}
-	if m.showPicker {
-		t.Error("showPicker must stay false on the grouped view")
+	if m.drilledFromHost {
+		t.Error("drilledFromHost must stay false on the grouped view")
 	}
 	if cmd == nil {
 		t.Error("should return the grouped load batch")
@@ -1914,8 +1640,8 @@ func TestServerScreen_LocalSelection_WithComposer(t *testing.T) {
 	if m.composer != mc {
 		t.Error("composer should be the local composer")
 	}
-	if !m.showPicker {
-		t.Error("showPicker should be true so esc navigates back")
+	if !m.drilledFromHost {
+		t.Error("drilledFromHost should be true so esc drills back out")
 	}
 	if cmd == nil {
 		t.Error("should return loadServices command")
@@ -1984,8 +1710,8 @@ func TestServerScreen_ConnectSuccess(t *testing.T) {
 	if m.serverErr != nil {
 		t.Errorf("serverErr = %v, want nil", m.serverErr)
 	}
-	if m.showPicker {
-		t.Error("showPicker must stay false on the grouped view")
+	if m.drilledFromHost {
+		t.Error("drilledFromHost must stay false on the grouped view")
 	}
 	if cmd == nil {
 		t.Error("should return the grouped load batch")
@@ -2029,62 +1755,6 @@ func TestServerScreen_QuitReturnsQuit(t *testing.T) {
 	_, cmd := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'q'}})
 	if cmd == nil {
 		t.Fatal("expected quit command, got nil")
-	}
-}
-
-func TestEscFromProjectScreen_WithServers_GoesToServerScreen(t *testing.T) {
-	mc := &mockComposer{}
-	localLoader := func(ctx context.Context) ([]compose.Project, error) { return nil, nil }
-	m := NewModel(nil, io.Discard, mockFactory(mc), testServers, mockConnectCb(mc),
-		WithLocalProjectLoader(localLoader))
-	// Simulate state after connecting to remote server and being on project screen
-	m.screen = screenSelectProject
-	m.serverName = "prod"
-	m.showPicker = true
-	disconnectCalled := false
-	m.disconnectFunc = func() error { disconnectCalled = true; return nil }
-	m.projectLoader = func(ctx context.Context) ([]compose.Project, error) {
-		return nil, fmt.Errorf("remote loader")
-	}
-
-	updated, cmd := m.Update(tea.KeyMsg{Type: tea.KeyEsc})
-	m = updated.(Model)
-
-	if m.screen != screenSelectServer {
-		t.Errorf("screen = %d, want %d (screenSelectServer)", m.screen, screenSelectServer)
-	}
-	if m.serverName != "" {
-		t.Errorf("serverName should be cleared, got %q", m.serverName)
-	}
-	if m.disconnectFunc != nil {
-		t.Error("disconnectFunc should be nil after going back")
-	}
-	if m.projectLoader == nil {
-		t.Error("projectLoader should be restored to localProjectLoader after going back")
-	}
-
-	// Disconnect is called async via tea.Cmd
-	if cmd != nil {
-		// Execute the command to trigger disconnect
-		msg := cmd()
-		_ = msg
-		if !disconnectCalled {
-			t.Error("disconnect should have been called")
-		}
-	}
-}
-
-func TestEscFromProjectScreen_WithoutServers_DoesNothing(t *testing.T) {
-	mc := &mockComposer{}
-	m := NewModel(nil, io.Discard, mockFactory(mc), nil, nil)
-	m.screen = screenSelectProject
-	m.showPicker = true
-
-	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyEsc})
-	m = updated.(Model)
-
-	if m.screen != screenSelectProject {
-		t.Errorf("screen = %d, want %d (should stay on project screen)", m.screen, screenSelectProject)
 	}
 }
 
@@ -5568,52 +5238,6 @@ func TestRefreshStatus_Error(t *testing.T) {
 	}
 }
 
-func TestLoadProjects_Success(t *testing.T) {
-	projects := []compose.Project{
-		{Name: "app1", ConfigDir: "/app1"},
-		{Name: "app2", ConfigDir: "/app2"},
-	}
-
-	m := NewModel(nil, io.Discard, nil, nil, nil)
-	m.ctx = context.Background()
-	m.projectLoader = func(ctx context.Context) ([]compose.Project, error) {
-		return projects, nil
-	}
-
-	cmd := m.loadProjects()
-	msg := cmd()
-
-	projMsg, ok := msg.(projectsMsg)
-	if !ok {
-		t.Fatalf("expected projectsMsg, got %T", msg)
-	}
-	if projMsg.err != nil {
-		t.Fatalf("unexpected error: %v", projMsg.err)
-	}
-	if len(projMsg.projects) != 2 {
-		t.Errorf("got %d projects, want 2", len(projMsg.projects))
-	}
-}
-
-func TestLoadProjects_Error(t *testing.T) {
-	m := NewModel(nil, io.Discard, nil, nil, nil)
-	m.ctx = context.Background()
-	m.projectLoader = func(ctx context.Context) ([]compose.Project, error) {
-		return nil, fmt.Errorf("docker not running")
-	}
-
-	cmd := m.loadProjects()
-	msg := cmd()
-
-	projMsg, ok := msg.(projectsMsg)
-	if !ok {
-		t.Fatalf("expected projectsMsg, got %T", msg)
-	}
-	if projMsg.err == nil {
-		t.Fatal("expected error, got nil")
-	}
-}
-
 func TestViewSelectContainers_ConfirmState(t *testing.T) {
 	mc := &mockComposer{
 		services: []string{"web", "db"},
@@ -8185,7 +7809,7 @@ func TestQuitConfirmation_RemoteConnection_ShowsPrompt(t *testing.T) {
 	mc := &mockComposer{services: []string{"nginx"}}
 	m := NewModel(nil, io.Discard, mockFactory(mc), testServers, mockConnectCb(mc))
 	m.screen = screenSelectContainers
-	m.showPicker = true
+	m.drilledFromHost = true
 	m.setSingleGroup(mc.services)
 	m.selected = make(map[string]bool)
 	m.disconnectFunc = func() error { return nil }
@@ -8327,8 +7951,10 @@ func TestCtrlCConfirmation_AllRemoteScreens(t *testing.T) {
 		key    string
 		setup  func(m *Model)
 	}{
-		{"project select", screenSelectProject, "ctrl+c", func(m *Model) {
-			m.projects = []compose.Project{{Name: "app", ConfigDir: "/app"}}
+		{"containers grouped", screenSelectContainers, "ctrl+c", func(m *Model) {
+			m.grouped = true
+			m.svcGroups = []svcGroup{{proj: compose.Project{Name: "app", ConfigDir: "/app"}}}
+			m.svcEntries = rebuildSvcEntries(m.svcGroups)
 		}},
 		{"containers normal", screenSelectContainers, "ctrl+c", func(m *Model) {
 			m.setSingleGroup([]string{"nginx"})
@@ -8526,7 +8152,7 @@ func TestQBackNavigation_ContainerScreen(t *testing.T) {
 	mc := &mockComposer{}
 	m := NewModel(nil, io.Discard, mockFactory(mc), testServers, mockConnectCb(mc))
 	m.screen = screenSelectContainers
-	m.showPicker = true
+	m.drilledFromHost = true
 	m.setSingleGroup([]string{"nginx"})
 	m.selected = make(map[string]bool)
 	m.composer = mc
@@ -8549,7 +8175,7 @@ func TestQBackNavigation_ContainerScreenCancelsConfirming(t *testing.T) {
 	mc := &mockComposer{}
 	m := NewModel(nil, io.Discard, mockFactory(mc), testServers, mockConnectCb(mc))
 	m.screen = screenSelectContainers
-	m.showPicker = true
+	m.drilledFromHost = true
 	m.setSingleGroup([]string{"nginx"})
 	m.selected = selectedIdx(m, 0)
 	m.confirming = true
@@ -8575,7 +8201,7 @@ func TestQBackNavigation_ContainerScreenCancelsPendingExec(t *testing.T) {
 	mc := &mockComposer{}
 	m := NewModel(nil, io.Discard, mockFactory(mc), testServers, mockConnectCb(mc))
 	m.screen = screenSelectContainers
-	m.showPicker = true
+	m.drilledFromHost = true
 	m.setSingleGroup([]string{"nginx"})
 	m.selected = selectedIdx(m, 0)
 	m.confirming = true
@@ -8664,38 +8290,6 @@ func TestQBackNavigation_SettingsListCancelsDelete(t *testing.T) {
 	}
 }
 
-func TestQBackNavigation_ProjectScreen(t *testing.T) {
-	mc := &mockComposer{}
-	m := NewModel(nil, io.Discard, mockFactory(mc), testServers, mockConnectCb(mc))
-	m.screen = screenSelectProject
-	m.serverName = "prod"
-	disconnectCalls := 0
-	m.disconnectFunc = func() error {
-		disconnectCalls++
-		return nil
-	}
-
-	updated, cmd := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'q'}})
-	um := updated.(Model)
-
-	if um.screen != screenSelectServer {
-		t.Errorf("screen = %d, want screenSelectServer", um.screen)
-	}
-	if um.disconnectFunc != nil {
-		t.Error("disconnectFunc should be nil after back nav")
-	}
-	if cmd == nil {
-		t.Fatal("expected a tea.Cmd to run disconnect, got nil")
-	}
-	msg := cmd()
-	if _, ok := msg.(disconnectDoneMsg); !ok {
-		t.Errorf("expected disconnectDoneMsg, got %T", msg)
-	}
-	if disconnectCalls != 1 {
-		t.Errorf("disconnect called %d times, want 1", disconnectCalls)
-	}
-}
-
 func TestQBackNavigation_ProgressDoneReturnsToContainers(t *testing.T) {
 	tests := []struct {
 		name string
@@ -8750,69 +8344,11 @@ func TestQOnProgressWhileRunningIsNoop(t *testing.T) {
 	}
 }
 
-func TestQQuitsAtRoot_ProjectScreenNoServers(t *testing.T) {
-	mc := &mockComposer{}
-	m := NewModel(nil, io.Discard, mockFactory(mc), nil, nil)
-	m.screen = screenSelectProject
-
-	_, cmd := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'q'}})
-
-	if cmd == nil {
-		t.Fatal("expected quit cmd, got nil")
-	}
-	msg := cmd()
-	if _, ok := msg.(tea.QuitMsg); !ok {
-		t.Errorf("expected tea.QuitMsg, got %T", msg)
-	}
-}
-
-func TestQBackNavigation_ProjectScreenWithEmptyConfig(t *testing.T) {
-	// When the config file exists but has no servers, NewModel starts on
-	// screenSelectServer (showing just the Local entry). Selecting Local
-	// transitions to screenSelectProject. Pressing q there must navigate
-	// back to server-select, not quit — because there IS a parent screen.
-	mc := &mockComposer{}
-	emptyCfg := &config.Config{}
-	m := NewModel(nil, io.Discard, mockFactory(mc), nil, nil, WithConfig(emptyCfg))
-	m.screen = screenSelectProject
-
-	updated, cmd := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'q'}})
-	um := updated.(Model)
-
-	if um.screen != screenSelectServer {
-		t.Errorf("screen = %d, want screenSelectServer", um.screen)
-	}
-	// No tea.Quit should be returned.
-	if cmd != nil {
-		if msg := cmd(); msg != nil {
-			if _, isQuit := msg.(tea.QuitMsg); isQuit {
-				t.Errorf("got tea.QuitMsg, expected back navigation")
-			}
-		}
-	}
-}
-
-func TestEscBackNavigation_ProjectScreenWithEmptyConfig(t *testing.T) {
-	// Same parent-exists condition for esc: when m.config != nil and
-	// len(servers) == 0, esc must still navigate back to server-select.
-	mc := &mockComposer{}
-	emptyCfg := &config.Config{}
-	m := NewModel(nil, io.Discard, mockFactory(mc), nil, nil, WithConfig(emptyCfg))
-	m.screen = screenSelectProject
-
-	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyEsc})
-	um := updated.(Model)
-
-	if um.screen != screenSelectServer {
-		t.Errorf("screen = %d, want screenSelectServer", um.screen)
-	}
-}
-
 func TestQQuitsAtRoot_ContainerScreenStandalone(t *testing.T) {
 	mc := &mockComposer{services: []string{"nginx"}}
 	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
 	m.screen = screenSelectContainers
-	m.showPicker = false
+	m.drilledFromHost = false
 	m.confirming = false
 	m.setSingleGroup(mc.services)
 	m.selected = make(map[string]bool)
@@ -8872,7 +8408,7 @@ func TestCtrlCStillTriggersDisconnectPrompt(t *testing.T) {
 	mc := &mockComposer{}
 	m := NewModel(nil, io.Discard, mockFactory(mc), testServers, mockConnectCb(mc))
 	m.screen = screenSelectContainers
-	m.showPicker = true
+	m.drilledFromHost = true
 	m.setSingleGroup([]string{"nginx"})
 	m.selected = make(map[string]bool)
 	m.disconnectFunc = func() error { return nil }
@@ -8893,7 +8429,7 @@ func TestQDuringQuittingPromptStillSwallowed(t *testing.T) {
 	mc := &mockComposer{}
 	m := NewModel(nil, io.Discard, mockFactory(mc), testServers, mockConnectCb(mc))
 	m.screen = screenSelectContainers
-	m.showPicker = true
+	m.drilledFromHost = true
 	m.setSingleGroup([]string{"nginx"})
 	m.selected = make(map[string]bool)
 	m.disconnectFunc = func() error { return nil }
@@ -9386,7 +8922,7 @@ func TestStatsMsg_staleIgnored(t *testing.T) {
 func TestStatsMsg_staleErrorIgnored(t *testing.T) {
 	mc := &mockComposer{}
 	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
-	m.screen = screenSelectProject
+	m.screen = screenLogs
 
 	result, _ := m.Update(statsMsg{err: errors.New("boom")})
 	model := result.(Model)
@@ -9417,8 +8953,7 @@ func TestEsc_clearsStats(t *testing.T) {
 	mc := &mockComposer{services: []string{"web"}}
 	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
 	m.screen = screenSelectContainers
-	m.showPicker = true
-	m.projects = []compose.Project{{Name: "proj"}}
+	m.drilledFromHost = true
 	m.setSingleGroup([]string{"web"})
 	m.svcStatus = qStatus(m, map[string]runner.ServiceStatus{"web": {Running: true}})
 	m.stats = qStats(m, map[string]runner.ServiceStats{"web": {CPUPercent: 4.2}})
@@ -9492,28 +9027,11 @@ func TestRefreshStats_capturesCurrentSession(t *testing.T) {
 	}
 }
 
-func TestProjectEnter_bumpsStatsSession(t *testing.T) {
-	mc := &mockComposer{}
-	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
-	m.screen = screenSelectProject
-	m.projects = []compose.Project{{Name: "proj", ConfigDir: "/tmp"}}
-	m.projCursor = 0
-	m.statsSession = 1
-
-	result, _ := m.Update(tea.KeyMsg{Type: tea.KeyEnter})
-	model := result.(Model)
-
-	if model.statsSession <= 1 {
-		t.Errorf("statsSession = %d, want > 1 after project enter", model.statsSession)
-	}
-}
-
 func TestEsc_bumpsStatsSession(t *testing.T) {
 	mc := &mockComposer{services: []string{"web"}}
 	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
 	m.screen = screenSelectContainers
-	m.showPicker = true
-	m.projects = []compose.Project{{Name: "proj"}}
+	m.drilledFromHost = true
 	m.statsSession = 10
 
 	result, _ := m.Update(tea.KeyMsg{Type: tea.KeyEsc})
@@ -9995,107 +9513,6 @@ func TestServicesMsg_offScreenIgnored(t *testing.T) {
 
 	if len(model.services) != 1 || model.services[0] != "existing" {
 		t.Errorf("servicesMsg applied while off-screen: got %v, want [existing]", model.services)
-	}
-}
-
-// --- projectsMsg session guard tests ---
-
-// TestLoadProjects_capturesCurrentSession verifies loadProjects captures
-// m.projectsSession at fire time.
-func TestLoadProjects_capturesCurrentSession(t *testing.T) {
-	mc := &mockComposer{}
-	loader := func(context.Context) ([]compose.Project, error) {
-		return []compose.Project{{Name: "p", ConfigDir: "/p"}}, nil
-	}
-	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil, WithLocalProjectLoader(loader))
-	m.projectsSession = 17
-
-	msg, ok := m.loadProjects()().(projectsMsg)
-	if !ok {
-		t.Fatalf("expected projectsMsg, got %T", m.loadProjects()())
-	}
-	if msg.session != 17 {
-		t.Errorf("captured session = %d, want 17", msg.session)
-	}
-}
-
-// TestProjectsMsg_currentSessionAccepted verifies the happy path.
-func TestProjectsMsg_currentSessionAccepted(t *testing.T) {
-	mc := &mockComposer{}
-	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
-	m.screen = screenSelectProject
-	m.projectsSession = 7
-
-	result, _ := m.Update(projectsMsg{
-		projects: []compose.Project{{Name: "p", ConfigDir: "/p"}},
-		session:  7,
-	})
-	model := result.(Model)
-
-	if len(model.projects) != 1 || model.projects[0].Name != "p" {
-		t.Errorf("projects = %v, want [{Name: p}]", model.projects)
-	}
-}
-
-// TestProjectsMsg_staleSessionIgnored is the regression test for the codex
-// round-3 finding: loadProjects from server A must NOT overwrite m.projects
-// after the user has navigated to server B (which would let server B's
-// composerFactory get fed a path discovered on server A — potentially mounting
-// the wrong directory on deploy).
-func TestProjectsMsg_staleSessionIgnored(t *testing.T) {
-	mc := &mockComposer{}
-	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
-	m.screen = screenSelectProject
-	m.projectsSession = 9 // current (server B)
-	m.projects = []compose.Project{{Name: "b-proj", ConfigDir: "/b"}}
-
-	result, _ := m.Update(projectsMsg{
-		projects: []compose.Project{{Name: "a-proj", ConfigDir: "/a"}}, // stale, from server A
-		session:  4,
-	})
-	model := result.(Model)
-
-	if len(model.projects) != 1 || model.projects[0].Name != "b-proj" {
-		t.Errorf("stale projectsMsg clobbered projects: got %v, want [{b-proj}]", model.projects)
-	}
-}
-
-// TestProjectsMsg_offScreenIgnored verifies the screen-gate still applies.
-func TestProjectsMsg_offScreenIgnored(t *testing.T) {
-	mc := &mockComposer{}
-	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
-	m.screen = screenSelectServer // not the project picker
-	m.projectsSession = 3
-	m.projects = []compose.Project{{Name: "existing"}}
-
-	result, _ := m.Update(projectsMsg{
-		projects: []compose.Project{{Name: "unwanted"}},
-		session:  3,
-	})
-	model := result.(Model)
-
-	if len(model.projects) != 1 || model.projects[0].Name != "existing" {
-		t.Errorf("projectsMsg applied while off-screen: got %v, want [existing]", model.projects)
-	}
-}
-
-// TestProjectsMsg_errorWithCurrentSessionApplied verifies error responses on
-// the current session ARE applied — without this, a network error from the
-// remote loader would never surface.
-func TestProjectsMsg_errorWithCurrentSessionApplied(t *testing.T) {
-	mc := &mockComposer{}
-	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
-	m.screen = screenSelectProject
-	m.projectsSession = 5
-
-	result, _ := m.Update(projectsMsg{
-		err:     errors.New("ssh: connection refused"),
-		session: 5,
-	})
-	model := result.(Model)
-
-	if model.projErr == nil || model.projErr.Error() != "ssh: connection refused" {
-		t.Errorf("projErr = %v, want 'ssh: connection refused'", model.projErr)
 	}
 }
 
@@ -11148,28 +10565,26 @@ func TestUKeyPress_NoComposer(t *testing.T) {
 // documents and asserts that triggering it bumps both statsSession and
 // updatesSession (the two are paired across all 7 sites).
 func TestUpdatesSession_BumpsAtAllSites(t *testing.T) {
-	// 1. project pick (enter on screenSelectProject)
-	t.Run("project_pick", func(t *testing.T) {
+	// 1. drill in (enter on a group header)
+	t.Run("drill_in", func(t *testing.T) {
 		mc := &mockComposer{}
 		m := NewModel(nil, io.Discard, mockFactory(mc), nil, nil)
 		installFakeTick(&m)
-		m.screen = screenSelectProject
-		m.projects = []compose.Project{{Name: "p1", ConfigDir: "/p1"}}
-		m.projCursor = 0
+		parkOnGroupedScreen(&m, compose.Project{Name: "p1", ConfigDir: "/p1"}, compose.Project{Name: "p2", ConfigDir: "/p2"})
 		before := m.updatesSession
 		result, _ := m.Update(tea.KeyMsg{Type: tea.KeyEnter})
 		if result.(Model).updatesSession <= before {
-			t.Errorf("project_pick: updatesSession not bumped (before=%d, after=%d)", before, result.(Model).updatesSession)
+			t.Errorf("drill_in: updatesSession not bumped (before=%d, after=%d)", before, result.(Model).updatesSession)
 		}
 	})
 
-	// 2. esc container→proj
+	// 2. esc container→host view
 	t.Run("esc_container_to_proj", func(t *testing.T) {
 		mc := &mockComposer{}
 		m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
 		installFakeTick(&m)
 		m.screen = screenSelectContainers
-		m.showPicker = true
+		m.drilledFromHost = true
 		before := m.updatesSession
 		result, _ := m.Update(tea.KeyMsg{Type: tea.KeyEsc})
 		if result.(Model).updatesSession <= before {
@@ -11177,17 +10592,18 @@ func TestUpdatesSession_BumpsAtAllSites(t *testing.T) {
 		}
 	})
 
-	// 3. esc proj→server
-	t.Run("esc_proj_to_server", func(t *testing.T) {
+	// 3. esc host view→server
+	t.Run("esc_grouped_to_server", func(t *testing.T) {
 		mc := &mockComposer{}
 		srv := config.Server{Name: "s1", Host: "h1"}
 		m := NewModel(nil, io.Discard, mockFactory(mc), []config.Server{srv}, nil)
 		installFakeTick(&m)
-		m.screen = screenSelectProject
+		m.screen = screenSelectContainers
+		m.grouped = true
 		before := m.updatesSession
 		result, _ := m.Update(tea.KeyMsg{Type: tea.KeyEsc})
 		if result.(Model).updatesSession <= before {
-			t.Errorf("esc_proj_to_server: updatesSession not bumped (before=%d, after=%d)", before, result.(Model).updatesSession)
+			t.Errorf("esc_grouped_to_server: updatesSession not bumped (before=%d, after=%d)", before, result.(Model).updatesSession)
 		}
 	})
 
@@ -11248,9 +10664,9 @@ func TestUpdatesSession_BumpsAtAllSites(t *testing.T) {
 }
 
 // TestUpdatesSession_NotBumpedAtConnectResultError verifies the
-// connectResultMsg error path does NOT bump updatesSession (it's a
-// projectsSession site, not a stats/status/updates site — confirms the plan
-// constraint).
+// connectResultMsg error path does NOT bump updatesSession: it navigates BACK
+// to the server screen without fetching anything, so it invalidates the
+// rollback fetch only.
 func TestUpdatesSession_NotBumpedAtConnectResultError(t *testing.T) {
 	mc := &mockComposer{}
 	srv := config.Server{Name: "s1", Host: "h1"}
@@ -11264,7 +10680,7 @@ func TestUpdatesSession_NotBumpedAtConnectResultError(t *testing.T) {
 }
 
 // TestUpdatesSession_BumpSitesFireRefresh drives one representative site
-// from each fan-out branch (project pick, execDone, esc-from-progress,
+// from each fan-out branch (drill-in, execDone, esc-from-progress,
 // esc-from-logs, entryLocal fast-track) and confirms the returned batch
 // actually invokes CheckUpdates. The bump-only assertions above don't
 // catch a regression where the session bumps but refreshUpdates is dropped
@@ -11276,11 +10692,9 @@ func TestUpdatesSession_BumpSitesFireRefresh(t *testing.T) {
 		key   tea.Msg
 	}{
 		{
-			name: "project_pick",
+			name: "drill_in",
 			setup: func(m *Model) {
-				m.screen = screenSelectProject
-				m.projects = []compose.Project{{Name: "p1", ConfigDir: "/p1"}}
-				m.projCursor = 0
+				parkOnGroupedScreen(m, compose.Project{Name: "p1", ConfigDir: "/p1"}, compose.Project{Name: "p2", ConfigDir: "/p2"})
 			},
 			key: tea.KeyMsg{Type: tea.KeyEnter},
 		},
@@ -11854,7 +11268,7 @@ func TestUpdateDetailsMsg_ErroredEntryIsNotMerged(t *testing.T) {
 // TestUpdateDetailsMsg_LandsAfterNavigatingAway pins the second half of the
 // identity rule. A detail scan is the long half — three registry round-trips
 // per updated image, tens of seconds over SSH — so an ordinary esc to the
-// project picker mid-scan is routine. Because the batch carries the key it was
+// grouped host view mid-scan is routine. Because the batch carries the key it was
 // fetched under, the merge still lands on that project's entry, and returning
 // inside the 10-minute TTL shows the rows. Looking the key up at MERGE time
 // instead dropped the message, and nothing refetched: the entry is a fresh
@@ -11868,10 +11282,10 @@ func TestUpdateDetailsMsg_LandsAfterNavigatingAway(t *testing.T) {
 	fetched := time.Now()
 	m.updateCache = map[string]updateEntry{projectKey: {fetchedAt: fetched, results: map[string]bool{"web": true}}}
 
-	// esc to the project picker: projDir is cleared, so the current key is no
-	// longer the one the batch was fetched under.
+	// esc out to the grouped host view: projDir is cleared, so the current key
+	// is no longer the one the batch was fetched under.
 	m.projDir = ""
-	m.screen = screenSelectProject
+	m.grouped = true
 	if m.updatesCacheKey() == projectKey {
 		t.Fatal("precondition: leaving the project must change the cache key")
 	}
@@ -12219,21 +11633,19 @@ func TestUpdateDetails_GuardIsNotClearedByNavigation(t *testing.T) {
 			msg:   tea.KeyMsg{Type: tea.KeyEsc},
 		},
 		{
-			name:  "esc container→project",
-			setup: func(m *Model) { m.screen = screenSelectContainers; m.showPicker = true },
+			name:  "esc container→host view",
+			setup: func(m *Model) { m.screen = screenSelectContainers; m.drilledFromHost = true },
 			msg:   tea.KeyMsg{Type: tea.KeyEsc},
 		},
 		{
-			name:  "esc project→server",
-			setup: func(m *Model) { m.screen = screenSelectProject; m.servers = servers },
+			name:  "esc host view→server",
+			setup: func(m *Model) { m.screen = screenSelectContainers; m.grouped = true; m.servers = servers },
 			msg:   tea.KeyMsg{Type: tea.KeyEsc},
 		},
 		{
-			name: "project pick",
+			name: "drill in",
 			setup: func(m *Model) {
-				m.screen = screenSelectProject
-				m.projects = []compose.Project{{Name: "p1", ConfigDir: "/p1"}}
-				m.projCursor = 0
+				parkOnGroupedScreen(m, compose.Project{Name: "p1", ConfigDir: "/p1"}, compose.Project{Name: "p2", ConfigDir: "/p2"})
 			},
 			msg: tea.KeyMsg{Type: tea.KeyEnter},
 		},
@@ -12282,12 +11694,10 @@ func TestUpdateDetails_SelfHealsAtEveryScreenEntry(t *testing.T) {
 		msg   tea.Msg
 	}{
 		{
-			name: "project pick",
+			name: "drill in",
 			key:  "/p1|",
 			setup: func(m *Model) {
-				m.screen = screenSelectProject
-				m.projects = []compose.Project{{Name: "p1", ConfigDir: "/p1"}}
-				m.projCursor = 0
+				parkOnGroupedScreen(m, compose.Project{Name: "p1", ConfigDir: "/p1"}, compose.Project{Name: "p2", ConfigDir: "/p2"})
 			},
 			msg: tea.KeyMsg{Type: tea.KeyEnter},
 		},
@@ -13003,7 +12413,7 @@ func TestUpdateInFlight_ResetOnLeaveScreen_ContainerToProj(t *testing.T) {
 	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
 	installFakeTick(&m)
 	m.screen = screenSelectContainers
-	m.showPicker = true
+	m.drilledFromHost = true
 	m.updateInFlight = true
 
 	result, _ := m.Update(tea.KeyMsg{Type: tea.KeyEsc})
@@ -13012,19 +12422,20 @@ func TestUpdateInFlight_ResetOnLeaveScreen_ContainerToProj(t *testing.T) {
 	}
 }
 
-// TestUpdateInFlight_ResetOnLeaveScreen_ProjToServer verifies the same reset
+// TestUpdateInFlight_ResetOnLeaveScreen_GroupedToServer verifies the same reset
 // at the second leave-screen site.
-func TestUpdateInFlight_ResetOnLeaveScreen_ProjToServer(t *testing.T) {
+func TestUpdateInFlight_ResetOnLeaveScreen_GroupedToServer(t *testing.T) {
 	mc := &mockComposer{}
 	srv := config.Server{Name: "s1", Host: "h1"}
 	m := NewModel(nil, io.Discard, mockFactory(mc), []config.Server{srv}, nil)
 	installFakeTick(&m)
-	m.screen = screenSelectProject
+	m.screen = screenSelectContainers
+	m.grouped = true
 	m.updateInFlight = true
 
 	result, _ := m.Update(tea.KeyMsg{Type: tea.KeyEsc})
 	if result.(Model).updateInFlight {
-		t.Error("esc proj→server should reset updateInFlight to false")
+		t.Error("esc host view→server should reset updateInFlight to false")
 	}
 }
 
@@ -13985,10 +13396,10 @@ func TestSearchCycleOffMatchBelowAll(t *testing.T) {
 }
 
 // TestSearchTwoStageEsc: first esc clears the committed search and stays on the
-// container screen; second esc navigates back to the project picker.
+// container screen; second esc navigates back to the grouped host view.
 func TestSearchTwoStageEsc(t *testing.T) {
 	m := committedSearchModel([]string{"api", "web", "worker"}, "w")
-	m.showPicker = true // so the second esc has a project picker to return to
+	m.drilledFromHost = true // so the second esc has a host view to return to
 	if m.searchQuery == "" {
 		t.Fatal("precondition: committed search expected")
 	}
@@ -14363,16 +13774,16 @@ func TestSearchClearedOnServicesReload(t *testing.T) {
 }
 
 // TestSearchClearedOnEscToProject: a context switch off the container screen
-// (esc → project picker) clears the committed search.
+// (esc → grouped host view) clears the committed search.
 func TestSearchClearedOnEscToProject(t *testing.T) {
 	m := committedSearchModel([]string{"api", "web", "worker"}, "w")
-	m.showPicker = true
+	m.drilledFromHost = true
 	if m.searchQuery == "" {
 		t.Fatal("precondition: committed search expected")
 	}
 
 	// First esc clears the search (two-stage guard); the SECOND esc back-navigates.
-	// After the second esc we're on the project picker AND search stays clear.
+	// After the second esc we're on the grouped host view AND search stays clear.
 	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyEsc})
 	m = updated.(Model)
 	assertSearchCleared(t, m, "after 1st esc (search clear)")
@@ -14392,7 +13803,7 @@ func TestSearchClearedOnEscToProject(t *testing.T) {
 // asserts the unconditional (idempotent) clearSearch at the back-nav site.
 func TestSearchClearedOnEscToProjectNoActiveSearch(t *testing.T) {
 	m := containerSearchModel([]string{"api", "web", "worker"})
-	m.showPicker = true
+	m.drilledFromHost = true
 	// No active search — first (and only) esc back-navigates directly.
 	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyEsc})
 	m = updated.(Model)
@@ -14706,31 +14117,36 @@ func TestSearchClearedOnEntryLocal(t *testing.T) {
 	assertSearchCleared(t, m, "after entryLocal")
 }
 
-// TestSearchClearedOnEscProjectToServer: esc from the project picker back to the
-// server screen clears any active search (defensive — search is container-scoped).
-func TestSearchClearedOnEscProjectToServer(t *testing.T) {
+// TestSearchClearedOnEscGroupedToServer: esc from the grouped host view back to
+// the server screen clears any active search.
+func TestSearchClearedOnEscGroupedToServer(t *testing.T) {
 	mc := &mockComposer{}
 	m := NewModel(nil, io.Discard, mockFactory(mc), testServers, mockConnectCb(mc))
 	installFakeTick(&m)
-	m.screen = screenSelectProject
-	m.showPicker = true
+	m.screen = screenSelectContainers
+	m.grouped = true
 	m.disconnectFunc = func() error { return nil }
-	// Seed a stale committed search.
+	// Seed a stale committed search. The first esc is the two-stage clear, the
+	// second back-navigates — and must leave the search cleared either way.
 	m.searchQuery = "w"
 	m.searchMatches = []int{1, 2}
 
 	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyEsc})
 	m = updated.(Model)
+	assertSearchCleared(t, m, "after the two-stage esc")
+
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyEsc})
+	m = updated.(Model)
 
 	if m.screen != screenSelectServer {
-		t.Fatalf("screen = %d, want screenSelectServer (esc project→server)", m.screen)
+		t.Fatalf("screen = %d, want screenSelectServer (esc host view→server)", m.screen)
 	}
-	assertSearchCleared(t, m, "after esc project→server")
+	assertSearchCleared(t, m, "after esc host view→server")
 }
 
 // TestSearchClearedOnConnectError: a failed remote connect swaps the projectLoader
 // and resets transient state; it must also clear a committed search (the error
-// path lands the user on the project picker with no valid service list).
+// path lands the user back on the server screen with no valid service list).
 func TestSearchClearedOnConnectError(t *testing.T) {
 	mc := &mockComposer{}
 	m := NewModel(nil, io.Discard, mockFactory(mc), testServers, mockConnectCb(mc))
@@ -16629,19 +16045,21 @@ func TestUpdatesCacheKey_FollowsComposerAcrossNavigation(t *testing.T) {
 		return local
 	}, []config.Server{{Name: "prod", Host: "prod.example.com"}}, nil)
 	installFakeTick(&m)
-	m.screen = screenSelectProject
-	m.showPicker = true
-	m.projects = []compose.Project{{Name: compose.UnmanagedProjectName, Desc: "2 containers", Unmanaged: true}}
+	parkOnGroupedScreen(&m,
+		compose.Project{Name: "shop", ConfigDir: "/srv/shop"},
+		compose.Project{Name: compose.UnmanagedProjectName, Unmanaged: true},
+	)
+	m.svcCursor = headerIndexFor(t, m.svcEntries, 1)
 
 	updated, _ := m.Update(keyMsgFor("enter"))
 	m = updated.(Model)
 	if got := m.updatesCacheKey(); got != "unmanaged||" {
-		t.Fatalf("after picking the unmanaged row, key = %q, want %q", got, "unmanaged||")
+		t.Fatalf("after drilling into the unmanaged group, key = %q, want %q", got, "unmanaged||")
 	}
 
-	updated, _ = m.Update(keyMsgFor("esc")) // containers -> project
+	updated, _ = m.Update(keyMsgFor("esc")) // drilled -> grouped host view
 	m = updated.(Model)
-	updated, _ = m.Update(keyMsgFor("esc")) // project -> server
+	updated, _ = m.Update(keyMsgFor("esc")) // host view -> server
 	m = updated.(Model)
 	if m.screen != screenSelectServer {
 		t.Fatalf("screen = %d, want screenSelectServer", m.screen)
@@ -19066,7 +18484,7 @@ func TestEnterGroupedContainers_ResetsAndBumpsSessions(t *testing.T) {
 	m.grouped = false
 	m.composer = &g.mockComposer
 	m.projName, m.projDir = "old", "/old"
-	m.showPicker = true
+	m.drilledFromHost = true
 	m.setSingleGroup([]string{"stale"})
 	m.svcStatus = map[string]runner.ServiceStatus{"old/stale": {}}
 	m.stats = map[string]runner.ServiceStats{"old/stale": {}}
@@ -19087,20 +18505,20 @@ func TestEnterGroupedContainers_ResetsAndBumpsSessions(t *testing.T) {
 		t.Error("grouped mode must hold no composer")
 	}
 	for name, got := range map[string]bool{
-		"svcGroups":  m.svcGroups != nil,
-		"svcEntries": m.svcEntries != nil,
-		"services":   m.services != nil,
-		"svcStatus":  m.svcStatus != nil,
-		"stats":      m.stats != nil,
-		"statsErr":   m.statsErr != nil,
-		"svcErr":     m.svcErr != nil,
-		"showPicker": m.showPicker,
-		"selection":  len(m.selected) != 0,
-		"cursor":     m.svcCursor != 0,
-		"offset":     m.svcOffset != 0,
-		"projName":   m.projName != "",
-		"projDir":    m.projDir != "",
-		"updatesErr": m.updatesErr != "",
+		"svcGroups":       m.svcGroups != nil,
+		"svcEntries":      m.svcEntries != nil,
+		"services":        m.services != nil,
+		"svcStatus":       m.svcStatus != nil,
+		"stats":           m.stats != nil,
+		"statsErr":        m.statsErr != nil,
+		"svcErr":          m.svcErr != nil,
+		"drilledFromHost": m.drilledFromHost,
+		"selection":       len(m.selected) != 0,
+		"cursor":          m.svcCursor != 0,
+		"offset":          m.svcOffset != 0,
+		"projName":        m.projName != "",
+		"projDir":         m.projDir != "",
+		"updatesErr":      m.updatesErr != "",
 	} {
 		if got {
 			t.Errorf("%s survived the landing", name)
@@ -19205,7 +18623,7 @@ func TestGroupedScreen_EscGoesBackToServerScreen(t *testing.T) {
 }
 
 // Standalone local run: the grouped screen is a ROOT — esc does nothing and q
-// quits, exactly as the project picker behaved in the same situation.
+// quits, exactly as the screen under the server picker has always behaved.
 func TestGroupedScreen_IsRootWithoutServers(t *testing.T) {
 	g, projects := groupedFixture()
 	m := groupedTestModel(g, projects)
@@ -19551,15 +18969,15 @@ func TestBackToServerScreen_RestoresLocalCallbacks(t *testing.T) {
 	m.composerFactory = func(compose.Project) runner.Composer { return nil }
 	m.projectLoader = func(ctx context.Context) ([]compose.Project, error) { return nil, nil }
 	m.grouped = true
-	projSess := m.projectsSession
+	statusSess := m.statusSession
 
 	m.backToServerScreen()
 
 	if m.projectLoader == nil || m.composerFactory == nil {
 		t.Fatal("the local callbacks must be restored, never left nil")
 	}
-	if m.projectsSession == projSess {
-		t.Error("swapping the projectLoader must bump projectsSession")
+	if m.statusSession == statusSess {
+		t.Error("swapping the projectLoader must invalidate the grouped load it feeds")
 	}
 	if m.refreshInFlight || m.updateInFlight {
 		t.Error("the new context must start with both in-flight guards clear")
@@ -20152,7 +19570,7 @@ func TestGroupedScreen_EnterDrillsIntoProject(t *testing.T) {
 	if !slices.Equal(m.services, []string{"api", "db"}) {
 		t.Errorf("services = %v, want the group's rows painted immediately", m.services)
 	}
-	if !m.showPicker {
+	if !m.drilledFromHost {
 		t.Error("the drilled screen must report a parent so esc can drill back out")
 	}
 	if len(m.selected) != 0 {
@@ -20252,11 +19670,129 @@ func TestGroupedScreen_DrillRoundTrip(t *testing.T) {
 	if m.projName != "" || m.projDir != "" {
 		t.Error("drill-out must drop the project identity")
 	}
-	if m.showPicker {
+	if m.drilledFromHost {
 		t.Error("the grouped screen is not reached through a picker")
 	}
 	if cmd == nil {
 		t.Error("drill-out must reload the host view")
+	}
+}
+
+// TestEscChain_DrilledToGroupedToServer walks the whole back-navigation ladder
+// the deleted project picker used to sit in the middle of: a drilled project
+// esc's out to the grouped host view, and the host view esc's out to the server
+// picker. Nothing between them is a screen of its own any more.
+func TestEscChain_DrilledToGroupedToServer(t *testing.T) {
+	g, projects := groupedFixture()
+	f := newDrillFactory(g)
+	m := NewModel(nil, io.Discard, f.factory(), testServers, mockConnectCb(&g.mockComposer))
+	installFakeTick(&m)
+	m.projectLoader = func(ctx context.Context) ([]compose.Project, error) { return projects, nil }
+	m.screen = screenSelectContainers
+	m.grouped = true
+	m.serverName = "prod"
+	m.disconnectFunc = func() error { return nil }
+	updated, _ := m.Update(m.loadGroups()())
+	m = updated.(Model)
+
+	m.svcCursor = headerIndexFor(t, m.svcEntries, 1) // the shop header
+	updated, _ = m.Update(keyMsgFor("enter"))
+	m = updated.(Model)
+	if m.grouped || m.projName != "shop" {
+		t.Fatalf("drill-in left grouped=%v proj=%q, want the drilled shop screen", m.grouped, m.projName)
+	}
+	if !m.canGoBack() {
+		t.Fatal("a drilled screen reached by drill-in must report a parent")
+	}
+
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyEsc})
+	m = updated.(Model)
+	if !m.grouped || m.screen != screenSelectContainers {
+		t.Fatalf("first esc left screen %d grouped %v, want the grouped host view", m.screen, m.grouped)
+	}
+
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyEsc})
+	m = updated.(Model)
+	if m.screen != screenSelectServer {
+		t.Fatalf("second esc left screen %d, want the server picker", m.screen)
+	}
+	if m.serverName != "" || m.disconnectFunc != nil {
+		t.Error("esc to the server screen must drop the remote connection state")
+	}
+	if m.svcGroups != nil || m.svcEntries != nil {
+		t.Error("esc to the server screen must drop the host rows")
+	}
+}
+
+// TestRootScreenQ_ContainerModes pins the q rule for both modes of the one
+// screen whose LEAVE binding is conditional. q quits ONLY where esc has no
+// parent to reach; everywhere else it rewrites to esc, and the `?` overlay's
+// LEAVE group reads the same predicate.
+func TestRootScreenQ_ContainerModes(t *testing.T) {
+	tests := []struct {
+		name       string
+		setup      func(*Model)
+		servers    []config.Server
+		wantQuit   bool
+		wantScreen screen
+	}{
+		{
+			name:     "grouped standalone quits",
+			setup:    func(m *Model) { m.grouped = true },
+			wantQuit: true,
+		},
+		{
+			name:       "grouped with servers goes back",
+			setup:      func(m *Model) { m.grouped = true },
+			servers:    testServers,
+			wantScreen: screenSelectServer,
+		},
+		{
+			name:     "drilled standalone quits",
+			setup:    func(m *Model) { m.setSingleGroup([]string{"web"}) },
+			wantQuit: true,
+		},
+		{
+			name: "drilled from the host view goes back",
+			setup: func(m *Model) {
+				m.drilledFromHost = true
+				m.setSingleGroup([]string{"web"})
+			},
+			wantScreen: screenSelectContainers,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			mc := &mockComposer{services: []string{"web"}}
+			m := NewModel(mc, io.Discard, mockFactory(mc), tt.servers, nil)
+			installFakeTick(&m)
+			m.screen = screenSelectContainers
+			m.composer = mc
+			tt.setup(&m)
+
+			if got := m.canGoBack(); got == tt.wantQuit {
+				t.Fatalf("canGoBack() = %v, want %v — q and the LEAVE group read it", got, !tt.wantQuit)
+			}
+
+			updated, cmd := m.Update(keyMsgFor("q"))
+			um := updated.(Model)
+
+			if tt.wantQuit {
+				if cmd == nil {
+					t.Fatal("q at a root screen must quit")
+				}
+				if _, ok := cmd().(tea.QuitMsg); !ok {
+					t.Errorf("q returned %T, want tea.QuitMsg", cmd())
+				}
+				return
+			}
+			if um.screen != tt.wantScreen {
+				t.Errorf("q left screen %d, want %d", um.screen, tt.wantScreen)
+			}
+			if tt.wantScreen == screenSelectContainers && !um.grouped {
+				t.Error("q on a drilled screen must drill out to the grouped host view")
+			}
+		})
 	}
 }
 

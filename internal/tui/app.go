@@ -148,7 +148,7 @@ type RollbackPreparer interface {
 // Inspector and UpdateDetailer, so runner.Composer and its five mocks stay
 // untouched. Only *compose.HostContainers implements it, and the TUI reaches
 // it through composerFactory(compose.Project{Unmanaged: true}) — the same
-// synthetic project the unmanaged picker row already used — so no existing
+// synthetic project the unmanaged row already used — so no existing
 // signature (ProjectLoader, ConnectCallback, ComposerFactory) changes.
 //
 // A factory that cannot produce one (a test mock) simply yields no grouped
@@ -274,11 +274,9 @@ type screen int
 
 const (
 	screenSelectServer screen = iota
-	// screenSelectProject is UNREACHABLE in production: the grouped host view
-	// replaced it as the "which project?" screen, and drilling in or out is a
-	// state change on the container screen rather than a separate screen. Its
-	// handlers, view and tests stay wired only until the deletion sweep.
-	screenSelectProject
+	// There is no project-select screen: the grouped host view replaced it as
+	// the "which project?" screen, and drilling in or out is a state change on
+	// the container screen rather than a separate screen.
 	screenSelectContainers
 	screenProgress
 	screenLogs
@@ -315,14 +313,23 @@ type Model struct {
 	localFactory       ComposerFactory
 	localProjectLoader ProjectLoader
 
-	// Screen: project select
-	projects        []compose.Project
-	projCursor      int
-	projErr         error
+	// Project identity of the DRILLED container screen. Empty in grouped mode,
+	// where no single project owns the screen.
 	projName        string // selected project name, for breadcrumbs
-	showPicker      bool   // true if the project picker was shown
 	composerFactory ComposerFactory
-	projectsSession uint64 // bumped at every transition that swaps the projectLoader (server pick, server disconnect, local fast-track, etc.) so a stale loadProjects from server A can't overwrite server B's list
+
+	// drilledFromHost marks a single-project container screen that has the
+	// grouped host view above it — reached by drilling into a group header, or
+	// by the local fast track from the server picker. It is the drilled
+	// screen's canGoBack rule: esc drills back out to the host view.
+	//
+	// It is false for the ONE drilled screen with nothing underneath it: a
+	// standalone `cdeploy` launched in a directory that holds a compose file,
+	// with no servers configured. That screen is a root — q quits and esc does
+	// nothing — and no predicate derivable from the composer, the factory or
+	// the group list can tell it apart from a drill-in, so the entry sites
+	// record it instead.
+	drilledFromHost bool
 
 	// Screen 1: service select
 	services []string
@@ -367,8 +374,8 @@ type Model struct {
 	// screenSelectContainers (when the cache is stale) and explicitly via `U`.
 	// Cache is in-memory and process-local — not persisted across cdeploy
 	// runs. updateCache key is projectDir + "|" + serverName (empty serverName
-	// = local). projDir is empty for the local-fast-track entry (no project
-	// picker), giving the local-no-picker context a single cache slot of "".
+	// = local). projDir is empty for the local-fast-track entry, giving that
+	// context a single cache slot of "".
 	updateCache     map[string]updateEntry
 	updatesSession  uint64          // mirror of statsSession — bumped at the 7 context-change sites so a stale CheckUpdates response can't hydrate UpdateAvailable into a different project's svcStatus map
 	updateInFlight  bool            // mirror of refreshInFlight for refreshUpdates — prevents a slow CheckUpdates from stacking on the next screen entry / `U` press
@@ -568,11 +575,6 @@ func (s stepState) display() string {
 
 // Messages
 type stepEventMsg runner.StepEvent
-type projectsMsg struct {
-	projects []compose.Project
-	err      error
-	session  uint64 // captured from m.projectsSession at fetch time; without it, a stale load from server A could overwrite the project list after the user has switched to server B
-}
 
 // servicesMsg carries a container-screen load in either of the two shapes the
 // screen has. The DRILLED shape (services + status) comes from loadServices and
@@ -836,9 +838,9 @@ type inspectDataMsg struct {
 //
 // Decision table for starting screen:
 //
-//	servers!=nil               -> screenSelectServer  (always show picker)
-//	servers=nil + composer=nil -> screenSelectProject
-//	servers=nil + composer!=nil -> screenSelectContainers
+//	servers!=nil                -> screenSelectServer (always show picker)
+//	servers=nil + composer=nil  -> screenSelectContainers, GROUPED host view
+//	servers=nil + composer!=nil -> screenSelectContainers, DRILLED single project
 //
 // Option configures optional Model behavior.
 type Option func(*Model)
@@ -907,9 +909,9 @@ func NewModel(composer runner.Composer, logWriter io.Writer, factory ComposerFac
 		m.screen = screenSelectServer
 	} else if composer == nil {
 		// No cwd compose file and no servers: land on the grouped host view.
-		// It replaces the project picker as the "which project?" screen —
-		// every project on the host is a foldable group, so picking one is a
-		// drill-in rather than a separate screen.
+		// It is the "which project?" screen — every project on the host is a
+		// foldable group, so picking one is a drill-in rather than a separate
+		// screen.
 		m.screen = screenSelectContainers
 		m.grouped = true
 		m.statsRequested = true
@@ -1030,24 +1032,6 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case tea.KeyMsg:
 		return m.handleKey(msg)
-
-	case projectsMsg:
-		// Drop responses from a stale projectLoader (server A's load lands after
-		// the user has switched to server B). Same race class as
-		// statusMsg/statsMsg/servicesMsg — without the guard, m.projects would
-		// be populated from server A while m.composerFactory now points at B,
-		// so selecting a project would feed B's factory an A-discovered path.
-		if m.screen != screenSelectProject || msg.session != m.projectsSession {
-			return m, nil
-		}
-		if msg.err != nil {
-			m.projErr = msg.err
-			return m, nil
-		}
-		m.projErr = nil
-		m.projects = msg.projects
-		m.projCursor = 0
-		return m, nil
 
 	case servicesMsg:
 		// Drop responses from a previous context (same race class as statusMsg/statsMsg):
@@ -1438,7 +1422,6 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		connectCmd, factory, loader, disconnect := m.connectCb(server)
 		m.composerFactory = factory
 		m.projectLoader = loader
-		m.projectsSession++
 		m.disconnectFunc = disconnect
 		return m, tea.ExecProcess(connectCmd, func(err error) tea.Msg {
 			return connectResultMsg{err: err}
@@ -1456,7 +1439,6 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.serverErr = msg.err
 			m.composerFactory = m.localFactory
 			m.projectLoader = m.localProjectLoader
-			m.projectsSession++
 			m.disconnectFunc = nil
 			m.quitting = false
 			// Clear ALL transient state from the failed connect attempt: name,
@@ -1492,8 +1474,8 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 		m.serverErr = nil
-		// A successful connect now lands on LIVE data instead of a static
-		// picker, so this site DOES bump statsSession / statusSession /
+		// A successful connect lands on LIVE data rather than a static list,
+		// so this site DOES bump statsSession / statusSession /
 		// updatesSession (enterGroupedContainers does it) — the inverse of the
 		// rule that held while the next screen was the project picker. The
 		// resource those counters guard is fetched from here on, so the site
@@ -2035,11 +2017,6 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		switch m.screen {
 		case screenSelectServer:
 			return m, tea.Quit
-		case screenSelectProject:
-			if !m.canGoBack() {
-				return m, tea.Quit
-			}
-			key = "esc"
 		case screenSelectContainers:
 			// The extra !m.confirming term has no canGoBack analogue: an armed
 			// prompt takes q as "cancel" (the esc handler clears it) even on the
@@ -2076,7 +2053,6 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 				m.serverColor = ""
 				m.composerFactory = m.localFactory
 				m.projectLoader = m.localProjectLoader
-				m.projectsSession++
 				m.disconnectFunc = nil
 				m.quitting = false
 				// Explicit cleanup for downstream state from any previous
@@ -2122,7 +2098,9 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 					// a fresh fetch just because a now-stale fetch is still
 					// in flight.
 					m.updateInFlight = false
-					m.showPicker = true
+					// The grouped host view is the parent screen: esc from
+					// this drilled fast track drills back out to it.
+					m.drilledFromHost = true
 					m.screen = screenSelectContainers
 					cmds := []tea.Cmd{m.loadContainerScreenCmd(), m.statsRefreshCmd()}
 					if c := m.maybeRefreshUpdatesCmd(); c != nil {
@@ -2144,7 +2122,6 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 				connectCmd, factory, loader, disconnect := m.connectCb(server)
 				m.composerFactory = factory
 				m.projectLoader = loader
-				m.projectsSession++
 				m.disconnectFunc = disconnect
 				return m, tea.ExecProcess(connectCmd, func(err error) tea.Msg {
 					return connectResultMsg{err: err}
@@ -2159,54 +2136,6 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 				m.settingsDelete = false
 				return m, nil
 			}
-		}
-
-	case screenSelectProject:
-		switch key {
-		case "ctrl+c":
-			return m.tryQuit()
-		case "esc":
-			if m.canGoBack() {
-				// Hoisted out of the return for the same reason every other
-				// pointer-receiver helper is: the evaluation order of a bare
-				// operand against a call operand is unspecified.
-				cmd := m.backToServerScreen()
-				return m, cmd
-			}
-		case "up", "k":
-			if m.projCursor > 0 {
-				m.projCursor--
-			}
-		case "down", "j":
-			if m.projCursor < len(m.projects)-1 {
-				m.projCursor++
-			}
-		case "enter":
-			if len(m.projects) == 0 {
-				return m, nil
-			}
-			proj := m.projects[m.projCursor]
-			m.projName = proj.Name
-			m.projDir = proj.ConfigDir
-			m.composer = m.composerFactory(proj)
-			m.grouped = false
-			m.statsSession++
-			m.statusSession++
-			m.updatesSession++
-			m.rollbackFetchSession++
-			m.statsRequested = true
-			m.refreshInFlight = true
-			// Reset updateInFlight before calling maybeRefreshUpdatesCmd: the
-			// session bump above invalidates any pending updatesMsg, so the
-			// guard inside maybeRefreshUpdatesCmd must not refuse to fire a
-			// fresh fetch just because a now-stale fetch is still in flight.
-			m.updateInFlight = false
-			m.screen = screenSelectContainers
-			cmds := []tea.Cmd{m.loadContainerScreenCmd(), m.statsRefreshCmd()}
-			if c := m.maybeRefreshUpdatesCmd(); c != nil {
-				cmds = append(cmds, c)
-			}
-			return m, tea.Batch(cmds...)
 		}
 
 	case screenSelectContainers:
@@ -2326,10 +2255,10 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 				}
 				return m, nil
 			}
-			if m.showPicker {
+			if m.drilledFromHost {
 				// Drill out: the grouped host view is the screen above a
 				// single project now, so esc goes there rather than to a
-				// separate picker. enterGroupedContainers owns the whole
+				// separate screen. enterGroupedContainers owns the whole
 				// reset — composer, project identity, rows, selection, search,
 				// wait state and the four session counters — which is exactly
 				// the backward-navigation cleanup this site owes.
@@ -4703,19 +4632,6 @@ func (m Model) readLogChunk() tea.Cmd {
 	}
 }
 
-func (m Model) loadProjects() tea.Cmd {
-	loader := m.projectLoader
-	ctx := m.ctx
-	session := m.projectsSession
-	return func() tea.Msg {
-		if loader == nil {
-			return projectsMsg{err: fmt.Errorf("no project loader configured"), session: session}
-		}
-		projects, err := loader(ctx)
-		return projectsMsg{projects: projects, err: err, session: session}
-	}
-}
-
 func (m Model) refreshStatus() tea.Cmd {
 	ctx := m.ctx
 	c := m.composer
@@ -4973,8 +4889,8 @@ func servicesWithUpdate(results map[string]bool) []string {
 
 // updatesCacheKey returns the cache key for the current context. The format
 // is projDir + "|" + serverName, prefixed with "unmanaged|" for the synthetic
-// unmanaged row. Empty serverName means local. For the local-fast-track entry
-// (no project picker), projDir is empty too, so the key is just "|".
+// unmanaged row. Empty serverName means local. For the local-fast-track entry,
+// projDir is empty too, so the key is just "|".
 //
 // The prefix is load-bearing: the unmanaged row has an empty ConfigDir, so a
 // local unmanaged view would key "|" as well — a direct collision with the
@@ -5567,8 +5483,9 @@ func (m *Model) fixSvcOffset() {
 
 // currentProject describes the project the container screen is showing. It is
 // the group identity behind the single-group shape: name and config dir come
-// from the picker, and Unmanaged mirrors the composer, so the synthetic
-// unmanaged bucket is recognisable as a group like any other.
+// from the drill-in (or the local fast track), and Unmanaged mirrors the
+// composer, so the synthetic unmanaged bucket is recognisable as a group like
+// any other.
 func (m Model) currentProject() compose.Project {
 	return compose.Project{Name: m.projName, ConfigDir: m.projDir, Unmanaged: m.readOnly()}
 }
@@ -5607,7 +5524,7 @@ func (m *Model) enterGroupedContainers() tea.Cmd {
 	m.composer = nil
 	m.projName = ""
 	m.projDir = ""
-	m.showPicker = false
+	m.drilledFromHost = false
 	m.clearSvcGroups()
 	m.svcStatus = nil
 	m.stats = nil
@@ -5710,8 +5627,8 @@ func (m *Model) drillIntoGroup(gi int) tea.Cmd {
 	}
 	m.grouped = false
 	// The grouped view is the parent screen from here on: canGoBack and the
-	// footer's back label both read showPicker on the drilled screen.
-	m.showPicker = true
+	// footer's back label both read drilledFromHost on the drilled screen.
+	m.drilledFromHost = true
 	m.composer = c
 	m.projName = g.proj.Name
 	m.projDir = g.proj.ConfigDir
@@ -5748,15 +5665,11 @@ func (m *Model) drillIntoGroup(gi int) tea.Cmd {
 	return tea.Batch(cmds...)
 }
 
-// backToServerScreen is the shared esc body for the screens that sit directly
-// under the server picker. It restores the local callbacks, drops the remote
-// connection and clears every piece of downstream state, per the
-// backward-navigation cleanup discipline — a stale closure or a stale project
-// identity here is the failure mode that rule exists for.
-//
-// It clears the container screen's row state as well as the project picker's.
-// Both callers benefit: the grouped screen must drop its groups, and doing it
-// unconditionally means neither caller can forget half the list.
+// backToServerScreen is the esc body of the grouped host view, the one screen
+// that sits directly under the server picker. It restores the local callbacks,
+// drops the remote connection and clears every piece of downstream state, per
+// the backward-navigation cleanup discipline — a stale closure or a stale
+// project identity here is the failure mode that rule exists for.
 func (m *Model) backToServerScreen() tea.Cmd {
 	disconnectFn := m.disconnectFunc
 	m.screen = screenSelectServer
@@ -5772,17 +5685,13 @@ func (m *Model) backToServerScreen() tea.Cmd {
 	m.statsSession++
 	m.statusSession++
 	m.updatesSession++
-	m.projectsSession++
 	m.rollbackFetchSession++
 	m.refreshInFlight = false
 	m.updateInFlight = false
 	m.updatesErr = ""
 	m.projName = ""
 	m.projDir = ""
-	m.projects = nil
-	m.projCursor = 0
-	m.projErr = nil
-	m.showPicker = false
+	m.drilledFromHost = false
 	m.clearSvcGroups()
 	m.svcStatus = nil
 	m.stats = nil
@@ -5945,8 +5854,6 @@ func (m Model) View() string {
 	switch m.screen {
 	case screenSelectServer:
 		return m.viewSelectServer()
-	case screenSelectProject:
-		return m.viewSelectProject()
 	case screenSelectContainers:
 		return m.viewSelectContainers()
 	case screenProgress:
@@ -6063,69 +5970,6 @@ func (m Model) serverBadge() string {
 	return style.Render(" " + m.serverName + " ")
 }
 
-func (m Model) viewSelectProject() string {
-	var b strings.Builder
-	b.WriteString(titleStyle.Render(m.breadcrumb() + " > select project"))
-	b.WriteString("\n\n")
-
-	if m.projects == nil && m.projErr == nil {
-		b.WriteString("  Loading projects...\n")
-		return b.String()
-	}
-
-	if m.projErr != nil {
-		b.WriteString(stepFailed.Render(fmt.Sprintf("  Error: %v\n", m.projErr)))
-		help := "  q quit"
-		if len(m.servers) > 0 || m.config != nil {
-			help = "  q back"
-		}
-		b.WriteString(helpStyle.Render("\n" + help))
-		return b.String()
-	}
-
-	if len(m.projects) == 0 {
-		b.WriteString("  No Docker Compose projects found\n")
-		help := "  q quit"
-		if len(m.servers) > 0 || m.config != nil {
-			help = "  q back"
-		}
-		b.WriteString(helpStyle.Render("\n" + help))
-		return b.String()
-	}
-
-	maxNameLen := 0
-	for _, proj := range m.projects {
-		if len(proj.Name) > maxNameLen {
-			maxNameLen = len(proj.Name)
-		}
-	}
-
-	for i, proj := range m.projects {
-		cursor := "  "
-		style := itemStyle
-		if i == m.projCursor {
-			cursor = "> "
-			style = selectedItemStyle
-		}
-		name := fmt.Sprintf("%-*s", maxNameLen, proj.Name)
-		b.WriteString(style.Render(cursor + name))
-		b.WriteString("   ")
-		desc := shortenPath(proj.ConfigDir)
-		if proj.Desc != "" {
-			desc = proj.Desc
-		}
-		b.WriteString(descStyle.Render(desc))
-		b.WriteString("\n")
-	}
-
-	helpText := "\n  up/down navigate  •  enter select  •  q quit"
-	if len(m.servers) > 0 || m.config != nil {
-		helpText = "\n  up/down navigate  •  enter select  •  q back"
-	}
-	b.WriteString(helpStyle.Render(helpText))
-	return b.String()
-}
-
 // healthIndicator returns a fixed-width health icon for the TUI container list.
 func healthIndicator(health string) string {
 	switch health {
@@ -6149,17 +5993,15 @@ func (m Model) canGoBack() bool {
 	switch m.screen {
 	case screenSelectServer:
 		return false
-	case screenSelectProject:
-		return len(m.servers) > 0 || m.config != nil
 	case screenSelectContainers:
 		if m.grouped {
-			// The grouped host view replaced the project picker as the screen
-			// under the server picker, so it inherits that screen's rule: esc
-			// goes back to the server list when there is one, and the screen is
+			// The grouped host view is the screen under the server picker, so
+			// it carries that position's rule: esc goes back to the server
+			// list when there is one, and the screen is
 			// a ROOT (q quits, esc does nothing) on a standalone local run.
 			return len(m.servers) > 0 || m.config != nil
 		}
-		return m.showPicker
+		return m.drilledFromHost
 	}
 	return true
 }
@@ -6338,7 +6180,7 @@ func (m Model) viewSelectContainers() string {
 	if m.svcErr != nil {
 		b.WriteString("\n\n")
 		b.WriteString(stepFailed.Render(fmt.Sprintf("  Error: %v\n", m.svcErr)))
-		if m.showPicker {
+		if m.canGoBack() {
 			b.WriteString(helpStyle.Render("\n  q back"))
 		} else {
 			b.WriteString(helpStyle.Render("\n  q quit"))

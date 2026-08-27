@@ -245,8 +245,8 @@ func TestProjectsWithUnmanaged_AppendsRow(t *testing.T) {
 	if last.Name != compose.UnmanagedProjectName || !last.Unmanaged {
 		t.Fatalf("last row = %+v, want the synthetic unmanaged row", last)
 	}
-	if last.Desc != "2 containers" {
-		t.Errorf("unmanaged row desc = %q, want %q", last.Desc, "2 containers")
+	if last.ConfigDir != "" {
+		t.Errorf("unmanaged row ConfigDir = %q, want empty", last.ConfigDir)
 	}
 }
 

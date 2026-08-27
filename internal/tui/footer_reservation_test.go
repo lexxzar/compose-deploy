@@ -44,7 +44,7 @@ func TestContainerFooterReservation(t *testing.T) {
 		m.selected = map[string]bool{}
 		m.height = 24
 		m.width = width
-		m.showPicker = true
+		m.drilledFromHost = true
 		return m
 	}
 
@@ -234,7 +234,7 @@ func TestContainerView_ExcessLineWidthIsPaddingOnly(t *testing.T) {
 				m.selected = map[string]bool{}
 				m.height = 24
 				m.width = width
-				m.showPicker = true
+				m.drilledFromHost = true
 				m.searchInput = textinput.New()
 				if readOnly {
 					m.composer = &readOnlyMockComposer{}
@@ -288,7 +288,7 @@ func TestSearchBarLineNeverWraps(t *testing.T) {
 		m.selected = map[string]bool{}
 		m.height = 24
 		m.width = width
-		m.showPicker = true
+		m.drilledFromHost = true
 		m.searchInput = textinput.New()
 		return m
 	}
@@ -547,7 +547,7 @@ func containerFooterModel(picker bool) Model {
 	m.screen = screenSelectContainers
 	m.setSingleGroup([]string{"web", "db"})
 	m.selected = map[string]bool{}
-	m.showPicker = picker
+	m.drilledFromHost = picker
 	m.width, m.height = 80, 24
 	return m
 }
@@ -608,7 +608,7 @@ func TestContainerFooter_AdvertisesOnlyWorkingKeys(t *testing.T) {
 				}
 				for _, tok := range toks {
 					if !strings.Contains(out, tok) {
-						t.Errorf("readOnly=%v showPicker=%v state=%s: footer missing %q; got:\n%s",
+						t.Errorf("readOnly=%v drilledFromHost=%v state=%s: footer missing %q; got:\n%s",
 							readOnly, picker, st.name, tok, out)
 					}
 				}
@@ -618,7 +618,7 @@ func TestContainerFooter_AdvertisesOnlyWorkingKeys(t *testing.T) {
 				}
 				for _, tok := range bad {
 					if strings.Contains(out, tok) {
-						t.Errorf("readOnly=%v showPicker=%v state=%s: footer advertises %q, which does nothing here; got:\n%s",
+						t.Errorf("readOnly=%v drilledFromHost=%v state=%s: footer advertises %q, which does nothing here; got:\n%s",
 							readOnly, picker, st.name, tok, out)
 					}
 				}
@@ -667,16 +667,16 @@ func TestContainerFooter_RendersOneLineAtEighty(t *testing.T) {
 					}
 					found = true
 					if !strings.Contains(line, end.probe) {
-						t.Errorf("readOnly=%v showPicker=%v state=%s: footer split into two lines at width 80 (%q missing from the %q line): %q",
+						t.Errorf("readOnly=%v drilledFromHost=%v state=%s: footer split into two lines at width 80 (%q missing from the %q line): %q",
 							readOnly, picker, st.name, end.probe, end.anchor, line)
 					}
 					if w := ansi.StringWidth(line); w > 80 {
-						t.Errorf("readOnly=%v showPicker=%v state=%s: footer line is %d cells, exceeds width 80: %q",
+						t.Errorf("readOnly=%v drilledFromHost=%v state=%s: footer line is %d cells, exceeds width 80: %q",
 							readOnly, picker, st.name, w, line)
 					}
 				}
 				if !found {
-					t.Errorf("readOnly=%v showPicker=%v state=%s: no footer line contains %q",
+					t.Errorf("readOnly=%v drilledFromHost=%v state=%s: no footer line contains %q",
 						readOnly, picker, st.name, end.anchor)
 				}
 			}
@@ -694,7 +694,7 @@ const oldContainerHelpLine2 = "  r restart  •  d deploy  •  s stop  •  R r
 // is 3 bytes but one display cell, so len() over-counted 2 per separator).
 func oldContainerFooterLines(m Model) int {
 	back := "q quit"
-	if m.showPicker {
+	if m.drilledFromHost {
 		back = "q back"
 	}
 	line1 := fmt.Sprintf("  space toggle  •  a all  •  / search  •  %s", back)
@@ -737,7 +737,7 @@ func TestSvcVisibleCount_GainsRowVersusOldFooter(t *testing.T) {
 		m.selected = map[string]bool{}
 		m.height = 24
 		m.width = width
-		m.showPicker = picker
+		m.drilledFromHost = picker
 		return m
 	}
 
@@ -762,7 +762,7 @@ func TestSvcVisibleCount_GainsRowVersusOldFooter(t *testing.T) {
 			old := m.height - headerLines - oldContainerFooterLines(m)
 			got := m.svcVisibleCount()
 			if got != old+tc.gain {
-				t.Errorf("width=%d showPicker=%v: svcVisibleCount()=%d, old build=%d, want a gain of %d",
+				t.Errorf("width=%d drilledFromHost=%v: svcVisibleCount()=%d, old build=%d, want a gain of %d",
 					tc.width, picker, got, old, tc.gain)
 			}
 		}
@@ -810,7 +810,7 @@ func TestContainerFooter_NeverExceedsWidth(t *testing.T) {
 				m := Model{}
 				m.screen = screenSelectContainers
 				m.width = width
-				m.showPicker = true
+				m.drilledFromHost = true
 				if readOnly {
 					m.composer = &readOnlyMockComposer{}
 				}

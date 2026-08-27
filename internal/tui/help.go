@@ -106,10 +106,10 @@ func progressGroups(phase progressPhase) []helpGroup {
 	}
 }
 
-// leaveGroup is the LEAVE group for the two screens whose back binding is
-// conditional (project and containers). With a parent screen, q and esc both
-// navigate back; without one, q quits and esc does nothing — so the overlay
-// must not advertise a back key that exits the program. canGoBack comes from
+// leaveGroup is the LEAVE group for the container screen, the one screen whose
+// back binding is conditional. With a parent screen, q and esc both navigate
+// back; without one, q quits and esc does nothing — so the overlay must not
+// advertise a back key that exits the program. canGoBack comes from
 // Model.canGoBack(), the predicate that also picks the footer's back label.
 func leaveGroup(canGoBack bool) helpGroup {
 	if !canGoBack {
@@ -246,18 +246,6 @@ func helpGroupsFor(s screen, hc helpContext) []helpGroup {
 			}},
 		}
 
-	case screenSelectProject:
-		return []helpGroup{
-			{title: "MOVE", entries: []helpEntry{
-				{"↑ k", "up"},
-				{"↓ j", "down"},
-			}},
-			{title: "ACT", actions: true, entries: []helpEntry{
-				{"enter", "select"},
-			}},
-			leaveGroup(canGoBack),
-		}
-
 	case screenSelectContainers:
 		if hc.readOnly {
 			return readOnlyContainerGroups(canGoBack)
@@ -386,8 +374,6 @@ func screenName(s screen) string {
 	switch s {
 	case screenSelectServer:
 		return "servers"
-	case screenSelectProject:
-		return "projects"
 	case screenSelectContainers:
 		return "services"
 	case screenProgress:

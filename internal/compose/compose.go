@@ -37,7 +37,7 @@ type portKey struct {
 //
 // Unmanaged marks the synthetic row that stands for the host containers carrying no
 // com.docker.compose.project label. That row has no compose file, so ConfigDir is
-// empty and Desc carries the container count the picker shows instead of a path.
+// empty and no compose command reports on it.
 type Project struct {
 	Name string
 	// Status is the compose lifecycle status from `docker compose ls`, e.g.
@@ -46,9 +46,6 @@ type Project struct {
 	Status string
 	// ConfigDir is the directory containing the compose file; empty when Unmanaged.
 	ConfigDir string
-	// Desc overrides the project picker's description column. Empty on a compose
-	// project, where the picker shows the shortened ConfigDir.
-	Desc      string
 	Unmanaged bool
 }
 

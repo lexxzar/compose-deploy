@@ -18,7 +18,6 @@ import (
 // skipping every screen-table test in this file.
 var allScreens = []screen{
 	screenSelectServer,
-	screenSelectProject,
 	screenSelectContainers,
 	screenProgress,
 	screenLogs,
@@ -137,8 +136,7 @@ func helpKeyTokensCtx(s screen, hc helpContext) map[string]bool {
 // must be added to both places.
 func TestHelpGroups_NamesEveryBoundKey(t *testing.T) {
 	bound := map[screen][]string{
-		screenSelectServer:  {"q", "ctrl+c", "up", "k", "down", "j", "enter", "s"},
-		screenSelectProject: {"q", "ctrl+c", "esc", "up", "k", "down", "j", "enter"},
+		screenSelectServer: {"q", "ctrl+c", "up", "k", "down", "j", "enter", "s"},
 		screenSelectContainers: {
 			"q", "ctrl+c", "esc", "enter", "up", "k", "down", "j", " ", "a",
 			"r", "d", "s", "R", "n", "N", "/", "l", "c", "x", "U", "i",
@@ -264,10 +262,11 @@ func TestHelpGroups_ReadOnlyDropsGatedKeys(t *testing.T) {
 	}
 }
 
-// TestHelpGroups_LeaveGroupMatchesFooter pins the two screens whose LEAVE
-// binding is conditional. On a standalone run q QUITS and esc does nothing, so
-// an overlay that says "back" would tell the user to press the key that exits
-// the program — and would contradict the footer rendered a moment earlier.
+// TestHelpGroups_LeaveGroupMatchesFooter pins the container screen, whose
+// LEAVE binding is conditional in both of its modes. On a standalone run q
+// QUITS and esc does nothing, so an overlay that says "back" would tell the
+// user to press the key that exits the program — and would contradict the
+// footer rendered a moment earlier.
 func TestHelpGroups_LeaveGroupMatchesFooter(t *testing.T) {
 	tests := []struct {
 		name      string
@@ -278,18 +277,20 @@ func TestHelpGroups_LeaveGroupMatchesFooter(t *testing.T) {
 		checkFoot bool
 	}{
 		{
-			name:     "project with servers",
-			m:        Model{screen: screenSelectProject, servers: testServers},
+			name:     "grouped with servers",
+			m:        Model{screen: screenSelectContainers, grouped: true, servers: testServers},
 			wantKeys: "q esc", wantDesc: "back",
+			wantFoot: "q back", checkFoot: true,
 		},
 		{
-			name:     "project standalone",
-			m:        Model{screen: screenSelectProject},
+			name:     "grouped standalone",
+			m:        Model{screen: screenSelectContainers, grouped: true},
 			wantKeys: "q", wantDesc: "quit",
+			wantFoot: "q quit", checkFoot: true,
 		},
 		{
-			name:     "containers from the picker",
-			m:        Model{screen: screenSelectContainers, showPicker: true},
+			name:     "containers drilled in from the host view",
+			m:        Model{screen: screenSelectContainers, drilledFromHost: true},
 			wantKeys: "q esc", wantDesc: "back",
 			wantFoot: "q back", checkFoot: true,
 		},
@@ -303,8 +304,8 @@ func TestHelpGroups_LeaveGroupMatchesFooter(t *testing.T) {
 		// label is the first token on it. The overlay reads the same predicate
 		// and must not disagree.
 		{
-			name:     "read-only containers from the picker",
-			m:        Model{screen: screenSelectContainers, showPicker: true, composer: &readOnlyMockComposer{}},
+			name:     "read-only containers drilled in from the host view",
+			m:        Model{screen: screenSelectContainers, drilledFromHost: true, composer: &readOnlyMockComposer{}},
 			wantKeys: "q esc", wantDesc: "back",
 			wantFoot: "q back", checkFoot: true,
 		},
@@ -372,13 +373,13 @@ func TestViewHelp_ReplacesScreen(t *testing.T) {
 // no test here shells out to docker.
 func readOnlyOverlayModel(width, height int) Model {
 	m := Model{
-		screen:     screenSelectContainers,
-		selected:   make(map[string]bool),
-		showPicker: true,
-		composer:   &readOnlyMockComposer{},
-		width:      width,
-		height:     height,
-		helpOpen:   true,
+		screen:          screenSelectContainers,
+		selected:        make(map[string]bool),
+		drilledFromHost: true,
+		composer:        &readOnlyMockComposer{},
+		width:           width,
+		height:          height,
+		helpOpen:        true,
 	}
 	m.setSingleGroup([]string{"watchtower", "portainer"})
 	return m
@@ -415,7 +416,7 @@ func TestReadOnly_NoGatedKeyAdvertised(t *testing.T) {
 
 	for _, picker := range []bool{true, false} {
 		m := readOnlyOverlayModel(120, 24)
-		m.showPicker = picker
+		m.drilledFromHost = picker
 
 		named := map[string]bool{}
 		for _, g := range m.helpGroups() {
@@ -430,13 +431,13 @@ func TestReadOnly_NoGatedKeyAdvertised(t *testing.T) {
 		}
 		for _, k := range gatedTokens {
 			if named[k] {
-				t.Errorf("showPicker=%v: read-only overlay names gated key %q", picker, k)
+				t.Errorf("drilledFromHost=%v: read-only overlay names gated key %q", picker, k)
 			}
 		}
 		overlay := ansi.Strip(m.View())
 		for _, tok := range gatedOverlay {
 			if strings.Contains(overlay, tok) {
-				t.Errorf("showPicker=%v: read-only overlay advertises %q, got:\n%s", picker, tok, overlay)
+				t.Errorf("drilledFromHost=%v: read-only overlay advertises %q, got:\n%s", picker, tok, overlay)
 			}
 		}
 
@@ -444,7 +445,7 @@ func TestReadOnly_NoGatedKeyAdvertised(t *testing.T) {
 		footer := ansi.Strip(m.containerFooter())
 		for _, tok := range gatedFooter {
 			if strings.Contains(footer, tok) {
-				t.Errorf("showPicker=%v: read-only footer advertises %q, got: %q", picker, tok, footer)
+				t.Errorf("drilledFromHost=%v: read-only footer advertises %q, got: %q", picker, tok, footer)
 			}
 		}
 	}
@@ -696,7 +697,7 @@ func TestViewHelp_NarrowTerminalKeepsActionKeys(t *testing.T) {
 	// Below 65 columns the overlay stacks to one column, which is where the
 	// budget bites; 24 is the classic short terminal.
 	for _, w := range []int{30, 40, 50, 59} {
-		m := Model{screen: screenSelectContainers, width: w, height: 24, showPicker: true, helpOpen: true}
+		m := Model{screen: screenSelectContainers, width: w, height: 24, drilledFromHost: true, helpOpen: true}
 		view := ansi.Strip(m.View())
 		for _, s := range want {
 			if !strings.Contains(view, s) {
@@ -719,7 +720,7 @@ func TestViewHelp_InspectSurvivesTheFirstTruncation(t *testing.T) {
 	for _, w := range []int{30, 40, 50, 59} {
 		// 23 is one below the height that fits every action row, so it is
 		// exactly the first notch where something must go.
-		m := Model{screen: screenSelectContainers, width: w, height: 23, showPicker: true, helpOpen: true}
+		m := Model{screen: screenSelectContainers, width: w, height: 23, drilledFromHost: true, helpOpen: true}
 		view := ansi.Strip(m.View())
 		if !strings.Contains(view, "inspect") {
 			t.Errorf("width %d: i was the first key sacrificed; move it up inside inspectGroup:\n%s", w, view)
@@ -731,7 +732,7 @@ func TestViewHelp_InspectSurvivesTheFirstTruncation(t *testing.T) {
 	// Asserting `check updates` is ABSENT at height 23 instead would pin the
 	// whole overlay's first sacrifice, so any future row in any action group
 	// would fail this test with a message about inspect.
-	m := Model{screen: screenSelectContainers, width: 50, height: 24, showPicker: true, helpOpen: true}
+	m := Model{screen: screenSelectContainers, width: 50, height: 24, drilledFromHost: true, helpOpen: true}
 	view := ansi.Strip(m.View())
 	if !strings.Contains(view, "check updates") {
 		t.Fatalf("height 24 no longer fits every action row:\n%s", view)
@@ -1041,7 +1042,6 @@ func TestTypingInInput(t *testing.T) {
 		{"settings form field 3", Model{screen: screenSettingsForm, settingsField: 3}, true},
 		{"settings form color picker", Model{screen: screenSettingsForm, settingsField: 4}, false},
 		{"server select", Model{screen: screenSelectServer}, false},
-		{"project select", Model{screen: screenSelectProject}, false},
 		{"progress", Model{screen: screenProgress}, false},
 		{"config", Model{screen: screenConfig}, false},
 		{"settings list", Model{screen: screenSettingsList}, false},
@@ -1058,7 +1058,7 @@ func TestTypingInInput(t *testing.T) {
 // --- Task 4: `?` key-reference overlay acceptance pins ------------------
 
 // TestHelpOverlay_OpensFromEveryScreen proves the "? opens the overlay from
-// all 8 screens, and the content matches the screen it was opened from"
+// every screen, and the content matches the screen it was opened from"
 // criterion. TestViewHelp_ReplacesScreen renders viewHelp with the flag
 // pre-set; this one drives the real `?` keypress through Update, so it also
 // covers the intercept reaching every screen.
@@ -1070,7 +1070,6 @@ func TestHelpOverlay_OpensFromEveryScreen(t *testing.T) {
 		notWant string
 	}{
 		{s: screenSelectServer, want: "settings", notWant: "rollback"},
-		{s: screenSelectProject, want: "select", notWant: "settings"},
 		{s: screenSelectContainers, want: "rollback", notWant: "regex mode"},
 		// A bare Model is the RUNNING phase, where esc cancels the operation.
 		// The other two phases are pinned by TestHelpGroups_ProgressPhases.
@@ -1577,7 +1576,7 @@ func TestHelpGroups_EscClearsQueryBeforeBack(t *testing.T) {
 	t.Run("containers", func(t *testing.T) {
 		for _, key := range []string{"q", "esc"} {
 			m := helpContainerModel()
-			m.showPicker = true
+			m.drilledFromHost = true
 			m = pressKey(m, '/')
 			for _, r := range "web" {
 				m = pressKey(m, r)
