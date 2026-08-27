@@ -438,3 +438,63 @@ func formatBatchTargets(batches []opBatch) string {
 	}
 	return strings.Join(parts, " → ")
 }
+
+// svcRowID names one container-screen row by WHAT it is rather than by where it
+// sits. The row list is rebuilt wholesale — by the 5-second grouped reload, by a
+// fold, by a search that unfolds a group — so an index is not an identity: a
+// container started or removed anywhere on the host inserts or deletes rows and
+// slides every index below it.
+//
+// It is the same identity rule the fold state (project name) and the selection
+// (svcKey) already use, extended to the one piece of user state that was still
+// a raw integer: the cursor.
+type svcRowID struct {
+	proj    string
+	service string // empty on a group header
+	header  bool
+}
+
+// ok reports whether the ID names a real row. The zero value does not: it is
+// what rowIDAt returns for an out-of-range cursor, and restoring from it would
+// jump the cursor to whatever unnamed group happens to sort first.
+func (id svcRowID) ok() bool { return id.proj != "" || id.service != "" }
+
+// rowIDAt names the row at index i by identity. Out of range yields the zero
+// value, which ok() rejects.
+func rowIDAt(entries []svcEntry, groups []svcGroup, i int) svcRowID {
+	if i < 0 || i >= len(entries) {
+		return svcRowID{}
+	}
+	e := entries[i]
+	proj := ""
+	if e.groupIdx >= 0 && e.groupIdx < len(groups) {
+		proj = groups[e.groupIdx].proj.Name
+	}
+	return svcRowID{proj: proj, service: e.name, header: e.kind == entrySvcGroupHeader}
+}
+
+// indexOfRowID finds the row the ID names in a REBUILT list. It reports false
+// when the row is gone (its container was removed, its project disappeared, or
+// its group folded), which is the caller's cue to fall back to a clamp.
+//
+// A header and a service row of the same project are different rows, so the
+// kind is part of the match: a single-project host emits no header at all, and
+// a header ID must not silently land on that project's first service.
+func indexOfRowID(entries []svcEntry, groups []svcGroup, id svcRowID) (int, bool) {
+	if !id.ok() {
+		return 0, false
+	}
+	for i, e := range entries {
+		if (e.kind == entrySvcGroupHeader) != id.header || e.name != id.service {
+			continue
+		}
+		proj := ""
+		if e.groupIdx >= 0 && e.groupIdx < len(groups) {
+			proj = groups[e.groupIdx].proj.Name
+		}
+		if proj == id.proj {
+			return i, true
+		}
+	}
+	return 0, false
+}

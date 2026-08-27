@@ -34,6 +34,11 @@ type helpContext struct {
 	// second meaning (fold a group) that the drilled screen has no row for.
 	grouped bool
 	phase   progressPhase
+	// midSequence marks a health gate with another batch still to come, where
+	// esc STOPS the sequence and enter releases it. With no batch behind it
+	// the two keys do the same thing (end the wait), so the table says so
+	// once instead of promising a choice that does not exist.
+	midSequence bool
 }
 
 // helpGroups returns the key reference for the current screen, with the LEAVE
@@ -42,10 +47,11 @@ type helpContext struct {
 // write keys, and the progress table resolved from the operation's phase.
 func (m Model) helpGroups() []helpGroup {
 	return helpGroupsFor(m.screen, helpContext{
-		canGoBack: m.canGoBack(),
-		readOnly:  m.readOnly(),
-		grouped:   m.grouped,
-		phase:     m.progressPhase(),
+		canGoBack:   m.canGoBack(),
+		readOnly:    m.readOnly(),
+		grouped:     m.grouped,
+		phase:       m.progressPhase(),
+		midSequence: m.midSequence(),
 	})
 }
 
@@ -76,16 +82,27 @@ func (m Model) progressPhase() progressPhase {
 // progressGroups is the screenProgress key table. Unlike every other screen it
 // varies by sub-state, because esc changes MEANING across the three phases:
 // while the pipeline runs it CANCELS the operation, during the health gate it
-// skips the wait, and once finished it navigates back. A static table would
-// name the wrong action in the highest-risk phase. The key tokens are the same
-// three in every phase, so the drift pin holds whichever phase it samples.
-func progressGroups(phase progressPhase) []helpGroup {
+// stops the sequence, and once finished it navigates back. A static table would
+// name the wrong action in the highest-risk phase.
+//
+// The waiting phase names TWO outcomes when a batch is still to come, because
+// the gate binds two: esc stops, enter skips the wait and lets the next project
+// start. Naming only "skip health wait" there under-described a key that
+// launched a whole project's pipeline — the exact failure the footer/overlay
+// rules exist to prevent. With nothing left to release the two keys do the same
+// thing, and the table says so on one row.
+func progressGroups(phase progressPhase, midSequence bool) []helpGroup {
 	switch phase {
 	case progressWaiting:
+		wait := []helpEntry{{"enter q esc", "skip health wait"}}
+		if midSequence {
+			wait = []helpEntry{
+				{"enter", "skip health wait, start the next project"},
+				{"q esc", "stop, skip the projects left"},
+			}
+		}
 		return []helpGroup{
-			{title: "WAIT", entries: []helpEntry{
-				{"q esc", "skip health wait"},
-			}},
+			{title: "WAIT", entries: wait},
 			{title: "LEAVE", entries: []helpEntry{
 				{"ctrl+c", "quit"},
 			}},
@@ -185,14 +202,24 @@ func selectGroup(grouped bool) helpGroup {
 // one of them), so appending it after U would make it the first key dropped.
 // Second keeps the existing sacrifice order (U, then x, then c) unchanged, and
 // TestViewHelp_InspectSurvivesTheFirstTruncation pins that.
-func inspectGroup(readOnly bool) helpGroup {
+//
+// The read-only enter row names TWO meanings in the GROUPED host view, on one
+// row, the way `space` does on the writable grouped table. enter is not gated
+// on readOnly, so on a host whose only group is the unmanaged bucket it still
+// drills into that group — and the read-only table, which drops SELECT whole,
+// had no other row to say so.
+func inspectGroup(readOnly, grouped bool) helpGroup {
 	entries := []helpEntry{{"l", "logs"}, {"i", "inspect"}}
 	if !readOnly {
 		entries = append(entries, helpEntry{"c", "config"})
 	}
 	entries = append(entries, helpEntry{"x", "exec"}, helpEntry{"U", "check updates"})
 	if readOnly {
-		entries = append(entries, helpEntry{"enter", "confirm the exec prompt"})
+		desc := "confirm the exec prompt"
+		if grouped {
+			desc = "drill into the project · confirm the exec prompt"
+		}
+		entries = append(entries, helpEntry{"enter", desc})
 	}
 	return helpGroup{title: "INSPECT", actions: true, entries: entries}
 }
@@ -206,7 +233,7 @@ func inspectGroup(readOnly bool) helpGroup {
 // Group ORDER carries the same load as the writable table: LEAVE sits 3rd of 4
 // so splitHelpGroups leaves it in the left column, and the actions flags still
 // drive singleColumnOrder's truncation order.
-func readOnlyContainerGroups(canGoBack bool) []helpGroup {
+func readOnlyContainerGroups(canGoBack, grouped bool) []helpGroup {
 	return []helpGroup{
 		{title: "MOVE", entries: []helpEntry{
 			{"↑ k", "up"},
@@ -214,7 +241,7 @@ func readOnlyContainerGroups(canGoBack bool) []helpGroup {
 		}},
 		findGroup(),
 		leaveGroup(canGoBack),
-		inspectGroup(true),
+		inspectGroup(true, grouped),
 	}
 }
 
@@ -249,7 +276,7 @@ func helpGroupsFor(s screen, hc helpContext) []helpGroup {
 
 	case screenSelectContainers:
 		if hc.readOnly {
-			return readOnlyContainerGroups(canGoBack)
+			return readOnlyContainerGroups(canGoBack, hc.grouped)
 		}
 		return []helpGroup{
 			{title: "MOVE", entries: []helpEntry{
@@ -269,11 +296,11 @@ func helpGroupsFor(s screen, hc helpContext) []helpGroup {
 				// be opened from the idle screen, where enter does nothing.
 				{"enter", "confirm the prompt"},
 			}},
-			inspectGroup(false),
+			inspectGroup(false, hc.grouped),
 		}
 
 	case screenProgress:
-		return progressGroups(hc.phase)
+		return progressGroups(hc.phase, hc.midSequence)
 
 	case screenLogs:
 		return []helpGroup{

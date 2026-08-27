@@ -345,7 +345,7 @@ Confirmed design decisions (brainstormed and validated; do not re-litigate):
   - empty group: `TestBuildSvcGroups_EmptyProjectKeepsItsGroup`, `TestGroupHeaderLine_EmptyGroupIsBare`
   - unmanaged-only host: ➕ `TestGroupedScreen_UnmanagedOnlyHost` (added here), `TestAllSelected_UnmanagedOnlyHostIsFalse`
   - single-project host: `TestViewSelectContainers_GroupedSingleProjectHasNoIndent`, `TestViewSelectContainers_SingleGroupHasNoHeaderOrIndent`
-  - esc mid-sequence: `TestBatchSequence_EscDoesNotAdvance`, `TestBatchWait_EscSkipReleasesTheNextBatch`, `TestBatchWait_DepartureRunsCleanupAndClearsWait`
+  - esc mid-sequence: `TestBatchSequence_EscDoesNotAdvance`, `TestBatchWait_EscStopsTheSequence`, `TestBatchWait_EnterReleasesTheNextBatch`, `TestBatchWait_DepartureRunsCleanupAndClearsWait`
   - cursor move during a `U` scan: `TestGroupedU_ForKeySurvivesCursorMove`
 - [x] verify: no automatic update scan fires in grouped mode; the update cache entry is shared between grouped and drilled mode
   - `autoUpdatesAllowed()` = `!readOnly() && !grouped`; `maybeRefreshUpdatesCmd` early-returns on `m.grouped`. Pinned by `TestGroupedMode_AllAutoScanEntryPointsRefuse`, `TestGroupedInit_FiresNoUpdateScan`, `TestGroupedMode_NoAutomaticUpdateScan`, `TestGroupedU_FetchesNoDetailBatch`
@@ -364,6 +364,19 @@ Confirmed design decisions (brainstormed and validated; do not re-litigate):
   - ➕ the `?`-overlay paragraph states `progressPhase()` resolves `waiting` first "since it implies `done`" — Task 11 made a mid-sequence gate open with `done` FALSE, so the ordering rule stays but its reason must be restated (a gate can be open with `done` set, with `failed` set, or with neither)
   - ➕ the wait-phase paragraph must say the gate is PER BATCH: `pipelineDoneMsg` opens it, `batchDoneMsg` (not `pipelineDoneMsg`) releases the next batch, a whole-project batch resolves its targets through `waitTargetsMsg`/`ListServices`, and a failing gate stops the sequence only when a batch is still to come
 - [x] moved by the orchestrator at completion
+
+## Review round 3 corrections
+*Applied after the third review iteration; the plan text above is left as written.*
+
+- **`esc` at a mid-sequence health gate now STOPS the sequence; `enter` releases the next batch.** The plan and rounds 1-2 had `esc` release it, described in the footer and the `?` overlay only as "skip health wait" — so the universal abort key launched a whole project's stop → rm → pull → create → start, at the one point in a multi-project run where a user who wants to abort is sitting. `esc` now spells the stop the same way a failing gate does (`m.failed` + `markBatchesSkipped` + a `batchSession` bump); `midSequence()` drives a two-outcome footer and a two-row WAIT table. On the last batch nothing changes.
+- **The grouped reload re-anchors the cursor by IDENTITY** (`svcRowID{proj, service, header}`), not by index: the rows come from a live `docker ps`, so a container appearing anywhere on the host slid the cursor onto another row every 5 seconds. `searchReturnID` applies the same rule to the search bar's return cursor, which typing can move by unfolding a group.
+- **The round-2 `m.confirming` drop is scoped**: the DRILLED payload is still dropped but is remembered in `svcReloadPending` and re-dispatched, because nothing else reloads a drilled screen.
+- **`clearWaitState` no longer clears `opContainers`** (it is the batch's target set, which the grouped title reads); `clearBatchSequence` owns it, and the progress departure now also cancels the final batch's context.
+- **A grouped scan's SUCCESS re-derives `updatesErr` from the cache** rather than clearing it flat, so a success on one group cannot erase another's still-fresh failure; `maybeRefreshUpdatesCmd`'s grouped branch moved ABOVE the in-flight guard so the warning still ages out during a `U` scan.
+- **`progressStepWindow` anchors on the running batch's TAIL**, so a batch taller than the row budget keeps the running step on screen.
+- **The `i`/`x` type-assert refusals and the `c` fall-through re-clamp** with `fixSvcOffset()`, like every other gated container key.
+- **The read-only GROUPED `?` table names `enter`'s drill** — it is not gated on `readOnly`, so an unmanaged-only host really does drill. The footer keeps its four tokens (curated subset; a lone group draws no header).
+- **`cmd/root.go` gained `detectGuard`**: the plugin/standalone verdict is written by the `ProjectLoader` goroutine and read by the `ComposerFactory` on the UI goroutine, and grouped mode runs the loader on every 5-second tick. `localComposerFor`/`remoteComposerFor` now take the verdict as a value.
 
 ## Post-Completion
 *Items requiring manual intervention - no checkboxes, informational only*

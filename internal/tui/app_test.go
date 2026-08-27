@@ -20766,9 +20766,57 @@ func TestBatchWait_StaleTargetsRejected(t *testing.T) {
 	}
 }
 
-// esc on the health gate means "don't wait", not "stop": mid-sequence it
-// releases the next batch.
-func TestBatchWait_EscSkipReleasesTheNextBatch(t *testing.T) {
+// esc on a MID-SEQUENCE health gate STOPS the sequence. The gate is where a
+// multi-project deploy spends most of its wall clock, so it is where a user who
+// wants to abort is sitting — and esc is the abort key everywhere else on this
+// screen. Releasing the next batch from it made the universal abort key launch
+// a whole project's stop → rm → pull → create → start.
+func TestBatchWait_EscStopsTheSequence(t *testing.T) {
+	var log []string
+	m, made := twoBatchModel(t, &log, nil)
+	m = drainPipeline(t, m)
+	if !m.waiting {
+		t.Fatal("precondition: batch 0 must be waiting")
+	}
+	perBatch := m.batchStepCount
+
+	stopped, cmd := m.Update(tea.KeyMsg{Type: tea.KeyEsc})
+	m = stopped.(Model)
+	if m.waiting {
+		t.Error("esc must close the gate")
+	}
+	if m.screen != screenProgress {
+		t.Errorf("screen = %d, want screenProgress — the stop resolves the screen, it does not navigate", m.screen)
+	}
+	if cmd != nil {
+		t.Fatalf("esc at a mid-sequence gate must release NOTHING, got %T", cmd())
+	}
+	if !m.failed {
+		t.Error("a stopped sequence needs a terminal state so the next esc navigates back")
+	}
+	if _, ok := made["shop"]; ok {
+		t.Error("batch 1 must NOT start after esc")
+	}
+	for i := perBatch; i < len(m.steps); i++ {
+		if m.steps[i].status != statusSkipped {
+			t.Errorf("steps[%d].status = %q, want %q — the batches behind the stop say so", i, m.steps[i].status, statusSkipped)
+		}
+	}
+	// A batchDoneMsg already on its way is discarded by the session bump.
+	stale, _ := m.Update(batchDoneMsg{batchIdx: 0, session: 0})
+	if stale.(Model).batchIdx != 0 {
+		t.Error("a stopped sequence must not advance on a stale batchDoneMsg")
+	}
+	// And the next esc leaves the screen.
+	back, _ := m.Update(tea.KeyMsg{Type: tea.KeyEsc})
+	if back.(Model).screen != screenSelectContainers {
+		t.Error("the second esc must leave the progress screen")
+	}
+}
+
+// enter is the key that carries the old "skip the wait and carry on" meaning:
+// mid-sequence it releases the next batch.
+func TestBatchWait_EnterReleasesTheNextBatch(t *testing.T) {
 	var log []string
 	m, made := twoBatchModel(t, &log, nil)
 	m = drainPipeline(t, m)
@@ -20776,20 +20824,23 @@ func TestBatchWait_EscSkipReleasesTheNextBatch(t *testing.T) {
 		t.Fatal("precondition: batch 0 must be waiting")
 	}
 
-	skipped, cmd := m.Update(tea.KeyMsg{Type: tea.KeyEsc})
+	skipped, cmd := m.Update(tea.KeyMsg{Type: tea.KeyEnter})
 	m = skipped.(Model)
 	if m.waiting {
-		t.Error("esc must close the gate")
+		t.Error("enter must close the gate")
+	}
+	if m.failed {
+		t.Error("enter is a skip, not a stop — it must not mark the operation failed")
 	}
 	if m.screen != screenProgress {
-		t.Errorf("screen = %d, want screenProgress — esc on the gate is a skip, not a back-nav", m.screen)
+		t.Errorf("screen = %d, want screenProgress — enter on the gate is a skip, not a back-nav", m.screen)
 	}
 	if cmd == nil {
 		t.Fatal("a skipped mid-sequence gate must release the next batch")
 	}
 	done, ok := cmd().(batchDoneMsg)
 	if !ok {
-		t.Fatalf("esc produced %T, want batchDoneMsg", cmd())
+		t.Fatalf("enter produced %T, want batchDoneMsg", cmd())
 	}
 	advanced, _ := m.Update(done)
 	m = advanced.(Model)
@@ -21412,8 +21463,8 @@ func TestEscCancel_LeavesATerminalState(t *testing.T) {
 }
 
 // A mid-sequence health gate opens with done AND failed both false, because
-// pipelineDoneMsg sets done only for the LAST batch. q and ctrl+c must still
-// work there — the `?` overlay's WAIT group names both.
+// pipelineDoneMsg sets done only for the LAST batch. q, enter and ctrl+c must
+// still work there — the `?` overlay's WAIT group names all three.
 func TestProgressWait_QAndCtrlCAreLiveMidSequence(t *testing.T) {
 	newModel := func() Model {
 		return Model{
@@ -21443,17 +21494,29 @@ func TestProgressWait_QAndCtrlCAreLiveMidSequence(t *testing.T) {
 		t.Fatal("precondition: the phase must resolve to waiting")
 	}
 
-	// q rewrites to esc, which skips the gate and releases the next batch.
-	skipped, cmd := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("q")})
-	got := skipped.(Model)
+	// q rewrites to esc, which closes the gate and STOPS the sequence.
+	stopped, cmd := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("q")})
+	got := stopped.(Model)
 	if got.waiting {
-		t.Error("q must skip the health wait, not be swallowed")
+		t.Error("q must close the health gate, not be swallowed")
 	}
-	if cmd == nil {
-		t.Fatal("skipping a mid-sequence gate must release the next batch")
+	if cmd != nil {
+		t.Fatalf("q at a mid-sequence gate must release nothing, got %T", cmd())
 	}
-	if _, ok := cmd().(batchDoneMsg); !ok {
-		t.Errorf("cmd produced %T, want batchDoneMsg", cmd())
+	if !got.failed {
+		t.Error("q must resolve the screen so the next press navigates back")
+	}
+
+	// enter is the key that releases the next batch there.
+	released, ecmd := newModel().Update(tea.KeyMsg{Type: tea.KeyEnter})
+	if released.(Model).waiting {
+		t.Error("enter must close the health gate")
+	}
+	if ecmd == nil {
+		t.Fatal("enter at a mid-sequence gate must release the next batch")
+	}
+	if _, ok := ecmd().(batchDoneMsg); !ok {
+		t.Errorf("cmd produced %T, want batchDoneMsg", ecmd())
 	}
 
 	// ctrl+c quits (no remote connection here, so tryQuit returns tea.Quit).
@@ -21551,23 +21614,27 @@ func TestProgressWindow_NoMarkersWhenEverythingFits(t *testing.T) {
 
 func TestProgressStepWindow(t *testing.T) {
 	tests := []struct {
-		name                string
-		total, rows, lo, hi int
-		wantStart, wantEnd  int
+		name               string
+		total, rows, hi    int
+		wantStart, wantEnd int
 	}{
-		{"everything fits", 10, 10, 0, 5, 0, 10},
-		{"budget larger than the plan", 4, 9, 0, 4, 0, 4},
-		{"zero budget renders everything", 4, 0, 0, 4, 0, 4},
-		{"first batch anchors at the top", 25, 10, 0, 5, 0, 10},
-		{"last batch scrolls into view", 25, 10, 20, 25, 15, 25},
-		{"a batch taller than the budget shows its head", 25, 3, 20, 25, 20, 23},
+		{"everything fits", 10, 10, 5, 0, 10},
+		{"budget larger than the plan", 4, 9, 4, 0, 4},
+		{"zero budget renders everything", 4, 0, 4, 0, 4},
+		{"first batch anchors at the top", 25, 10, 5, 0, 10},
+		{"last batch scrolls into view", 25, 10, 25, 15, 25},
+		// A batch taller than the budget anchors on its TAIL: the running
+		// batch's LAST row is the last one drawn, so the step actually running
+		// is on screen instead of scrolled off below the window. The old rule
+		// pulled start back to the batch's FIRST row and drew (20, 23).
+		{"a batch taller than the budget shows its tail", 25, 3, 25, 22, 25},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			start, end := progressStepWindow(tt.total, tt.rows, tt.lo, tt.hi)
+			start, end := progressStepWindow(tt.total, tt.rows, tt.hi)
 			if start != tt.wantStart || end != tt.wantEnd {
-				t.Errorf("progressStepWindow(%d,%d,%d,%d) = (%d,%d), want (%d,%d)",
-					tt.total, tt.rows, tt.lo, tt.hi, start, end, tt.wantStart, tt.wantEnd)
+				t.Errorf("progressStepWindow(%d,%d,%d) = (%d,%d), want (%d,%d)",
+					tt.total, tt.rows, tt.hi, start, end, tt.wantStart, tt.wantEnd)
 			}
 		})
 	}
@@ -21743,10 +21810,18 @@ func TestGroupedScreen_UnmanagedOnlyHostIsReadOnly(t *testing.T) {
 		t.Fatal("an unmanaged-only grouped host must read as read-only")
 	}
 	line1, line2 := m.containerHelpLines()
-	for _, tok := range []string{"d deploy", "r restart", "space", "enter drill in"} {
+	for _, tok := range []string{"d deploy", "r restart", "space"} {
 		if strings.Contains(line1+line2, tok) {
 			t.Errorf("the footer advertises %q, which refuses on this host: %q / %q", tok, line1, line2)
 		}
+	}
+	// enter is a different case: it is NOT gated on readOnly, so it really does
+	// drill into the unmanaged group. The footer omits it because it is a
+	// curated subset and a lone group renders no header — the drilled screen
+	// shows the same rows. The `?` overlay is what has to name it, and
+	// TestHelpGroups_ReadOnlyGroupedNamesTheDrill pins that half.
+	if strings.Contains(line1+line2, "enter drill in") {
+		t.Errorf("the read-only footer must keep its four tokens: %q / %q", line1, line2)
 	}
 	// A host with a compose project alongside it stays writable.
 	mixed := groupedScreenModel(svcGroupOf("shop", "api"), unmanagedGroupOf("watchtower"))
@@ -22371,5 +22446,480 @@ func TestViewProgress_TitleIsClampedToWidth(t *testing.T) {
 		if w := ansi.StringWidth(line); w > m.width {
 			t.Fatalf("line overruns width %d (%d cells): %q", m.width, w, line)
 		}
+	}
+}
+
+// --- third review round: pins for the fixes that round produced ---
+
+// TestGroupedReload_CursorSurvivesByIdentity is the pin for the cursor's third
+// piece of user state. The grouped reload IS the 5-second refresh and its rows
+// come from a live `docker ps`, so a container started anywhere on the host
+// inserts a row and slides every index below it. The cursor addresses drill-in,
+// l/i/c/U and — through the empty-selection rule — the whole-project d/r/s, so
+// an index-only survival re-aimed every one of them without a keystroke.
+func TestGroupedReload_CursorSurvivesByIdentity(t *testing.T) {
+	g, projects := groupedFixture()
+	m := groupedTestModel(g, projects)
+	updated, _ := m.Update(m.loadGroups()())
+	m = updated.(Model)
+
+	// Park the cursor on the LAST row and record what it names.
+	m.svcCursor = len(m.svcEntries) - 1
+	before := rowIDAt(m.svcEntries, m.svcGroups, m.svcCursor)
+	if before.service != "watchtower" {
+		t.Fatalf("precondition: the last row is %+v, want the watchtower service row", before)
+	}
+
+	// A container appears in the FIRST group, sorting above its sibling: every
+	// row below it shifts down by one.
+	g.groupedStatus["blog"] = map[string]runner.ServiceStatus{
+		"cache": {Running: true},
+		"web":   {Running: true},
+	}
+	updated, _ = m.Update(m.loadGroups()())
+	m = updated.(Model)
+
+	after := rowIDAt(m.svcEntries, m.svcGroups, m.svcCursor)
+	if after != before {
+		t.Errorf("cursor moved from %+v to %+v; the row it names must survive the rebuild", before, after)
+	}
+	if m.svcCursor != len(m.svcEntries)-1 {
+		t.Errorf("svcCursor = %d, want %d (the new last row)", m.svcCursor, len(m.svcEntries)-1)
+	}
+}
+
+// A header and a service row of the same project are different rows, so the
+// kind is part of the identity — otherwise a header ID would silently land on
+// that project's first service after a single-project host drops its header.
+func TestRowIDAt_HeaderAndServiceAreDifferentRows(t *testing.T) {
+	m := groupedModel(svcGroupOf("blog", "web"), svcGroupOf("shop", "api"))
+	head := rowIDAt(m.svcEntries, m.svcGroups, 0)
+	if !head.header || head.proj != "blog" || head.service != "" {
+		t.Fatalf("row 0 = %+v, want the blog header", head)
+	}
+	svc := rowIDAt(m.svcEntries, m.svcGroups, 1)
+	if svc.header || svc.service != "web" {
+		t.Fatalf("row 1 = %+v, want the web service row", svc)
+	}
+	// A single-group host emits NO header, so the header ID must not resolve.
+	one := groupedModel(svcGroupOf("blog", "web"))
+	if i, ok := indexOfRowID(one.svcEntries, one.svcGroups, head); ok {
+		t.Errorf("the blog header resolved to row %d on a headerless list", i)
+	}
+	if i, ok := indexOfRowID(one.svcEntries, one.svcGroups, svc); !ok || i != 0 {
+		t.Errorf("the web row resolved to (%d,%v), want (0,true)", i, ok)
+	}
+	// An out-of-range cursor names nothing, and nothing must not restore.
+	if id := rowIDAt(m.svcEntries, m.svcGroups, 99); id.ok() {
+		t.Errorf("an out-of-range cursor named %+v", id)
+	}
+}
+
+// A row that is genuinely gone falls back to the clamp rather than jumping to
+// an unrelated row.
+func TestRestoreCursorRow_FallsBackToClamp(t *testing.T) {
+	m := groupedModel(svcGroupOf("blog", "web"), svcGroupOf("shop", "api"))
+	gone := svcRowID{proj: "ghost", service: "vanished"}
+	m.svcCursor = 99
+	m.restoreCursorRow(gone)
+	if m.svcCursor != len(m.svcEntries)-1 {
+		t.Errorf("svcCursor = %d, want the clamped last row %d", m.svcCursor, len(m.svcEntries)-1)
+	}
+}
+
+// drilledConfirmModel is a DRILLED (non-grouped) container screen with an armed
+// confirmation prompt — the state in which a still-in-flight loadServices
+// payload has to be refused.
+func drilledConfirmModel(t *testing.T, mc *mockComposer) Model {
+	t.Helper()
+	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
+	installFakeTick(&m)
+	m.screen = screenSelectContainers
+	m.composer = mc
+	m.ctx = context.Background()
+	m.width, m.height = 100, 24
+	// drillIntoGroup installs the host-ps subset first, then dispatches
+	// loadServices — so the screen has rows to select from while the fetch runs.
+	m.setSingleGroup([]string{"web"})
+	m.selected = map[string]bool{m.svcKeyAt(0): true}
+	m.confirming = true
+	m.pendingOp = runner.Restart
+	return m
+}
+
+// TestDrilledServicesMsg_ConfirmingReloadIsRedispatched pins the completion of
+// the round-2 confirming guard. Dropping the drilled payload is right — it
+// resets the selection and the cursor wholesale — but nothing else re-dispatches
+// loadServices during a drilled visit, so the screen would keep the host-ps
+// subset (and swallow the fetch's error) for the whole visit.
+func TestDrilledServicesMsg_ConfirmingReloadIsRedispatched(t *testing.T) {
+	mc := &mockComposer{services: []string{"api", "web", "worker"}}
+	m := drilledConfirmModel(t, mc)
+
+	arrived, cmd := m.Update(servicesMsg{services: mc.services, session: m.statusSession})
+	m = arrived.(Model)
+	if cmd != nil {
+		t.Errorf("an armed prompt must drop the payload, got %T", cmd())
+	}
+	if !m.svcReloadPending {
+		t.Fatal("the dropped drilled payload must be remembered")
+	}
+	if len(modelServices(m)) != 1 {
+		t.Fatalf("services = %v, want the pre-fetch subset", modelServices(m))
+	}
+
+	// Cancelling the prompt fires it again.
+	closed, cmd := m.Update(tea.KeyMsg{Type: tea.KeyEsc})
+	m = closed.(Model)
+	if m.svcReloadPending {
+		t.Error("the flag must clear once the reload is re-dispatched")
+	}
+	if cmd == nil {
+		t.Fatal("closing the prompt must re-dispatch loadServices")
+	}
+	msg, ok := cmd().(servicesMsg)
+	if !ok {
+		t.Fatalf("cmd produced %T, want servicesMsg", cmd())
+	}
+	if len(msg.services) != 3 {
+		t.Errorf("the re-dispatch returned %v, want all three compose services", msg.services)
+	}
+}
+
+// The grouped payload keeps the old behaviour: it is dropped and NOT
+// remembered, because the 5-second tick refetches it on its own.
+func TestGroupedServicesMsg_ConfirmingDropIsNotRemembered(t *testing.T) {
+	g, projects := groupedFixture()
+	m := groupedTestModel(g, projects)
+	updated, _ := m.Update(m.loadGroups()())
+	m = updated.(Model)
+	m.confirming = true
+
+	arrived, _ := m.Update(m.loadGroups()())
+	if arrived.(Model).svcReloadPending {
+		t.Error("the grouped payload has its own refetch; it must not set the flag")
+	}
+}
+
+// A prompt closed by CONFIRMING leaves for the progress/exec screen instead of
+// reloading, so containerFetchBatch is the second consumer of the same flag —
+// the return from progress settles the debt.
+func TestSvcReloadPending_SettledByTheReturnFromProgress(t *testing.T) {
+	mc := &mockComposer{services: []string{"api", "web", "worker"}}
+	m := drilledConfirmModel(t, mc)
+	m.confirming = false
+	m.svcReloadPending = true
+
+	cmd := m.containerFetchBatch(false)
+	if m.svcReloadPending {
+		t.Error("containerFetchBatch must consume the flag")
+	}
+	if cmd == nil {
+		t.Fatal("containerFetchBatch returned no command")
+	}
+	batch, ok := cmd().(tea.BatchMsg)
+	if !ok {
+		t.Fatalf("cmd produced %T, want tea.BatchMsg", cmd())
+	}
+	found := false
+	for _, c := range batch {
+		if msg, ok := c().(servicesMsg); ok && len(msg.services) == 3 {
+			found = true
+		}
+	}
+	if !found {
+		t.Error("a pending reload must make containerFetchBatch(false) run loadServices, not refreshStatus")
+	}
+}
+
+// TestUpdatesMsg_GroupedSuccessKeepsAnotherGroupsWarning pins the scoped clear.
+// A U scan covers ONE group, so a flat `updatesErr = ""` on success erased a
+// warning that belonged to a different one — and nothing in grouped mode would
+// put it back, since U is the only trigger there.
+func TestUpdatesMsg_GroupedSuccessKeepsAnotherGroupsWarning(t *testing.T) {
+	m := groupedScreenModel(svcGroupOf("blog", "web"), svcGroupOf("shop", "api"))
+	m.selected = map[string]bool{}
+	blogKey := m.projUpdatesCacheKey(m.svcGroups[0].proj)
+	shopKey := m.projUpdatesCacheKey(m.svcGroups[1].proj)
+	m.updateCache = map[string]updateEntry{
+		blogKey: {fetchedAt: time.Now(), err: true, errMsg: "updates: blog registry down"},
+	}
+	m.updatesErr = "updates: blog registry down"
+
+	updated, _ := m.Update(updatesMsg{results: map[string]bool{"api": true}, session: m.updatesSession, forKey: shopKey})
+	got := updated.(Model)
+
+	if got.updatesErr != "updates: blog registry down" {
+		t.Errorf("updatesErr = %q, want blog's still-fresh failure preserved", got.updatesErr)
+	}
+
+	// And a success on the group that FAILED does clear it.
+	updated, _ = got.Update(updatesMsg{results: map[string]bool{"web": false}, session: got.updatesSession, forKey: blogKey})
+	if cleared := updated.(Model).updatesErr; cleared != "" {
+		t.Errorf("updatesErr = %q, want cleared once blog itself succeeded", cleared)
+	}
+}
+
+// The drilled screen holds ONE project, so its clear stays unconditional.
+func TestUpdatesMsg_DrilledSuccessClearsTheWarning(t *testing.T) {
+	mc := &mockComposer{services: []string{"web"}}
+	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
+	installFakeTick(&m)
+	m.screen = screenSelectContainers
+	m.updatesErr = "updates: boom"
+
+	updated, _ := m.Update(updatesMsg{results: map[string]bool{"web": false}, session: m.updatesSession, forKey: m.updatesCacheKey()})
+	if got := updated.(Model).updatesErr; got != "" {
+		t.Errorf("updatesErr = %q, want cleared", got)
+	}
+}
+
+// TestMaybeRefreshUpdates_GroupedExpiresErrWhileAScanIsInFlight pins the branch
+// ORDER. The grouped branch schedules nothing, so the in-flight guard has
+// nothing to protect there — and behind the guard the one thing the branch does
+// do (age out the soft warning) was skipped for the whole life of a U scan.
+func TestMaybeRefreshUpdates_GroupedExpiresErrWhileAScanIsInFlight(t *testing.T) {
+	m := groupedScreenModel(svcGroupOf("blog", "web"))
+	key := m.projUpdatesCacheKey(m.svcGroups[0].proj)
+	m.updateCache = map[string]updateEntry{
+		key: {fetchedAt: time.Now().Add(-2 * updatesErrorTTL), err: true, errMsg: "updates: boom"},
+	}
+	m.updatesErr = "updates: boom"
+	m.updateInFlight = true
+
+	if cmd := m.maybeRefreshUpdatesCmd(); cmd != nil {
+		t.Errorf("grouped mode must schedule nothing, got %T", cmd())
+	}
+	if m.updatesErr != "" {
+		t.Errorf("updatesErr = %q, want the expired warning aged out despite the in-flight scan", m.updatesErr)
+	}
+}
+
+// TestContainerKeys_UnsupportedCapabilityReclampsOffset is the type-assert twin
+// of TestReadOnly_GatedKeyReclampsOffset: i, x and c also return early when the
+// composer implements neither Inspector, ExecProvider nor ConfigProvider, and
+// the dispatch cleared m.warning above them.
+func TestContainerKeys_UnsupportedCapabilityReclampsOffset(t *testing.T) {
+	for _, key := range []string{"i", "x", "c"} {
+		t.Run(key, func(t *testing.T) {
+			var services []string
+			for i := 0; i < 30; i++ {
+				services = append(services, fmt.Sprintf("svc-%02d", i))
+			}
+			mc := &mockComposer{services: services}
+			m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
+			installFakeTick(&m)
+			m.screen = screenSelectContainers
+			m.composer = mc
+			m.ctx = context.Background()
+			m.width, m.height = 100, 24
+			m.setSingleGroup(services)
+			m.warning = "Container is not running"
+			m.svcCursor = len(m.svcEntries) - 1
+			m.fixSvcOffset()
+			if m.svcOffset == 0 {
+				t.Fatal("precondition: the list must scroll at this height")
+			}
+
+			updated, _ := m.Update(keyMsgFor(key))
+			got := updated.(Model)
+
+			if got.screen != screenSelectContainers {
+				t.Fatalf("key %q changed screen to %d; the mock supports none of the three", key, got.screen)
+			}
+			want := len(got.svcEntries) - got.svcVisibleCount()
+			if got.svcOffset != want {
+				t.Errorf("svcOffset = %d, want %d; the refusal left a blank row at the bottom", got.svcOffset, want)
+			}
+		})
+	}
+}
+
+// TestEscFromProgress_CancelsTheLastBatchContext pins the leak fix. batchDoneMsg
+// cancels each batch as the next takes over m.cancel, but the LAST batch has no
+// successor — so leaving the screen is where its context has to be released.
+func TestEscFromProgress_CancelsTheLastBatchContext(t *testing.T) {
+	mc := &mockComposer{services: []string{"web"}}
+	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
+	installFakeTick(&m)
+	m.screen = screenProgress
+	m.composer = mc
+	m.pendingOp = runner.Deploy
+	m.done = true
+	ctx, cancel := context.WithCancel(context.Background())
+	m.ctx = context.Background()
+	m.cancel = cancel
+
+	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyEsc})
+	if updated.(Model).screen != screenSelectContainers {
+		t.Fatalf("screen = %d, want screenSelectContainers", updated.(Model).screen)
+	}
+	select {
+	case <-ctx.Done():
+	default:
+		t.Error("the final batch's context is still live after leaving the progress screen")
+	}
+	if updated.(Model).cancel != nil {
+		t.Error("m.cancel must be nil after the departure")
+	}
+}
+
+// opContainers is the BATCH's resolved target set, not wait state — the grouped
+// progress title reads it. Clearing it on an esc-skipped gate re-titled a
+// named-service operation "all services"; clearBatchSequence owns it instead.
+func TestClearWaitState_KeepsOpContainers(t *testing.T) {
+	m := Model{opContainers: []string{"api", "db"}, waiting: true}
+	m.clearWaitState()
+	if len(m.opContainers) != 2 {
+		t.Errorf("opContainers = %v, want the batch's target set preserved", m.opContainers)
+	}
+	if m.waiting {
+		t.Error("clearWaitState must still close the gate")
+	}
+	m.clearBatchSequence()
+	if m.opContainers != nil {
+		t.Errorf("opContainers = %v, want nil once the sequence itself is dropped", m.opContainers)
+	}
+}
+
+// The visible half of the same rule: a gate skipped on the last batch keeps the
+// title naming the services the batch actually ran.
+func TestViewProgress_SkippedGateKeepsTheNamedTargets(t *testing.T) {
+	m := Model{
+		screen:         screenProgress,
+		pendingOp:      runner.Deploy,
+		grouped:        true,
+		width:          100,
+		height:         24,
+		done:           true,
+		waiting:        true,
+		batchStepCount: 1,
+		batches:        []opBatch{{proj: compose.Project{Name: "shop"}, services: []string{"api"}}},
+		opContainers:   []string{"api"},
+		steps:          []stepState{progressStep(runner.StepStopping, runner.StatusDone)},
+	}
+	m.waitState = runner.NewWaitState([]string{"api"})
+	m.waitDeadline = time.Now().Add(time.Minute)
+
+	skipped, _ := m.Update(tea.KeyMsg{Type: tea.KeyEsc})
+	out := ansi.Strip(skipped.(Model).viewProgress())
+	if strings.Contains(out, "all services") {
+		t.Errorf("the skipped gate re-titled a named operation:\n%s", out)
+	}
+	if !strings.Contains(out, "api") {
+		t.Errorf("the title must still name the batch's services:\n%s", out)
+	}
+}
+
+// TestViewProgress_MidSequenceGateNamesBothOutcomes pins the footer half of the
+// esc/enter split. The gate binds two keys with opposite consequences, and the
+// destructive one is the key that starts the next project.
+func TestViewProgress_MidSequenceGateNamesBothOutcomes(t *testing.T) {
+	base := func(batches int) Model {
+		m := Model{
+			screen:         screenProgress,
+			pendingOp:      runner.Deploy,
+			width:          120,
+			height:         24,
+			waiting:        true,
+			batchStepCount: 1,
+			steps:          []stepState{progressStep(runner.StepStopping, runner.StatusDone)},
+		}
+		for i := 0; i < batches; i++ {
+			m.batches = append(m.batches, opBatch{proj: compose.Project{Name: fmt.Sprintf("p%d", i)}})
+		}
+		m.waitState = runner.NewWaitState([]string{"api"})
+		m.waitDeadline = time.Now().Add(time.Minute)
+		return m
+	}
+
+	mid := ansi.Strip(base(2).viewProgress())
+	if !strings.Contains(mid, "enter skip wait") || !strings.Contains(mid, "q esc stop") {
+		t.Errorf("a mid-sequence gate must name both outcomes, got:\n%s", mid)
+	}
+
+	last := ansi.Strip(base(1).viewProgress())
+	if strings.Contains(last, "stop") {
+		t.Errorf("with nothing left to release the footer must not promise a choice, got:\n%s", last)
+	}
+	if !strings.Contains(last, "enter q esc skip") {
+		t.Errorf("the last batch's gate is a plain skip, got:\n%s", last)
+	}
+}
+
+// TestSearch_EscWhileTypingRestoresTheRowAfterAnUnfold pins the identity twin of
+// searchReturn. Typing UNFOLDS a group holding a match, which grows svcEntries
+// under the raw index the `/` press captured.
+func TestSearch_EscWhileTypingRestoresTheRowAfterAnUnfold(t *testing.T) {
+	// The folded group sits ABOVE the cursor, so opening it pushes every row
+	// below it down by one — which is what makes the raw index wrong.
+	m := groupedScreenModel(
+		svcGroupOf("archive", "db"),
+		svcGroupOf("shop", "api"),
+	)
+	m.svcGroups[0].folded = true
+	m.svcEntries = rebuildSvcEntries(m.svcGroups)
+	// Rows: 0 = archive header (folded), 1 = shop header, 2 = api.
+	m.svcCursor = 2
+	before := rowIDAt(m.svcEntries, m.svcGroups, m.svcCursor)
+	if before.service != "api" {
+		t.Fatalf("precondition: row 2 is %+v, want the api row", before)
+	}
+
+	m = pressGroupKey(m, "/")
+	if !m.searching {
+		t.Fatal("precondition: / must open the search input")
+	}
+	m = pressGroupKey(m, "db")
+	if m.svcGroups[0].folded {
+		t.Fatal("precondition: the match must unfold its group")
+	}
+	if len(m.svcEntries) != 4 {
+		t.Fatalf("precondition: the unfold must grow the list, got %d rows", len(m.svcEntries))
+	}
+
+	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyEsc})
+	got := updated.(Model)
+	after := rowIDAt(got.svcEntries, got.svcGroups, got.svcCursor)
+	if after != before {
+		t.Errorf("cursor restored to %+v, want the row it left from, %+v", after, before)
+	}
+}
+
+// TestProgressWindow_TallBatchKeepsTheRunningStep is the behavioural half of the
+// window's tail anchor. On a terminal with fewer rows to spare than the batch
+// has steps, pulling the window back to the batch's FIRST row showed its head
+// while the step that was actually running scrolled off the bottom.
+func TestProgressWindow_TallBatchKeepsTheRunningStep(t *testing.T) {
+	stepNames := runner.Steps(runner.Deploy)
+	var batches []opBatch
+	var steps []stepState
+	for _, name := range []string{"p0", "p1", "p2", "p3", "p4"} {
+		batches = append(batches, opBatch{proj: compose.Project{Name: name, ConfigDir: "/srv/" + name}})
+		for _, step := range stepNames {
+			steps = append(steps, stepState{name: step, label: name + ": " + step, status: runner.StatusDone})
+		}
+	}
+	// The LAST batch is running, and its LAST step is the one in flight.
+	running := len(steps) - 1
+	steps[running].status = runner.StatusRunning
+	m := Model{
+		screen:         screenProgress,
+		pendingOp:      runner.Deploy,
+		ctx:            context.Background(),
+		batches:        batches,
+		batchStepCount: len(stepNames),
+		batchIdx:       len(batches) - 1,
+		steps:          steps,
+		width:          100,
+		height:         12, // fewer rows to spare than the batch has steps
+	}
+
+	out := ansi.Strip(m.viewProgress())
+	if !strings.Contains(out, steps[running].label) {
+		t.Errorf("the running step %q scrolled out of the window:\n%s", steps[running].label, out)
+	}
+	if lines := strings.Split(strings.TrimRight(out, "\n"), "\n"); len(lines) > m.height {
+		t.Errorf("viewProgress rendered %d lines into a %d-row terminal:\n%s", len(lines), m.height, out)
 	}
 }

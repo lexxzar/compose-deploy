@@ -141,7 +141,9 @@ func TestHelpGroups_NamesEveryBoundKey(t *testing.T) {
 			"q", "ctrl+c", "esc", "enter", "up", "k", "down", "j", " ", "a",
 			"r", "d", "s", "R", "n", "N", "/", "l", "c", "x", "U", "i",
 		},
-		screenProgress: {"q", "ctrl+c", "esc"},
+		// enter is bound only in the waiting sub-state, where it releases the
+		// health gate. progressGroups names it in both midSequence variants.
+		screenProgress: {"q", "ctrl+c", "esc", "enter"},
 		screenLogs: {
 			"q", "ctrl+c", "esc", "enter", "ctrl+r", "w", "p", "G", "f", "/",
 			"n", "N", "up", "down", "left", "right", "pgup", "pgdown",
@@ -241,20 +243,22 @@ func TestHelpGroups_ReadOnlyNamesEveryBoundKey(t *testing.T) {
 func TestHelpGroups_ReadOnlyDropsGatedKeys(t *testing.T) {
 	gated := []string{"d", "r", "s", "R", "c", " ", "a"}
 	for _, canGoBack := range []bool{true, false} {
-		named := helpKeyTokens(screenSelectContainers, canGoBack, true)
-		for _, k := range gated {
-			if named[k] {
-				t.Errorf("canGoBack=%v: read-only table names gated key %q", canGoBack, k)
+		for _, grouped := range []bool{false, true} {
+			named := helpKeyTokensCtx(screenSelectContainers, helpContext{canGoBack: canGoBack, readOnly: true, grouped: grouped})
+			for _, k := range gated {
+				if named[k] {
+					t.Errorf("canGoBack=%v grouped=%v: read-only table names gated key %q", canGoBack, grouped, k)
+				}
 			}
-		}
-		for _, g := range readOnlyContainerGroups(canGoBack) {
-			if g.title == "SELECT" || g.title == "OPERATE" {
-				t.Errorf("canGoBack=%v: read-only table still carries the %q group", canGoBack, g.title)
-			}
-			for _, e := range g.entries {
-				for _, dead := range []string{"toggle", "all", "deploy", "restart", "stop", "rollback", "config"} {
-					if strings.Contains(e.desc, dead) {
-						t.Errorf("canGoBack=%v: read-only entry %+v describes the gated action %q", canGoBack, e, dead)
+			for _, g := range readOnlyContainerGroups(canGoBack, grouped) {
+				if g.title == "SELECT" || g.title == "OPERATE" {
+					t.Errorf("canGoBack=%v grouped=%v: read-only table still carries the %q group", canGoBack, grouped, g.title)
+				}
+				for _, e := range g.entries {
+					for _, dead := range []string{"toggle", "all", "deploy", "restart", "stop", "rollback", "config"} {
+						if strings.Contains(e.desc, dead) {
+							t.Errorf("canGoBack=%v grouped=%v: read-only entry %+v describes the gated action %q", canGoBack, grouped, e, dead)
+						}
 					}
 				}
 			}
@@ -1341,17 +1345,19 @@ func TestHelpGroups_ProgressPhases(t *testing.T) {
 	// The drift pin unions the tokens over the phases, so a phase that dropped
 	// a key would still look covered. Every phase must name all three.
 	for _, phase := range allProgressPhases {
-		got := map[string]bool{}
-		for _, g := range progressGroups(phase) {
-			for _, e := range g.entries {
-				for _, tok := range strings.Fields(e.keys) {
-					got[tok] = true
+		for _, midSeq := range []bool{false, true} {
+			got := map[string]bool{}
+			for _, g := range progressGroups(phase, midSeq) {
+				for _, e := range g.entries {
+					for _, tok := range strings.Fields(e.keys) {
+						got[tok] = true
+					}
 				}
 			}
-		}
-		for _, want := range []string{"q", "esc", "ctrl+c"} {
-			if !got[want] {
-				t.Errorf("phase %d does not name %q", phase, want)
+			for _, want := range []string{"q", "esc", "ctrl+c"} {
+				if !got[want] {
+					t.Errorf("phase %d (midSequence=%v) does not name %q", phase, midSeq, want)
+				}
 			}
 		}
 	}
@@ -1775,5 +1781,79 @@ func TestHelpGroups_GroupedNamesDrillIn(t *testing.T) {
 		if found != 1 {
 			t.Errorf("grouped=%v: OPERATE names enter %d times, want exactly 1", grouped, found)
 		}
+	}
+}
+
+// TestHelpGroups_ReadOnlyGroupedNamesTheDrill pins the one key the read-only
+// table used to mis-describe. enter is NOT gated on readOnly, so on a grouped
+// host whose only group is the unmanaged bucket it really does drill into that
+// group — while the table, which drops SELECT whole, named it as the exec
+// prompt's confirmation and nothing else.
+func TestHelpGroups_ReadOnlyGroupedNamesTheDrill(t *testing.T) {
+	find := func(groups []helpGroup, key string) (string, bool) {
+		for _, g := range groups {
+			for _, e := range g.entries {
+				for _, tok := range strings.Fields(e.keys) {
+					if tok == key {
+						return e.desc, true
+					}
+				}
+			}
+		}
+		return "", false
+	}
+
+	grouped, ok := find(readOnlyContainerGroups(true, true), "enter")
+	if !ok {
+		t.Fatal("the read-only grouped table does not name enter at all")
+	}
+	if !strings.Contains(grouped, "drill") {
+		t.Errorf("read-only grouped enter reads %q; it must name the drill it performs", grouped)
+	}
+	if !strings.Contains(grouped, "exec prompt") {
+		t.Errorf("read-only grouped enter reads %q; the x prompt still binds it too", grouped)
+	}
+
+	// The DRILLED read-only screen has no group to drill into, so it keeps the
+	// single meaning.
+	drilled, ok := find(readOnlyContainerGroups(true, false), "enter")
+	if !ok {
+		t.Fatal("the read-only drilled table does not name enter at all")
+	}
+	if strings.Contains(drilled, "drill") {
+		t.Errorf("read-only drilled enter reads %q; there is no group to drill into there", drilled)
+	}
+}
+
+// TestHelpGroups_ProgressWaitingMidSequence pins the overlay half of the
+// esc/enter split at the health gate. With a batch still to come the two keys
+// have OPPOSITE consequences — enter starts the next project's pipeline, esc
+// stops the sequence — so one row reading "skip health wait" under-described a
+// destructive action.
+func TestHelpGroups_ProgressWaitingMidSequence(t *testing.T) {
+	descs := func(midSequence bool) string {
+		var b strings.Builder
+		for _, g := range progressGroups(progressWaiting, midSequence) {
+			for _, e := range g.entries {
+				b.WriteString(e.keys + " => " + e.desc + "\n")
+			}
+		}
+		return b.String()
+	}
+
+	mid := descs(true)
+	if !strings.Contains(mid, "enter => skip health wait, start the next project") {
+		t.Errorf("the mid-sequence table must name what enter starts, got:\n%s", mid)
+	}
+	if !strings.Contains(mid, "q esc => stop, skip the projects left") {
+		t.Errorf("the mid-sequence table must name esc as a stop, got:\n%s", mid)
+	}
+
+	last := descs(false)
+	if !strings.Contains(last, "enter q esc => skip health wait") {
+		t.Errorf("with nothing left to release the three keys share one row, got:\n%s", last)
+	}
+	if strings.Contains(last, "stop") {
+		t.Errorf("the last batch's gate must not promise a choice, got:\n%s", last)
 	}
 }

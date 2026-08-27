@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"sync"
 
 	"github.com/lexxzar/compose-deploy/internal/compose"
 	"github.com/lexxzar/compose-deploy/internal/config"
@@ -85,21 +86,18 @@ Remote server configuration (~/.cdeploy/servers.yml):
 			// It avoids failing TUI startup when Docker is not installed locally
 			// (the user may only target remote servers).
 			localDetector := compose.New(dir)
-			var localDetected bool
+			var localDetect detectGuard
 
 			detectLocal := func(ctx context.Context) error {
-				if localDetected {
-					return nil
-				}
-				if err := localDetector.Detect(ctx); err != nil {
-					return err
-				}
-				localDetected = true
-				return nil
+				return localDetect.resolve(
+					func() error { return localDetector.Detect(ctx) },
+					func() bool { return localDetector.Standalone },
+				)
 			}
 
 			factory := func(proj compose.Project) runner.Composer {
-				return localComposerFor(proj, localDetector, localDetected)
+				standalone, detected := localDetect.verdict()
+				return localComposerFor(proj, localDetector, standalone, detected)
 			}
 
 			// When the cwd has a compose file, try to detect the local
@@ -128,11 +126,16 @@ Remote server configuration (~/.cdeploy/servers.yml):
 					}
 					rc := compose.NewRemote(server.Host, projDir)
 					connectCmd := rc.ConnectCmd(cmd.Context())
+					var remoteDetect detectGuard
 					remoteFactory := func(proj compose.Project) runner.Composer {
-						return remoteComposerFor(proj, rc)
+						standalone, _ := remoteDetect.verdict()
+						return remoteComposerFor(proj, rc, standalone)
 					}
 					loader := func(ctx context.Context) ([]compose.Project, error) {
-						if err := rc.Detect(ctx); err != nil {
+						if err := remoteDetect.resolve(
+							func() error { return rc.Detect(ctx) },
+							func() bool { return rc.Standalone },
+						); err != nil {
 							return nil, err
 						}
 						return rc.ListProjects(ctx)
@@ -208,13 +211,13 @@ func Execute() error {
 // unmanaged row has no compose file and no ConfigDir, so it gets the read-only
 // host-container composer; every other row gets a Compose rooted at its config
 // directory, inheriting the plugin/standalone verdict when one was detected.
-func localComposerFor(proj compose.Project, detector *compose.Compose, detected bool) runner.Composer {
+func localComposerFor(proj compose.Project, detector *compose.Compose, standalone, detected bool) runner.Composer {
 	if proj.Unmanaged {
 		return compose.NewLocalHostContainers(detector)
 	}
 	lc := compose.New(proj.ConfigDir)
 	if detected {
-		lc.SetStandalone(detector.Standalone)
+		lc.SetStandalone(standalone)
 	}
 	return lc
 }
@@ -223,11 +226,53 @@ func localComposerFor(proj compose.Project, detector *compose.Compose, detected 
 // reuses the LIVE RemoteCompose so the existing ControlMaster socket carries
 // the docker ps / stats / logs calls; a compose project gets a fresh composer
 // pointed at the same host.
-func remoteComposerFor(proj compose.Project, rc *compose.RemoteCompose) runner.Composer {
+func remoteComposerFor(proj compose.Project, rc *compose.RemoteCompose, standalone bool) runner.Composer {
 	if proj.Unmanaged {
 		return compose.NewRemoteHostContainers(rc)
 	}
 	newRC := compose.NewRemote(rc.Host, proj.ConfigDir)
-	newRC.SetStandalone(rc.Standalone)
+	newRC.SetStandalone(standalone)
 	return newRC
+}
+
+// detectGuard serialises the plugin/standalone probe between the two goroutines
+// that both need its verdict. The ProjectLoader runs inside a tea.Cmd goroutine
+// and is what calls Detect(); the ComposerFactory runs on the UI goroutine and
+// reads the verdict to stamp every composer it builds. In the grouped host view
+// the loader runs on the 5-second tick and the factory on every action key, so
+// the two are live together for the whole session — an unguarded bool plus a
+// Compose.Standalone field written by one and read by the other is a data race
+// whose failure mode is a composer built with the wrong docker variant.
+//
+// The verdict is COPIED out of the composer under the lock rather than read
+// through the pointer later, so the factory never touches a field Detect writes.
+type detectGuard struct {
+	mu         sync.Mutex
+	detected   bool
+	standalone bool
+}
+
+// resolve runs probe unless a previous call already succeeded, then records
+// what standalone reports. A failed probe records nothing, so the next caller
+// retries — that is what keeps a TUI started without local Docker usable if
+// Docker appears later in the session.
+func (d *detectGuard) resolve(probe func() error, standalone func() bool) error {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if d.detected {
+		return nil
+	}
+	if err := probe(); err != nil {
+		return err
+	}
+	d.standalone = standalone()
+	d.detected = true
+	return nil
+}
+
+// verdict returns the recorded (standalone, detected) pair.
+func (d *detectGuard) verdict() (standalone, detected bool) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return d.standalone, d.detected
 }

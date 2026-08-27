@@ -404,6 +404,10 @@ type Model struct {
 	pendingOp   runner.Operation
 	pendingExec bool
 	warning     string
+	// svcReloadPending records a DRILLED loadServices payload that the armed
+	// prompt refused, so the prompt's two on-screen exits can fire it again.
+	// Grouped mode needs no such flag — its 5-second tick refetches on its own.
+	svcReloadPending bool
 
 	// Quit confirmation state (for remote connections)
 	quitting bool
@@ -559,6 +563,11 @@ type Model struct {
 	searchQuery   string          // current query; != "" ⇒ highlights + n/N live
 	searchMatches []int           // svcEntries indices of the rows that match (cached); headers never match
 	searchReturn  int             // svcCursor to restore on esc-while-typing
+	// searchReturnID is searchReturn's identity twin. Typing into the search
+	// input UNFOLDS a group holding a match, and the grouped 5-second reload
+	// rebuilds the rows underneath — either renumbers svcEntries, so the raw
+	// index alone restored the cursor to a different row.
+	searchReturnID svcRowID
 
 	// Shared
 	ctx       context.Context
@@ -1103,6 +1112,17 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// Nothing is lost — the next tick after the prompt closes refetches —
 		// and refreshInFlight was already cleared above.
 		if m.confirming {
+			// The DRILLED payload is dropped for the same reason — it resets
+			// the selection and the cursor wholesale, so a confirm landing
+			// after it would resolve "restart: nginx" into "restart
+			// everything" — but unlike the grouped one nothing re-dispatches
+			// it: containerFetchBatch(false) resolves to refreshStatus, so the
+			// drilled screen would keep the host-ps-derived subset (and swallow
+			// a loadServices error) for the whole visit. Remember it and fire
+			// it again when the prompt closes.
+			if !msg.groupedPayload {
+				m.svcReloadPending = true
+			}
 			return m, nil
 		}
 		if msg.err != nil {
@@ -1116,6 +1136,9 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			// what the user set: cursor, selection, fold state and an active
 			// search all survive. Resetting them here would fight the user
 			// every tick. The landing sites clear that state once, on entry.
+			// Capture the cursor's identity BEFORE the rebuild renumbers
+			// every row; restoreCursorRow puts it back on the same row below.
+			cursorID := m.cursorRowID()
 			m.setGroups(buildSvcGroups(msg.projects, msg.hostStatus, m.svcGroups))
 			m.svcStatus = flattenQualified(msg.hostStatus)
 			// The stats half rides the same message and fails on its own: a
@@ -1140,7 +1163,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			// grouped scan, so no other path would ever clear the text.
 			m.expireGroupedUpdatesErr()
 			m.pruneSelection()
-			m.clampSvcCursor()
+			m.restoreCursorRow(cursorID)
 			// searchMatches indexes svcEntries, which the rebuild renumbered.
 			m.searchMatches = computeMatches(m.svcEntries, m.searchQuery)
 			m.fixSvcOffset()
@@ -1394,7 +1417,14 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.fixSvcOffset()
 			return m, nil
 		}
+		// Grouped mode holds several projects at once and this scan covered
+		// ONE of them, so the clear is re-derived from the cache rather than
+		// unconditional: a success on `web` must not erase a still-unexpired
+		// failure warning that belongs to `db`.
 		m.updatesErr = ""
+		if m.grouped {
+			m.updatesErr = m.groupedUpdatesErr()
+		}
 		// Fresh successful refresh: clear UpdateAvailable for every service
 		// in svcStatus BEFORE hydrating so verdicts the new result omits
 		// (build-only this time, failed lookup, removed from compose) lose
@@ -1782,8 +1812,6 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.cancel()
 		}
 		// Drop the finished batch's verdicts before the next one arms its own.
-		// clearWaitState also nils opContainers, which startBatch re-sets from
-		// the batch it launches — so the order here is load-bearing.
 		m.clearWaitState()
 		m.batchIdx++
 		// Hoisted: startBatch mutates the receiver.
@@ -1997,6 +2025,27 @@ func (m Model) tryQuit() (tea.Model, tea.Cmd) {
 	return m, tea.Quit
 }
 
+// takeSvcReload returns the drilled reload a prompt refused, and clears the
+// flag. Nil when nothing is pending — or when there is no composer to reload
+// through, which is grouped mode: loadServices dereferences m.composer, and a
+// flag that outlived a drill-out must not fire there.
+//
+// It is the prompt-close half of the pair. The other half is
+// containerFetchBatch, which consumes the same flag: a prompt closed by
+// CONFIRMING leaves for the progress or exec screen instead of reloading, so
+// without that second consumer the flag would sit set until some unrelated
+// prompt closed much later.
+func (m *Model) takeSvcReload() tea.Cmd {
+	if !m.svcReloadPending {
+		return nil
+	}
+	m.svcReloadPending = false
+	if m.composer == nil {
+		return nil
+	}
+	return m.loadServices()
+}
+
 // runRollbackCleanup invokes and clears the stored rollback-prep cleanup if set.
 // Idempotent (nils the field) so a later leave-progress path can't double-invoke.
 func (m *Model) runRollbackCleanup() {
@@ -2115,11 +2164,11 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		case screenProgress:
 			// A running pipeline swallows q: an in-flight operation must not be
 			// cancelled by the back key. An OPEN HEALTH GATE does not — the
-			// gate's esc means "skip the wait", and m.waiting is its own
-			// terminal-enough state. Without the !m.waiting term a mid-sequence
-			// gate (which opens with done and failed both false) left q inert
-			// for up to one wait timeout per batch while the `?` overlay's WAIT
-			// group still advertised it.
+			// gate's esc STOPS (it never starts the next batch), and m.waiting
+			// is its own terminal-enough state. Without the !m.waiting term a
+			// mid-sequence gate (which opens with done and failed both false)
+			// left q inert for up to one wait timeout per batch while the `?`
+			// overlay's WAIT group still advertised it.
 			if !m.done && !m.failed && !m.waiting {
 				return m, nil
 			}
@@ -2253,7 +2302,7 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 					if len(batches) == 0 || !m.bindProjComposer(batches[0].proj) {
 						m.confirming = false
 						m.fixSvcOffset()
-						return m, nil
+						return m, m.takeSvcReload()
 					}
 				default:
 					batches = []opBatch{{proj: m.currentProject(), services: m.selectedContainers()}}
@@ -2268,7 +2317,7 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 				// one project's composer to the next row's action key.
 				m.unbindGroupedComposer()
 				m.fixSvcOffset()
-				return m, nil
+				return m, m.takeSvcReload()
 			}
 			return m, nil
 		}
@@ -2292,9 +2341,13 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 				// return cursor before clearSearch() (which resets
 				// searchReturn) and delegate the field reset so this stays in
 				// lockstep if clearSearch() gains a field.
-				ret := m.searchReturn
+				ret, id := m.searchReturn, m.searchReturnID
 				m.clearSearch()
+				if i, ok := indexOfRowID(m.svcEntries, m.svcGroups, id); ok {
+					ret = i
+				}
 				m.svcCursor = ret
+				m.clampSvcCursor()
 				m.fixSvcOffset()
 				return m, nil
 			default:
@@ -2544,6 +2597,7 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.searchInput = textinput.New()
 			m.searching = true
 			m.searchReturn = m.svcCursor
+			m.searchReturnID = m.cursorRowID()
 			// Set Width on this PERSISTED model so bubbles scrolls the value
 			// horizontally to keep the cursor visible (a value-receiver set in
 			// searchBarLine would be discarded). Width 0 = unbounded when size
@@ -2587,6 +2641,7 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 				return m.enterConfig()
 			}
 			m.unbindGroupedComposer()
+			m.fixSvcOffset()
 		case "i":
 			// Deliberately NOT gated on m.readOnly(): inspect is read-only by
 			// nature and works identically on both container variants, so it is
@@ -2604,6 +2659,9 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			}
 			if _, ok := m.composer.(Inspector); !ok {
 				m.unbindGroupedComposer()
+				// The dispatch cleared m.warning above, which frees a footer
+				// row — every other gated container key re-clamps for it.
+				m.fixSvcOffset()
 				return m, nil
 			}
 			return m.enterInspect()
@@ -2621,6 +2679,7 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			}
 			if _, ok := m.composer.(ExecProvider); !ok {
 				m.unbindGroupedComposer()
+				m.fixSvcOffset()
 				return m, nil
 			}
 			if st, ok := m.svcStatus[m.svcKeyAt(m.svcCursor)]; !ok || !st.Running {
@@ -3237,19 +3296,44 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			if m.done || m.failed || m.waiting {
 				return m.tryQuit()
 			}
-		case "esc":
+		case "enter":
 			if m.waiting {
-				// Skip the health wait: stop polling and drop the (partial)
-				// verdicts, but leave the operation "done". clearWaitState bumps
-				// waitSession so any in-flight poll/tick is discarded. The user
-				// stays on the progress screen in the plain done state; a second
-				// esc falls through to the back-nav cleanup below.
-				//
-				// Mid-sequence the skip releases the next batch: esc on the
-				// health gate means "don't wait", not "stop" — stopping is what
-				// esc does while a pipeline is running, one sub-state earlier.
+				// enter is the health gate's "skip the wait and carry on": it
+				// stops polling, drops the (partial) verdicts and releases the
+				// next batch. It exists because esc had to keep meaning "stop"
+				// — see the esc case below.
 				m.clearWaitState()
 				return m, m.batchFinished()
+			}
+		case "esc":
+			if m.waiting {
+				// esc at the health gate STOPS. It never starts work.
+				//
+				// The gate is where a multi-project deploy spends most of its
+				// wall clock (one DefaultWaitTimeout per batch), so it is where
+				// a user who wants to abort is sitting — and esc is the abort
+				// key everywhere else on this screen. Releasing the next batch
+				// from it meant the universal abort key launched a whole
+				// project's stop → rm → pull → create → start. `enter` above
+				// carries that release instead.
+				//
+				// The stop is spelled the same way a failing gate is
+				// (waitPhaseResolved): the batches behind this one say
+				// "(skipped)" rather than sitting at ○, and m.failed gives the
+				// screen a terminal state so the next esc navigates back. The
+				// session bump discards a batchDoneMsg already on its way.
+				m.clearWaitState()
+				if m.batchIdx+1 < len(m.batches) {
+					m.batchSession++
+					m.markBatchesSkipped(m.batchIdx + 1)
+					m.failed = true
+					return m, nil
+				}
+				// Nothing left to stop: the last (or only) batch's gate is a
+				// plain skip, exactly as it has always been. The operation
+				// stays "done"; a second esc falls through to the back-nav
+				// cleanup below.
+				return m, nil
 			}
 			if m.done || m.failed {
 				// Invalidate the update-availability cache for the current
@@ -3305,6 +3389,13 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 				m.done = false
 				m.failed = false
 				m.eventCh = nil
+				// The final batch's context is otherwise never cancelled:
+				// batchDoneMsg cancels each batch as the next takes over
+				// m.cancel, but the last one has no successor, so leaving the
+				// screen is where it has to be released.
+				if m.cancel != nil {
+					m.cancel()
+				}
 				m.cancel = nil
 				m.logContent = ""
 				m.rollbackErr = ""
@@ -3488,6 +3579,7 @@ func (m *Model) clearBatchSequence() {
 	m.batches = nil
 	m.batchIdx = 0
 	m.batchStepCount = 0
+	m.opContainers = nil
 	m.batchSession++
 }
 
@@ -3824,6 +3916,14 @@ func (m *Model) waitPhaseResolved() tea.Cmd {
 	return m.batchFinished()
 }
 
+// midSequence reports whether another batch is still to come after the current
+// one. It is the single predicate behind the health gate's two-outcome key
+// table and its footer: with nothing left to release, esc and enter both simply
+// end the wait, and advertising a choice there would be noise.
+func (m Model) midSequence() bool {
+	return m.batchIdx+1 < len(m.batches)
+}
+
 // batchFinished ends the batch at m.batchIdx and returns the Cmd that releases
 // its successor. The last batch has nothing left to release, so it returns nil
 // — that bound is the ONE place the "is there another batch" question is asked
@@ -3901,11 +4001,14 @@ func (m Model) waitTick() tea.Cmd {
 // in-flight poll/tick is invalidated. Called at every departure site and on
 // esc-skip. Idempotent — safe to call when no wait is active (it just re-bumps
 // the session over already-zero fields).
+// It does NOT clear opContainers: that is the BATCH's resolved target set, not
+// wait state, and viewProgress's grouped title reads it. Clearing it here made
+// an esc-skipped gate re-title a named-service operation "all services".
+// clearBatchSequence owns it, at the progress departure.
 func (m *Model) clearWaitState() {
 	m.waiting = false
 	m.waitState = runner.WaitState{}
 	m.waitDeadline = time.Time{}
-	m.opContainers = nil
 	m.waitSession++
 }
 
@@ -4941,9 +5044,14 @@ func (m Model) statsRefreshCmd() tea.Cmd {
 // updateInFlight, and every caller owns the same Model this writes to.
 func (m *Model) containerFetchBatch(initial bool) tea.Cmd {
 	load := m.statusRefreshCmd()
-	if initial && !m.grouped {
+	// svcReloadPending is the second trigger: a drilled loadServices payload
+	// that an armed prompt dropped is owed a re-dispatch, and a prompt closed
+	// by CONFIRMING leaves the screen rather than reloading — so the return
+	// from progress/exec/logs is where that debt is settled.
+	if !m.grouped && (initial || m.svcReloadPending) {
 		load = m.loadServices()
 	}
+	m.svcReloadPending = false
 	cmds := []tea.Cmd{load, m.statsRefreshCmd()}
 	if c := m.maybeRefreshUpdatesCmd(); c != nil {
 		cmds = append(cmds, c)
@@ -5225,16 +5333,34 @@ func (m *Model) hydrateGroupedUpdates() {
 // self-heal) can ever run there. Without this the warning from one failed U
 // outlives the failure it describes for the rest of the visit.
 func (m *Model) expireGroupedUpdatesErr() {
-	if m.updatesErr == "" || m.updateCache == nil {
+	if m.updatesErr == "" {
 		return
+	}
+	if m.groupedUpdatesErr() == "" {
+		m.updatesErr = ""
+	}
+}
+
+// groupedUpdatesErr returns the soft update warning the VISIBLE groups justify:
+// the message of the first group whose cached entry is a still-unexpired
+// failure, or "" when none is.
+//
+// It is the single derivation behind both the expiry on the periodic reload and
+// the clear a successful scan performs. A scan covers one group, so a flat
+// `updatesErr = ""` on success erased a warning that belonged to a different
+// one — and nothing in grouped mode would ever put it back, since U is the only
+// trigger there.
+func (m Model) groupedUpdatesErr() string {
+	if m.updateCache == nil {
+		return ""
 	}
 	for _, g := range m.svcGroups {
 		entry, ok := m.updateCache[m.projUpdatesCacheKey(g.proj)]
 		if ok && entry.err && time.Since(entry.fetchedAt) < updatesErrorTTL {
-			return
+			return entry.errMsg
 		}
 	}
-	m.updatesErr = ""
+	return ""
 }
 
 // updatesCacheLookup returns the cached entry for the current context and a
@@ -5300,9 +5426,10 @@ func (m Model) updatesCacheLookup() (updateEntry, bool) {
 // new context's fetch would have been dropped at the bump site —
 // resulting in no glyphs until the next periodic tick).
 func (m *Model) maybeRefreshUpdatesCmd() tea.Cmd {
-	if m.updateInFlight {
-		return nil
-	}
+	// The grouped branch runs BEFORE the in-flight guard. It schedules nothing,
+	// so the guard has nothing to protect here — and behind the guard the one
+	// thing this branch does do (age out the soft warning) was skipped for the
+	// whole life of a U scan.
 	if m.grouped {
 		// Grouped mode owns neither the single cache key this helper looks up
 		// nor the single composer a refill would fetch through — updatesCacheKey
@@ -5310,6 +5437,9 @@ func (m *Model) maybeRefreshUpdatesCmd() tea.Cmd {
 		// scheduled from here until U scopes a scan to one group. The warning
 		// still has to age out, which is the one thing this branch does.
 		m.expireGroupedUpdatesErr()
+		return nil
+	}
+	if m.updateInFlight {
 		return nil
 	}
 	entry, fresh := m.updatesCacheLookup()
@@ -5464,6 +5594,7 @@ func (m *Model) clearSearch() {
 	m.searchQuery = ""
 	m.searchMatches = nil
 	m.searchReturn = 0
+	m.searchReturnID = svcRowID{}
 	m.searchInput.SetValue("")
 	m.searchInput.Blur()
 }
@@ -5949,6 +6080,7 @@ func (m *Model) drillIntoGroup(gi int) tea.Cmd {
 	m.svcOffset = 0
 	m.confirming = false
 	m.pendingExec = false
+	m.svcReloadPending = false
 	m.warning = ""
 	m.svcErr = nil
 	m.updatesErr = ""
@@ -6045,6 +6177,7 @@ func (m *Model) setGroups(groups []svcGroup) {
 // callbacks, search, wait) stays at the site.
 func (m *Model) clearContainerScreen() {
 	m.clearSvcGroups()
+	m.svcReloadPending = false
 	m.svcStatus = nil
 	m.stats = nil
 	m.statsErr = nil
@@ -6071,6 +6204,31 @@ func (m Model) drilledServices() []string {
 		return nil
 	}
 	return m.svcGroups[0].services
+}
+
+// cursorRowID names the row under the cursor by identity, for a caller about to
+// rebuild the row list. Paired with restoreCursorRow: capture BEFORE the
+// rebuild, restore after.
+func (m Model) cursorRowID() svcRowID {
+	return rowIDAt(m.svcEntries, m.svcGroups, m.svcCursor)
+}
+
+// restoreCursorRow re-anchors the cursor on the row id names, falling back to a
+// clamp when that row is gone.
+//
+// The grouped reload is the 5-second refresh, and its row list is derived from
+// a live `docker ps`: a container started or removed ANYWHERE on the host, or a
+// project whose last container disappeared, inserts or deletes rows and slides
+// every index below it. An index-only survival therefore slid the cursor onto
+// another service — or another project's header — without a keystroke, and the
+// cursor addresses drill-in, l/i/c/U and (through the empty-selection rule) the
+// whole-project d/r/s. Selection and fold state already survive by identity;
+// this is the third piece of user state doing the same.
+func (m *Model) restoreCursorRow(id svcRowID) {
+	if i, ok := indexOfRowID(m.svcEntries, m.svcGroups, id); ok {
+		m.svcCursor = i
+	}
+	m.clampSvcCursor()
 }
 
 // clampSvcCursor pulls the cursor back inside svcEntries. The grouped reload is
@@ -6395,6 +6553,12 @@ func (m Model) containerHelpLines() (line1, line2 string) {
 		back = "q back"
 	}
 	if m.readOnly() {
+		// enter is NOT gated on readOnly, so a grouped host whose only group is
+		// the unmanaged bucket still drills in on it — but the footer is a
+		// curated subset (l, a, /, i, c, U, R live in the `?` overlay only) and
+		// that drill buys nothing there: a lone group renders no header, so the
+		// drilled screen shows the same rows the grouped one already does. The
+		// overlay names enter's real meaning; the footer keeps its four tokens.
 		return fmt.Sprintf("  %s  •  ? keys", back), "  l logs  •  x exec"
 	}
 	if m.grouped {
@@ -7246,18 +7410,22 @@ func (m Model) viewInspect() string {
 // that is actually running on screen, preferring to show as much of the
 // finished work above it as fits.
 //
-// rows is the row budget; total is len(m.steps); lo and hi bound the running
-// batch. It returns the half-open [start, end) slice to draw.
-func progressStepWindow(total, rows, lo, hi int) (int, int) {
+// rows is the row budget; total is len(m.steps); hi is the END of the running
+// batch's step range. It returns the half-open [start, end) slice to draw.
+//
+// The window is anchored on hi, the running batch's LAST row, never on its
+// first: a batch taller than the budget (a five-step pipeline on a terminal
+// with three rows to spare) would otherwise show its head while the step that
+// is actually running scrolled off the bottom. Anchoring on the tail shows as
+// much of the finished work above it as the budget allows, which is the same
+// thing the fitting case has always done.
+func progressStepWindow(total, rows, hi int) (int, int) {
 	if rows >= total || rows <= 0 {
 		return 0, total
 	}
 	start := 0
 	if hi > rows {
 		start = hi - rows
-	}
-	if start > lo {
-		start = lo
 	}
 	if start > total-rows {
 		start = total - rows
@@ -7347,8 +7515,13 @@ func (m Model) viewProgress() string {
 	}
 
 	switch {
+	case m.waiting && m.midSequence():
+		// The gate binds two outcomes here, and the destructive one is the key
+		// that starts the next project — so the footer names both rather than
+		// letting "skip" stand for either.
+		tb.WriteString(helpStyle.Render("\n" + clampToWidth("  enter skip wait  •  q esc stop", m.width)))
 	case m.waiting:
-		tb.WriteString(helpStyle.Render("\n  q esc skip"))
+		tb.WriteString(helpStyle.Render("\n  enter q esc skip"))
 	case m.done || m.failed:
 		tb.WriteString(helpStyle.Render("\n  q back"))
 	default:
@@ -7375,8 +7548,8 @@ func (m Model) viewProgress() string {
 			rows = 1
 		}
 	}
-	lo, hi := m.currentStepRange()
-	first, last := progressStepWindow(len(m.steps), rows, lo, hi)
+	_, hi := m.currentStepRange()
+	first, last := progressStepWindow(len(m.steps), rows, hi)
 
 	var b strings.Builder
 	b.WriteString(head)

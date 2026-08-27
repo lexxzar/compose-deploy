@@ -1,7 +1,9 @@
 package cmd
 
 import (
+	"errors"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/lexxzar/compose-deploy/internal/compose"
@@ -212,7 +214,7 @@ func TestLocalComposerFor(t *testing.T) {
 	detector.SetStandalone(true)
 
 	t.Run("unmanaged row gets the read-only host composer", func(t *testing.T) {
-		got := localComposerFor(compose.Project{Name: compose.UnmanagedProjectName, Unmanaged: true}, detector, true)
+		got := localComposerFor(compose.Project{Name: compose.UnmanagedProjectName, Unmanaged: true}, detector, true, true)
 		if _, ok := got.(*compose.HostContainers); !ok {
 			t.Fatalf("got %T, want *compose.HostContainers", got)
 		}
@@ -225,7 +227,7 @@ func TestLocalComposerFor(t *testing.T) {
 	})
 
 	t.Run("compose row gets a Compose rooted at its config dir", func(t *testing.T) {
-		got := localComposerFor(compose.Project{Name: "my-app", ConfigDir: "/srv/my-app"}, detector, true)
+		got := localComposerFor(compose.Project{Name: "my-app", ConfigDir: "/srv/my-app"}, detector, true, true)
 		lc, ok := got.(*compose.Compose)
 		if !ok {
 			t.Fatalf("got %T, want *compose.Compose", got)
@@ -239,7 +241,7 @@ func TestLocalComposerFor(t *testing.T) {
 	})
 
 	t.Run("undetected local docker does not inherit a verdict", func(t *testing.T) {
-		got := localComposerFor(compose.Project{Name: "my-app", ConfigDir: "/srv/my-app"}, detector, false)
+		got := localComposerFor(compose.Project{Name: "my-app", ConfigDir: "/srv/my-app"}, detector, true, false)
 		lc := got.(*compose.Compose)
 		if lc.Standalone {
 			t.Error("Standalone must stay false when detection never ran")
@@ -252,7 +254,7 @@ func TestRemoteComposerFor(t *testing.T) {
 	rc.SetStandalone(true)
 
 	t.Run("unmanaged row reuses the live RemoteCompose", func(t *testing.T) {
-		got := remoteComposerFor(compose.Project{Name: compose.UnmanagedProjectName, Unmanaged: true}, rc)
+		got := remoteComposerFor(compose.Project{Name: compose.UnmanagedProjectName, Unmanaged: true}, rc, true)
 		if _, ok := got.(*compose.HostContainers); !ok {
 			t.Fatalf("got %T, want *compose.HostContainers", got)
 		}
@@ -262,7 +264,7 @@ func TestRemoteComposerFor(t *testing.T) {
 	})
 
 	t.Run("compose row gets a RemoteCompose for its dir", func(t *testing.T) {
-		got := remoteComposerFor(compose.Project{Name: "my-app", ConfigDir: "/srv/my-app"}, rc)
+		got := remoteComposerFor(compose.Project{Name: "my-app", ConfigDir: "/srv/my-app"}, rc, true)
 		newRC, ok := got.(*compose.RemoteCompose)
 		if !ok {
 			t.Fatalf("got %T, want *compose.RemoteCompose", got)
@@ -277,4 +279,78 @@ func TestRemoteComposerFor(t *testing.T) {
 			t.Error("the detected standalone verdict must be inherited")
 		}
 	})
+}
+
+// --- detectGuard: the plugin/standalone probe is shared between the
+// ProjectLoader goroutine (which runs it) and the ComposerFactory on the UI
+// goroutine (which reads its verdict). ---
+
+// TestDetectGuard_ProbesOnceAndRecordsTheVerdict pins the once-only contract and
+// the copy-out: the factory must never read the field Detect writes.
+func TestDetectGuard_ProbesOnceAndRecordsTheVerdict(t *testing.T) {
+	var d detectGuard
+	if standalone, detected := d.verdict(); standalone || detected {
+		t.Fatalf("zero value = (%v,%v), want (false,false)", standalone, detected)
+	}
+
+	probes := 0
+	run := func() error { probes++; return nil }
+	if err := d.resolve(run, func() bool { return true }); err != nil {
+		t.Fatalf("resolve: %v", err)
+	}
+	if err := d.resolve(run, func() bool { return false }); err != nil {
+		t.Fatalf("second resolve: %v", err)
+	}
+	if probes != 1 {
+		t.Errorf("probe ran %d times, want 1", probes)
+	}
+	standalone, detected := d.verdict()
+	if !standalone || !detected {
+		t.Errorf("verdict = (%v,%v), want (true,true)", standalone, detected)
+	}
+}
+
+// A failed probe records nothing, so the next caller retries — that is what
+// keeps a TUI started without local Docker usable if Docker appears later.
+func TestDetectGuard_FailureRetries(t *testing.T) {
+	var d detectGuard
+	boom := errors.New("docker not found")
+	if err := d.resolve(func() error { return boom }, func() bool { return true }); !errors.Is(err, boom) {
+		t.Fatalf("resolve err = %v, want %v", err, boom)
+	}
+	if _, detected := d.verdict(); detected {
+		t.Fatal("a failed probe must not record a verdict")
+	}
+	probes := 0
+	if err := d.resolve(func() error { probes++; return nil }, func() bool { return true }); err != nil {
+		t.Fatalf("retry: %v", err)
+	}
+	if probes != 1 {
+		t.Errorf("the retry ran the probe %d times, want 1", probes)
+	}
+}
+
+// TestDetectGuard_ConcurrentResolveAndVerdict is the race pin. In the grouped
+// host view the loader runs on the 5-second tick and the factory on every
+// action key, so the two are live together for the whole session; without the
+// mutex `go test -race` flags the unsynchronised bool pair.
+func TestDetectGuard_ConcurrentResolveAndVerdict(t *testing.T) {
+	var d detectGuard
+	var wg sync.WaitGroup
+	for i := 0; i < 8; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			_ = d.resolve(func() error { return nil }, func() bool { return true })
+		}()
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			d.verdict()
+		}()
+	}
+	wg.Wait()
+	if standalone, detected := d.verdict(); !standalone || !detected {
+		t.Errorf("verdict = (%v,%v), want (true,true)", standalone, detected)
+	}
 }
