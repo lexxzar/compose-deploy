@@ -13,7 +13,7 @@ type svcEntryKind int
 
 const (
 	entrySvcGroupHeader svcEntryKind = iota
-	entrySvcService
+	entryService
 )
 
 // svcEntry is one rendered row of the container screen. It is derived state:
@@ -56,22 +56,201 @@ func rebuildSvcEntries(groups []svcGroup) []svcEntry {
 			continue
 		}
 		for _, name := range g.services {
-			entries = append(entries, svcEntry{kind: entrySvcService, groupIdx: gi, name: name})
+			entries = append(entries, svcEntry{kind: entryService, groupIdx: gi, name: name})
 		}
 	}
 	return entries
 }
 
 // groupsHaveHeaders is the single home of the "does this screen draw group
-// headers" rule: more than one group. rebuildSvcEntries emits the header rows
-// off it and the renderer takes its 2-cell service indent off the same call, so
-// a host that happens to hold exactly one project renders byte-identically to
-// the drilled screen.
-//
-// Render decisions that must follow the entry model — the service indent, the
-// caption pad, the scroll indicators — read THIS, never m.grouped: grouped mode
-// with a single project emits no headers.
+// headers" rule: more than one group. Every render decision that must follow
+// the entry model — the service indent, the caption pad, the scroll indicators
+// — reads THIS, never m.grouped, because grouped mode with a single project
+// emits no headers and must render byte-identically to the drilled screen.
 func groupsHaveHeaders(groups []svcGroup) bool { return len(groups) > 1 }
+
+// svcKeySep separates the project half of a qualified key from the service
+// half. "/" is safe: docker compose rejects it in both a project name and a
+// service name, so no pair can produce an ambiguous key.
+const svcKeySep = "/"
+
+// svcKey is the single producer of the qualified key that identifies one
+// service inside one project. Selection, status, stats and update verdicts all
+// key on it, because a bare service name collides across projects.
+//
+// Qualified keys live only inside the tui Model. Every message boundary
+// converts: nothing qualified may reach runner or compose.
+func svcKey(projName, service string) string {
+	return projName + svcKeySep + service
+}
+
+// qualifyMap converts a bare-name map, as every Composer method returns one,
+// into the qualified-key form the Model holds. It is the message-boundary
+// conversion svcKey describes.
+func qualifyMap[V any](projName string, src map[string]V) map[string]V {
+	if src == nil {
+		return nil
+	}
+	out := make(map[string]V, len(src))
+	for name, v := range src {
+		out[svcKey(projName, name)] = v
+	}
+	return out
+}
+
+// flattenQualified converts a host-wide project → service → value map, the
+// shape both grouped fetches return, into the flat qualified-key form the
+// Model holds. It is the grouped twin of qualifyMap.
+func flattenQualified[V any](host map[string]map[string]V) map[string]V {
+	if host == nil {
+		return nil
+	}
+	out := make(map[string]V)
+	for proj, svcs := range host {
+		for svc, v := range svcs {
+			out[svcKey(proj, svc)] = v
+		}
+	}
+	return out
+}
+
+// groupProjName names the group at index gi. An out-of-range index yields the
+// empty string rather than panicking: svcEntries is rebuilt from svcGroups, so
+// the two can only disagree if a caller wrote svcEntries by hand.
+func (m Model) groupProjName(gi int) string {
+	if gi < 0 || gi >= len(m.svcGroups) {
+		return ""
+	}
+	return m.svcGroups[gi].proj.Name
+}
+
+// svcKeyAt returns the qualified key of the row at index i, or "" when the row
+// is a group header or the index is out of range. Callers that key selection,
+// status or stats off a row index must go through it — the owning group, not
+// the model's current project, decides the prefix.
+func (m Model) svcKeyAt(i int) string {
+	if i < 0 || i >= len(m.svcEntries) {
+		return ""
+	}
+	e := m.svcEntries[i]
+	if e.kind != entryService {
+		return ""
+	}
+	return svcKey(m.groupProjName(e.groupIdx), e.name)
+}
+
+// ownerProjName names the group that an incoming bare-name payload belongs to.
+// The composer that produced the payload serves exactly one project, and the
+// drilled path installs exactly one group, so the answer is that group's
+// project; the m.projName fallback covers a payload that lands before
+// setSingleGroup has run.
+func (m Model) ownerProjName() string {
+	if len(m.svcGroups) == 1 {
+		return m.svcGroups[0].proj.Name
+	}
+	return m.projName
+}
+
+// svcRef is one service the container screen owns: the group it belongs to,
+// the bare name a Composer knows it by, and the qualified key the Model stores
+// it under.
+type svcRef struct {
+	groupIdx int
+	name     string
+	key      string
+}
+
+// eachSvcRef visits every service in every group, in group order, and stops as
+// soon as fn returns false.
+//
+// Fold state is deliberately ignored: folding hides ROWS, never services, so
+// selection, counting and column-width helpers go through the refs instead of
+// over svcEntries, which would drop a folded group's services.
+//
+// The count and boolean helpers run on the hot path — fixSvcOffset calls
+// hasStatusColumns on every keystroke, and the render pass asks for the
+// selection count and the select-all state — so materialising the whole list to
+// answer "how many" or "any?" is the one allocation those callers do not need.
+// svcRefs stays for the render pass, which genuinely wants the list.
+func (m Model) eachSvcRef(fn func(svcRef) bool) {
+	for gi, g := range m.svcGroups {
+		for _, name := range g.services {
+			if !fn(svcRef{groupIdx: gi, name: name, key: svcKey(g.proj.Name, name)}) {
+				return
+			}
+		}
+	}
+}
+
+// eachSelectableRef is eachSvcRef minus the unmanaged bucket. Selection feeds
+// the compose pipelines, and an unmanaged container has no compose project to
+// run one against, so `a`, allSelected and the title's denominator all go
+// through it — otherwise `a` would appear to select rows whose checkbox is not
+// even drawn.
+func (m Model) eachSelectableRef(fn func(svcRef) bool) {
+	m.eachSvcRef(func(r svcRef) bool {
+		if m.groupUnmanaged(r.groupIdx) {
+			return true
+		}
+		return fn(r)
+	})
+}
+
+// svcRefs is eachSvcRef WITH the slice, for the render pass.
+func (m Model) svcRefs() []svcRef {
+	var refs []svcRef
+	m.eachSvcRef(func(r svcRef) bool {
+		refs = append(refs, r)
+		return true
+	})
+	return refs
+}
+
+// groupUnmanaged reports whether the group at gi is the synthetic unmanaged
+// bucket. Its rows are read-only host containers with no compose file behind
+// them, so they carry no checkbox and never enter a selection.
+func (m Model) groupUnmanaged(gi int) bool {
+	if gi < 0 || gi >= len(m.svcGroups) {
+		return false
+	}
+	return m.svcGroups[gi].proj.Unmanaged
+}
+
+// cursorEntry returns the row under the cursor. The cursor indexes svcEntries,
+// so it may sit on a group header; callers that need a service must go through
+// cursorService.
+func (m Model) cursorEntry() (svcEntry, bool) {
+	if m.svcCursor < 0 || m.svcCursor >= len(m.svcEntries) {
+		return svcEntry{}, false
+	}
+	return m.svcEntries[m.svcCursor], true
+}
+
+// cursorService returns the service name under the cursor, and false when the
+// cursor sits on a group header or out of range. Every action key that acts on
+// "the service under the cursor" reads it — indexing services by svcCursor is
+// wrong now that headers occupy rows of their own, and the false it returns for
+// an out-of-range cursor subsumes the empty-list check those keys used to carry
+// on top of it.
+func (m Model) cursorService() (string, bool) {
+	e, ok := m.cursorEntry()
+	if !ok || e.kind != entryService {
+		return "", false
+	}
+	return e.name, true
+}
+
+// cursorGroup returns the group the cursor row belongs to. Unlike cursorService
+// it accepts a header row: a header IS its group, and the keys that act on a
+// whole project — drill-in, config — are exactly the ones a header row should
+// answer.
+func (m Model) cursorGroup() (svcGroup, bool) {
+	e, ok := m.cursorEntry()
+	if !ok || e.groupIdx < 0 || e.groupIdx >= len(m.svcGroups) {
+		return svcGroup{}, false
+	}
+	return m.svcGroups[e.groupIdx], true
+}
 
 // groupCounts totals one group's live state for its header row: how many of its
 // services are running, how many report a failing healthcheck, and how many have
@@ -103,197 +282,8 @@ func groupCounts(g svcGroup, status map[string]runner.ServiceStatus) (up, unheal
 	return up, unhealthy, updates
 }
 
-// svcKeySep separates the project half of a qualified key from the service
-// half. "/" is safe: docker compose rejects it in both a project name and a
-// service name, so no pair can produce an ambiguous key.
-const svcKeySep = "/"
-
-// svcKey is the single producer of the qualified key that identifies one
-// service inside one project. Selection, status, stats and update verdicts all
-// key on it, because a bare service name collides across projects — two
-// projects each owning a "db" is the common case, not the exotic one.
-//
-// Qualified keys live only inside the tui Model. Every message boundary
-// converts: nothing qualified may reach runner or compose.
-func svcKey(projName, service string) string {
-	return projName + svcKeySep + service
-}
-
-// groupProjName names the group at index gi. An out-of-range index yields the
-// empty string rather than panicking: svcEntries is rebuilt from svcGroups, so
-// the two can only disagree if a caller wrote svcEntries by hand.
-func (m Model) groupProjName(gi int) string {
-	if gi < 0 || gi >= len(m.svcGroups) {
-		return ""
-	}
-	return m.svcGroups[gi].proj.Name
-}
-
-// svcKeyAt returns the qualified key of the row at index i, or "" when the row
-// is a group header or the index is out of range. Callers that key selection,
-// status or stats off a row index must go through it — the owning group, not
-// the model's current project, decides the prefix.
-func (m Model) svcKeyAt(i int) string {
-	if i < 0 || i >= len(m.svcEntries) {
-		return ""
-	}
-	e := m.svcEntries[i]
-	if e.kind != entrySvcService {
-		return ""
-	}
-	return svcKey(m.groupProjName(e.groupIdx), e.name)
-}
-
-// ownerProjName names the group that an incoming bare-name payload belongs to.
-// The composer that produced the payload serves exactly one project, and the
-// drilled path installs exactly one group, so the answer is that group's
-// project; the m.projName fallback covers a payload that lands before
-// setSingleGroup has run.
-func (m Model) ownerProjName() string {
-	if len(m.svcGroups) == 1 {
-		return m.svcGroups[0].proj.Name
-	}
-	return m.projName
-}
-
-// qualifyMap converts a bare-name map, as every Composer method returns one,
-// into the qualified-key form the Model holds. It is the message-boundary
-// conversion: qualified keys live only inside the Model, so nothing qualified
-// may travel back out to runner or compose.
-func qualifyMap[V any](projName string, src map[string]V) map[string]V {
-	if src == nil {
-		return nil
-	}
-	out := make(map[string]V, len(src))
-	for name, v := range src {
-		out[svcKey(projName, name)] = v
-	}
-	return out
-}
-
-// svcRef is one service the container screen owns: the group it belongs to,
-// the bare name a Composer knows it by, and the qualified key the Model stores
-// it under.
-type svcRef struct {
-	groupIdx int
-	name     string
-	key      string
-}
-
-// eachSvcRef visits every service in every group, in group order, and stops as
-// soon as fn returns false. It is svcRefs WITHOUT the slice.
-//
-// The count and boolean helpers run on the hot path — fixSvcOffset calls
-// hasStatusColumns on every keystroke, and the render pass asks for the
-// selection count and the select-all state — so materialising the whole list to
-// answer "how many" or "any?" is the one allocation those callers do not need.
-// svcRefs stays for the render pass, which genuinely wants the list.
-//
-// Fold state is deliberately ignored here too: folding hides ROWS, never
-// services.
-func (m Model) eachSvcRef(fn func(svcRef) bool) {
-	for gi, g := range m.svcGroups {
-		for _, name := range g.services {
-			if !fn(svcRef{groupIdx: gi, name: name, key: svcKey(g.proj.Name, name)}) {
-				return
-			}
-		}
-	}
-}
-
-// eachSelectableRef is eachSvcRef minus the unmanaged bucket — the same
-// predicate selectableRefs applies, without the two slices it builds.
-func (m Model) eachSelectableRef(fn func(svcRef) bool) {
-	m.eachSvcRef(func(r svcRef) bool {
-		if m.groupUnmanaged(r.groupIdx) {
-			return true
-		}
-		return fn(r)
-	})
-}
-
-// svcRefs enumerates every service in every group, in group order. Fold state
-// is deliberately ignored — folding hides ROWS, never services — so selection,
-// counting and column-width helpers go through it instead of over svcEntries,
-// which would drop a folded group's services from the selection.
-func (m Model) svcRefs() []svcRef {
-	var refs []svcRef
-	for gi, g := range m.svcGroups {
-		for _, name := range g.services {
-			refs = append(refs, svcRef{groupIdx: gi, name: name, key: svcKey(g.proj.Name, name)})
-		}
-	}
-	return refs
-}
-
-// groupUnmanaged reports whether the group at gi is the synthetic unmanaged
-// bucket. Its rows are read-only host containers with no compose file behind
-// them, so they carry no checkbox and never enter a selection.
-func (m Model) groupUnmanaged(gi int) bool {
-	if gi < 0 || gi >= len(m.svcGroups) {
-		return false
-	}
-	return m.svcGroups[gi].proj.Unmanaged
-}
-
-// selectableRefs is svcRefs minus the unmanaged bucket. Selection feeds the
-// compose pipelines, and an unmanaged container has no compose project to run
-// one against, so `a`, allSelected and the title's denominator all read this
-// rather than svcRefs — otherwise `a` would appear to select rows whose
-// checkbox is not even drawn.
-func (m Model) selectableRefs() []svcRef {
-	refs := m.svcRefs()
-	out := refs[:0:0]
-	for _, r := range refs {
-		if m.groupUnmanaged(r.groupIdx) {
-			continue
-		}
-		out = append(out, r)
-	}
-	return out
-}
-
-// cursorEntry returns the row under the cursor. The cursor indexes svcEntries,
-// so it may sit on a group header; callers that need a service must go through
-// cursorService.
-func (m Model) cursorEntry() (svcEntry, bool) {
-	if m.svcCursor < 0 || m.svcCursor >= len(m.svcEntries) {
-		return svcEntry{}, false
-	}
-	return m.svcEntries[m.svcCursor], true
-}
-
-// cursorService returns the service name under the cursor, and false when the
-// cursor sits on a group header or out of range. Every action key that acts on
-// "the service under the cursor" reads it — indexing services by svcCursor is
-// wrong now that headers occupy rows of their own.
-func (m Model) cursorService() (string, bool) {
-	e, ok := m.cursorEntry()
-	if !ok || e.kind != entrySvcService {
-		return "", false
-	}
-	return e.name, true
-}
-
-// flattenQualified converts a host-wide project → service → value map, the
-// shape both grouped fetches return, into the flat qualified-key form the
-// Model holds. It is the grouped twin of qualifyMap and the same message
-// boundary: nothing qualified travels back out to runner or compose.
-func flattenQualified[V any](host map[string]map[string]V) map[string]V {
-	if host == nil {
-		return nil
-	}
-	out := make(map[string]V)
-	for proj, svcs := range host {
-		for svc, v := range svcs {
-			out[svcKey(proj, svc)] = v
-		}
-	}
-	return out
-}
-
 // buildSvcGroups folds the grouped payload — the project list from the
-// ProjectLoader and the host-wide status map from GroupedHost — into the row
+// ProjectLoader and the host-wide status map from GroupHost — into the row
 // model.
 //
 // Project ORDER comes from the loader, not from the status map: the loader
@@ -357,18 +347,6 @@ func buildSvcGroups(projects []compose.Project, host map[string]map[string]runne
 		add(compose.Project{Name: compose.UnmanagedProjectName, Unmanaged: true})
 	}
 	return groups
-}
-
-// cursorGroup returns the group the cursor row belongs to. Unlike cursorService
-// it accepts a header row: a header IS its group, and the keys that act on a
-// whole project — drill-in, config — are exactly the ones a header row should
-// answer.
-func (m Model) cursorGroup() (svcGroup, bool) {
-	e, ok := m.cursorEntry()
-	if !ok || e.groupIdx < 0 || e.groupIdx >= len(m.svcGroups) {
-		return svcGroup{}, false
-	}
-	return m.svcGroups[e.groupIdx], true
 }
 
 // opBatch is one project's share of an operation: the project to build a
@@ -442,12 +420,7 @@ func formatBatchTargets(batches []opBatch) string {
 // svcRowID names one container-screen row by WHAT it is rather than by where it
 // sits. The row list is rebuilt wholesale — by the 5-second grouped reload, by a
 // fold, by a search that unfolds a group — so an index is not an identity: a
-// container started or removed anywhere on the host inserts or deletes rows and
-// slides every index below it.
-//
-// It is the same identity rule the fold state (project name) and the selection
-// (svcKey) already use, extended to the one piece of user state that was still
-// a raw integer: the cursor.
+// container started or removed anywhere on the host slides every index below it.
 type svcRowID struct {
 	proj    string
 	service string // empty on a group header

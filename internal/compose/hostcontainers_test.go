@@ -1596,7 +1596,7 @@ func TestNewRemoteHostContainers_InspectSplicesSSHExtraArgs(t *testing.T) {
 	}
 }
 
-// --- GroupedHost ---
+// --- GroupHost ---
 
 func TestLabelValue(t *testing.T) {
 	tests := []struct {
@@ -1642,7 +1642,7 @@ func TestHostContainers_GroupedStatus(t *testing.T) {
 
 	got, err := groupedStatusOf(h)
 	if err != nil {
-		t.Fatalf("GroupedHost() error = %v", err)
+		t.Fatalf("GroupHost() error = %v", err)
 	}
 	if len(got) != 3 {
 		t.Fatalf("groups = %v, want shop, blog and %s", groupNames(got), UnmanagedProjectName)
@@ -1689,7 +1689,7 @@ func TestHostContainers_GroupedStatus_ScaledReplicas(t *testing.T) {
 
 	got, err := groupedStatusOf(h)
 	if err != nil {
-		t.Fatalf("GroupedHost() error = %v", err)
+		t.Fatalf("GroupHost() error = %v", err)
 	}
 	api := got["shop"]["api"]
 	if !api.Running {
@@ -1729,7 +1729,7 @@ func TestHostContainers_GroupedStatus_RestartingReplica(t *testing.T) {
 
 	got, err := groupedStatusOf(h)
 	if err != nil {
-		t.Fatalf("GroupedHost() error = %v", err)
+		t.Fatalf("GroupHost() error = %v", err)
 	}
 	api := got["shop"]["api"]
 	if api.Running {
@@ -1743,7 +1743,7 @@ func TestHostContainers_GroupedStatus_RestartingReplica(t *testing.T) {
 	h = &HostContainers{docker: &fakeDockerRunner{runOut: []byte(ps)}}
 	got, err = groupedStatusOf(h)
 	if err != nil {
-		t.Fatalf("GroupedHost() error = %v", err)
+		t.Fatalf("GroupHost() error = %v", err)
 	}
 	if api = got["shop"]["api"]; api.Uptime != "4h" || !api.Running {
 		t.Errorf("api = %+v, want the running replica to win over the restarting one", api)
@@ -1759,7 +1759,7 @@ func TestHostContainers_GroupedStatus_LabelValueWithComma(t *testing.T) {
 
 	got, err := groupedStatusOf(h)
 	if err != nil {
-		t.Fatalf("GroupedHost() error = %v", err)
+		t.Fatalf("GroupHost() error = %v", err)
 	}
 	if len(got) != 1 {
 		t.Fatalf("groups = %v, want shop only", groupNames(got))
@@ -1778,7 +1778,7 @@ func TestHostContainers_GroupedStatus_SiblingKeysAreNotAProject(t *testing.T) {
 
 	got, err := groupedStatusOf(h)
 	if err != nil {
-		t.Fatalf("GroupedHost() error = %v", err)
+		t.Fatalf("GroupHost() error = %v", err)
 	}
 	if _, ok := got[UnmanagedProjectName]["odd"]; !ok {
 		t.Errorf("groups = %v, want the container in the unmanaged bucket", got)
@@ -1797,7 +1797,7 @@ func TestHostContainers_GroupedStatus_NameFallbacks(t *testing.T) {
 
 	got, err := groupedStatusOf(h)
 	if err != nil {
-		t.Fatalf("GroupedHost() error = %v", err)
+		t.Fatalf("GroupHost() error = %v", err)
 	}
 	if _, ok := got[UnmanagedProjectName]["blank-proj"]; !ok {
 		t.Errorf("unmanaged = %+v, want the empty-project container", got[UnmanagedProjectName])
@@ -1815,10 +1815,10 @@ func TestHostContainers_GroupedStatus_EmptyHost(t *testing.T) {
 
 	got, err := groupedStatusOf(h)
 	if err != nil {
-		t.Fatalf("GroupedHost() error = %v", err)
+		t.Fatalf("GroupHost() error = %v", err)
 	}
 	if len(got) != 0 {
-		t.Errorf("GroupedHost() status = %v, want no groups", got)
+		t.Errorf("GroupHost() status = %v, want no groups", got)
 	}
 }
 
@@ -1855,7 +1855,7 @@ func TestHostContainers_GroupedStatus_RealFixture(t *testing.T) {
 
 	got, err := groupedStatusOf(h)
 	if err != nil {
-		t.Fatalf("GroupedHost() error = %v", err)
+		t.Fatalf("GroupHost() error = %v", err)
 	}
 	if len(got) < 2 {
 		t.Fatalf("groups = %v, want at least one project plus the unmanaged bucket", groupNames(got))
@@ -1888,12 +1888,12 @@ func TestHostContainers_GroupedStatus_RealFixture(t *testing.T) {
 }
 
 func groupedStatusOf(h *HostContainers) (map[string]map[string]runner.ServiceStatus, error) {
-	snap, err := h.GroupedHost(context.Background())
+	snap, err := h.GroupHost(context.Background())
 	return snap.Status, err
 }
 
 func groupedStatsOf(h *HostContainers) (map[string]map[string]runner.ServiceStats, error) {
-	snap, err := h.GroupedHost(context.Background())
+	snap, err := h.GroupHost(context.Background())
 	if err != nil {
 		return nil, err
 	}
@@ -1922,7 +1922,7 @@ func TestHostContainers_GroupedStats(t *testing.T) {
 
 	got, err := groupedStatsOf(h)
 	if err != nil {
-		t.Fatalf("GroupedHost() stats error = %v", err)
+		t.Fatalf("GroupHost() stats error = %v", err)
 	}
 	if len(got) != 3 {
 		t.Fatalf("groups = %d, want shop, blog and %s", len(got), UnmanagedProjectName)
@@ -1966,10 +1966,10 @@ func TestHostContainers_GroupedStats_EmptyHostSkipsStatsCall(t *testing.T) {
 
 	got, err := groupedStatsOf(h)
 	if err != nil {
-		t.Fatalf("GroupedHost() stats error = %v", err)
+		t.Fatalf("GroupHost() stats error = %v", err)
 	}
 	if got != nil {
-		t.Errorf("GroupedHost() stats = %v, want nil", got)
+		t.Errorf("GroupHost() stats = %v, want nil", got)
 	}
 	if len(f.runCalls) != 1 {
 		t.Errorf("docker stats ran with zero containers: %v", f.runCalls)
@@ -1980,7 +1980,7 @@ func TestHostContainers_GroupedStats_Errors(t *testing.T) {
 	t.Run("ps failure", func(t *testing.T) {
 		h := &HostContainers{docker: &fakeDockerRunner{runErr: errors.New("boom")}}
 		if _, err := groupedStatsOf(h); err == nil {
-			t.Fatal("GroupedHost() stats error = nil, want the ps failure")
+			t.Fatal("GroupHost() stats error = nil, want the ps failure")
 		}
 	})
 	t.Run("stats failure", func(t *testing.T) {
@@ -1988,7 +1988,7 @@ func TestHostContainers_GroupedStats_Errors(t *testing.T) {
 		h := &HostContainers{docker: f}
 		_, err := groupedStatsOf(h)
 		if err == nil {
-			t.Fatal("GroupedHost() stats error = nil, want the stats failure")
+			t.Fatal("GroupHost() stats error = nil, want the stats failure")
 		}
 		// The wrap names WHICH host-wide call failed; its ps sibling is
 		// asserted the same way, so the two cannot be told apart by accident.
@@ -2007,13 +2007,13 @@ func TestHostContainers_GroupedStats_Errors(t *testing.T) {
 		f := &fakeDockerRunner{runFunc: hostRunFunc(hostPsGrouped, "{not json", nil)}
 		h := &HostContainers{docker: f}
 		if _, err := groupedStatsOf(h); err == nil {
-			t.Fatal("GroupedHost() stats error = nil, want a stats parse failure")
+			t.Fatal("GroupHost() stats error = nil, want a stats parse failure")
 		}
 	})
 	t.Run("unparseable ps", func(t *testing.T) {
 		h := &HostContainers{docker: &fakeDockerRunner{runOut: []byte("{not json")}}
 		if _, err := groupedStatsOf(h); err == nil {
-			t.Fatal("GroupedHost() stats error = nil, want a parse failure")
+			t.Fatal("GroupHost() stats error = nil, want a parse failure")
 		}
 	})
 }
@@ -2033,7 +2033,7 @@ func TestHostContainers_GroupedStats_SkipsUnjoinableEntries(t *testing.T) {
 
 	got, err := groupedStatsOf(h)
 	if err != nil {
-		t.Fatalf("GroupedHost() stats error = %v", err)
+		t.Fatalf("GroupHost() stats error = %v", err)
 	}
 	un := got[UnmanagedProjectName]
 	if len(un) != 1 {
@@ -2054,10 +2054,10 @@ func TestHostContainers_GroupedStats_AllStoppedIsNil(t *testing.T) {
 
 	got, err := groupedStatsOf(h)
 	if err != nil {
-		t.Fatalf("GroupedHost() stats error = %v", err)
+		t.Fatalf("GroupHost() stats error = %v", err)
 	}
 	if got != nil {
-		t.Errorf("GroupedHost() stats = %v, want nil when nothing is running", got)
+		t.Errorf("GroupHost() stats = %v, want nil when nothing is running", got)
 	}
 }
 
@@ -2072,7 +2072,7 @@ func TestHostContainers_EmptyProjectLabelIsUnmanagedOnBothSides(t *testing.T) {
 
 	got, err := groupedStatusOf(h)
 	if err != nil {
-		t.Fatalf("GroupedHost() error = %v", err)
+		t.Fatalf("GroupHost() error = %v", err)
 	}
 	if _, ok := got[UnmanagedProjectName]["orphan"]; !ok {
 		t.Fatalf("grouped = %v, want orphan in the unmanaged bucket", got)
@@ -2093,11 +2093,11 @@ func TestHostContainers_EmptyProjectLabelIsUnmanagedOnBothSides(t *testing.T) {
 	}
 }
 
-// TestHostContainers_GroupedHost_RemoteSplice pins that the grouped read needs
+// TestHostContainers_GroupHost_RemoteSplice pins that the grouped read needs
 // no new SSH plumbing: both halves go through the same run seam, so
 // SSHExtraArgs still land immediately before the host argument and the two argv
 // strings are unchanged.
-func TestHostContainers_GroupedHost_RemoteSplice(t *testing.T) {
+func TestHostContainers_GroupHost_RemoteSplice(t *testing.T) {
 	extras := []string{"-p", "2222"}
 	host := "user@example.com"
 	var captured [][]string
@@ -2112,7 +2112,7 @@ func TestHostContainers_GroupedHost_RemoteSplice(t *testing.T) {
 
 	got, err := groupedStatsOf(NewRemoteHostContainers(r))
 	if err != nil {
-		t.Fatalf("GroupedHost() stats error = %v", err)
+		t.Fatalf("GroupHost() stats error = %v", err)
 	}
 	if len(got) != 3 {
 		t.Errorf("groups = %d, want 3", len(got))
@@ -2121,7 +2121,7 @@ func TestHostContainers_GroupedHost_RemoteSplice(t *testing.T) {
 		t.Fatalf("ssh invocations = %d, want 2", len(captured))
 	}
 	for _, args := range captured {
-		assertExtraBeforeHost(t, "HostContainers GroupedHost", args, host, extras)
+		assertExtraBeforeHost(t, "HostContainers GroupHost", args, host, extras)
 	}
 	if remoteCmd := captured[0][len(captured[0])-1]; remoteCmd != `docker 'ps' '-a' '--size=false' '--format' '{{json .}}'` {
 		t.Errorf("remote ps command = %q", remoteCmd)

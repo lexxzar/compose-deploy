@@ -33,8 +33,8 @@ func TestRebuildSvcEntries(t *testing.T) {
 			name:   "single group emits no header",
 			groups: []svcGroup{testGroup("web", false, "nginx", "api")},
 			want: []svcEntry{
-				{kind: entrySvcService, groupIdx: 0, name: "nginx"},
-				{kind: entrySvcService, groupIdx: 0, name: "api"},
+				{kind: entryService, groupIdx: 0, name: "nginx"},
+				{kind: entryService, groupIdx: 0, name: "api"},
 			},
 		},
 		{
@@ -55,10 +55,10 @@ func TestRebuildSvcEntries(t *testing.T) {
 			},
 			want: []svcEntry{
 				{kind: entrySvcGroupHeader, groupIdx: 0},
-				{kind: entrySvcService, groupIdx: 0, name: "nginx"},
-				{kind: entrySvcService, groupIdx: 0, name: "api"},
+				{kind: entryService, groupIdx: 0, name: "nginx"},
+				{kind: entryService, groupIdx: 0, name: "api"},
 				{kind: entrySvcGroupHeader, groupIdx: 1},
-				{kind: entrySvcService, groupIdx: 1, name: "postgres"},
+				{kind: entryService, groupIdx: 1, name: "postgres"},
 			},
 		},
 		{
@@ -70,7 +70,7 @@ func TestRebuildSvcEntries(t *testing.T) {
 			want: []svcEntry{
 				{kind: entrySvcGroupHeader, groupIdx: 0},
 				{kind: entrySvcGroupHeader, groupIdx: 1},
-				{kind: entrySvcService, groupIdx: 1, name: "postgres"},
+				{kind: entryService, groupIdx: 1, name: "postgres"},
 			},
 		},
 		{
@@ -81,7 +81,7 @@ func TestRebuildSvcEntries(t *testing.T) {
 			},
 			want: []svcEntry{
 				{kind: entrySvcGroupHeader, groupIdx: 0},
-				{kind: entrySvcService, groupIdx: 0, name: "nginx"},
+				{kind: entryService, groupIdx: 0, name: "nginx"},
 				{kind: entrySvcGroupHeader, groupIdx: 1},
 			},
 		},
@@ -93,9 +93,9 @@ func TestRebuildSvcEntries(t *testing.T) {
 			},
 			want: []svcEntry{
 				{kind: entrySvcGroupHeader, groupIdx: 0},
-				{kind: entrySvcService, groupIdx: 0, name: "db"},
+				{kind: entryService, groupIdx: 0, name: "db"},
 				{kind: entrySvcGroupHeader, groupIdx: 1},
-				{kind: entrySvcService, groupIdx: 1, name: "db"},
+				{kind: entryService, groupIdx: 1, name: "db"},
 			},
 		},
 		{
@@ -106,9 +106,9 @@ func TestRebuildSvcEntries(t *testing.T) {
 			},
 			want: []svcEntry{
 				{kind: entrySvcGroupHeader, groupIdx: 0},
-				{kind: entrySvcService, groupIdx: 0, name: "nginx"},
+				{kind: entryService, groupIdx: 0, name: "nginx"},
 				{kind: entrySvcGroupHeader, groupIdx: 1},
-				{kind: entrySvcService, groupIdx: 1, name: "portainer"},
+				{kind: entryService, groupIdx: 1, name: "portainer"},
 			},
 		},
 	}
@@ -286,12 +286,16 @@ type recordingComposer struct {
 	mockComposer
 	mu            sync.Mutex
 	gotContainers [][]string
+	recorded      chan struct{} // one send per step; buffered past the step count so record never blocks
 }
 
 func (c *recordingComposer) record(containers []string) {
 	c.mu.Lock()
-	defer c.mu.Unlock()
 	c.gotContainers = append(c.gotContainers, append([]string(nil), containers...))
+	c.mu.Unlock()
+	if c.recorded != nil {
+		c.recorded <- struct{}{}
+	}
 }
 
 // calls returns a snapshot of what the pipeline has recorded so far.
@@ -331,10 +335,14 @@ func (c *recordingComposer) Start(ctx context.Context, containers []string, w io
 // name docker compose knows it by, so a leaked "proj/svc" would reach the
 // docker CLI as a service that does not exist.
 func TestQualifiedKeys_NeverCrossIntoRunner(t *testing.T) {
-	rc := &recordingComposer{mockComposer: mockComposer{
-		services: []string{"api", "db"},
-		status:   map[string]runner.ServiceStatus{"api": {Running: true}, "db": {Running: true}},
-	}}
+	steps := len(runner.Steps(runner.Deploy))
+	rc := &recordingComposer{
+		mockComposer: mockComposer{
+			services: []string{"api", "db"},
+			status:   map[string]runner.ServiceStatus{"api": {Running: true}, "db": {Running: true}},
+		},
+		recorded: make(chan struct{}, steps),
+	}
 	m := NewModel(rc, io.Discard, func(compose.Project) runner.Composer { return rc }, nil, nil)
 	m.screen = screenSelectContainers
 	m.projName = "shop"
@@ -370,17 +378,14 @@ func TestQualifiedKeys_NeverCrossIntoRunner(t *testing.T) {
 		cmd()
 	}
 	deadline := time.After(2 * time.Second)
-	calls := rc.calls()
-	for len(calls) < len(runner.Steps(runner.Deploy)) {
+	for i := 0; i < steps; i++ {
 		select {
+		case <-rc.recorded:
 		case <-deadline:
-			t.Fatalf("pipeline did not finish: %v", calls)
-		default:
-			time.Sleep(time.Millisecond)
+			t.Fatalf("pipeline did not finish: %v", rc.calls())
 		}
-		calls = rc.calls()
 	}
-	for _, call := range calls {
+	for _, call := range rc.calls() {
 		for _, name := range call {
 			if strings.Contains(name, svcKeySep) {
 				t.Errorf("a qualified key reached the composer: %q", name)
@@ -594,7 +599,7 @@ func TestGroupCounts(t *testing.T) {
 	}
 }
 
-// selectableRefs drops the unmanaged bucket: those rows draw no checkbox, so
+// eachSelectableRef drops the unmanaged bucket: those rows draw no checkbox, so
 // nothing that reads a selection may count them.
 func TestSelectableRefs_DropsUnmanaged(t *testing.T) {
 	m := Model{svcGroups: []svcGroup{
@@ -604,13 +609,17 @@ func TestSelectableRefs_DropsUnmanaged(t *testing.T) {
 	if got := len(m.svcRefs()); got != 3 {
 		t.Fatalf("svcRefs = %d, want 3 (every service, unmanaged included)", got)
 	}
-	refs := m.selectableRefs()
+	var refs []svcRef
+	m.eachSelectableRef(func(r svcRef) bool {
+		refs = append(refs, r)
+		return true
+	})
 	if len(refs) != 2 {
-		t.Fatalf("selectableRefs = %v, want the two compose services", refs)
+		t.Fatalf("eachSelectableRef yielded %v, want the two compose services", refs)
 	}
 	for _, r := range refs {
 		if r.groupIdx != 0 {
-			t.Errorf("selectableRefs kept %+v from the unmanaged bucket", r)
+			t.Errorf("eachSelectableRef kept %+v from the unmanaged bucket", r)
 		}
 	}
 	if !m.groupUnmanaged(1) {

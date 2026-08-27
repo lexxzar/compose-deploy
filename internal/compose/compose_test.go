@@ -61,6 +61,14 @@ func TestParseProjects(t *testing.T) {
 			},
 		},
 		{
+			// The empty-ConfigDir sentinel, pinned at its source: filepath.Dir("")
+			// returns "." — not "" — and docker reports an empty ConfigFiles for
+			// any project it discovers from the com.docker.compose.project label
+			// alone. A "." would read as a real directory at every consumer: the
+			// TUI's operableProject guard would accept the group and a
+			// whole-project deploy would run stop/rm/pull/create/start in
+			// cdeploy's own working directory, and cmd/list would print that
+			// directory's services under the wrong project header.
 			name:  "no config files leaves ConfigDir empty",
 			input: `[{"Name":"orphan","Status":"running(1)","ConfigFiles":""}]`,
 			want: []Project{
@@ -126,27 +134,6 @@ func TestParseProjects(t *testing.T) {
 				}
 			}
 		})
-	}
-}
-
-// TestParseProjects_NoConfigFilesNeverYieldsDot pins the empty-ConfigDir
-// sentinel at its source. filepath.Dir("") returns "." — not "" — and docker
-// reports an empty ConfigFiles for any project it discovers from the
-// com.docker.compose.project label alone. A "." would then read as a real
-// directory at every consumer: the TUI's operableProject guard would accept
-// the group and a whole-project deploy would run stop/rm/pull/create/start in
-// cdeploy's own working directory, and cmd/list would print that directory's
-// services under the wrong project header.
-func TestParseProjects_NoConfigFilesNeverYieldsDot(t *testing.T) {
-	got, err := parseProjects([]byte(`[{"Name":"orphan","Status":"running(1)","ConfigFiles":""}]`))
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if len(got) != 1 {
-		t.Fatalf("got %d projects, want 1", len(got))
-	}
-	if got[0].ConfigDir != "" {
-		t.Fatalf("ConfigDir = %q, want empty — a %q resolves to cdeploy's own cwd at every consumer", got[0].ConfigDir, ".")
 	}
 }
 

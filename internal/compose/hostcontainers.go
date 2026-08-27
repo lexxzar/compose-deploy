@@ -81,10 +81,9 @@ func parseHostContainers(data []byte) ([]hostPsEntry, error) {
 // carry a comma. Do not reuse this helper for an arbitrary label key.
 func labelValue(labels, key string) (string, bool) {
 	var rest string
-	switch {
-	case strings.HasPrefix(labels, key):
+	if strings.HasPrefix(labels, key) {
 		rest = labels[len(key):]
-	default:
+	} else {
 		i := strings.Index(labels, ","+key)
 		if i < 0 {
 			return "", false
@@ -447,7 +446,7 @@ type GroupedHostSnapshot struct {
 	StatsErr error
 }
 
-// GroupedHost returns the whole grouped host view in ONE `docker ps` plus ONE
+// GroupHost returns the whole grouped host view in ONE `docker ps` plus ONE
 // `docker stats`, regardless of how many projects the host runs. That fixed
 // cost is what makes the grouped TUI screen affordable over SSH: a per-project
 // `docker compose ps` would be one round-trip per project, and asking for
@@ -459,7 +458,7 @@ type GroupedHostSnapshot struct {
 // The gap this trades for the price: a service declared in a compose file but
 // never created has no container, so it has no row here. Drilling into a single
 // project goes through ListServices and shows it.
-func (h *HostContainers) GroupedHost(ctx context.Context) (GroupedHostSnapshot, error) {
+func (h *HostContainers) GroupHost(ctx context.Context) (GroupedHostSnapshot, error) {
 	entries, err := h.hostEntries(ctx)
 	if err != nil {
 		return GroupedHostSnapshot{}, err

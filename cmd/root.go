@@ -101,7 +101,7 @@ Remote server configuration (~/.cdeploy/servers.yml):
 			}
 
 			// When the cwd has a compose file, try to detect the local
-			// Docker variant so the TUI can skip the project picker.
+			// Docker variant so the TUI can fast-track to the drilled screen.
 			// If servers are configured, detection failure is non-fatal —
 			// the user may only target remote servers.
 			var c runner.Composer
@@ -200,12 +200,6 @@ Remote server configuration (~/.cdeploy/servers.yml):
 func Execute() error {
 	return NewRootCmd().Execute()
 }
-
-// The TUI ProjectLoader is plain ListProjects on both paths. The synthetic
-// "(unmanaged)" group is NOT appended here: buildSvcGroups derives it from the
-// host-wide status map the grouped loader already fetched, so asking the host
-// to count unmanaged containers separately would be a second `docker ps` per
-// refresh for an answer the first one already carries.
 
 // localComposerFor is the local tui.ComposerFactory body. The synthetic
 // unmanaged row has no compose file and no ConfigDir, so it gets the read-only

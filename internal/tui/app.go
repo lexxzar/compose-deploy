@@ -160,7 +160,7 @@ type RollbackPreparer interface {
 // A factory that cannot produce one (a test mock) simply yields no grouped
 // data: the screen renders the projects the loader found with no status.
 type HostGrouper interface {
-	GroupedHost(ctx context.Context) (compose.GroupedHostSnapshot, error)
+	GroupHost(ctx context.Context) (compose.GroupedHostSnapshot, error)
 }
 
 // ReadOnlyComposer marks a composer whose write methods refuse. The method is
@@ -584,12 +584,6 @@ type Model struct {
 // then closes its channel.
 const statusSkipped = "skipped"
 
-// stepState is one row of the progress screen. name is the RUNNER step name and
-// is what a StepEvent is matched against; label is what the screen draws. The
-// two differ only in a multi-batch sequence, where the label carries the
-// project prefix ("web: Pulling") that makes two identically-named steps
-// distinguishable on screen — the match itself never uses the label, because
-// the same five names repeat in every batch.
 // stepState is one row of the progress screen. name is the RUNNER step name a
 // StepEvent matches on; label is the drawn text, which carries the "web: "
 // project prefix in a multi-batch sequence. enterProgress is the only producer
@@ -2302,7 +2296,9 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 					if len(batches) == 0 || !m.bindProjComposer(batches[0].proj) {
 						m.confirming = false
 						m.fixSvcOffset()
-						return m, m.takeSvcReload()
+						// Hoisted: pointer receiver, same m as the return.
+						cmd := m.takeSvcReload()
+						return m, cmd
 					}
 				default:
 					batches = []opBatch{{proj: m.currentProject(), services: m.selectedContainers()}}
@@ -2317,7 +2313,9 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 				// one project's composer to the next row's action key.
 				m.unbindGroupedComposer()
 				m.fixSvcOffset()
-				return m, m.takeSvcReload()
+				// Hoisted: pointer receiver, same m as the return.
+				cmd := m.takeSvcReload()
+				return m, cmd
 			}
 			return m, nil
 		}
@@ -2488,9 +2486,10 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 				return m, nil
 			}
 			allSel := m.allSelected()
-			for _, r := range m.selectableRefs() {
+			m.eachSelectableRef(func(r svcRef) bool {
 				m.selected[r.key] = !allSel
-			}
+				return true
+			})
 		case "r":
 			if m.readOnly() {
 				m.fixSvcOffset()
@@ -2549,8 +2548,6 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			}
 			if _, ok := m.composer.(RollbackPreparer); !ok {
 				m.unbindGroupedComposer()
-				// The dispatch cleared m.warning above, which frees a footer
-				// row — every other gated container key re-clamps for it.
 				m.fixSvcOffset()
 				return m, nil
 			}
@@ -2610,9 +2607,6 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.searchInput.Focus()
 			return m, nil
 		case "l":
-			// cursorService() is false whenever there is no row under the
-			// cursor at all, so it subsumes the empty-list check the three keys
-			// used to carry on top of it.
 			if _, ok := m.cursorService(); !ok {
 				m.fixSvcOffset()
 				return m, nil
@@ -2650,9 +2644,6 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			// Deliberately NOT gated on m.readOnly(): inspect is read-only by
 			// nature and works identically on both container variants, so it is
 			// named in both help tables.
-			// cursorService() is false whenever there is no row under the
-			// cursor at all, so it subsumes the empty-list check the three keys
-			// used to carry on top of it.
 			if _, ok := m.cursorService(); !ok {
 				m.fixSvcOffset()
 				return m, nil
@@ -2663,16 +2654,11 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			}
 			if _, ok := m.composer.(Inspector); !ok {
 				m.unbindGroupedComposer()
-				// The dispatch cleared m.warning above, which frees a footer
-				// row — every other gated container key re-clamps for it.
 				m.fixSvcOffset()
 				return m, nil
 			}
 			return m.enterInspect()
 		case "x":
-			// cursorService() is false whenever there is no row under the
-			// cursor at all, so it subsumes the empty-list check the three keys
-			// used to carry on top of it.
 			if _, ok := m.cursorService(); !ok {
 				m.fixSvcOffset()
 				return m, nil
@@ -4963,7 +4949,7 @@ func (m Model) hostGrouper() HostGrouper {
 }
 
 // loadGroups is the grouped screen's WHOLE fetch: the ProjectLoader for the
-// project list and ORDER, plus one host-wide GroupedHost for every container's
+// project list and ORDER, plus one host-wide GroupHost for every container's
 // state AND its CPU/memory. It reuses statusSession because it is loadServices'
 // grouped counterpart — same lifecycle, same context changes, same staleness
 // rule.
@@ -5002,7 +4988,7 @@ func (m Model) loadGroups() tea.Cmd {
 		if hg == nil {
 			return servicesMsg{groupedPayload: true, projects: projects, session: session}
 		}
-		snap, err := hg.GroupedHost(ctx)
+		snap, err := hg.GroupHost(ctx)
 		if err != nil {
 			return servicesMsg{groupedPayload: true, err: err, session: session}
 		}
@@ -5506,6 +5492,7 @@ func (m *Model) maybeRefreshUpdatesCmd() tea.Cmd {
 // is opt-in — so the read-only screen matches it: the glyph column stays blank
 // until the user asks for it, and the `?` overlay already advertises
 // `U check updates`.
+//
 // Grouped mode is refused for the same reason and one more: it has no single
 // composer and no single cache key, so an automatic scan there would fan out
 // across every project on the host at once. U is the only trigger there too.
@@ -5706,7 +5693,7 @@ func computeMatches(entries []svcEntry, query string) []int {
 	q := strings.ToLower(query)
 	var matches []int
 	for i, e := range entries {
-		if e.kind != entrySvcService {
+		if e.kind != entryService {
 			continue
 		}
 		if strings.Contains(strings.ToLower(e.name), q) {
@@ -5759,8 +5746,7 @@ func (m Model) hasStatusColumns() bool {
 	}
 	found := false
 	m.eachSvcRef(func(r svcRef) bool {
-		key := r.key
-		if st, ok := m.svcStatus[key]; ok {
+		if st, ok := m.svcStatus[r.key]; ok {
 			if st.Created != "" || st.Uptime != "" || len(st.Ports) > 0 {
 				found = true
 				return false
@@ -5770,7 +5756,7 @@ func (m Model) hasStatusColumns() bool {
 			// column). The Service captions row is governed by the other
 			// columns; if none of those are present, no captions row is shown.
 		}
-		if _, ok := m.stats[key]; ok && m.svcStatus[key].Running {
+		if _, ok := m.stats[r.key]; ok && m.svcStatus[r.key].Running {
 			found = true
 			return false
 		}
@@ -5863,7 +5849,6 @@ func (m Model) svcVisibleCount() int {
 	return visible
 }
 
-// fixSvcOffset adjusts svcOffset so that svcCursor is within the visible window.
 // fixServerCursor clamps serverCursor to a valid selectable entry after
 // serverEntries has been rebuilt (e.g. after settings add/edit/delete).
 func (m *Model) fixServerCursor() {
@@ -5886,6 +5871,11 @@ func (m *Model) fixServerCursor() {
 	}
 }
 
+// fixSvcOffset adjusts svcOffset so that svcCursor is within the visible window.
+//
+// Every gated container key calls it before returning: the dispatch clears
+// m.warning above the switch, which frees a footer row and changes how many
+// service rows fit.
 func (m *Model) fixSvcOffset() {
 	visible := m.svcVisibleCount()
 
