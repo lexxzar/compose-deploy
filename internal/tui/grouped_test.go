@@ -2695,7 +2695,7 @@ func TestGroupedRollback_BatchCarriesTheCapturedProject(t *testing.T) {
 	if len(got.batches) != 1 || got.batches[0].proj.Name != "shop" {
 		t.Fatalf("batches = %+v, want one shop batch", got.batches)
 	}
-	if got.projUpdatesCacheKey(got.batches[0].proj) != "/srv/shop|" {
+	if got.projUpdatesCacheKey(got.batches[0].proj) != "/srv/shop\x00shop|" {
 		t.Errorf("batch cache key = %q, want the shop project's own key",
 			got.projUpdatesCacheKey(got.batches[0].proj))
 	}
@@ -2780,8 +2780,8 @@ func TestProjUpdatesCacheKey_DirlessProjectsStayDistinct(t *testing.T) {
 	}
 	// The unmanaged prefix rule is unchanged.
 	un := m.projUpdatesCacheKey(compose.Project{Name: compose.UnmanagedProjectName, Unmanaged: true})
-	if un != "unmanaged||" {
-		t.Errorf("unmanaged key = %q, want %q", un, "unmanaged||")
+	if want := "unmanaged|\x00" + compose.UnmanagedProjectName + "|"; un != want {
+		t.Errorf("unmanaged key = %q, want %q", un, want)
 	}
 	// updatesCacheKey is projUpdatesCacheKey applied to the current project.
 	if m.updatesCacheKey() != m.projUpdatesCacheKey(m.currentProject()) {
@@ -3703,5 +3703,136 @@ func TestSearch_EscWhileTypingRestoresTheRowAfterAnUnfold(t *testing.T) {
 	after := rowIDAt(got.svcEntries, got.svcGroups, got.svcCursor)
 	if after != before {
 		t.Errorf("cursor restored to %+v, want the row it left from, %+v", after, before)
+	}
+}
+
+// evilLabel is a compose-LOOKING label carrying an OSC 52 clipboard write plus
+// a CSI screen clear - the payload a `docker run --label` can plant on any
+// docker host cdeploy connects to.
+const (
+	evilOSC     = "\x1b]52;c;cHduZWQ="
+	evilCSI     = "\x1b[2J\x1b[H"
+	evilPayload = "52;c;cHduZWQ="
+)
+
+// TestGroupedView_NeverEmitsLabelControlSequences is the terminal-injection pin.
+// Project and service names on the host view come from container labels, and the
+// screen redraws itself every 5 seconds, so an escape sequence in a label would
+// be replayed into the user's terminal with no keystroke at all. Every surface a
+// label-derived name reaches is checked: the group header, the service row, the
+// breadcrumb after drilling in, and the confirmation prompt.
+func TestGroupedView_NeverEmitsLabelControlSequences(t *testing.T) {
+	g := &mockGrouper{
+		groupedStatus: map[string]map[string]runner.ServiceStatus{
+			"sh" + evilOSC + "op": {"ap" + evilCSI + "i": {Running: true}},
+			"blog":                {"web": {Running: true}},
+		},
+	}
+	projects := []compose.Project{
+		{Name: "sh" + evilOSC + "op", ConfigDir: "/srv/shop"},
+		{Name: "blog", ConfigDir: "/srv/blog"},
+	}
+	m := groupedTestModel(g, projects)
+	updated, _ := m.Update(m.loadGroups()())
+	m = updated.(Model)
+	m.width, m.height = 100, 30
+
+	clean := func(t *testing.T, where, view string) {
+		t.Helper()
+		if strings.Contains(view, evilPayload) {
+			t.Errorf("%s replayed the OSC payload:\n%q", where, view)
+		}
+		if strings.Contains(view, "\x1b]") {
+			t.Errorf("%s emitted an OSC introducer:\n%q", where, view)
+		}
+		if strings.Contains(view, "\x1b[2J") || strings.Contains(view, "\x1b[H") {
+			t.Errorf("%s emitted a screen-clear sequence:\n%q", where, view)
+		}
+	}
+
+	// The header and the row both carry the name.
+	view := m.viewSelectContainers()
+	clean(t, "the grouped list", view)
+	stripped := ansi.Strip(view)
+	if !strings.Contains(stripped, "shop") || !strings.Contains(stripped, "api") {
+		t.Errorf("the sanitized names must still be shown:\n%s", stripped)
+	}
+
+	// The confirmation prompt names the batch (project plus services).
+	m.selected[svcKey("shop", "api")] = true
+	armed := pressGroupKey(m, "d")
+	if !armed.confirming {
+		t.Fatalf("precondition: d must arm the prompt; warning = %q", armed.warning)
+	}
+	clean(t, "the confirm prompt", armed.viewSelectContainers())
+
+	// And the breadcrumb once drilled in.
+	m.svcCursor = headerIndexFor(t, m.svcEntries, 0)
+	drilled, _ := m.Update(keyMsgFor("enter"))
+	dm := drilled.(Model)
+	if dm.grouped {
+		t.Fatalf("precondition: enter must drill in")
+	}
+	clean(t, "the drilled breadcrumb", dm.breadcrumb())
+	if !strings.Contains(ansi.Strip(dm.breadcrumb()), "shop") {
+		t.Errorf("breadcrumb lost the project name: %q", dm.breadcrumb())
+	}
+}
+
+// TestGroupedRefreshError_GatesRowActions is the invisible-target pin. A refresh
+// failure replaces the whole list with an error screen while the groups and the
+// selection behind it are deliberately kept, so d/r/s used to arm a prompt the
+// renderer had no slot to draw - and the enter that followed ran the operation
+// against rows the user could not see.
+func TestGroupedRefreshError_GatesRowActions(t *testing.T) {
+	g, projects := groupedFixture()
+	m := groupedTestModel(g, projects)
+	updated, _ := m.Update(m.loadGroups()())
+	m = updated.(Model)
+	m.width, m.height = 100, 30
+	m.selected[svcKey("shop", "api")] = true
+
+	// A failed grouped refresh: the rows survive, the renderer hides them.
+	errored, _ := m.Update(servicesMsg{groupedPayload: true, err: errors.New("docker daemon gone"), session: m.statusSession})
+	m = errored.(Model)
+	if m.svcErr == nil || len(m.svcGroups) == 0 {
+		t.Fatalf("precondition: the error must be set and the groups kept")
+	}
+	if !strings.Contains(ansi.Strip(m.viewSelectContainers()), "docker daemon gone") {
+		t.Fatal("precondition: the error screen must replace the list")
+	}
+
+	for _, key := range []string{"d", "r", "s", "R", "a", " ", "/", "i", "l", "c", "x", "U"} {
+		got := pressGroupKey(m, key)
+		if got.confirming {
+			t.Errorf("%q armed a confirmation the error screen cannot draw", key)
+		}
+		if got.searching {
+			t.Errorf("%q opened the search bar behind the error screen", key)
+		}
+		if got.screen != screenSelectContainers {
+			t.Errorf("%q left the error screen for screen %d", key, got.screen)
+		}
+	}
+
+	// enter cannot start an operation either - there is no armed prompt to
+	// confirm, and it must not drill into an invisible row.
+	got, _ := m.Update(keyMsgFor("enter"))
+	after := got.(Model)
+	if after.screen != screenSelectContainers || !after.grouped {
+		t.Error("enter acted on a row the error screen hides")
+	}
+
+	// The two keys the error screen DOES advertise stay live. esc drills back
+	// out of a project reached from the host view, and ctrl+c still quits.
+	drilled := m
+	drilled.grouped = false
+	drilled.drilledFromHost = true
+	out, _ := drilled.Update(keyMsgFor("esc"))
+	if !out.(Model).grouped {
+		t.Error("esc must still leave the error screen")
+	}
+	if _, cmd := m.Update(tea.KeyMsg{Type: tea.KeyCtrlC}); cmd == nil {
+		t.Error("ctrl+c must still quit from the error screen")
 	}
 }

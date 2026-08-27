@@ -855,8 +855,10 @@ func TestSetSingleGroup(t *testing.T) {
 		if m.svcGroups == nil {
 			t.Error("services must stay non-nil, or the screen renders its loading state")
 		}
-		if len(m.svcEntries) != 0 {
-			t.Errorf("svcEntries = %+v, want no rows", m.svcEntries)
+		// It draws its header and nothing else: a screen with zero rows has no
+		// cursor and names no project (see groupsHaveHeaders).
+		if len(m.svcEntries) != 1 || m.svcEntries[0].kind != entrySvcGroupHeader {
+			t.Errorf("svcEntries = %+v, want a lone group header", m.svcEntries)
 		}
 	})
 
@@ -11711,7 +11713,7 @@ func TestUpdateDetails_SelfHealsAtEveryScreenEntry(t *testing.T) {
 	}{
 		{
 			name: "drill in",
-			key:  "/p1|",
+			key:  "/p1\x00p1|",
 			setup: func(m *Model) {
 				parkOnGroupedScreen(m, compose.Project{Name: "p1", ConfigDir: "/p1"}, compose.Project{Name: "p2", ConfigDir: "/p2"})
 			},
@@ -11719,25 +11721,25 @@ func TestUpdateDetails_SelfHealsAtEveryScreenEntry(t *testing.T) {
 		},
 		{
 			name:  "entryLocal fast-track",
-			key:   "|",
+			key:   "\x00|",
 			setup: func(m *Model) { m.screen = screenSelectServer; m.serverCursor = 0 },
 			msg:   tea.KeyMsg{Type: tea.KeyEnter},
 		},
 		{
 			name:  "execDone",
-			key:   "|",
+			key:   "\x00|",
 			setup: func(m *Model) { m.screen = screenSelectContainers },
 			msg:   execDoneMsg{},
 		},
 		{
 			name:  "esc from logs",
-			key:   "|",
+			key:   "\x00|",
 			setup: func(m *Model) { m.screen = screenLogs },
 			msg:   tea.KeyMsg{Type: tea.KeyEsc},
 		},
 		{
 			name: "esc from progress",
-			key:  "|",
+			key:  "\x00|",
 			setup: func(m *Model) {
 				m.screen = screenProgress
 				m.done = true
@@ -12472,30 +12474,59 @@ func TestRefreshUpdates_capturesCurrentSession(t *testing.T) {
 	}
 }
 
-// TestUpdatesCacheKey_Composition verifies the cache key format documented
-// in the comment: projDir + "|" + serverName, empty serverName = local.
+// TestUpdatesCacheKey_Composition verifies the cache key format documented in
+// the comment: projDir + NUL + projName + "|" + serverName, empty serverName =
+// local. The last two cases are the finding the key format exists for: two
+// projects deployed with `docker compose -p` out of ONE directory are two
+// container sets, and on ConfigDir alone they shared a cache entry.
 func TestUpdatesCacheKey_Composition(t *testing.T) {
 	tests := []struct {
 		name       string
 		projDir    string
+		projName   string
 		serverName string
 		want       string
 	}{
-		{"local_no_project", "", "", "|"},
-		{"local_with_project", "/srv/app", "", "/srv/app|"},
-		{"remote_with_project", "/srv/app", "prod", "/srv/app|prod"},
-		{"remote_no_project", "", "prod", "|prod"},
+		{"local_no_project", "", "", "", "\x00|"},
+		{"local_with_project", "/srv/app", "app", "", "/srv/app\x00app|"},
+		{"remote_with_project", "/srv/app", "app", "prod", "/srv/app\x00app|prod"},
+		{"remote_no_project", "", "", "prod", "\x00|prod"},
+		{"named_project_in_shared_dir", "/srv/app", "blue", "", "/srv/app\x00blue|"},
+		{"sibling_named_project", "/srv/app", "green", "", "/srv/app\x00green|"},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			mc := &mockComposer{}
 			m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
 			m.projDir = tc.projDir
+			m.projName = tc.projName
 			m.serverName = tc.serverName
 			if got := m.updatesCacheKey(); got != tc.want {
 				t.Errorf("updatesCacheKey() = %q, want %q", got, tc.want)
 			}
 		})
+	}
+}
+
+// TestUpdatesCacheKey_NamedProjectsInOneDirStayDistinct is the finding pin: two
+// compose projects launched with `-p` out of the same directory are separate
+// container sets and must not share one update-cache entry — a shared entry
+// paints one project's ⇧ verdicts onto the other's rows and suppresses its own
+// scan for the whole TTL.
+func TestUpdatesCacheKey_NamedProjectsInOneDirStayDistinct(t *testing.T) {
+	mc := &mockComposer{}
+	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
+	blue := m.projUpdatesCacheKey(compose.Project{Name: "blue", ConfigDir: "/srv/app"})
+	green := m.projUpdatesCacheKey(compose.Project{Name: "green", ConfigDir: "/srv/app"})
+	if blue == green {
+		t.Errorf("two -p projects in one directory share the cache key %q", blue)
+	}
+	// The separator must not be spellable by either half, or one (dir, name)
+	// pair could forge another's key. "/srv" + "app|x" is the shape that
+	// collides on a printable separator.
+	if m.projUpdatesCacheKey(compose.Project{Name: "app", ConfigDir: "/srv"}) ==
+		m.projUpdatesCacheKey(compose.Project{Name: "", ConfigDir: "/srvapp"}) {
+		t.Error("the separator is forgeable: two different projects spell one key")
 	}
 }
 
@@ -15588,14 +15619,14 @@ func TestEscFromProgress_RollbackInvalidatesUpdateCache(t *testing.T) {
 		composer:    &mockComposer{},
 		ctx:         context.Background(),
 		batches:     []opBatch{{}},
-		updateCache: map[string]updateEntry{"|": {results: map[string]bool{"web": true}}},
+		updateCache: map[string]updateEntry{"\x00|": {results: map[string]bool{"web": true}}},
 	}
 	if _, ok := m.updateCache[m.updatesCacheKey()]; !ok {
 		t.Fatalf("precondition: cache should hold key %q", m.updatesCacheKey())
 	}
 	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyEsc})
 	m = updated.(Model)
-	if _, ok := m.updateCache["|"]; ok {
+	if _, ok := m.updateCache["\x00|"]; ok {
 		t.Error("a successful Rollback should invalidate the update-availability cache")
 	}
 }
@@ -16071,8 +16102,8 @@ func TestUpdatesCacheKey_FollowsComposerAcrossNavigation(t *testing.T) {
 
 	updated, _ := m.Update(keyMsgFor("enter"))
 	m = updated.(Model)
-	if got := m.updatesCacheKey(); got != "unmanaged||" {
-		t.Fatalf("after drilling into the unmanaged group, key = %q, want %q", got, "unmanaged||")
+	if got := m.updatesCacheKey(); got != "unmanaged|\x00(unmanaged)|" {
+		t.Fatalf("after drilling into the unmanaged group, key = %q, want %q", got, "unmanaged|\x00(unmanaged)|")
 	}
 
 	updated, _ = m.Update(keyMsgFor("esc")) // drilled -> grouped host view
@@ -16087,8 +16118,8 @@ func TestUpdatesCacheKey_FollowsComposerAcrossNavigation(t *testing.T) {
 	m.serverCursor = 0
 	updated, _ = m.Update(keyMsgFor("enter"))
 	m = updated.(Model)
-	if got := m.updatesCacheKey(); got != "|" {
-		t.Errorf("after the local fast-track, key = %q, want %q", got, "|")
+	if got := m.updatesCacheKey(); got != "\x00|" {
+		t.Errorf("after the local fast-track, key = %q, want %q", got, "\x00|")
 	}
 }
 
@@ -16103,7 +16134,7 @@ func TestUpdatesCache_UnmanagedDoesNotReplayFastTrackVerdicts(t *testing.T) {
 	m.svcStatus = qStatus(m, map[string]runner.ServiceStatus{"web": {Running: true}})
 	m.updateCache = map[string]updateEntry{
 		// The local-fast-track slot, populated by a previous compose context.
-		"|": {fetchedAt: time.Now(), results: map[string]bool{"web": true}},
+		"\x00|": {fetchedAt: time.Now(), results: map[string]bool{"web": true}},
 	}
 
 	updated, cmd := m.Update(statusMsg{
@@ -17894,5 +17925,101 @@ func TestInspectKey_MissingContainerSurfacesNamedError(t *testing.T) {
 	}
 	if strings.Contains(view, "Loading") {
 		t.Error("a failed fetch must not leave the screen reading as loading")
+	}
+}
+
+// TestRollbackPreppedMsg_CarriesBatchIdentity is the superseded-prep pin. The
+// screen alone is not identity: a cancelled prep keeps running until
+// PrepareRollback notices its context, and the user can be back on
+// screenProgress with a DIFFERENT operation by the time it answers. Ungated,
+// its error failed that operation, its success overwrote the cleanup the new
+// one owns, and the waitForEvent it starts put a second consumer on the live
+// event channel.
+func TestRollbackPreppedMsg_CarriesBatchIdentity(t *testing.T) {
+	newModel := func() Model {
+		events := make(chan runner.StepEvent)
+		close(events)
+		return Model{screen: screenProgress, eventCh: events, batchIdx: 1, batchSession: 7}
+	}
+
+	cases := []struct {
+		name string
+		msg  rollbackPreppedMsg
+	}{
+		{"stale session", rollbackPreppedMsg{batchIdx: 1, session: 6}},
+		{"stale batch index", rollbackPreppedMsg{batchIdx: 0, session: 7}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name+" error is dropped", func(t *testing.T) {
+			m := newModel()
+			msg := tc.msg
+			msg.err = errors.New("pull failed")
+			updated, cmd := m.Update(msg)
+			got := updated.(Model)
+			if got.failed {
+				t.Error("a superseded prep error marked the current operation failed")
+			}
+			if got.rollbackErr != "" {
+				t.Errorf("rollbackErr = %q, want empty", got.rollbackErr)
+			}
+			if cmd != nil {
+				t.Error("a superseded prep must not schedule anything")
+			}
+		})
+		t.Run(tc.name+" success is dropped and cleaned up", func(t *testing.T) {
+			m := newModel()
+			calls := 0
+			msg := tc.msg
+			msg.cleanup = func() { calls++ }
+			updated, cmd := m.Update(msg)
+			got := updated.(Model)
+			if calls != 1 {
+				t.Errorf("cleanup ran %d times, want 1 - the override file leaks otherwise", calls)
+			}
+			if got.rollbackCleanup != nil {
+				t.Error("a superseded prep overwrote the current batch's cleanup")
+			}
+			if cmd != nil {
+				t.Error("a superseded prep started a second consumer on the event channel")
+			}
+		})
+	}
+
+	t.Run("the current batch is accepted", func(t *testing.T) {
+		m := newModel()
+		updated, cmd := m.Update(rollbackPreppedMsg{cleanup: func() {}, batchIdx: 1, session: 7})
+		if updated.(Model).rollbackCleanup == nil {
+			t.Error("the matching prep must store its cleanup")
+		}
+		if cmd == nil {
+			t.Error("the matching prep must start consuming events")
+		}
+	})
+}
+
+// prepareRollbackCmd stamps the identity at DISPATCH, the same moment
+// waitForEvent does, so a prep and the pipeline it starts are one batch.
+func TestPrepareRollbackCmd_StampsCurrentBatchIdentity(t *testing.T) {
+	mc := &mockRollbackComposer{prepErr: errors.New("nope")}
+	m := Model{composer: mc, rollbackSnapshot: rollbackTestSnapshot(), ctx: context.Background(), batchIdx: 2, batchSession: 9}
+	events := make(chan runner.StepEvent, 1)
+
+	msg, ok := m.prepareRollbackCmd(context.Background(), []string{"web"}, io.Discard, events)().(rollbackPreppedMsg)
+	if !ok {
+		t.Fatal("cmd should produce a rollbackPreppedMsg")
+	}
+	if msg.batchIdx != 2 || msg.session != 9 {
+		t.Errorf("identity = (idx %d, session %d), want (2, 9)", msg.batchIdx, msg.session)
+	}
+
+	// The capability-refusal branch carries it too - it is the one that can
+	// answer instantly while a later operation is already on screen.
+	plain := Model{composer: &mockComposer{}, ctx: context.Background(), batchIdx: 3, batchSession: 11}
+	msg, ok = plain.prepareRollbackCmd(context.Background(), nil, io.Discard, events)().(rollbackPreppedMsg)
+	if !ok {
+		t.Fatal("cmd should produce a rollbackPreppedMsg")
+	}
+	if msg.batchIdx != 3 || msg.session != 11 {
+		t.Errorf("refusal identity = (idx %d, session %d), want (3, 11)", msg.batchIdx, msg.session)
 	}
 }

@@ -143,6 +143,15 @@ type RemoteCompose struct {
 	// pre-ExtraComposeFiles behavior.
 	ExtraComposeFiles []string
 
+	// ProjectName, when non-empty, is spliced into every remote compose
+	// invocation as a shell-escaped `-p <name>` before the subcommand. See
+	// Compose.ProjectName: without it a composer built from ConfigDir alone
+	// targets whatever project the remote directory resolves to by default,
+	// which is the wrong container set for any project deployed with
+	// `-p` / COMPOSE_PROJECT_NAME. Default "" = byte-identical remote command
+	// string to the pre-ProjectName behavior.
+	ProjectName string
+
 	detected bool // true after Detect() or SetStandalone() has been called
 
 	// testing hooks; nil = use real exec
@@ -309,6 +318,17 @@ func (r *RemoteCompose) Close() error {
 	return cmd.Run()
 }
 
+// projectFlag renders the shell-escaped `-p <name> ` fragment, with the
+// trailing space, or "" when no project name is set. Every remote compose
+// invocation splices it — remoteCommand for the pipeline and the read methods,
+// ExecCommand because it builds its own argv.
+func (r *RemoteCompose) projectFlag() string {
+	if r.ProjectName == "" {
+		return ""
+	}
+	return "-p " + shellEscape(r.ProjectName) + " "
+}
+
 // remoteCommand builds an ssh command that runs a docker compose subcommand
 // on the remote host via the ControlMaster socket.
 func (r *RemoteCompose) remoteCommand(ctx context.Context, args ...string) *exec.Cmd {
@@ -323,12 +343,14 @@ func (r *RemoteCompose) remoteCommand(ctx context.Context, args ...string) *exec
 	}
 
 	// Splice shell-escaped `-f <file>` pairs immediately after the compose
-	// binary, before the subcommand. fileFlags keeps a trailing space so the
-	// nil case ("") reproduces the exact byte-identical command string.
+	// binary, before the subcommand, then the `-p <name>` pair. Both keep a
+	// trailing space so the empty case ("") reproduces the exact byte-identical
+	// command string.
 	var fileFlags string
 	for _, f := range r.ExtraComposeFiles {
 		fileFlags += "-f " + shellEscape(f) + " "
 	}
+	fileFlags += r.projectFlag()
 
 	remoteCmd := fmt.Sprintf("CURRENT_UID=$(id -u):$(id -g) %s %s%s",
 		composeBin, fileFlags, strings.Join(escaped, " "))
@@ -630,8 +652,8 @@ func (r *RemoteCompose) ExecCommand(ctx context.Context, service string, command
 		escapedArgs = append(escapedArgs, shellEscape(a))
 	}
 
-	remoteCmd := fmt.Sprintf("CURRENT_UID=$(id -u):$(id -g) %s %s",
-		composeBin, strings.Join(escapedArgs, " "))
+	remoteCmd := fmt.Sprintf("CURRENT_UID=$(id -u):$(id -g) %s %s%s",
+		composeBin, r.projectFlag(), strings.Join(escapedArgs, " "))
 
 	if r.ProjectDir != "" {
 		remoteCmd = fmt.Sprintf("cd %s && %s", shellEscape(r.ProjectDir), remoteCmd)

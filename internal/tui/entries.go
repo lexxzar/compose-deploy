@@ -39,8 +39,8 @@ type svcGroup struct {
 //
 // A single group emits NO header at all — that degenerate shape is what makes
 // the drilled single-project screen render exactly as it did before grouping
-// existed, so the header is a multi-group affordance only. A single folded
-// group therefore emits nothing.
+// existed, so the header is a multi-group affordance only. groupsHaveHeaders
+// owns the one exception that keeps that suppression from emptying the screen.
 func rebuildSvcEntries(groups []svcGroup) []svcEntry {
 	if len(groups) == 0 {
 		return nil
@@ -67,7 +67,46 @@ func rebuildSvcEntries(groups []svcGroup) []svcEntry {
 // the entry model — the service indent, the caption pad, the scroll indicators
 // — reads THIS, never m.grouped, because grouped mode with a single project
 // emits no headers and must render byte-identically to the drilled screen.
-func groupsHaveHeaders(groups []svcGroup) bool { return len(groups) > 1 }
+//
+// The one exception: a LONE group that contributes no service rows of its own
+// keeps its header. Suppressing it there leaves the screen with zero rows, and
+// a screen with no rows has no cursor — nothing to unfold, drill into, select
+// or operate on, and no name saying which project the user is even looking at.
+// Both shapes are reachable: a sole project whose containers are all gone (an
+// empty group), and a folded group that outlived the other groups on the host
+// (the 5-second reload rebuilds from what `docker ps` still reports, and fold
+// state survives the rebuild by project name).
+func groupsHaveHeaders(groups []svcGroup) bool {
+	if len(groups) > 1 {
+		return true
+	}
+	if len(groups) == 1 {
+		return groups[0].folded || len(groups[0].services) == 0
+	}
+	return false
+}
+
+// sanitizeName makes one docker-derived identifier safe to write to a
+// terminal. Project and service names on the host view come from container
+// LABELS (com.docker.compose.project / .service), and any `docker run --label`
+// can set those to arbitrary bytes — a compose-LOOKING container is enough.
+// The grouped screen redraws itself every 5 seconds without the user touching
+// a key, so an OSC 52 clipboard write or a CSI sequence hidden in a label
+// would be replayed into the terminal on its own; ansi.StringWidth counts an
+// escape sequence as zero cells, so the clamps and the column padding pass it
+// straight through.
+//
+// It is sanitizeInspectLine, the pass every decoded inspect line already goes
+// through — ONE implementation, so the two screens cannot disagree about what
+// is safe to draw. Applying it to the NAME rather than to the rendered line
+// keeps the width math honest: every consumer (header, row, breadcrumb,
+// confirm prompt, progress title, warnings, search bar) measures and pads the
+// same already-safe string.
+//
+// A real compose project is unaffected: compose rejects anything outside
+// [a-zA-Z0-9._-] in a service name and [a-z0-9_-] in a project name, so this
+// is a no-op on every name compose itself could have produced.
+func sanitizeName(s string) string { return sanitizeInspectLine(s) }
 
 // svcKeySep separates the project half of a qualified key from the service
 // half. "/" is safe: docker compose rejects it in both a project name and a
@@ -80,8 +119,15 @@ const svcKeySep = "/"
 //
 // Qualified keys live only inside the tui Model. Every message boundary
 // converts: nothing qualified may reach runner or compose.
+//
+// Both halves are sanitized here, which is what keeps the keys matching the
+// group rows: buildSvcGroups and setSingleGroup store sanitized names, so a
+// map converted through qualifyMap/flattenQualified — whose keys arrive raw
+// from the composer — would otherwise miss every row whose label carried an
+// escape. sanitizeName is idempotent, so re-keying an already-safe name is
+// free.
 func svcKey(projName, service string) string {
-	return projName + svcKeySep + service
+	return sanitizeName(projName) + svcKeySep + sanitizeName(service)
 }
 
 // qualifyMap converts a bare-name map, as every Composer method returns one,
@@ -313,14 +359,21 @@ func buildSvcGroups(projects []compose.Project, host map[string]map[string]runne
 
 	groups := make([]svcGroup, 0, len(projects))
 	seen := make(map[string]bool, len(projects))
+	// add takes the project as the loader reported it, because `host` is keyed
+	// by the RAW label and the lookup has to match. Everything the Model then
+	// keeps is the sanitized form — the group's name, its service names, the
+	// fold lookup and the dedupe — so no label-derived byte reaches a render
+	// site or a qualified key unfiltered. See sanitizeName.
 	add := func(p compose.Project) {
+		raw := p.Name
+		p.Name = sanitizeName(raw)
 		if p.Name == "" || seen[p.Name] {
 			return
 		}
 		seen[p.Name] = true
-		svcs := make([]string, 0, len(host[p.Name]))
-		for name := range host[p.Name] {
-			svcs = append(svcs, name)
+		svcs := make([]string, 0, len(host[raw]))
+		for name := range host[raw] {
+			svcs = append(svcs, sanitizeName(name))
 		}
 		groups = append(groups, svcGroup{proj: p, services: sortServices(svcs), folded: folded[p.Name]})
 	}
@@ -331,7 +384,7 @@ func buildSvcGroups(projects []compose.Project, host map[string]map[string]runne
 	var extra []string
 	unmanagedExtra := false
 	for name := range host {
-		if seen[name] || name == "" {
+		if seen[sanitizeName(name)] || name == "" {
 			continue
 		}
 		if name == compose.UnmanagedProjectName {

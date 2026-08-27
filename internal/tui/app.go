@@ -836,9 +836,21 @@ type rollbackSnapshotMsg struct {
 // reset — stored on the Model and invoked when LEAVING screenProgress, never
 // goroutine-deferred (see the rollback cleanup timing race rule). On failure err
 // is set and the op is marked failed before any pipeline step runs.
+//
+// batchIdx and session carry the SAME identity stepEventMsg and pipelineDoneMsg
+// carry, captured in startBatch at the moment the prep was dispatched. The
+// screen alone is not identity: a prep the user cancelled with esc keeps
+// running until PrepareRollback notices the cancelled context, and by the time
+// it answers the user can already be on screenProgress again with a different
+// operation. Ungated, its err marked THAT operation failed, its success
+// overwrote the cleanup the new one owns, and the waitForEvent it starts put a
+// SECOND consumer on the live event channel — two readers splitting one
+// pipeline's events, which loses steps and hangs the sequence.
 type rollbackPreppedMsg struct {
-	cleanup func()
-	err     error
+	cleanup  func()
+	err      error
+	batchIdx int
+	session  uint64
 }
 
 type logChunkMsg struct {
@@ -1965,10 +1977,13 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case rollbackPreppedMsg:
-		// Prep runs only for a Rollback launched from screenProgress. If the user
-		// left the screen before it returned, invoke any cleanup so the override
-		// file / ExtraComposeFiles don't leak, then drop.
-		if m.screen != screenProgress {
+		// Prep runs only for the Rollback batch that dispatched it. Anything
+		// else — the user left screenProgress, cancelled the sequence (esc
+		// bumps batchSession), or the sequence has already moved on to the next
+		// batch — is a superseded answer: invoke any cleanup so the override
+		// file / ExtraComposeFiles don't leak, then drop it. Accepting one
+		// would fail, or double-consume the events of, whatever is running now.
+		if m.screen != screenProgress || msg.session != m.batchSession || msg.batchIdx != m.batchIdx {
 			if msg.cleanup != nil {
 				msg.cleanup()
 			}
@@ -2376,6 +2391,23 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 
 		m.warning = ""
+
+		// A load or refresh error replaces the WHOLE list on screen:
+		// viewSelectContainers early-returns with the error text and a single
+		// `q back` / `q quit` line, so the rows, the checkboxes and the cursor
+		// are invisible. The groups and the selection behind it are kept on
+		// purpose — a transient refresh failure must not throw away fold state
+		// or a selection — so every key that acts on a row has to go inert
+		// here, or it acts on rows the user cannot see. d/r/s armed a
+		// confirmation the error screen has no slot to draw, and the enter that
+		// followed ran the operation against that invisible stale selection.
+		//
+		// esc and ctrl+c are the only keys the error screen advertises; `?`
+		// (handled by the intercept above, and never a row action) still opens.
+		if m.svcErr != nil && key != "esc" && key != "ctrl+c" {
+			m.fixSvcOffset()
+			return m, nil
+		}
 
 		switch key {
 		case "ctrl+c":
@@ -3750,13 +3782,19 @@ func (m Model) fetchRollbackSnapshot() tea.Cmd {
 // returned rollbackPreppedMsg carries the cleanup (stored on the Model, invoked
 // on leaving screenProgress) or the prep error (op marked failed). ctx is the
 // cancelable pipeline context so an esc-cancel aborts an in-flight pull.
+//
+// The batch index and the batch session are captured HERE, at dispatch, in the
+// same way waitForEvent captures them — see rollbackPreppedMsg for what an
+// unidentified answer does to the operation that superseded it.
 func (m Model) prepareRollbackCmd(ctx context.Context, containers []string, logW io.Writer, events chan runner.StepEvent) tea.Cmd {
 	composer := m.composer
 	snap := m.rollbackSnapshot
+	idx := m.batchIdx
+	session := m.batchSession
 	return func() tea.Msg {
 		p, ok := composer.(RollbackPreparer)
 		if !ok {
-			return rollbackPreppedMsg{err: fmt.Errorf("rollback is not supported for this connection")}
+			return rollbackPreppedMsg{err: fmt.Errorf("rollback is not supported for this connection"), batchIdx: idx, session: session}
 		}
 		var entries map[string]compose.SnapshotEntry
 		if snap != nil {
@@ -3764,10 +3802,10 @@ func (m Model) prepareRollbackCmd(ctx context.Context, containers []string, logW
 		}
 		cleanup, err := p.PrepareRollback(ctx, entries, containers, logW)
 		if err != nil {
-			return rollbackPreppedMsg{err: err}
+			return rollbackPreppedMsg{err: err, batchIdx: idx, session: session}
 		}
 		go runner.Run(ctx, composer, runner.Rollback, containers, logW, events)
-		return rollbackPreppedMsg{cleanup: cleanup}
+		return rollbackPreppedMsg{cleanup: cleanup, batchIdx: idx, session: session}
 	}
 }
 
@@ -5191,10 +5229,10 @@ func servicesWithUpdate(results map[string]bool) []string {
 	return svcs
 }
 
-// updatesCacheKey returns the cache key for the current context. The format
-// is projDir + "|" + serverName, prefixed with "unmanaged|" for the synthetic
-// unmanaged row. Empty serverName means local. For the local-fast-track entry,
-// projDir is empty too, so the key is just "|".
+// updatesCacheKey returns the cache key for the current context. The format is
+// projDir + NUL + projName + "|" + serverName, prefixed with "unmanaged|" for
+// the synthetic unmanaged row. Empty serverName means local. For the
+// local-fast-track entry both project halves are empty, so the key is "\x00|".
 //
 // The prefix is load-bearing: the unmanaged row has an empty ConfigDir, so a
 // local unmanaged view would key "|" as well — a direct collision with the
@@ -5218,17 +5256,19 @@ func (m Model) updatesCacheKey() string {
 // go through the current-context key alone. updatesCacheKey is now this
 // function applied to currentProject(), which is what keeps the grouped and
 // drilled views sharing one entry per project.
+// BOTH project halves are in the key, and neither alone would do. The config
+// directory does not identify a project: `docker compose -p a` and
+// `docker compose -p b` in one directory are two projects with two container
+// sets, shown as two groups, and on ConfigDir alone they shared one entry — so
+// one project's verdicts were painted onto the other's rows and its own scan
+// was suppressed for the whole 10m TTL. The name does not identify one either:
+// a group buildSvcGroups synthesised from the host status map has no ConfigDir
+// at all, and two hosts can run the same project name from different trees.
+//
+// NUL is the separator because no filesystem path and no docker project name
+// can contain it, so no (dir, name) pair can spell another pair's key.
 func (m Model) projUpdatesCacheKey(proj compose.Project) string {
-	disc := proj.ConfigDir
-	if disc == "" && !proj.Unmanaged && proj.Name != "" {
-		// A group buildSvcGroups synthesised from the host status map (the
-		// project list did not report it) has no ConfigDir, so every such group
-		// would key the same empty slot — and collide with the local fast
-		// track's own bare "|". The project name is the only thing that tells
-		// them apart.
-		disc = "name:" + proj.Name
-	}
-	key := disc + "|" + m.serverName
+	key := proj.ConfigDir + "\x00" + proj.Name + "|" + m.serverName
 	if proj.Unmanaged {
 		return "unmanaged|" + key
 	}
@@ -5914,12 +5954,22 @@ func (m Model) currentProject() compose.Project {
 // A nil slice means "no project loaded" (the screen renders its loading state),
 // so it clears the group state instead of installing an empty group. An empty
 // but non-nil slice is a real project that owns no services.
+//
+// The names are sanitized here for the same reason buildSvcGroups sanitizes
+// its own: on the unmanaged screen this slice is container names, and on a
+// drilled compose project the status map that pairs with it is keyed by the
+// service LABEL. One safe form on both sides, matching the qualified keys
+// svcKey produces. See sanitizeName.
 func (m *Model) setSingleGroup(services []string) {
 	if services == nil {
 		m.clearSvcGroups()
 		return
 	}
-	m.svcGroups = []svcGroup{{proj: m.currentProject(), services: services}}
+	safe := make([]string, 0, len(services))
+	for _, s := range services {
+		safe = append(safe, sanitizeName(s))
+	}
+	m.svcGroups = []svcGroup{{proj: m.currentProject(), services: safe}}
 	m.svcEntries = rebuildSvcEntries(m.svcGroups)
 }
 

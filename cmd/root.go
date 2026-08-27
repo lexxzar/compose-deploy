@@ -205,11 +205,20 @@ func Execute() error {
 // unmanaged row has no compose file and no ConfigDir, so it gets the read-only
 // host-container composer; every other row gets a Compose rooted at its config
 // directory, inheriting the plugin/standalone verdict when one was detected.
+//
+// The project NAME is carried through as well, not just the directory. Compose
+// derives a project from the working directory when none is named, and that is
+// not the same project for anything deployed with `docker compose -p` or
+// COMPOSE_PROJECT_NAME: `docker compose ls` reports those under their real
+// names while several of them share one ConfigDir. Dropping the name made every
+// such row address the directory's default project instead — the picker showed
+// one project and `d`/`r`/`s` stopped and removed another's containers.
 func localComposerFor(proj compose.Project, detector *compose.Compose, standalone, detected bool) runner.Composer {
 	if proj.Unmanaged {
 		return compose.NewLocalHostContainers(detector)
 	}
 	lc := compose.New(proj.ConfigDir)
+	lc.ProjectName = proj.Name
 	if detected {
 		lc.SetStandalone(standalone)
 	}
@@ -219,12 +228,13 @@ func localComposerFor(proj compose.Project, detector *compose.Compose, standalon
 // remoteComposerFor is the remote twin of localComposerFor. The unmanaged row
 // reuses the LIVE RemoteCompose so the existing ControlMaster socket carries
 // the docker ps / stats / logs calls; a compose project gets a fresh composer
-// pointed at the same host.
+// pointed at the same host, named by the same project the row came from.
 func remoteComposerFor(proj compose.Project, rc *compose.RemoteCompose, standalone bool) runner.Composer {
 	if proj.Unmanaged {
 		return compose.NewRemoteHostContainers(rc)
 	}
 	newRC := compose.NewRemote(rc.Host, proj.ConfigDir)
+	newRC.ProjectName = proj.Name
 	newRC.SetStandalone(standalone)
 	return newRC
 }

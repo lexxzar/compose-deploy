@@ -429,9 +429,9 @@ func TestBatchSequence_InvalidatesEveryBatchCacheKey(t *testing.T) {
 	m, _ := twoBatchModel(t, &log, nil)
 	m.serverName = "prod"
 	m.updateCache = map[string]updateEntry{
-		"/srv/blog|prod":  {fetchedAt: time.Now(), results: map[string]bool{"web": true}},
-		"/srv/shop|prod":  {fetchedAt: time.Now(), results: map[string]bool{"api": true}},
-		"/srv/other|prod": {fetchedAt: time.Now(), results: map[string]bool{"x": true}},
+		"/srv/blog\x00blog|prod":   {fetchedAt: time.Now(), results: map[string]bool{"web": true}},
+		"/srv/shop\x00shop|prod":   {fetchedAt: time.Now(), results: map[string]bool{"api": true}},
+		"/srv/other\x00other|prod": {fetchedAt: time.Now(), results: map[string]bool{"x": true}},
 	}
 	m = drainBatch(t, m)
 	m = drainBatch(t, m)
@@ -441,12 +441,12 @@ func TestBatchSequence_InvalidatesEveryBatchCacheKey(t *testing.T) {
 	back, _ = m.Update(tea.KeyMsg{Type: tea.KeyEsc}) // leave the screen
 	m = back.(Model)
 
-	for _, key := range []string{"/srv/blog|prod", "/srv/shop|prod"} {
+	for _, key := range []string{"/srv/blog\x00blog|prod", "/srv/shop\x00shop|prod"} {
 		if _, ok := m.updateCache[key]; ok {
 			t.Errorf("cache entry %q survived a successful deploy of that project", key)
 		}
 	}
-	if _, ok := m.updateCache["/srv/other|prod"]; !ok {
+	if _, ok := m.updateCache["/srv/other\x00other|prod"]; !ok {
 		t.Error("a project the sequence never touched must keep its cache entry")
 	}
 }

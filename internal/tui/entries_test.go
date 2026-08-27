@@ -38,14 +38,23 @@ func TestRebuildSvcEntries(t *testing.T) {
 			},
 		},
 		{
-			name:   "single folded group emits nothing",
+			// The lone exception to "a single group emits no header": with the
+			// header suppressed AND the services folded away, the screen would
+			// have zero rows — no cursor, so no way to unfold it again.
+			name:   "single folded group keeps its header",
 			groups: []svcGroup{testGroup("web", true, "nginx", "api")},
-			want:   nil,
+			want: []svcEntry{
+				{kind: entrySvcGroupHeader, groupIdx: 0},
+			},
 		},
 		{
-			name:   "single empty group emits nothing",
+			// Same rule, other shape: a sole project whose containers are all
+			// gone would otherwise render as a blank screen naming nothing.
+			name:   "single empty group keeps its header",
 			groups: []svcGroup{testGroup("web", false)},
-			want:   nil,
+			want: []svcEntry{
+				{kind: entrySvcGroupHeader, groupIdx: 0},
+			},
 		},
 		{
 			name: "multi group emits a header per group",
@@ -452,8 +461,12 @@ func TestBuildSvcGroups_EmptyProjectKeepsItsGroup(t *testing.T) {
 	if len(got) != 1 || got[0].proj.Name != "idle" || len(got[0].services) != 0 {
 		t.Fatalf("groups = %v, want one empty idle group", groupShape(got))
 	}
-	if entries := rebuildSvcEntries(got); entries != nil {
-		t.Errorf("a lone empty group emits no header, got %v", entries)
+	// A lone group with no service rows KEEPS its header: without it the screen
+	// has zero rows, hence no cursor, hence no way to drill in or even see which
+	// project is being looked at.
+	entries := rebuildSvcEntries(got)
+	if len(entries) != 1 || entries[0].kind != entrySvcGroupHeader {
+		t.Errorf("a lone empty group must render its header, got %v", entries)
 	}
 }
 
@@ -534,6 +547,10 @@ func TestFlattenQualified(t *testing.T) {
 // groupsHaveHeaders is the single home of the header rule, and the renderer's
 // indent reads it too — so a grouped host holding exactly one project must
 // report false, or the drilled screen and the one-project host would disagree.
+//
+// The two single-group exceptions are the finding pin: a lone group that
+// contributes no service rows keeps its header, because suppressing it empties
+// the screen and an empty screen has no cursor to unfold or drill from.
 func TestGroupsHaveHeaders(t *testing.T) {
 	tests := []struct {
 		name   string
@@ -541,7 +558,9 @@ func TestGroupsHaveHeaders(t *testing.T) {
 		want   bool
 	}{
 		{"none", nil, false},
-		{"one", []svcGroup{{proj: compose.Project{Name: "web"}}}, false},
+		{"one", []svcGroup{{proj: compose.Project{Name: "web"}, services: []string{"nginx"}}}, false},
+		{"one folded", []svcGroup{{proj: compose.Project{Name: "web"}, services: []string{"nginx"}, folded: true}}, true},
+		{"one empty", []svcGroup{{proj: compose.Project{Name: "web"}}}, true},
 		{"two", []svcGroup{{proj: compose.Project{Name: "web"}}, {proj: compose.Project{Name: "db"}}}, true},
 	}
 	for _, tt := range tests {
@@ -808,5 +827,79 @@ func TestFormatBatchTargets(t *testing.T) {
 				t.Errorf("formatBatchTargets() = %q, want %q", got, tc.want)
 			}
 		})
+	}
+}
+
+// TestSanitizeName_StripsTerminalControls pins the sanitiser the grouped view
+// depends on: project and service names come from container LABELS, which any
+// `docker run --label` sets to arbitrary bytes.
+func TestSanitizeName_StripsTerminalControls(t *testing.T) {
+	tests := []struct {
+		name string
+		in   string
+		want string
+	}{
+		{"plain name is untouched", "shop-api_1.0", "shop-api_1.0"},
+		{"OSC 52 clipboard write", "web\x1b]52;c;cHduZWQ=\a", "web"},
+		{"CSI screen clear", "web\x1b[2J\x1b[Hgone", "webgone"},
+		{"bare BEL and CR", "web\a\r", "web"},
+		{"8-bit CSI introducer", "web\u009b2Kx", "web2Kx"},
+		{"8-bit OSC introducer", "web\u009d52;c;x", "web52;c;x"},
+		{"DEL", "web\u007f", "web"},
+		{"tab and newline", "we\tb\nc", "webc"},
+		{"unicode survives", "web-Ω", "web-Ω"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := sanitizeName(tt.in); got != tt.want {
+				t.Errorf("sanitizeName(%q) = %q, want %q", tt.in, got, tt.want)
+			}
+			// Idempotent: svcKey re-applies it to names the groups already hold.
+			if got := sanitizeName(sanitizeName(tt.in)); got != tt.want {
+				t.Errorf("sanitizeName is not idempotent for %q", tt.in)
+			}
+		})
+	}
+}
+
+// TestBuildSvcGroups_SanitizesLabelDerivedNames is the injection pin. The
+// grouped screen redraws every 5 seconds on its own, so an escape sequence in a
+// label would be replayed into the terminal without the user pressing a key.
+// The row must survive - hiding a container is not the fix - with the escape
+// gone and its status still joined to it.
+func TestBuildSvcGroups_SanitizesLabelDerivedNames(t *testing.T) {
+	const evilProj = "sh\x1b]52;c;cHduZWQ=\aop"
+	const evilSvc = "ap\x1b[2Ji"
+	host := map[string]map[string]runner.ServiceStatus{
+		evilProj: {evilSvc: {Running: true}},
+	}
+	got := buildSvcGroups([]compose.Project{{Name: evilProj, ConfigDir: "/srv/shop"}}, host, nil)
+	if len(got) != 1 {
+		t.Fatalf("groups = %v, want one", groupShape(got))
+	}
+	if got[0].proj.Name != "shop" {
+		t.Errorf("project name = %q, want %q", got[0].proj.Name, "shop")
+	}
+	if len(got[0].services) != 1 || got[0].services[0] != "api" {
+		t.Fatalf("services = %v, want [api]", got[0].services)
+	}
+	// The status map still joins: flattenQualified goes through svcKey, which
+	// sanitizes both halves, so the row keeps its running dot.
+	status := flattenQualified(host)
+	if !status[svcKey(got[0].proj.Name, got[0].services[0])].Running {
+		t.Error("the sanitized row lost its status; the key halves disagree")
+	}
+}
+
+// A group whose fold state was set before a refresh must keep it, and the fold
+// map is keyed by the sanitized name on both sides.
+func TestBuildSvcGroups_FoldSurvivesSanitizing(t *testing.T) {
+	const evilProj = "sh\x1b[31mop"
+	host := map[string]map[string]runner.ServiceStatus{evilProj: {"api": {}}}
+	first := buildSvcGroups([]compose.Project{{Name: evilProj}}, host, nil)
+	first[0].folded = true
+	second := buildSvcGroups([]compose.Project{{Name: evilProj}}, host, first)
+	if len(second) != 1 || !second[0].folded {
+		t.Errorf("fold state lost across a refresh: %+v", second)
 	}
 }

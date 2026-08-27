@@ -3472,3 +3472,79 @@ func TestRemotePrepareRollback_SameDigestWarning(t *testing.T) {
 		t.Errorf("prep did not proceed past the advisory: %v", r.ExtraComposeFiles)
 	}
 }
+
+// TestRemoteCommand_ProjectName is the remote twin of TestCommand_ProjectName:
+// the `-p <name>` pair is shell-escaped and lands before the subcommand, and an
+// empty name leaves the remote command string byte-identical.
+func TestRemoteCommand_ProjectName(t *testing.T) {
+	t.Run("plugin", func(t *testing.T) {
+		r := &RemoteCompose{Host: "user@example.com", ProjectDir: "/srv/app", SocketPath: "/tmp/s"}
+		r.ProjectName = "blue"
+		cmd := r.remoteCommand(context.Background(), "stop", "web")
+		got := cmd.Args[len(cmd.Args)-1]
+		want := "docker compose -p 'blue' 'stop' 'web'"
+		if !strings.Contains(got, want) {
+			t.Errorf("remote command should contain %q, got: %q", want, got)
+		}
+	})
+	t.Run("standalone with extra files", func(t *testing.T) {
+		r := &RemoteCompose{Host: "user@example.com", SocketPath: "/tmp/s", Standalone: true}
+		r.ProjectName = "blue"
+		r.ExtraComposeFiles = []string{"/app/compose.yml"}
+		cmd := r.remoteCommand(context.Background(), "start")
+		got := cmd.Args[len(cmd.Args)-1]
+		want := "docker-compose -f '/app/compose.yml' -p 'blue' 'start'"
+		if !strings.Contains(got, want) {
+			t.Errorf("remote command should contain %q, got: %q", want, got)
+		}
+	})
+	t.Run("escaped", func(t *testing.T) {
+		r := &RemoteCompose{Host: "user@example.com", SocketPath: "/tmp/s"}
+		r.ProjectName = "it's blue"
+		cmd := r.remoteCommand(context.Background(), "stop")
+		got := cmd.Args[len(cmd.Args)-1]
+		want := "-p 'it'\\''s blue'"
+		if !strings.Contains(got, want) {
+			t.Errorf("remote command should contain %q, got: %q", want, got)
+		}
+	})
+	t.Run("exec splices it too", func(t *testing.T) {
+		r := &RemoteCompose{Host: "user@example.com", ProjectDir: "/srv/app", SocketPath: "/tmp/s"}
+		r.ProjectName = "blue"
+		cmd, err := r.ExecCommand(context.Background(), "web", []string{"/bin/sh"})
+		if err != nil {
+			t.Fatalf("ExecCommand: %v", err)
+		}
+		got := cmd.Args[len(cmd.Args)-1]
+		want := "docker compose -p 'blue' 'exec' 'web' '/bin/sh'"
+		if !strings.Contains(got, want) {
+			t.Errorf("remote exec command should contain %q, got: %q", want, got)
+		}
+	})
+	t.Run("empty name is byte-identical", func(t *testing.T) {
+		named := &RemoteCompose{Host: "user@example.com", ProjectDir: "/srv/app", SocketPath: "/tmp/s"}
+		plain := &RemoteCompose{Host: "user@example.com", ProjectDir: "/srv/app", SocketPath: "/tmp/s"}
+		named.ProjectName = ""
+		for _, args := range [][]string{
+			{"stop", "web"}, {"rm", "-f"}, {"pull"}, {"up", "--no-start"},
+			{"start"}, {"config", "--services"}, {"ps", "-a", "--format", "json"},
+		} {
+			a := named.remoteCommand(context.Background(), args...).Args
+			b := plain.remoteCommand(context.Background(), args...).Args
+			if strings.Join(a, "\x00") != strings.Join(b, "\x00") {
+				t.Errorf("remote argv drifted for %v:\n%v\n%v", args, a, b)
+			}
+		}
+		na, err := named.ExecCommand(context.Background(), "web", nil)
+		if err != nil {
+			t.Fatalf("ExecCommand: %v", err)
+		}
+		pa, err := plain.ExecCommand(context.Background(), "web", nil)
+		if err != nil {
+			t.Fatalf("ExecCommand: %v", err)
+		}
+		if strings.Join(na.Args, "\x00") != strings.Join(pa.Args, "\x00") {
+			t.Errorf("remote exec argv drifted:\n%v\n%v", na.Args, pa.Args)
+		}
+	})
+}

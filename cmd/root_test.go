@@ -240,6 +240,22 @@ func TestLocalComposerFor(t *testing.T) {
 		if !lc.Standalone {
 			t.Error("a detected standalone verdict must be inherited")
 		}
+		// The NAME as well as the directory. `docker compose ls` reports a
+		// project launched with `-p` (or COMPOSE_PROJECT_NAME) under its real
+		// name while several such projects share one ConfigDir; a composer
+		// built from the directory alone would address the directory's default
+		// project and stop/remove another project's containers.
+		if lc.ProjectName != "my-app" {
+			t.Errorf("ProjectName = %q, want %q", lc.ProjectName, "my-app")
+		}
+	})
+
+	t.Run("two -p projects in one dir get two composers", func(t *testing.T) {
+		blue := localComposerFor(compose.Project{Name: "blue", ConfigDir: "/srv/app"}, detector, true, true).(*compose.Compose)
+		green := localComposerFor(compose.Project{Name: "green", ConfigDir: "/srv/app"}, detector, true, true).(*compose.Compose)
+		if blue.ProjectName == green.ProjectName {
+			t.Fatalf("both composers name project %q; one project's keys would target the other", blue.ProjectName)
+		}
 	})
 
 	t.Run("undetected local docker does not inherit a verdict", func(t *testing.T) {
@@ -279,6 +295,17 @@ func TestRemoteComposerFor(t *testing.T) {
 		}
 		if !newRC.Standalone {
 			t.Error("the detected standalone verdict must be inherited")
+		}
+		if newRC.ProjectName != "my-app" {
+			t.Errorf("ProjectName = %q, want %q", newRC.ProjectName, "my-app")
+		}
+	})
+
+	t.Run("two -p projects in one dir get two composers", func(t *testing.T) {
+		blue := remoteComposerFor(compose.Project{Name: "blue", ConfigDir: "/srv/app"}, rc, true).(*compose.RemoteCompose)
+		green := remoteComposerFor(compose.Project{Name: "green", ConfigDir: "/srv/app"}, rc, true).(*compose.RemoteCompose)
+		if blue.ProjectName == green.ProjectName {
+			t.Fatalf("both composers name project %q; one project's keys would target the other", blue.ProjectName)
 		}
 	})
 }

@@ -239,6 +239,16 @@ type Compose struct {
 	// producing byte-identical argv to the pre-ExtraComposeFiles behavior.
 	ExtraComposeFiles []string
 
+	// ProjectName, when non-empty, is spliced into every compose invocation as
+	// `-p <name>` before the subcommand. Compose otherwise derives the project
+	// from the working directory (or the compose file's `name:`), which is NOT
+	// the project a `docker compose -p other` / COMPOSE_PROJECT_NAME deployment
+	// runs under: several projects can share one directory, so a composer built
+	// from ConfigDir alone would stop and remove another project's containers.
+	// Default "" = no `-p` flag, producing byte-identical argv to the
+	// pre-ProjectName behavior.
+	ProjectName string
+
 	detected bool // true after Detect() or SetStandalone() has been called
 
 	// testing hooks; nil = use real exec
@@ -366,7 +376,7 @@ func withStderr(err error) error {
 }
 
 func (c *Compose) command(ctx context.Context, args ...string) *exec.Cmd {
-	fileArgs := composeFileArgs(c.ExtraComposeFiles)
+	fileArgs := append(composeFileArgs(c.ExtraComposeFiles), projectNameArgs(c.ProjectName)...)
 	var cmd *exec.Cmd
 	if c.Standalone {
 		cmd = exec.CommandContext(ctx, "docker-compose", append(fileArgs, args...)...)
@@ -395,6 +405,19 @@ func composeFileArgs(files []string) []string {
 		out = append(out, "-f", f)
 	}
 	return out
+}
+
+// projectNameArgs expands a project name into the `-p <name>` argv pair. It
+// returns nil for an empty name so callers emit byte-identical argv to the
+// pre-ProjectName behavior. It sits AFTER the `-f` pairs and before the
+// subcommand: both are compose top-level flags, and keeping `-f` first leaves
+// the ExtraComposeFiles splice rule (main file first, immediately after the
+// compose binary) exactly as it was.
+func projectNameArgs(name string) []string {
+	if name == "" {
+		return nil
+	}
+	return []string{"-p", name}
 }
 
 // psEntry matches the JSON schema of `docker compose ps --format json`.

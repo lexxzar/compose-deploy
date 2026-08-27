@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 
@@ -2673,4 +2674,64 @@ func TestDedupAndSortPorts(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestCommand_ProjectName pins the `-p <name>` splice. Without it a composer
+// built from a project's ConfigDir addresses whatever project that directory
+// resolves to by default, which is NOT the project for anything launched with
+// `docker compose -p` or COMPOSE_PROJECT_NAME — several of those can share one
+// directory, so the wrong container set gets stopped and removed.
+func TestCommand_ProjectName(t *testing.T) {
+	t.Run("plugin", func(t *testing.T) {
+		c := &Compose{ProjectDir: "/srv/app", UID: "1000:1000", ProjectName: "blue"}
+		got := c.command(context.Background(), "stop", "web").Args[1:]
+		want := []string{"compose", "-p", "blue", "stop", "web"}
+		if !slices.Equal(got, want) {
+			t.Errorf("args = %v, want %v", got, want)
+		}
+	})
+	t.Run("standalone", func(t *testing.T) {
+		c := &Compose{ProjectDir: "/srv/app", UID: "1000:1000", Standalone: true, ProjectName: "blue"}
+		got := c.command(context.Background(), "start", "web").Args[1:]
+		want := []string{"-p", "blue", "start", "web"}
+		if !slices.Equal(got, want) {
+			t.Errorf("args = %v, want %v", got, want)
+		}
+	})
+	t.Run("with extra compose files", func(t *testing.T) {
+		c := &Compose{
+			ProjectDir:        "/srv/app",
+			UID:               "1000:1000",
+			ProjectName:       "blue",
+			ExtraComposeFiles: []string{"/srv/app/compose.yml", "/tmp/override.yml"},
+		}
+		got := c.command(context.Background(), "up", "--no-start").Args[1:]
+		// -f keeps its place immediately after the compose binary (main file
+		// first); -p follows, still before the subcommand.
+		want := []string{
+			"compose",
+			"-f", "/srv/app/compose.yml",
+			"-f", "/tmp/override.yml",
+			"-p", "blue",
+			"up", "--no-start",
+		}
+		if !slices.Equal(got, want) {
+			t.Errorf("args = %v, want %v", got, want)
+		}
+	})
+	t.Run("empty name is byte-identical", func(t *testing.T) {
+		named := &Compose{ProjectDir: "/srv/app", UID: "1000:1000", ProjectName: ""}
+		plain := &Compose{ProjectDir: "/srv/app", UID: "1000:1000"}
+		for _, args := range [][]string{
+			{"stop", "web"}, {"rm", "-f"}, {"pull"}, {"up", "--no-start"},
+			{"start"}, {"config", "--services"}, {"ps", "-a", "--format", "json"},
+			{"logs", "web"}, {"exec", "web", "/bin/sh"},
+		} {
+			a := named.command(context.Background(), args...).Args
+			b := plain.command(context.Background(), args...).Args
+			if !slices.Equal(a, b) {
+				t.Errorf("argv drifted for %v: %v vs %v", args, a, b)
+			}
+		}
+	})
 }
