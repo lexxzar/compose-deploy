@@ -3,6 +3,7 @@ package tui
 import (
 	"context"
 	"io"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -386,5 +387,125 @@ func TestQualifiedKeys_NeverCrossIntoRunner(t *testing.T) {
 		if strings.Contains(name, svcKeySep) {
 			t.Errorf("waitState verdict keyed by a qualified key: %q", name)
 		}
+	}
+}
+
+func groupShape(groups []svcGroup) []string {
+	out := make([]string, 0, len(groups))
+	for _, g := range groups {
+		out = append(out, g.proj.Name+"["+strings.Join(g.services, ",")+"]")
+	}
+	return out
+}
+
+func TestBuildSvcGroups_OrderComesFromTheLoader(t *testing.T) {
+	projects := []compose.Project{
+		{Name: "blog", ConfigDir: "/srv/blog"},
+		{Name: "shop", ConfigDir: "/srv/shop"},
+		{Name: compose.UnmanagedProjectName, Unmanaged: true},
+	}
+	host := map[string]map[string]runner.ServiceStatus{
+		"shop":                       {"api": {Running: true}, "db": {}},
+		"blog":                       {"web": {Running: true}},
+		compose.UnmanagedProjectName: {"watchtower": {Running: true}},
+	}
+
+	got := buildSvcGroups(projects, host, nil)
+	want := []string{"blog[web]", "shop[api,db]", "(unmanaged)[watchtower]"}
+	if shape := groupShape(got); !slices.Equal(shape, want) {
+		t.Errorf("groups = %v, want %v", shape, want)
+	}
+	if got[1].proj.ConfigDir != "/srv/shop" {
+		t.Errorf("shop ConfigDir = %q, want the loader's value", got[1].proj.ConfigDir)
+	}
+	if !got[2].proj.Unmanaged {
+		t.Error("the unmanaged row must keep its Unmanaged flag")
+	}
+}
+
+// A project the loader reported but the host has no container for is a real
+// state (everything removed), so it renders as an empty group rather than
+// vanishing.
+func TestBuildSvcGroups_EmptyProjectKeepsItsGroup(t *testing.T) {
+	got := buildSvcGroups([]compose.Project{{Name: "idle"}}, nil, nil)
+	if len(got) != 1 || got[0].proj.Name != "idle" || len(got[0].services) != 0 {
+		t.Fatalf("groups = %v, want one empty idle group", groupShape(got))
+	}
+	if entries := rebuildSvcEntries(got); entries != nil {
+		t.Errorf("a lone empty group emits no header, got %v", entries)
+	}
+}
+
+// `docker compose ls` and `docker ps` are two calls and can disagree. A
+// container whose project the loader missed must still be visible.
+func TestBuildSvcGroups_HostOnlyProjectsAppendedLast(t *testing.T) {
+	host := map[string]map[string]runner.ServiceStatus{
+		"known":                      {"a": {}},
+		"zulu":                       {"b": {}},
+		"alpha":                      {"c": {}},
+		compose.UnmanagedProjectName: {"stray": {}},
+	}
+	got := buildSvcGroups([]compose.Project{{Name: "known"}}, host, nil)
+	want := []string{"known[a]", "alpha[c]", "zulu[b]", "(unmanaged)[stray]"}
+	if shape := groupShape(got); !slices.Equal(shape, want) {
+		t.Errorf("groups = %v, want %v", shape, want)
+	}
+	if !got[3].proj.Unmanaged {
+		t.Error("a host-only unmanaged bucket must still be flagged Unmanaged")
+	}
+}
+
+// Folding is UI state the user set, and buildSvcGroups also runs on the 5s
+// reload, so it has to survive a refresh. It is matched by project NAME
+// because the group slice is rebuilt wholesale.
+func TestBuildSvcGroups_PreservesFoldState(t *testing.T) {
+	prev := []svcGroup{
+		{proj: compose.Project{Name: "shop"}, folded: true},
+		{proj: compose.Project{Name: "blog"}},
+	}
+	host := map[string]map[string]runner.ServiceStatus{"shop": {"api": {}}, "blog": {"web": {}}}
+	got := buildSvcGroups([]compose.Project{{Name: "shop"}, {Name: "blog"}}, host, prev)
+	if !got[0].folded {
+		t.Error("shop lost its fold across the reload")
+	}
+	if got[1].folded {
+		t.Error("blog was never folded")
+	}
+}
+
+func TestBuildSvcGroups_DuplicateAndUnnamedProjectsDropped(t *testing.T) {
+	projects := []compose.Project{{Name: "shop"}, {Name: "shop"}, {Name: ""}}
+	got := buildSvcGroups(projects, map[string]map[string]runner.ServiceStatus{"shop": {"api": {}}}, nil)
+	if shape := groupShape(got); !slices.Equal(shape, []string{"shop[api]"}) {
+		t.Errorf("groups = %v, want a single shop group", shape)
+	}
+}
+
+func TestBuildSvcGroups_EmptyHostIsNonNil(t *testing.T) {
+	got := buildSvcGroups(nil, nil, nil)
+	if got == nil {
+		t.Fatal("buildSvcGroups() = nil; an empty host must still install an empty group slice")
+	}
+	if len(got) != 0 {
+		t.Errorf("groups = %v, want none", groupShape(got))
+	}
+}
+
+func TestFlattenQualified(t *testing.T) {
+	if got := flattenQualified[runner.ServiceStatus](nil); got != nil {
+		t.Errorf("flattenQualified(nil) = %v, want nil", got)
+	}
+	// Two projects owning a service of the same name is the case the qualified
+	// key exists for: neither may overwrite the other.
+	host := map[string]map[string]runner.ServiceStatus{
+		"shop": {"db": {Running: true}},
+		"blog": {"db": {Running: false}},
+	}
+	got := flattenQualified(host)
+	if len(got) != 2 {
+		t.Fatalf("flattenQualified() = %v, want 2 distinct keys", got)
+	}
+	if !got[svcKey("shop", "db")].Running || got[svcKey("blog", "db")].Running {
+		t.Errorf("flattenQualified() = %v; the two db services collided", got)
 	}
 }

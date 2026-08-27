@@ -657,3 +657,64 @@ func (h *HostContainers) Inspect(ctx context.Context, name string) ([]byte, erro
 	}
 	return raw, nil
 }
+
+// GroupedStats returns CPU and memory usage for every container on the host,
+// grouped by compose project exactly as GroupedStatus groups status: the outer
+// key is the project name, the inner key the service name, and containers with
+// no compose project label land under UnmanagedProjectName.
+//
+// It is the stats half of the grouped host view and costs the same two
+// host-wide calls the per-project path already pays (`docker ps` for the
+// ID→service pairs, `docker stats --no-stream` for the numbers) regardless of
+// how many projects the host runs — the point of the grouped screen is that
+// neither call scales with project count.
+//
+// The early return before the stats call mirrors ContainerStats: the join
+// against an empty pair list is guaranteed empty, and `docker stats` is a
+// ~1.5s host-wide call (a full SSH round-trip remotely) that the 5s refresh
+// tick would otherwise pay forever on an empty host.
+func (h *HostContainers) GroupedStats(ctx context.Context) (map[string]map[string]runner.ServiceStats, error) {
+	out, err := h.docker.run(ctx, hostPsArgs...)
+	if err != nil {
+		return nil, fmt.Errorf("listing host containers: %w", err)
+	}
+	entries, err := parseHostContainers(out)
+	if err != nil {
+		return nil, err
+	}
+	pairs := make(map[string][]psIDService)
+	for _, e := range entries {
+		if e.ID == "" {
+			continue
+		}
+		proj, svc := hostGroupKey(e)
+		if svc == "" {
+			continue
+		}
+		pairs[proj] = append(pairs[proj], psIDService{ID: shortContainerID(e.ID), Service: svc})
+	}
+	if len(pairs) == 0 {
+		return nil, nil
+	}
+	statsOut, err := h.docker.run(ctx, hostStatsArgs...)
+	if err != nil {
+		return nil, fmt.Errorf("fetching host container stats: %w", err)
+	}
+	all, err := parseStatsOutput(statsOut)
+	if err != nil {
+		return nil, err
+	}
+	grouped := make(map[string]map[string]runner.ServiceStats, len(pairs))
+	for proj, ps := range pairs {
+		// A project whose containers are all stopped is absent from the stats
+		// output, so it contributes no map at all rather than an empty one —
+		// the same "only running containers appear" rule ContainerStats keeps.
+		if g := aggregateStatsByService(ps, all); len(g) > 0 {
+			grouped[proj] = g
+		}
+	}
+	if len(grouped) == 0 {
+		return nil, nil
+	}
+	return grouped, nil
+}

@@ -217,15 +217,27 @@ func TestNewModel_SkipsPickerWhenComposerProvided(t *testing.T) {
 	}
 }
 
-func TestNewModel_ShowsPickerWhenNoComposer(t *testing.T) {
+func TestNewModel_LandsOnGroupedWhenNoComposer(t *testing.T) {
 	mc := &mockComposer{}
 	m := NewModel(nil, io.Discard, mockFactory(mc), nil, nil)
 
-	if m.screen != screenSelectProject {
-		t.Errorf("screen = %d, want %d (screenSelectProject)", m.screen, screenSelectProject)
+	if m.screen != screenSelectContainers {
+		t.Errorf("screen = %d, want %d (screenSelectContainers)", m.screen, screenSelectContainers)
 	}
-	if !m.showPicker {
-		t.Error("showPicker should be true when no composer")
+	if !m.grouped {
+		t.Error("grouped should be true when no cwd compose file")
+	}
+	if m.showPicker {
+		t.Error("showPicker must stay false: the grouped view replaced the project picker")
+	}
+	if !m.refreshInFlight {
+		t.Error("refreshInFlight should be armed for the stats fetch Init() fires")
+	}
+	if m.updateInFlight {
+		t.Error("updateInFlight must stay clear: grouped mode never scans automatically")
+	}
+	if m.autoUpdatesAllowed() {
+		t.Error("autoUpdatesAllowed must be false in grouped mode")
 	}
 }
 
@@ -421,6 +433,7 @@ func TestSelectContainers_EscGoesBackWhenPickerShown(t *testing.T) {
 	m := NewModel(nil, io.Discard, mockFactory(mc), nil, nil)
 	m.screen = screenSelectContainers
 	m.showPicker = true
+	m.grouped = false // drilled mode: NewModel now starts grouped
 	m.setSingleGroup(mc.services)
 	m.selected[m.svcKeyAt(0)] = true
 	m.composer = mc
@@ -449,6 +462,7 @@ func TestSelectContainers_EscLoadsProjectsWhenNil(t *testing.T) {
 	m := NewModel(nil, io.Discard, mockFactory(mc), nil, nil)
 	m.screen = screenSelectContainers
 	m.showPicker = true
+	m.grouped = false // drilled mode: NewModel now starts grouped
 	m.setSingleGroup(mc.services)
 	m.composer = mc
 	// projects is nil (local fast-path skipped project screen)
@@ -709,9 +723,21 @@ func TestView_AllScreens(t *testing.T) {
 	}
 }
 
+// parkOnProjectScreen puts a freshly built Model on the project picker.
+// NewModel no longer lands there — the grouped host view took its place as the
+// screen under the server picker — but screenSelectProject stays wired until
+// its deletion task, so its own tests park the model explicitly instead of
+// relying on the start-screen decision.
+func parkOnProjectScreen(m *Model) {
+	m.screen = screenSelectProject
+	m.grouped = false
+	m.showPicker = true
+}
+
 func TestSelectProject_Navigation(t *testing.T) {
 	mc := &mockComposer{}
 	m := NewModel(nil, io.Discard, mockFactory(mc), nil, nil)
+	parkOnProjectScreen(&m)
 	m.projects = []compose.Project{
 		{Name: "alpha", ConfigDir: "/a"},
 		{Name: "beta", ConfigDir: "/b"},
@@ -750,6 +776,7 @@ func TestSelectProject_Navigation(t *testing.T) {
 func TestSelectProject_EnterTransitionsToContainers(t *testing.T) {
 	mc := &mockComposer{}
 	m := NewModel(nil, io.Discard, mockFactory(mc), nil, nil)
+	parkOnProjectScreen(&m)
 	m.projects = []compose.Project{
 		{Name: "my-app", ConfigDir: "/work/my-app"},
 	}
@@ -771,6 +798,7 @@ func TestSelectProject_EnterTransitionsToContainers(t *testing.T) {
 func TestSelectProject_EnterWithNoProjects(t *testing.T) {
 	mc := &mockComposer{}
 	m := NewModel(nil, io.Discard, mockFactory(mc), nil, nil)
+	parkOnProjectScreen(&m)
 
 	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyEnter})
 	m = updated.(Model)
@@ -783,6 +811,7 @@ func TestSelectProject_EnterWithNoProjects(t *testing.T) {
 func TestSelectProject_QuitReturnsQuit(t *testing.T) {
 	mc := &mockComposer{}
 	m := NewModel(nil, io.Discard, mockFactory(mc), nil, nil)
+	parkOnProjectScreen(&m)
 
 	_, cmd := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'q'}})
 	if cmd == nil {
@@ -793,6 +822,7 @@ func TestSelectProject_QuitReturnsQuit(t *testing.T) {
 func TestProjectsMsg_PopulatesProjects(t *testing.T) {
 	mc := &mockComposer{}
 	m := NewModel(nil, io.Discard, mockFactory(mc), nil, nil)
+	parkOnProjectScreen(&m)
 
 	projects := []compose.Project{
 		{Name: "alpha", ConfigDir: "/a"},
@@ -812,6 +842,7 @@ func TestProjectsMsg_PopulatesProjects(t *testing.T) {
 func TestProjectsMsg_Error(t *testing.T) {
 	mc := &mockComposer{}
 	m := NewModel(nil, io.Discard, mockFactory(mc), nil, nil)
+	parkOnProjectScreen(&m)
 
 	updated, _ := m.Update(projectsMsg{err: io.ErrUnexpectedEOF})
 	m = updated.(Model)
@@ -824,6 +855,7 @@ func TestProjectsMsg_Error(t *testing.T) {
 func TestViewSelectProject_WithProjects(t *testing.T) {
 	mc := &mockComposer{}
 	m := NewModel(nil, io.Discard, mockFactory(mc), nil, nil)
+	parkOnProjectScreen(&m)
 	m.projects = []compose.Project{
 		{Name: "api-proxy", ConfigDir: "/Work/docker/api-proxy"},
 		{Name: "forms-app", ConfigDir: "/Work/docker/forms-app"},
@@ -844,6 +876,7 @@ func TestViewSelectProject_WithProjects(t *testing.T) {
 func TestViewSelectProject_Loading(t *testing.T) {
 	mc := &mockComposer{}
 	m := NewModel(nil, io.Discard, mockFactory(mc), nil, nil)
+	parkOnProjectScreen(&m)
 
 	v := m.View()
 	if !strings.Contains(v, "Loading projects") {
@@ -854,6 +887,7 @@ func TestViewSelectProject_Loading(t *testing.T) {
 func TestViewSelectProject_Error(t *testing.T) {
 	mc := &mockComposer{}
 	m := NewModel(nil, io.Discard, mockFactory(mc), nil, nil)
+	parkOnProjectScreen(&m)
 	m.projErr = fmt.Errorf("connection refused")
 
 	v := m.View()
@@ -884,6 +918,7 @@ func TestViewSelectProject_ErrorWithPicker(t *testing.T) {
 func TestViewSelectProject_Empty(t *testing.T) {
 	mc := &mockComposer{}
 	m := NewModel(nil, io.Discard, mockFactory(mc), nil, nil)
+	parkOnProjectScreen(&m)
 	m.projects = []compose.Project{}
 
 	v := m.View()
@@ -911,6 +946,7 @@ func TestViewSelectProject_EmptyWithPicker(t *testing.T) {
 func TestViewSelectProject_UnmanagedRow(t *testing.T) {
 	mc := &mockComposer{}
 	m := NewModel(nil, io.Discard, mockFactory(mc), nil, nil)
+	parkOnProjectScreen(&m)
 	m.projects = []compose.Project{
 		{Name: "my-app", Status: "running(3)", ConfigDir: "/srv/my-app"},
 		{Name: compose.UnmanagedProjectName, Desc: "3 containers", Unmanaged: true},
@@ -931,6 +967,7 @@ func TestViewSelectProject_UnmanagedRow(t *testing.T) {
 func TestViewSelectProject_UnmanagedRowIsLast(t *testing.T) {
 	mc := &mockComposer{}
 	m := NewModel(nil, io.Discard, mockFactory(mc), nil, nil)
+	parkOnProjectScreen(&m)
 	m.projects = []compose.Project{
 		{Name: "zebra", Status: "running(1)", ConfigDir: "/srv/zebra"},
 		{Name: compose.UnmanagedProjectName, Desc: "1 container", Unmanaged: true},
@@ -1728,7 +1765,7 @@ func TestNewModel_StartScreenDecisionTable(t *testing.T) {
 		servers    []config.Server
 		wantScreen screen
 	}{
-		{"no servers, no composer -> project", nil, nil, screenSelectProject},
+		{"no servers, no composer -> grouped containers", nil, nil, screenSelectContainers},
 		{"no servers, composer -> containers", mc, nil, screenSelectContainers},
 		{"servers, no composer -> server", nil, testServers, screenSelectServer},
 		{"servers, composer -> server", mc, testServers, screenSelectServer},
@@ -1753,10 +1790,10 @@ func TestNewModel_BackwardCompat_NilServers(t *testing.T) {
 		t.Errorf("screen = %d, want %d", m.screen, screenSelectContainers)
 	}
 
-	// Without composer
+	// Without composer: the grouped host view, not the deleted picker.
 	m = NewModel(nil, io.Discard, mockFactory(mc), nil, nil)
-	if m.screen != screenSelectProject {
-		t.Errorf("screen = %d, want %d", m.screen, screenSelectProject)
+	if m.screen != screenSelectContainers || !m.grouped {
+		t.Errorf("screen = %d grouped = %v, want %d true", m.screen, m.grouped, screenSelectContainers)
 	}
 }
 
@@ -1820,8 +1857,11 @@ func TestServerScreen_LocalSelection(t *testing.T) {
 	updated, cmd := m.Update(tea.KeyMsg{Type: tea.KeyEnter})
 	m = updated.(Model)
 
-	if m.screen != screenSelectProject {
-		t.Errorf("screen = %d, want %d (screenSelectProject)", m.screen, screenSelectProject)
+	if m.screen != screenSelectContainers {
+		t.Errorf("screen = %d, want %d (screenSelectContainers)", m.screen, screenSelectContainers)
+	}
+	if !m.grouped {
+		t.Error("Local with no cwd compose file lands on the grouped host view")
 	}
 	if m.serverName != "" {
 		t.Errorf("serverName should be empty for local, got %q", m.serverName)
@@ -1832,11 +1872,11 @@ func TestServerScreen_LocalSelection(t *testing.T) {
 	if m.projectLoader == nil {
 		t.Error("projectLoader should be restored to localProjectLoader for local")
 	}
-	if !m.showPicker {
-		t.Error("showPicker should be true after local selection")
+	if m.showPicker {
+		t.Error("showPicker must stay false on the grouped view")
 	}
 	if cmd == nil {
-		t.Error("should return loadProjects command")
+		t.Error("should return the grouped load batch")
 	}
 }
 
@@ -1920,17 +1960,20 @@ func TestServerScreen_ConnectSuccess(t *testing.T) {
 	updated, cmd := m.Update(connectResultMsg{err: nil})
 	m = updated.(Model)
 
-	if m.screen != screenSelectProject {
-		t.Errorf("screen = %d, want %d (screenSelectProject)", m.screen, screenSelectProject)
+	if m.screen != screenSelectContainers {
+		t.Errorf("screen = %d, want %d (screenSelectContainers)", m.screen, screenSelectContainers)
+	}
+	if !m.grouped {
+		t.Error("a successful connect lands on the grouped host view")
 	}
 	if m.serverErr != nil {
 		t.Errorf("serverErr = %v, want nil", m.serverErr)
 	}
-	if !m.showPicker {
-		t.Error("showPicker should be true after successful connect")
+	if m.showPicker {
+		t.Error("showPicker must stay false on the grouped view")
 	}
 	if cmd == nil {
-		t.Error("should return loadProjects command")
+		t.Error("should return the grouped load batch")
 	}
 }
 
@@ -18624,5 +18667,656 @@ func TestViewSelectContainers_RendersGroupHeaders(t *testing.T) {
 	}
 	if strings.Contains(out, "postgres") {
 		t.Errorf("a folded group must not render its services:\n%s", out)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Grouped host view (Task 6): loader, landing flow and refresh dispatch.
+// ---------------------------------------------------------------------------
+
+// mockGrouper is the HostGrouper seam double. It is deliberately NOT a
+// runner.Composer method set of its own — the TUI reaches it by type-asserting
+// whatever composerFactory(compose.Project{Unmanaged: true}) returns, so the
+// double has to be reachable through a factory exactly as the real one is.
+type mockGrouper struct {
+	mockComposer
+	groupedStatus map[string]map[string]runner.ServiceStatus
+	groupedStats  map[string]map[string]runner.ServiceStats
+	statusErr2    error
+	statsErr2     error
+	statusCalls2  int
+	statsCalls2   int
+}
+
+func (m *mockGrouper) GroupedStatus(ctx context.Context) (map[string]map[string]runner.ServiceStatus, error) {
+	m.statusCalls2++
+	return m.groupedStatus, m.statusErr2
+}
+
+func (m *mockGrouper) GroupedStats(ctx context.Context) (map[string]map[string]runner.ServiceStats, error) {
+	m.statsCalls2++
+	return m.groupedStats, m.statsErr2
+}
+
+// Compile-time pin, for the same reason the Inspector block above carries one:
+// the grouped screen reaches GroupedStatus/GroupedStats through a runtime type
+// assertion, so a signature drift on the real implementation would leave the
+// suite green while the whole host view silently rendered no status.
+var _ HostGrouper = (*compose.HostContainers)(nil)
+
+func groupedTestModel(g *mockGrouper, projects []compose.Project) Model {
+	m := NewModel(nil, io.Discard, func(compose.Project) runner.Composer { return g }, nil, nil)
+	installFakeTick(&m)
+	m.projectLoader = func(ctx context.Context) ([]compose.Project, error) { return projects, nil }
+	m.screen = screenSelectContainers
+	m.grouped = true
+	return m
+}
+
+func groupedFixture() (*mockGrouper, []compose.Project) {
+	g := &mockGrouper{
+		groupedStatus: map[string]map[string]runner.ServiceStatus{
+			"shop":                       {"api": {Running: true}, "db": {}},
+			"blog":                       {"web": {Running: true}},
+			compose.UnmanagedProjectName: {"watchtower": {Running: true}},
+		},
+		groupedStats: map[string]map[string]runner.ServiceStats{
+			"shop": {"api": {CPUPercent: 12.5, MemoryUsed: 100}},
+			"blog": {"web": {CPUPercent: 1}},
+		},
+	}
+	projects := []compose.Project{
+		{Name: "blog", ConfigDir: "/srv/blog"},
+		{Name: "shop", ConfigDir: "/srv/shop"},
+		{Name: compose.UnmanagedProjectName, Unmanaged: true},
+	}
+	return g, projects
+}
+
+func TestLoadGroups_MergesLoaderAndHostStatus(t *testing.T) {
+	g, projects := groupedFixture()
+	m := groupedTestModel(g, projects)
+
+	msg, ok := m.loadGroups()().(servicesMsg)
+	if !ok {
+		t.Fatalf("loadGroups() produced %T, want servicesMsg", m.loadGroups()())
+	}
+	if !msg.groupedPayload {
+		t.Fatal("loadGroups() must mark its payload grouped; an empty host is a valid result")
+	}
+	if len(msg.projects) != 3 || len(msg.hostStatus) != 3 {
+		t.Fatalf("payload = %d projects / %d host groups, want 3/3", len(msg.projects), len(msg.hostStatus))
+	}
+	if msg.session != m.statusSession {
+		t.Errorf("session = %d, want %d (loadGroups reuses statusSession)", msg.session, m.statusSession)
+	}
+	// The payload stays in BARE-name form on the wire: qualification happens at
+	// arrival, so nothing qualified can travel back out to runner or compose.
+	for _, svcs := range msg.hostStatus {
+		for name := range svcs {
+			if strings.Contains(name, svcKeySep) {
+				t.Errorf("host status key %q is qualified; the wire form must be bare", name)
+			}
+		}
+	}
+}
+
+func TestLoadGroups_ErrorPaths(t *testing.T) {
+	t.Run("no loader", func(t *testing.T) {
+		g, _ := groupedFixture()
+		m := groupedTestModel(g, nil)
+		m.projectLoader = nil
+		msg := m.loadGroups()().(servicesMsg)
+		if msg.err == nil {
+			t.Fatal("a missing loader must report an error, not an empty host")
+		}
+	})
+	t.Run("loader failure", func(t *testing.T) {
+		g, _ := groupedFixture()
+		m := groupedTestModel(g, nil)
+		m.projectLoader = func(ctx context.Context) ([]compose.Project, error) {
+			return nil, errors.New("compose ls failed")
+		}
+		msg := m.loadGroups()().(servicesMsg)
+		if msg.err == nil || msg.groupedPayload {
+			t.Fatalf("loader failure = %+v, want an error and no payload", msg)
+		}
+	})
+	t.Run("host ps failure", func(t *testing.T) {
+		g, projects := groupedFixture()
+		g.statusErr2 = errors.New("docker ps failed")
+		m := groupedTestModel(g, projects)
+		msg := m.loadGroups()().(servicesMsg)
+		if msg.err == nil {
+			t.Fatal("a host-ps failure must land in svcErr, not be swallowed")
+		}
+	})
+	t.Run("factory without a grouper still lists projects", func(t *testing.T) {
+		mc := &mockComposer{}
+		m := NewModel(nil, io.Discard, mockFactory(mc), nil, nil)
+		m.projectLoader = func(ctx context.Context) ([]compose.Project, error) {
+			return []compose.Project{{Name: "shop"}}, nil
+		}
+		msg := m.loadGroups()().(servicesMsg)
+		if msg.err != nil {
+			t.Fatalf("err = %v; a composer that is no HostGrouper means no status, not a failure", msg.err)
+		}
+		if len(msg.projects) != 1 || msg.hostStatus != nil {
+			t.Errorf("payload = %+v, want the project list with no host status", msg)
+		}
+	})
+}
+
+func TestGroupedServicesMsg_Hydrates(t *testing.T) {
+	g, projects := groupedFixture()
+	m := groupedTestModel(g, projects)
+
+	updated, _ := m.Update(m.loadGroups()())
+	m = updated.(Model)
+
+	if m.svcErr != nil {
+		t.Fatalf("svcErr = %v", m.svcErr)
+	}
+	if shape := groupShape(m.svcGroups); !slices.Equal(shape, []string{"blog[web]", "shop[api,db]", "(unmanaged)[watchtower]"}) {
+		t.Fatalf("groups = %v", shape)
+	}
+	// Three headers plus four services.
+	if len(m.svcEntries) != 7 {
+		t.Errorf("entries = %d, want 7 (3 headers + 4 services)", len(m.svcEntries))
+	}
+	if !m.svcStatus[svcKey("shop", "api")].Running {
+		t.Errorf("svcStatus = %v; shop/api should be running", m.svcStatus)
+	}
+	if _, ok := m.svcStatus["api"]; ok {
+		t.Error("a bare-name key survived arrival; the handler must qualify")
+	}
+	if len(m.services) != 4 {
+		t.Errorf("services = %v, want the flat list of all four", m.services)
+	}
+}
+
+func TestGroupedServicesMsg_RejectsStaleSession(t *testing.T) {
+	g, projects := groupedFixture()
+	m := groupedTestModel(g, projects)
+	payload := m.loadGroups()().(servicesMsg)
+	m.statusSession++ // a context change happened while the fetch was in flight
+
+	updated, _ := m.Update(payload)
+	m = updated.(Model)
+
+	if m.svcGroups != nil {
+		t.Errorf("a stale grouped payload hydrated the screen: %v", groupShape(m.svcGroups))
+	}
+}
+
+func TestGroupedServicesMsg_OffScreenIsDropped(t *testing.T) {
+	g, projects := groupedFixture()
+	m := groupedTestModel(g, projects)
+	payload := m.loadGroups()().(servicesMsg)
+	m.screen = screenLogs
+
+	updated, _ := m.Update(payload)
+	if got := updated.(Model); got.svcGroups != nil {
+		t.Error("an off-screen grouped payload must be dropped")
+	}
+}
+
+// The grouped payload is BOTH the initial load and the 5s refresh, so a reload
+// must not fight the user: cursor, selection, fold and search all survive.
+func TestGroupedServicesMsg_ReloadPreservesUserState(t *testing.T) {
+	g, projects := groupedFixture()
+	m := groupedTestModel(g, projects)
+	updated, _ := m.Update(m.loadGroups()())
+	m = updated.(Model)
+
+	m.svcGroups[1].folded = true
+	m.setGroups(m.svcGroups)
+	m.svcCursor = 2
+	m.selected[svcKey("shop", "api")] = true
+	m.selected[svcKey("gone", "ghost")] = true
+
+	updated, _ = m.Update(m.loadGroups()())
+	m = updated.(Model)
+
+	if !m.svcGroups[1].folded {
+		t.Error("the fold was lost across a reload")
+	}
+	if m.svcCursor != 2 {
+		t.Errorf("svcCursor = %d, want 2 (a reload must not reset the cursor)", m.svcCursor)
+	}
+	if !m.selected[svcKey("shop", "api")] {
+		t.Error("the selection was lost across a reload")
+	}
+	if m.selected[svcKey("gone", "ghost")] {
+		t.Error("a selection whose service no longer exists must be pruned")
+	}
+}
+
+func TestGroupedServicesMsg_ShrinkClampsCursor(t *testing.T) {
+	g, projects := groupedFixture()
+	m := groupedTestModel(g, projects)
+	updated, _ := m.Update(m.loadGroups()())
+	m = updated.(Model)
+	m.svcCursor = len(m.svcEntries) - 1
+
+	g.groupedStatus = map[string]map[string]runner.ServiceStatus{"blog": {"web": {}}}
+	m.projectLoader = func(ctx context.Context) ([]compose.Project, error) {
+		return []compose.Project{{Name: "blog"}}, nil
+	}
+	updated, _ = m.Update(m.loadGroups()())
+	m = updated.(Model)
+
+	if m.svcCursor >= len(m.svcEntries) || m.svcCursor < 0 {
+		t.Errorf("svcCursor = %d with %d entries; the cursor must be clamped", m.svcCursor, len(m.svcEntries))
+	}
+}
+
+func TestGroupedStatsMsg_Hydrates(t *testing.T) {
+	g, projects := groupedFixture()
+	m := groupedTestModel(g, projects)
+	m.refreshInFlight = true
+
+	updated, _ := m.Update(m.refreshGroupedStats()())
+	m = updated.(Model)
+
+	if m.statsErr != nil {
+		t.Fatalf("statsErr = %v", m.statsErr)
+	}
+	if m.refreshInFlight {
+		t.Error("refreshInFlight must clear on a current-session stats arrival")
+	}
+	if m.stats[svcKey("shop", "api")].CPUPercent != 12.5 {
+		t.Errorf("stats = %v, want shop/api at 12.5%%", m.stats)
+	}
+	if _, ok := m.stats["api"]; ok {
+		t.Error("a bare-name stats key survived arrival")
+	}
+}
+
+// A stats failure never costs the status view: it lands in statsErr, which the
+// error ladder renders below svcErr.
+func TestGroupedStatsMsg_FailureIsSoft(t *testing.T) {
+	g, projects := groupedFixture()
+	g.statsErr2 = errors.New("docker stats failed")
+	m := groupedTestModel(g, projects)
+	updated, _ := m.Update(m.loadGroups()())
+	m = updated.(Model)
+
+	updated, _ = m.Update(m.refreshGroupedStats()())
+	m = updated.(Model)
+
+	if m.statsErr == nil {
+		t.Fatal("statsErr should carry the stats failure")
+	}
+	if m.svcErr != nil {
+		t.Errorf("svcErr = %v; a stats failure must not blank the status view", m.svcErr)
+	}
+	if len(m.svcGroups) != 3 {
+		t.Error("the grouped rows should survive a stats failure")
+	}
+}
+
+func TestRefreshGroupedStats_NoGrouperIsEmptyNotAnError(t *testing.T) {
+	mc := &mockComposer{}
+	m := NewModel(nil, io.Discard, mockFactory(mc), nil, nil)
+	msg := m.refreshGroupedStats()().(statsMsg)
+	if msg.err != nil || !msg.groupedPayload || msg.hostStats != nil {
+		t.Errorf("statsMsg = %+v, want an empty grouped payload with no error", msg)
+	}
+}
+
+// The tick gate used to read "m.composer == nil". Grouped mode holds no
+// composer by design, so the gate has to consult the factory instead — testing
+// for a composer would silence the periodic refresh on the host view.
+func TestRefreshTick_GroupedDispatchesHostWideFetches(t *testing.T) {
+	g, projects := groupedFixture()
+	m := groupedTestModel(g, projects)
+	m.refreshInFlight = false
+
+	_, cmd := m.Update(refreshTickMsg{})
+	batch, ok := cmd().(tea.BatchMsg)
+	if !ok {
+		t.Fatalf("tick produced %T, want a fetch batch", cmd())
+	}
+	for _, c := range batch {
+		c()
+	}
+	if g.statusCalls2 != 1 || g.statsCalls2 != 1 {
+		t.Errorf("grouped tick made %d status / %d stats calls, want 1/1", g.statusCalls2, g.statsCalls2)
+	}
+	if g.statusCalls != 0 || g.statsCalls != 0 {
+		t.Errorf("grouped tick fell through to the per-project composer: %d/%d", g.statusCalls, g.statsCalls)
+	}
+}
+
+func TestRefreshTick_GroupedWithoutFactoryIsRescheduleOnly(t *testing.T) {
+	g, projects := groupedFixture()
+	m := groupedTestModel(g, projects)
+	m.refreshInFlight = false
+	m.composerFactory = nil
+
+	_, cmd := m.Update(refreshTickMsg{})
+	if _, ok := cmd().(tea.BatchMsg); ok {
+		t.Error("a grouped screen with no factory has nothing to fetch through; expected a bare reschedule")
+	}
+}
+
+// Drilled mode keeps the exact per-project calls it always made.
+func TestRefreshTick_DrilledStillUsesTheComposer(t *testing.T) {
+	g, _ := groupedFixture()
+	m := NewModel(&g.mockComposer, io.Discard, func(compose.Project) runner.Composer { return g }, nil, nil)
+	installFakeTick(&m)
+	m.screen = screenSelectContainers
+	m.refreshInFlight = false
+
+	_, cmd := m.Update(refreshTickMsg{})
+	batch, ok := cmd().(tea.BatchMsg)
+	if !ok {
+		t.Fatalf("tick produced %T, want a fetch batch", cmd())
+	}
+	for _, c := range batch {
+		c()
+	}
+	if g.statusCalls != 1 || g.statsCalls != 1 {
+		t.Errorf("drilled tick made %d status / %d stats calls, want 1/1", g.statusCalls, g.statsCalls)
+	}
+	if g.statusCalls2 != 0 || g.statsCalls2 != 0 {
+		t.Errorf("drilled tick used the host-wide seam: %d/%d", g.statusCalls2, g.statsCalls2)
+	}
+}
+
+func TestInit_GroupedDispatchesGroupedLoad(t *testing.T) {
+	g, projects := groupedFixture()
+	m := groupedTestModel(g, projects)
+
+	batch, ok := m.Init()().(tea.BatchMsg)
+	if !ok {
+		t.Fatalf("Init() produced %T, want a batch", m.Init()())
+	}
+	for _, c := range batch {
+		c()
+	}
+	if g.statusCalls2 != 1 || g.statsCalls2 != 1 {
+		t.Errorf("Init() made %d grouped status / %d grouped stats calls, want 1/1", g.statusCalls2, g.statsCalls2)
+	}
+	if g.updatesCalls != 0 {
+		t.Error("Init() must not scan for updates in grouped mode")
+	}
+}
+
+func TestEnterGroupedContainers_ResetsAndBumpsSessions(t *testing.T) {
+	g, projects := groupedFixture()
+	m := groupedTestModel(g, projects)
+	m.screen = screenSelectServer
+	m.grouped = false
+	m.composer = &g.mockComposer
+	m.projName, m.projDir = "old", "/old"
+	m.showPicker = true
+	m.setSingleGroup([]string{"stale"})
+	m.svcStatus = map[string]runner.ServiceStatus{"old/stale": {}}
+	m.stats = map[string]runner.ServiceStats{"old/stale": {}}
+	m.statsErr = errors.New("old")
+	m.svcErr = errors.New("old")
+	m.selected = map[string]bool{"old/stale": true}
+	m.svcCursor, m.svcOffset = 3, 2
+	m.updatesErr = "old"
+	m.updateInFlight = true
+	stats, status, updates := m.statsSession, m.statusSession, m.updatesSession
+
+	cmd := m.enterGroupedContainers()
+
+	if m.screen != screenSelectContainers || !m.grouped {
+		t.Fatalf("screen = %d grouped = %v", m.screen, m.grouped)
+	}
+	if m.composer != nil {
+		t.Error("grouped mode must hold no composer")
+	}
+	for name, got := range map[string]bool{
+		"svcGroups":  m.svcGroups != nil,
+		"svcEntries": m.svcEntries != nil,
+		"services":   m.services != nil,
+		"svcStatus":  m.svcStatus != nil,
+		"stats":      m.stats != nil,
+		"statsErr":   m.statsErr != nil,
+		"svcErr":     m.svcErr != nil,
+		"showPicker": m.showPicker,
+		"selection":  len(m.selected) != 0,
+		"cursor":     m.svcCursor != 0,
+		"offset":     m.svcOffset != 0,
+		"projName":   m.projName != "",
+		"projDir":    m.projDir != "",
+		"updatesErr": m.updatesErr != "",
+	} {
+		if got {
+			t.Errorf("%s survived the landing", name)
+		}
+	}
+	if m.statsSession == stats || m.statusSession == status || m.updatesSession == updates {
+		t.Error("the landing site must bump all three session counters")
+	}
+	if !m.refreshInFlight {
+		t.Error("refreshInFlight should be armed for the stats fetch in the returned batch")
+	}
+	if m.updateInFlight {
+		t.Error("updateInFlight must be reset before the batch, like every context-change site")
+	}
+	if cmd == nil {
+		t.Fatal("enterGroupedContainers() returned no load batch")
+	}
+}
+
+func TestConnectSuccess_BumpsTheThreeCountersAndLandsGrouped(t *testing.T) {
+	mc := &mockComposer{}
+	m := NewModel(nil, io.Discard, mockFactory(mc), testServers, mockConnectCb(mc))
+	stats, status, updates := m.statsSession, m.statusSession, m.updatesSession
+	m.updateInFlight = true
+
+	updated, cmd := m.Update(connectResultMsg{err: nil})
+	m = updated.(Model)
+
+	if m.screen != screenSelectContainers || !m.grouped {
+		t.Fatalf("screen = %d grouped = %v, want the grouped host view", m.screen, m.grouped)
+	}
+	// The inverse of the old rule: this site now starts fetching live data, so
+	// it is the site that must invalidate whatever a previous server left in
+	// flight.
+	if m.statsSession == stats || m.statusSession == status || m.updatesSession == updates {
+		t.Error("the connect-success path must bump statsSession/statusSession/updatesSession")
+	}
+	if m.updateInFlight || !m.refreshInFlight {
+		t.Errorf("updateInFlight = %v refreshInFlight = %v", m.updateInFlight, m.refreshInFlight)
+	}
+	if cmd == nil {
+		t.Error("connect success should return the grouped load batch")
+	}
+}
+
+func TestConnectError_ClearsGroupedState(t *testing.T) {
+	mc := &mockComposer{}
+	m := NewModel(nil, io.Discard, mockFactory(mc), testServers, mockConnectCb(mc))
+	m.grouped = true
+	m.setGroups([]svcGroup{{proj: compose.Project{Name: "shop"}, services: []string{"api"}}})
+	m.svcStatus = map[string]runner.ServiceStatus{svcKey("shop", "api"): {}}
+	m.stats = map[string]runner.ServiceStats{svcKey("shop", "api"): {}}
+	m.selected = map[string]bool{svcKey("shop", "api"): true}
+	m.svcCursor, m.svcOffset = 1, 1
+
+	updated, _ := m.Update(connectResultMsg{err: errors.New("ssh failed")})
+	m = updated.(Model)
+
+	if m.grouped {
+		t.Error("a failed connect leaves the server screen; grouped must be cleared")
+	}
+	if m.svcGroups != nil || m.svcEntries != nil || m.services != nil {
+		t.Error("the grouped rows must not outlive the failed connect")
+	}
+	if m.svcStatus != nil || m.stats != nil || len(m.selected) != 0 {
+		t.Error("status, stats and selection must be cleared on the connect error path")
+	}
+	if m.svcCursor != 0 || m.svcOffset != 0 {
+		t.Errorf("cursor/offset = %d/%d, want 0/0", m.svcCursor, m.svcOffset)
+	}
+}
+
+func TestGroupedScreen_EscGoesBackToServerScreen(t *testing.T) {
+	g, projects := groupedFixture()
+	m := NewModel(nil, io.Discard, func(compose.Project) runner.Composer { return g }, testServers, mockConnectCb(&g.mockComposer))
+	installFakeTick(&m)
+	m.projectLoader = func(ctx context.Context) ([]compose.Project, error) { return projects, nil }
+	m.enterGroupedContainers()
+	m.serverName = "prod"
+	disconnected := false
+	m.disconnectFunc = func() error { disconnected = true; return nil }
+
+	if !m.canGoBack() {
+		t.Fatal("the grouped screen is not a root screen when servers are configured")
+	}
+	updated, cmd := m.Update(tea.KeyMsg{Type: tea.KeyEsc})
+	m = updated.(Model)
+
+	if m.screen != screenSelectServer {
+		t.Fatalf("screen = %d, want %d", m.screen, screenSelectServer)
+	}
+	if m.grouped || m.svcGroups != nil || m.serverName != "" || m.disconnectFunc != nil {
+		t.Error("esc from the grouped screen must clear grouped state and the remote connection")
+	}
+	if cmd == nil {
+		t.Fatal("esc from a remote grouped screen should run the disconnect")
+	}
+	cmd()
+	if !disconnected {
+		t.Error("the disconnect callback was not invoked")
+	}
+}
+
+// Standalone local run: the grouped screen is a ROOT — esc does nothing and q
+// quits, exactly as the project picker behaved in the same situation.
+func TestGroupedScreen_IsRootWithoutServers(t *testing.T) {
+	g, projects := groupedFixture()
+	m := groupedTestModel(g, projects)
+
+	if m.canGoBack() {
+		t.Fatal("with no servers and no config the grouped screen has no parent")
+	}
+	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyEsc})
+	if got := updated.(Model); got.screen != screenSelectContainers {
+		t.Errorf("esc navigated off a root screen: screen = %d", got.screen)
+	}
+	_, cmd := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'q'}})
+	if cmd == nil {
+		t.Error("q must quit from the root grouped screen")
+	}
+}
+
+// Grouped mode has no single composer, so the keys that would need one are
+// refused rather than left to dereference nil.
+func TestGroupedScreen_RefusesComposerBoundKeys(t *testing.T) {
+	g, projects := groupedFixture()
+	base := groupedTestModel(g, projects)
+	updated, _ := base.Update(base.loadGroups()())
+	base = updated.(Model)
+	base.svcCursor = 1 // a service row, not a header
+
+	for _, key := range []string{"d", "r", "s", "R", "c", "l"} {
+		t.Run(key, func(t *testing.T) {
+			m := base
+			updated, cmd := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune(key)})
+			got := updated.(Model)
+			if got.screen != screenSelectContainers {
+				t.Errorf("%q navigated away: screen = %d", key, got.screen)
+			}
+			if got.confirming {
+				t.Errorf("%q armed a confirmation with no composer to run it", key)
+			}
+			if cmd != nil {
+				t.Errorf("%q produced a command in grouped mode", key)
+			}
+		})
+	}
+}
+
+func TestGroupedMode_NoAutomaticUpdateScan(t *testing.T) {
+	g, projects := groupedFixture()
+	m := groupedTestModel(g, projects)
+
+	if m.autoUpdatesAllowed() {
+		t.Error("autoUpdatesAllowed must be false in grouped mode")
+	}
+	if cmd := m.maybeRefreshUpdatesCmd(); cmd != nil {
+		t.Error("maybeRefreshUpdatesCmd must schedule nothing in grouped mode")
+	}
+	// U is the only trigger, and with no composer bound it is inert for now.
+	updated, cmd := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'U'}})
+	if cmd != nil {
+		t.Error("U must not fan out to the registry with no composer bound")
+	}
+	if got := updated.(Model); got.updateInFlight {
+		t.Error("U must not leave updateInFlight latched")
+	}
+	if g.updatesCalls != 0 {
+		t.Errorf("CheckUpdates ran %d times in grouped mode", g.updatesCalls)
+	}
+}
+
+func TestBackToServerScreen_RestoresLocalCallbacks(t *testing.T) {
+	g, projects := groupedFixture()
+	localLoader := func(ctx context.Context) ([]compose.Project, error) { return projects, nil }
+	m := NewModel(nil, io.Discard, func(compose.Project) runner.Composer { return g }, testServers, mockConnectCb(&g.mockComposer),
+		WithLocalProjectLoader(localLoader))
+	m.composerFactory = func(compose.Project) runner.Composer { return nil }
+	m.projectLoader = func(ctx context.Context) ([]compose.Project, error) { return nil, nil }
+	m.grouped = true
+	projSess := m.projectsSession
+
+	m.backToServerScreen()
+
+	if m.projectLoader == nil || m.composerFactory == nil {
+		t.Fatal("the local callbacks must be restored, never left nil")
+	}
+	if m.projectsSession == projSess {
+		t.Error("swapping the projectLoader must bump projectsSession")
+	}
+	if m.refreshInFlight || m.updateInFlight {
+		t.Error("the new context must start with both in-flight guards clear")
+	}
+}
+
+// The grouped header row is drawn in a later task; this only pins that the
+// current renderer survives multi-group entries and lists every service, so
+// the landing flow shipped here is not a crash waiting for that task.
+func TestGroupedScreen_RendersWithoutPanicking(t *testing.T) {
+	g, projects := groupedFixture()
+	m := groupedTestModel(g, projects)
+	m.width, m.height = 100, 30
+	updated, _ := m.Update(m.loadGroups()())
+	m = updated.(Model)
+	updated, _ = m.Update(m.refreshGroupedStats()())
+	m = updated.(Model)
+
+	v := m.View()
+	for _, name := range []string{"api", "db", "web", "watchtower"} {
+		if !strings.Contains(v, name) {
+			t.Errorf("grouped render is missing %q:\n%s", name, v)
+		}
+	}
+	if strings.Contains(v, "Loading services") {
+		t.Errorf("a hydrated grouped screen must not claim to be loading:\n%s", v)
+	}
+}
+
+// An empty host is a real result, not a stuck load: buildSvcGroups returns a
+// non-nil empty slice so setGroups installs a non-nil services list.
+func TestGroupedScreen_EmptyHostLeavesLoadingState(t *testing.T) {
+	g := &mockGrouper{}
+	m := groupedTestModel(g, nil)
+	m.width, m.height = 100, 30
+	updated, _ := m.Update(m.loadGroups()())
+	m = updated.(Model)
+
+	if m.services == nil {
+		t.Fatal("an empty host must still install a non-nil services slice")
+	}
+	if v := m.View(); strings.Contains(v, "Loading services") {
+		t.Errorf("an empty host must not render as still loading:\n%s", v)
 	}
 }

@@ -1,6 +1,9 @@
 package tui
 
-import "github.com/lexxzar/compose-deploy/internal/compose"
+import (
+	"github.com/lexxzar/compose-deploy/internal/compose"
+	"github.com/lexxzar/compose-deploy/internal/runner"
+)
 
 // svcEntryKind distinguishes a group header row from a service row on the
 // container screen.
@@ -168,4 +171,88 @@ func (m Model) cursorService() (string, bool) {
 		return "", false
 	}
 	return e.name, true
+}
+
+// flattenQualified converts a host-wide project → service → value map, the
+// shape both grouped fetches return, into the flat qualified-key form the
+// Model holds. It is the grouped twin of qualifyMap and the same message
+// boundary: nothing qualified travels back out to runner or compose.
+func flattenQualified[V any](host map[string]map[string]V) map[string]V {
+	if host == nil {
+		return nil
+	}
+	out := make(map[string]V)
+	for proj, svcs := range host {
+		for svc, v := range svcs {
+			out[svcKey(proj, svc)] = v
+		}
+	}
+	return out
+}
+
+// buildSvcGroups folds the grouped payload — the project list from the
+// ProjectLoader and the host-wide status map from GroupedStatus — into the row
+// model.
+//
+// Project ORDER comes from the loader, not from the status map: the loader
+// already sorts the compose projects and deliberately appends the synthetic
+// unmanaged row last, and a map has no order at all. A project the loader
+// reported but the host has no containers for yields an empty group, which
+// renders as a bare header — that is a real state (every container removed),
+// not an error.
+//
+// The reverse case is the safety net: a project present in the status map that
+// the loader did not report. `docker compose ls` and `docker ps` are two calls
+// and can disagree (a project created between them, or an unmanaged bucket
+// whose count call failed). Those groups are appended after the loader's, in
+// name order with the unmanaged bucket last, so a running container is never
+// silently invisible.
+//
+// prev supplies the fold state: folding is UI state the user set, and this
+// function also runs on the periodic reload, so a fold must survive a refresh.
+// It is matched by project NAME because the group slice is rebuilt wholesale.
+func buildSvcGroups(projects []compose.Project, host map[string]map[string]runner.ServiceStatus, prev []svcGroup) []svcGroup {
+	folded := make(map[string]bool, len(prev))
+	for _, g := range prev {
+		if g.folded {
+			folded[g.proj.Name] = true
+		}
+	}
+
+	groups := make([]svcGroup, 0, len(projects))
+	seen := make(map[string]bool, len(projects))
+	add := func(p compose.Project) {
+		if p.Name == "" || seen[p.Name] {
+			return
+		}
+		seen[p.Name] = true
+		svcs := make([]string, 0, len(host[p.Name]))
+		for name := range host[p.Name] {
+			svcs = append(svcs, name)
+		}
+		groups = append(groups, svcGroup{proj: p, services: sortServices(svcs), folded: folded[p.Name]})
+	}
+	for _, p := range projects {
+		add(p)
+	}
+
+	var extra []string
+	unmanagedExtra := false
+	for name := range host {
+		if seen[name] || name == "" {
+			continue
+		}
+		if name == compose.UnmanagedProjectName {
+			unmanagedExtra = true
+			continue
+		}
+		extra = append(extra, name)
+	}
+	for _, name := range sortServices(extra) {
+		add(compose.Project{Name: name})
+	}
+	if unmanagedExtra {
+		add(compose.Project{Name: compose.UnmanagedProjectName, Unmanaged: true})
+	}
+	return groups
 }

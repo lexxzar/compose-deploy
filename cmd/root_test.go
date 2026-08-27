@@ -8,6 +8,7 @@ import (
 	"testing"
 
 	"github.com/lexxzar/compose-deploy/internal/compose"
+	"github.com/lexxzar/compose-deploy/internal/tui"
 )
 
 func TestRootCmd_FlagRegistration(t *testing.T) {
@@ -281,6 +282,12 @@ func TestLocalComposerFor(t *testing.T) {
 		if _, ok := got.(*compose.HostContainers); !ok {
 			t.Fatalf("got %T, want *compose.HostContainers", got)
 		}
+		// The grouped host view addresses the host-wide seam through exactly
+		// this branch — composerFactory(compose.Project{Unmanaged: true}) — so
+		// the wiring is only correct if what comes back is a tui.HostGrouper.
+		if _, ok := got.(tui.HostGrouper); !ok {
+			t.Errorf("got %T, which is no tui.HostGrouper; the grouped screen would render no status", got)
+		}
 	})
 
 	t.Run("compose row gets a Compose rooted at its config dir", func(t *testing.T) {
@@ -314,6 +321,9 @@ func TestRemoteComposerFor(t *testing.T) {
 		got := remoteComposerFor(compose.Project{Name: compose.UnmanagedProjectName, Unmanaged: true}, rc)
 		if _, ok := got.(*compose.HostContainers); !ok {
 			t.Fatalf("got %T, want *compose.HostContainers", got)
+		}
+		if _, ok := got.(tui.HostGrouper); !ok {
+			t.Errorf("got %T, which is no tui.HostGrouper; the remote grouped screen would render no status", got)
 		}
 	})
 

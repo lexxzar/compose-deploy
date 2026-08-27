@@ -139,6 +139,25 @@ type RollbackPreparer interface {
 	PrepareRollback(ctx context.Context, entries map[string]compose.SnapshotEntry, services []string, w io.Writer) (func(), error)
 }
 
+// HostGrouper is the grouped host-view seam: one host-wide `docker ps` (and
+// one host-wide `docker stats`) folded into project → service maps, so the
+// grouped container screen costs a constant number of round-trips instead of
+// one per project.
+//
+// Declared here and type-asserted on the concrete composer, exactly like
+// Inspector and UpdateDetailer, so runner.Composer and its five mocks stay
+// untouched. Only *compose.HostContainers implements it, and the TUI reaches
+// it through composerFactory(compose.Project{Unmanaged: true}) — the same
+// synthetic project the unmanaged picker row already used — so no existing
+// signature (ProjectLoader, ConnectCallback, ComposerFactory) changes.
+//
+// A factory that cannot produce one (a test mock) simply yields no grouped
+// data: the screen renders the projects the loader found with no status.
+type HostGrouper interface {
+	GroupedStatus(ctx context.Context) (map[string]map[string]runner.ServiceStatus, error)
+	GroupedStats(ctx context.Context) (map[string]map[string]runner.ServiceStats, error)
+}
+
 // ReadOnlyComposer marks a composer whose write methods refuse. The method is
 // NAMED and returns a bool rather than being a marker: a method-less interface
 // is interface{}, which every composer satisfies, so m.readOnly() would be true
@@ -306,6 +325,19 @@ type Model struct {
 	// across a rebuild — that is why selection keys on svcKey.
 	svcGroups  []svcGroup
 	svcEntries []svcEntry
+
+	// grouped marks the host-wide mode of the container screen: every compose
+	// project on the host plus the unmanaged bucket, each a foldable group.
+	// It is an explicit field rather than a len(svcGroups) > 1 inference — a
+	// host can legitimately run exactly one project, and the drilled screen is
+	// always one group, so the two shapes are indistinguishable by count.
+	//
+	// In grouped mode m.composer stays nil: no single composer serves the whole
+	// host, so the action keys bind one at press time from the cursor's group.
+	// Every predicate that used to read "the composer" therefore has to consult
+	// this flag too — canGoBack, the refresh dispatch, the tick gate and
+	// autoUpdatesAllowed all branch on it.
+	grouped bool
 
 	// svcStatus and stats are keyed by the QUALIFIED key svcKey produces, not
 	// by the bare service name a Composer returns: two projects on one host
@@ -489,19 +521,46 @@ type projectsMsg struct {
 	err      error
 	session  uint64 // captured from m.projectsSession at fetch time; without it, a stale load from server A could overwrite the project list after the user has switched to server B
 }
+
+// servicesMsg carries a container-screen load in either of the two shapes the
+// screen has. The DRILLED shape (services + status) comes from loadServices and
+// carries the bare names one composer knows. The GROUPED shape (projects +
+// hostStatus) comes from loadGroups and carries every project on the host.
+//
+// Both shapes stay in BARE-name form on the wire: qualified keys live only
+// inside the Model, so the handler converts at arrival — flattenQualified for
+// the grouped shape, qualifyMap for the drilled one.
+//
+// groupedPayload discriminates rather than a nil check on either field: a host
+// with no projects and no containers is a legitimate grouped result whose two
+// payload fields are both empty, and it must clear the screen rather than be
+// mistaken for a drilled load.
 type servicesMsg struct {
 	services []string
 	status   map[string]runner.ServiceStatus
-	err      error
-	session  uint64 // reuses m.statusSession: loadServices fetches both list + initial status, so it lives in the same context lifecycle as refreshStatus
+
+	groupedPayload bool
+	projects       []compose.Project
+	hostStatus     map[string]map[string]runner.ServiceStatus
+
+	err     error
+	session uint64 // reuses m.statusSession: loadServices fetches both list + initial status, so it lives in the same context lifecycle as refreshStatus
 }
 type statusMsg struct {
 	status  map[string]runner.ServiceStatus
 	err     error
 	session uint64
 }
+
+// statsMsg mirrors servicesMsg's two shapes: drilled stats keyed by bare
+// service name, or the grouped host-wide map keyed project → service. The
+// handler qualifies whichever arrived.
 type statsMsg struct {
-	stats   map[string]runner.ServiceStats
+	stats map[string]runner.ServiceStats
+
+	groupedPayload bool
+	hostStats      map[string]map[string]runner.ServiceStats
+
 	err     error
 	session uint64
 }
@@ -753,8 +812,18 @@ func NewModel(composer runner.Composer, logWriter io.Writer, factory ComposerFac
 	if len(servers) > 0 || m.config != nil {
 		m.screen = screenSelectServer
 	} else if composer == nil {
-		m.screen = screenSelectProject
-		m.showPicker = true
+		// No cwd compose file and no servers: land on the grouped host view.
+		// It replaces the project picker as the "which project?" screen —
+		// every project on the host is a foldable group, so picking one is a
+		// drill-in rather than a separate screen.
+		m.screen = screenSelectContainers
+		m.grouped = true
+		m.statsRequested = true
+		m.refreshInFlight = true // Init() will fire refreshGroupedStats
+		// Grouped mode never scans automatically (autoUpdatesAllowed is false
+		// there), so the flag must start clear or the first U would be refused
+		// by a guard with no fetch behind it.
+		m.updateInFlight = false
 	} else {
 		m.screen = screenSelectContainers
 		m.statsRequested = true
@@ -782,8 +851,8 @@ func (m Model) Init() tea.Cmd {
 		}
 		return tick // server list is static from config; only the tick is live
 	}
-	if m.showPicker {
-		return tea.Batch(m.loadProjects(), tick)
+	if m.grouped {
+		return tea.Batch(m.loadGroups(), m.refreshGroupedStats(), tick)
 	}
 	// Fast-path: standalone container screen on launch. updateInFlight was
 	// set by NewModel for the standalone case (mirrors refreshInFlight), so
@@ -792,7 +861,7 @@ func (m Model) Init() tea.Cmd {
 	// a read-only composer handed straight to NewModel must not fan out to
 	// the registry before the user presses U. NewModel leaves updateInFlight
 	// clear in that case, so the two stay in step.
-	cmds := []tea.Cmd{m.loadServices(), m.refreshStats()}
+	cmds := []tea.Cmd{m.loadContainerScreenCmd(), m.statsRefreshCmd()}
 	if m.autoUpdatesAllowed() {
 		cmds = append(cmds, m.refreshUpdates())
 	}
@@ -900,6 +969,21 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 		m.svcErr = nil
+		if msg.groupedPayload {
+			// The grouped payload is BOTH the initial load and the 5-second
+			// refresh, so — unlike the drilled branch below — it must preserve
+			// what the user set: cursor, selection, fold state and an active
+			// search all survive. Resetting them here would fight the user
+			// every tick. The landing sites clear that state once, on entry.
+			m.setGroups(buildSvcGroups(msg.projects, msg.hostStatus, m.svcGroups))
+			m.svcStatus = flattenQualified(msg.hostStatus)
+			m.pruneSelection()
+			m.clampSvcCursor()
+			// searchMatches indexes svcEntries, which the rebuild renumbered.
+			m.searchMatches = computeMatches(m.svcEntries, m.searchQuery)
+			m.fixSvcOffset()
+			return m, nil
+		}
 		m.setSingleGroup(sortServices(msg.services))
 		// Qualify at arrival: the payload carries the bare names the composer
 		// knows, and the group installed a line above is the owner that turns
@@ -1006,7 +1090,11 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 		m.statsErr = nil
-		m.stats = qualifyMap(m.ownerProjName(), msg.stats)
+		if msg.groupedPayload {
+			m.stats = flattenQualified(msg.hostStats)
+		} else {
+			m.stats = qualifyMap(m.ownerProjName(), msg.stats)
+		}
 		m.fixSvcOffset()
 		return m, nil
 
@@ -1214,11 +1302,19 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// flight — on a slow remote SSH hop docker stats can take longer than
 		// statsRefreshInterval (5s), and without the m.refreshInFlight gate
 		// the next tick would stack another pair of fetches on top.
-		if m.screen != screenSelectContainers || m.confirming || m.composer == nil || m.refreshInFlight {
+		// The composer check gains a grouped branch: grouped mode holds no
+		// composer by design, so testing for one would silence the periodic
+		// refresh on exactly the screen that most needs it. What it needs
+		// instead is a factory to reach the host-wide seam through.
+		live := m.composer != nil
+		if m.grouped {
+			live = m.composerFactory != nil
+		}
+		if m.screen != screenSelectContainers || m.confirming || !live || m.refreshInFlight {
 			return m, m.refreshTick()
 		}
 		m.refreshInFlight = true
-		return m, tea.Batch(m.refreshStatus(), m.refreshStats(), m.refreshTick())
+		return m, tea.Batch(m.statusRefreshCmd(), m.statsRefreshCmd(), m.refreshTick())
 
 	case stepEventMsg:
 		return m.handleStepEvent(runner.StepEvent(msg))
@@ -1269,22 +1365,31 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.rollbackTargets = nil
 			m.rollbackCleanup = nil
 			m.rollbackFetchSession++
+			// The failed connect leaves the user on the server screen, so the
+			// grouped host view a previous server populated must go with it.
+			m.grouped = false
+			m.clearSvcGroups()
+			m.svcStatus = nil
+			m.stats = nil
+			m.statsErr = nil
+			m.svcErr = nil
+			m.selected = make(map[string]bool)
+			m.svcCursor = 0
+			m.svcOffset = 0
 			m.clearSearch()
 			m.clearWaitState()
 			return m, nil
 		}
 		m.serverErr = nil
-		m.showPicker = true
-		m.screen = screenSelectProject
-		// Note: only projectsSession is bumped here (above, via the no-op
-		// initial reset). statsSession / statusSession / updatesSession are
-		// intentionally NOT bumped at this site because the user has not yet
-		// entered a context that uses those counters — m.composer is still
-		// nil until a project is picked. The bumps for those three counters
-		// happen at the project-pick handler (below) where m.composer is
-		// swapped in, matching the "session is bumped at every site that
-		// swaps the resource the counter guards" discipline.
-		return m, m.loadProjects()
+		// A successful connect now lands on LIVE data instead of a static
+		// picker, so this site DOES bump statsSession / statusSession /
+		// updatesSession (enterGroupedContainers does it) — the inverse of the
+		// rule that held while the next screen was the project picker. The
+		// resource those counters guard is fetched from here on, so the site
+		// that starts fetching it is the site that must invalidate whatever a
+		// previous server left in flight.
+		cmd := m.enterGroupedContainers()
+		return m, cmd
 
 	case disconnectDoneMsg:
 		return m, nil
@@ -1454,7 +1559,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// guard inside maybeRefreshUpdatesCmd must not refuse to fire a
 		// fresh fetch just because a now-stale fetch is still in flight.
 		m.updateInFlight = false
-		cmds := []tea.Cmd{m.refreshStatus(), m.refreshStats()}
+		cmds := []tea.Cmd{m.statusRefreshCmd(), m.statsRefreshCmd()}
 		if c := m.maybeRefreshUpdatesCmd(); c != nil {
 			cmds = append(cmds, c)
 		}
@@ -1831,6 +1936,20 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 				m.clearWaitState()
 				if m.localComposer != nil {
 					m.composer = m.localComposer
+					// Local fast track: a cwd compose file means one project,
+					// so this stays the DRILLED single-group screen it always
+					// was rather than the host view. Any rows a previous
+					// context left behind go with it — the reload below
+					// replaces them, but not until its message arrives.
+					m.grouped = false
+					m.clearSvcGroups()
+					m.svcStatus = nil
+					m.stats = nil
+					m.statsErr = nil
+					m.svcErr = nil
+					m.selected = make(map[string]bool)
+					m.svcCursor = 0
+					m.svcOffset = 0
 					m.statsSession++
 					m.statusSession++
 					m.updatesSession++
@@ -1846,15 +1965,18 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 					m.updateInFlight = false
 					m.showPicker = true
 					m.screen = screenSelectContainers
-					cmds := []tea.Cmd{m.loadServices(), m.refreshStats()}
+					cmds := []tea.Cmd{m.loadContainerScreenCmd(), m.statsRefreshCmd()}
 					if c := m.maybeRefreshUpdatesCmd(); c != nil {
 						cmds = append(cmds, c)
 					}
 					return m, tea.Batch(cmds...)
 				}
-				m.showPicker = true
-				m.screen = screenSelectProject
-				return m, m.loadProjects()
+				// Hoisted out of the return: the helper has a pointer
+				// receiver and mutates the same m the return carries, and Go
+				// leaves the evaluation order of a bare operand against a call
+				// operand unspecified.
+				cmd := m.enterGroupedContainers()
+				return m, cmd
 			case entryServer:
 				server := m.servers[entry.serverIdx]
 				m.serverName = server.Name
@@ -1885,41 +2007,12 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		case "ctrl+c":
 			return m.tryQuit()
 		case "esc":
-			if len(m.servers) > 0 || m.config != nil {
-				// Back to server screen — disconnect if remote
-				disconnectFn := m.disconnectFunc
-				m.screen = screenSelectServer
-				m.serverName = ""
-				m.serverHost = ""
-				m.serverColor = ""
-				m.disconnectFunc = nil
-				m.quitting = false
-				m.projectLoader = m.localProjectLoader
-				m.composerFactory = m.localFactory
-				m.composer = nil
-				m.statsSession++
-				m.statusSession++
-				m.updatesSession++
-				m.projectsSession++
-				m.rollbackFetchSession++
-				m.refreshInFlight = false
-				m.updateInFlight = false
-				m.updatesErr = ""
-				m.projName = ""
-				m.projDir = ""
-				m.projects = nil
-				m.projCursor = 0
-				m.projErr = nil
-				m.showPicker = false
-				m.clearSearch()
-				m.clearWaitState()
-				if disconnectFn != nil {
-					return m, func() tea.Msg {
-						_ = disconnectFn()
-						return disconnectDoneMsg{}
-					}
-				}
-				return m, nil
+			if m.canGoBack() {
+				// Hoisted out of the return for the same reason every other
+				// pointer-receiver helper is: the evaluation order of a bare
+				// operand against a call operand is unspecified.
+				cmd := m.backToServerScreen()
+				return m, cmd
 			}
 		case "up", "k":
 			if m.projCursor > 0 {
@@ -1937,6 +2030,7 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.projName = proj.Name
 			m.projDir = proj.ConfigDir
 			m.composer = m.composerFactory(proj)
+			m.grouped = false
 			m.statsSession++
 			m.statusSession++
 			m.updatesSession++
@@ -1949,7 +2043,7 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			// fresh fetch just because a now-stale fetch is still in flight.
 			m.updateInFlight = false
 			m.screen = screenSelectContainers
-			cmds := []tea.Cmd{m.loadServices(), m.refreshStats()}
+			cmds := []tea.Cmd{m.loadContainerScreenCmd(), m.statsRefreshCmd()}
 			if c := m.maybeRefreshUpdatesCmd(); c != nil {
 				cmds = append(cmds, c)
 			}
@@ -2030,6 +2124,23 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 
 		m.warning = ""
 
+		// Grouped mode spans every project at once, so there is no single
+		// composer to run a pipeline with, open a log stream on or read a
+		// compose file from. These keys are refused rather than left to
+		// dereference a nil composer; Task 7 gives the grouped screen its own
+		// key table and Task 8 binds a composer from the cursor's group.
+		//
+		// Each refusal re-clamps first: the dispatch cleared m.warning above,
+		// which frees the warning footer line and grows svcVisibleCount() by
+		// one — the same rule the read-only gates follow.
+		if m.grouped {
+			switch key {
+			case "d", "r", "s", "R", "c", "l":
+				m.fixSvcOffset()
+				return m, nil
+			}
+		}
+
 		switch key {
 		case "ctrl+c":
 			return m.tryQuit()
@@ -2040,6 +2151,14 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			if m.searchQuery != "" {
 				m.clearSearch()
 				m.fixSvcOffset()
+				return m, nil
+			}
+			if m.grouped {
+				if m.canGoBack() {
+					// Hoisted: pointer receiver, same m as the return.
+					cmd := m.backToServerScreen()
+					return m, cmd
+				}
 				return m, nil
 			}
 			if m.showPicker {
@@ -2437,7 +2556,7 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			// guard inside maybeRefreshUpdatesCmd must not refuse to fire a
 			// fresh fetch just because a now-stale fetch is still in flight.
 			m.updateInFlight = false
-			cmds := []tea.Cmd{m.refreshStatus(), m.refreshStats()}
+			cmds := []tea.Cmd{m.statusRefreshCmd(), m.statsRefreshCmd()}
 			if c := m.maybeRefreshUpdatesCmd(); c != nil {
 				cmds = append(cmds, c)
 			}
@@ -2878,7 +2997,7 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 				// to fire a fresh fetch just because a now-stale fetch is
 				// still in flight.
 				m.updateInFlight = false
-				cmds := []tea.Cmd{m.refreshStatus(), m.refreshStats()}
+				cmds := []tea.Cmd{m.statusRefreshCmd(), m.statsRefreshCmd()}
 				if c := m.maybeRefreshUpdatesCmd(); c != nil {
 					cmds = append(cmds, c)
 				}
@@ -4087,6 +4206,104 @@ func (m Model) refreshStats() tea.Cmd {
 	}
 }
 
+// hostGrouper resolves the grouped host-view seam from the active factory. The
+// synthetic unmanaged project is the address of the host-wide composer — the
+// factory already branches on Unmanaged to build a *compose.HostContainers, so
+// the grouped screen reuses that branch instead of adding a signature.
+//
+// It returns nil when there is no factory, when the factory returns nothing, or
+// when what it returns is not a HostGrouper (a test mock). Callers treat nil as
+// "no host data": the projects the loader found still render.
+func (m Model) hostGrouper() HostGrouper {
+	if m.composerFactory == nil {
+		return nil
+	}
+	hg, ok := m.composerFactory(compose.Project{Unmanaged: true}).(HostGrouper)
+	if !ok {
+		return nil
+	}
+	return hg
+}
+
+// loadGroups is the grouped screen's status fetch: the ProjectLoader for the
+// project list and ORDER, plus one host-wide GroupedStatus for every
+// container's state. It reuses statusSession because it is loadServices'
+// grouped counterpart — same lifecycle, same context changes, same staleness
+// rule.
+//
+// A loader failure and a host-ps failure both land in svcErr: neither leaves a
+// usable screen, so both are the primary error. The stats half fails
+// independently into statsErr (see refreshGroupedStats).
+func (m Model) loadGroups() tea.Cmd {
+	ctx := m.ctx
+	loader := m.projectLoader
+	hg := m.hostGrouper()
+	session := m.statusSession
+	return func() tea.Msg {
+		if loader == nil {
+			return servicesMsg{err: fmt.Errorf("no project loader configured"), session: session}
+		}
+		projects, err := loader(ctx)
+		if err != nil {
+			return servicesMsg{err: err, session: session}
+		}
+		var host map[string]map[string]runner.ServiceStatus
+		if hg != nil {
+			host, err = hg.GroupedStatus(ctx)
+			if err != nil {
+				return servicesMsg{err: err, session: session}
+			}
+		}
+		return servicesMsg{groupedPayload: true, projects: projects, hostStatus: host, session: session}
+	}
+}
+
+// refreshGroupedStats is refreshStats' grouped counterpart: one host-wide
+// `docker stats` joined by container ID, split per project. A factory with no
+// HostGrouper behind it reports an empty result rather than an error — the
+// screen simply shows no CPU/Mem cells.
+func (m Model) refreshGroupedStats() tea.Cmd {
+	ctx := m.ctx
+	hg := m.hostGrouper()
+	session := m.statsSession
+	return func() tea.Msg {
+		if hg == nil {
+			return statsMsg{groupedPayload: true, session: session}
+		}
+		stats, err := hg.GroupedStats(ctx)
+		return statsMsg{groupedPayload: true, hostStats: stats, err: err, session: session}
+	}
+}
+
+// statusRefreshCmd and statsRefreshCmd are the mode-aware fetch pair every
+// container-screen entry and the periodic tick dispatch. Grouped mode has no
+// single composer to ask, so it goes host-wide; drilled mode keeps the exact
+// per-project calls it always made.
+func (m Model) statusRefreshCmd() tea.Cmd {
+	if m.grouped {
+		return m.loadGroups()
+	}
+	return m.refreshStatus()
+}
+
+func (m Model) statsRefreshCmd() tea.Cmd {
+	if m.grouped {
+		return m.refreshGroupedStats()
+	}
+	return m.refreshStats()
+}
+
+// loadContainerScreenCmd is the INITIAL load for whichever mode the screen is
+// entering: loadGroups host-wide, loadServices for one project. The two differ
+// from the refresh pair only in the drilled half, where the first fetch must
+// also discover the service list.
+func (m Model) loadContainerScreenCmd() tea.Cmd {
+	if m.grouped {
+		return m.loadGroups()
+	}
+	return m.loadServices()
+}
+
 // refreshUpdates fires CheckUpdates for the active composer with an empty
 // services slice (= "all services"). The returned updatesMsg carries the
 // current updatesSession so a stale response from a previous project/server
@@ -4338,6 +4555,13 @@ func (m *Model) maybeRefreshUpdatesCmd() tea.Cmd {
 	if m.updateInFlight {
 		return nil
 	}
+	if m.grouped {
+		// Grouped mode owns neither the single cache key this helper looks up
+		// nor the single composer a refill would fetch through — updatesCacheKey
+		// would resolve to whichever project was drilled last. Nothing is
+		// scheduled from here until U scopes a scan to one group.
+		return nil
+	}
 	entry, fresh := m.updatesCacheLookup()
 	if fresh {
 		if entry.err {
@@ -4393,8 +4617,11 @@ func (m *Model) maybeRefreshUpdatesCmd() tea.Cmd {
 // is opt-in — so the read-only screen matches it: the glyph column stays blank
 // until the user asks for it, and the `?` overlay already advertises
 // `U check updates`.
+// Grouped mode is refused for the same reason and one more: it has no single
+// composer and no single cache key, so an automatic scan there would fan out
+// across every project on the host at once. U is the only trigger there too.
 func (m Model) autoUpdatesAllowed() bool {
-	return !m.readOnly()
+	return !m.readOnly() && !m.grouped
 }
 
 // refreshTick returns a Cmd that fires a refreshTickMsg after
@@ -4760,6 +4987,134 @@ func (m *Model) setSingleGroup(services []string) {
 	m.svcEntries = rebuildSvcEntries(m.svcGroups)
 }
 
+// enterGroupedContainers lands on the grouped host view and returns its load
+// batch. Every landing site goes through it, so the ONE-TIME reset — cursor,
+// selection, search, per-project identity — lives in exactly one place. That
+// is what lets the servicesMsg grouped branch PRESERVE the same state on the
+// periodic reload, which is the same message arriving every 5 seconds.
+func (m *Model) enterGroupedContainers() tea.Cmd {
+	m.screen = screenSelectContainers
+	m.grouped = true
+	// No single composer serves a whole host, so grouped mode holds none. The
+	// capability type-asserts (Inspector, ExecProvider, ConfigProvider,
+	// RollbackPreparer) all read nil as "not available", which is exactly the
+	// inert behaviour the grouped screen wants until an action key binds one
+	// from the cursor's group.
+	m.composer = nil
+	m.projName = ""
+	m.projDir = ""
+	m.showPicker = false
+	m.clearSvcGroups()
+	m.svcStatus = nil
+	m.stats = nil
+	m.statsErr = nil
+	m.svcErr = nil
+	m.selected = make(map[string]bool)
+	m.svcCursor = 0
+	m.svcOffset = 0
+	m.confirming = false
+	m.pendingExec = false
+	m.warning = ""
+	m.clearSearch()
+	m.clearWaitState()
+	m.rollbackSnapshot = nil
+	m.rollbackTargets = nil
+	m.rollbackCleanup = nil
+	m.statsSession++
+	m.statusSession++
+	m.updatesSession++
+	m.rollbackFetchSession++
+	m.statsRequested = true
+	m.refreshInFlight = true
+	// Reset before the batch below, for the same reason every other
+	// context-change site does: the session bump invalidated any pending
+	// updatesMsg, and a leaked in-flight flag would refuse the next fetch.
+	m.updateInFlight = false
+	m.updatesErr = ""
+	return tea.Batch(m.loadGroups(), m.refreshGroupedStats())
+}
+
+// backToServerScreen is the shared esc body for the screens that sit directly
+// under the server picker. It restores the local callbacks, drops the remote
+// connection and clears every piece of downstream state, per the
+// backward-navigation cleanup discipline — a stale closure or a stale project
+// identity here is the failure mode that rule exists for.
+//
+// It clears the container screen's row state as well as the project picker's.
+// Both callers benefit: the grouped screen must drop its groups, and doing it
+// unconditionally means neither caller can forget half the list.
+func (m *Model) backToServerScreen() tea.Cmd {
+	disconnectFn := m.disconnectFunc
+	m.screen = screenSelectServer
+	m.grouped = false
+	m.serverName = ""
+	m.serverHost = ""
+	m.serverColor = ""
+	m.disconnectFunc = nil
+	m.quitting = false
+	m.projectLoader = m.localProjectLoader
+	m.composerFactory = m.localFactory
+	m.composer = nil
+	m.statsSession++
+	m.statusSession++
+	m.updatesSession++
+	m.projectsSession++
+	m.rollbackFetchSession++
+	m.refreshInFlight = false
+	m.updateInFlight = false
+	m.updatesErr = ""
+	m.projName = ""
+	m.projDir = ""
+	m.projects = nil
+	m.projCursor = 0
+	m.projErr = nil
+	m.showPicker = false
+	m.clearSvcGroups()
+	m.svcStatus = nil
+	m.stats = nil
+	m.statsErr = nil
+	m.svcErr = nil
+	m.selected = make(map[string]bool)
+	m.svcCursor = 0
+	m.svcOffset = 0
+	m.rollbackSnapshot = nil
+	m.rollbackTargets = nil
+	m.rollbackCleanup = nil
+	m.clearSearch()
+	m.clearWaitState()
+	if disconnectFn != nil {
+		return func() tea.Msg {
+			_ = disconnectFn()
+			return disconnectDoneMsg{}
+		}
+	}
+	return nil
+}
+
+// setGroups installs the grouped host view's row state. It is the grouped twin
+// of setSingleGroup and the only writer of svcGroups on that path.
+//
+// m.services is kept as the flat list of every service in every group because
+// the screen still reads it for the "have we loaded anything yet" test, the
+// empty-list guards on the action keys and the search-counter width budget. A
+// nil groups slice means "nothing loaded" (the screen renders its loading
+// state); an EMPTY but non-nil one is a real host with no projects and no
+// containers, so it must produce a non-nil services slice or the screen would
+// claim to still be loading for ever.
+func (m *Model) setGroups(groups []svcGroup) {
+	if groups == nil {
+		m.clearSvcGroups()
+		return
+	}
+	m.svcGroups = groups
+	m.svcEntries = rebuildSvcEntries(groups)
+	services := []string{}
+	for _, g := range groups {
+		services = append(services, g.services...)
+	}
+	m.services = services
+}
+
 // clearSvcGroups wipes the container screen's row state. Every departure site
 // that drops the service list calls it, so groups and entries can never outlive
 // the services they were derived from.
@@ -4767,6 +5122,37 @@ func (m *Model) clearSvcGroups() {
 	m.services = nil
 	m.svcGroups = nil
 	m.svcEntries = nil
+}
+
+// clampSvcCursor pulls the cursor back inside svcEntries. The grouped reload is
+// also the periodic refresh, so the row count can shrink under a cursor that
+// was valid a moment ago — fixSvcOffset only moves the WINDOW, never the
+// cursor, so it cannot do this job.
+func (m *Model) clampSvcCursor() {
+	if m.svcCursor >= len(m.svcEntries) {
+		m.svcCursor = len(m.svcEntries) - 1
+	}
+	if m.svcCursor < 0 {
+		m.svcCursor = 0
+	}
+}
+
+// pruneSelection drops selected keys whose service no longer exists. The
+// grouped reload runs every 5 seconds, so a service removed on the host would
+// otherwise stay silently selected and enter the next operation's batch.
+func (m *Model) pruneSelection() {
+	if len(m.selected) == 0 {
+		return
+	}
+	live := make(map[string]bool, len(m.selected))
+	for _, r := range m.svcRefs() {
+		live[r.key] = true
+	}
+	for key := range m.selected {
+		if !live[key] {
+			delete(m.selected, key)
+		}
+	}
 }
 
 func sortServices(services []string) []string {
@@ -5052,6 +5438,13 @@ func (m Model) canGoBack() bool {
 	case screenSelectProject:
 		return len(m.servers) > 0 || m.config != nil
 	case screenSelectContainers:
+		if m.grouped {
+			// The grouped host view replaced the project picker as the screen
+			// under the server picker, so it inherits that screen's rule: esc
+			// goes back to the server list when there is one, and the screen is
+			// a ROOT (q quits, esc does nothing) on a standalone local run.
+			return len(m.servers) > 0 || m.config != nil
+		}
 		return m.showPicker
 	}
 	return true

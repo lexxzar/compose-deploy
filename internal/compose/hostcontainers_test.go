@@ -1916,3 +1916,126 @@ func groupNames(groups map[string]map[string]runner.ServiceStatus) []string {
 	slices.Sort(names)
 	return names
 }
+
+// hostStatsGrouped pairs with hostPsGrouped by container ID. shop-db-1 is
+// deliberately absent: it is exited, so `docker stats` never reports it.
+const hostStatsGrouped = `{"ID":"aaa111222333","Name":"shop-api-1","CPUPerc":"10.00%","MemUsage":"100MiB / 512MiB"}
+{"ID":"bbb444555666","Name":"shop-api-2","CPUPerc":"5.50%","MemUsage":"50MiB / 512MiB"}
+{"ID":"ddd000111222","Name":"blog-web-1","CPUPerc":"1.25%","MemUsage":"32MiB / 256MiB"}
+{"ID":"eee333444555","Name":"watchtower","CPUPerc":"0.50%","MemUsage":"16MiB / 256MiB"}`
+
+func TestHostContainers_GroupedStats(t *testing.T) {
+	f := &fakeDockerRunner{runFunc: hostRunFunc(hostPsGrouped, hostStatsGrouped, nil)}
+	h := &HostContainers{docker: f}
+
+	got, err := h.GroupedStats(context.Background())
+	if err != nil {
+		t.Fatalf("GroupedStats() error = %v", err)
+	}
+	if len(got) != 3 {
+		t.Fatalf("groups = %d, want shop, blog and %s", len(got), UnmanagedProjectName)
+	}
+	// Replicas sum, exactly as the per-project ContainerStats aggregates them.
+	api := got["shop"]["api"]
+	if api.CPUPercent != 15.5 {
+		t.Errorf("shop/api CPUPercent = %v, want 15.5 (both replicas summed)", api.CPUPercent)
+	}
+	if api.MemoryUsed != 150*1024*1024 {
+		t.Errorf("shop/api MemoryUsed = %d, want %d", api.MemoryUsed, 150*1024*1024)
+	}
+	// The exited db is in ps but not in stats: skipped, never zero-filled.
+	if _, ok := got["shop"]["db"]; ok {
+		t.Error("a container absent from docker stats must be skipped, not zero-filled")
+	}
+	if got["blog"]["web"].CPUPercent != 1.25 {
+		t.Errorf("blog/web = %+v", got["blog"]["web"])
+	}
+	if got[UnmanagedProjectName]["watchtower"].MemoryUsed != 16*1024*1024 {
+		t.Errorf("unmanaged watchtower = %+v", got[UnmanagedProjectName]["watchtower"])
+	}
+	// Two host-wide calls total, regardless of project count.
+	if len(f.runCalls) != 2 {
+		t.Fatalf("run calls = %d, want 2 (ps + stats)", len(f.runCalls))
+	}
+	if strings.Join(f.runCalls[0], " ") != strings.Join(hostPsArgs, " ") {
+		t.Errorf("first call = %v, want %v", f.runCalls[0], hostPsArgs)
+	}
+	if strings.Join(f.runCalls[1], " ") != strings.Join(hostStatsArgs, " ") {
+		t.Errorf("second call = %v, want %v", f.runCalls[1], hostStatsArgs)
+	}
+}
+
+// TestHostContainers_GroupedStats_EmptyHostSkipsStatsCall mirrors the guard
+// ContainerStats carries: `docker stats --no-stream` is a ~1.5s host-wide call
+// that the 5s grouped refresh would otherwise pay forever on an empty host.
+func TestHostContainers_GroupedStats_EmptyHostSkipsStatsCall(t *testing.T) {
+	f := &fakeDockerRunner{runOut: []byte("")}
+	h := &HostContainers{docker: f}
+
+	got, err := h.GroupedStats(context.Background())
+	if err != nil {
+		t.Fatalf("GroupedStats() error = %v", err)
+	}
+	if got != nil {
+		t.Errorf("GroupedStats() = %v, want nil", got)
+	}
+	if len(f.runCalls) != 1 {
+		t.Errorf("docker stats ran with zero containers: %v", f.runCalls)
+	}
+}
+
+func TestHostContainers_GroupedStats_Errors(t *testing.T) {
+	t.Run("ps failure", func(t *testing.T) {
+		h := &HostContainers{docker: &fakeDockerRunner{runErr: errors.New("boom")}}
+		if _, err := h.GroupedStats(context.Background()); err == nil {
+			t.Fatal("GroupedStats() error = nil, want the ps failure")
+		}
+	})
+	t.Run("stats failure", func(t *testing.T) {
+		f := &fakeDockerRunner{runFunc: hostRunFunc(hostPsGrouped, "", errors.New("boom"))}
+		h := &HostContainers{docker: f}
+		if _, err := h.GroupedStats(context.Background()); err == nil {
+			t.Fatal("GroupedStats() error = nil, want the stats failure")
+		}
+	})
+	t.Run("unparseable ps", func(t *testing.T) {
+		h := &HostContainers{docker: &fakeDockerRunner{runOut: []byte("{not json")}}
+		if _, err := h.GroupedStats(context.Background()); err == nil {
+			t.Fatal("GroupedStats() error = nil, want a parse failure")
+		}
+	})
+}
+
+// TestHostContainers_GroupedStats_RemoteSplice pins that the stats half needs
+// no new SSH plumbing either — same run seam, same SSHExtraArgs-before-host
+// splice.
+func TestHostContainers_GroupedStats_RemoteSplice(t *testing.T) {
+	extras := []string{"-p", "2222"}
+	host := "user@example.com"
+	var captured [][]string
+	r := &RemoteCompose{Host: host, SocketPath: "/tmp/cdeploy-ctrl-abc-99", SSHExtraArgs: extras}
+	r.SetTestHooks(nil, func(cmd *exec.Cmd) ([]byte, error) {
+		captured = append(captured, append([]string(nil), cmd.Args...))
+		if strings.Contains(cmd.Args[len(cmd.Args)-1], "'stats'") {
+			return []byte(hostStatsGrouped), nil
+		}
+		return []byte(hostPsGrouped), nil
+	})
+
+	got, err := NewRemoteHostContainers(r).GroupedStats(context.Background())
+	if err != nil {
+		t.Fatalf("GroupedStats() error = %v", err)
+	}
+	if len(got) != 3 {
+		t.Errorf("groups = %d, want 3", len(got))
+	}
+	if len(captured) != 2 {
+		t.Fatalf("ssh invocations = %d, want 2", len(captured))
+	}
+	for _, args := range captured {
+		assertExtraBeforeHost(t, "HostContainers GroupedStats", args, host, extras)
+	}
+	if remoteCmd := captured[1][len(captured[1])-1]; remoteCmd != `docker 'stats' '--no-stream' '--format' '{{json .}}'` {
+		t.Errorf("remote stats command = %q", remoteCmd)
+	}
+}

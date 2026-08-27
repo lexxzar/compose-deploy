@@ -141,17 +141,25 @@ Confirmed design decisions (brainstormed and validated; do not re-litigate):
 
 **Files:**
 - Modify: `internal/tui/app.go`
-- Modify: `cmd/root.go`
+- Modify: `cmd/root_test.go` (➕ `cmd/root.go` needed NO change — `localComposerFor`/`remoteComposerFor` already return `*compose.HostContainers` for `Unmanaged: true`, which now satisfies `HostGrouper`; the test pins that wiring in both factories)
+- Modify: `internal/compose/hostcontainers.go` + `_test.go` (➕ `GroupedStats`, the stats half of the seam — Task 5 added only `GroupedStatus`, and `HostContainers.ContainerStats` filters to unmanaged containers, so grouped stats had nowhere to come from)
+- Modify: `internal/tui/entries.go` + `_test.go` (➕ the pure `buildSvcGroups`/`flattenQualified` merge helpers live beside the other row-model code)
 
-- [ ] declare `HostGrouper` in `tui` and type-assert it on `composerFactory(compose.Project{Unmanaged: true})`; add `loadGroups()` Cmd: `ProjectLoader` + `GroupedStatus` merged into a widened grouped `servicesMsg` (same `session` discipline)
-- [ ] landing flow: server select and `entryLocal` (no cwd compose file) land on the grouped container screen; local fast-track to drilled single-group mode unchanged; update `NewModel`'s start-screen decision table and `Init()`'s `showPicker` dispatch to `loadGroups()`
-- [ ] `connectResultMsg` SUCCESS path lands on grouped data: bump `statusSession`/`statsSession`/`updatesSession`, reset `updateInFlight`/`refreshInFlight`; error path unchanged
-- [ ] decide `canGoBack()`, the `showPicker` reads, and the `q`-quits-vs-rewrite rule for the grouped screen NOW (Task 13 stays pure deletion); grouped screen is non-root when servers exist
-- [ ] enumerate and convert ALL 7 refresh call sites plus the `refreshTickMsg` gate: grouped mode dispatches `loadGroups()`+`refreshStats()`; drilled mode keeps `refreshStatus()`; the tick gate's `m.composer == nil` check gains the grouped branch
-- [ ] stats: one `AllContainerStats` call joined by container ID per group via qualified keys; `refreshInFlight` guard unchanged; `ListProjects`/host-ps failure → `svcErr`, stats failure → `statsErr`
-- [ ] clear `svcGroups`/`svcEntries` at every departure site (esc chain, `entryLocal`, `connectResultMsg` error path)
-- [ ] write tests: grouped `servicesMsg` hydration, session rejection of stale grouped payloads, landing decision table, tick dispatch per mode, departure cleanup, error paths
-- [ ] run tests - must pass before task 7
+⚠️ Deviations taken to keep the landing flow shippable on its own:
+- The `d`/`r`/`s`/`R`/`c`/`l` refusal gate (a Task 7 checkbox) landed here: grouped mode holds `m.composer == nil`, and `d`/`r`/`s` arm a confirm whose `enter` calls `enterProgress`, while `l` calls `enterLogs` — both would dereference nil.
+- `autoUpdatesAllowed()` gained the `!m.grouped` term and `maybeRefreshUpdatesCmd` an early return (Task 12's first checkbox), for the same reason: `refreshUpdates`/`refillUpdateDetailsCmd` read `m.composer`.
+- `esc` grouped → server screen (a Task 8 checkbox) landed here because `canGoBack()` had to be decided now, and a footer that advertises `back` on a key that does nothing is the failure the shared predicate exists to prevent. Both callers go through the new `backToServerScreen()` helper.
+- `screenSelectProject` stays REACHABLE, via `esc` from the `entryLocal` drilled fast track. Task 8 rewires that esc to drill-out; Task 13 then deletes the screen.
+
+- [x] declare `HostGrouper` in `tui` and type-assert it on `composerFactory(compose.Project{Unmanaged: true})`; add `loadGroups()` Cmd: `ProjectLoader` + `GroupedStatus` merged into a widened grouped `servicesMsg` (same `session` discipline)
+- [x] landing flow: server select and `entryLocal` (no cwd compose file) land on the grouped container screen; local fast-track to drilled single-group mode unchanged; update `NewModel`'s start-screen decision table and `Init()`'s `showPicker` dispatch to `loadGroups()`
+- [x] `connectResultMsg` SUCCESS path lands on grouped data: bump `statusSession`/`statsSession`/`updatesSession`, reset `updateInFlight`/`refreshInFlight`; error path unchanged
+- [x] decide `canGoBack()`, the `showPicker` reads, and the `q`-quits-vs-rewrite rule for the grouped screen NOW (Task 13 stays pure deletion); grouped screen is non-root when servers exist
+- [x] enumerate and convert ALL 7 refresh call sites plus the `refreshTickMsg` gate: grouped mode dispatches `loadGroups()`+`refreshStats()`; drilled mode keeps `refreshStatus()`; the tick gate's `m.composer == nil` check gains the grouped branch
+- [x] stats: one `AllContainerStats` call joined by container ID per group via qualified keys; `refreshInFlight` guard unchanged; `ListProjects`/host-ps failure → `svcErr`, stats failure → `statsErr`
+- [x] clear `svcGroups`/`svcEntries` at every departure site (esc chain, `entryLocal`, `connectResultMsg` error path)
+- [x] write tests: grouped `servicesMsg` hydration, session rejection of stale grouped payloads, landing decision table, tick dispatch per mode, departure cleanup, error paths
+- [x] run tests - must pass before task 7
 
 ### Task 7: Fold, header aggregates, footer, and grouped rendering (phase 2)
 
