@@ -1820,15 +1820,15 @@ func TestGroupedFold_LeftFoldsFromAServiceRow(t *testing.T) {
 	}
 }
 
-// Z is one key with the shape `a` already uses: any group open means fold all,
+// z is one key with the shape `a` already uses: any group open means fold all,
 // otherwise unfold all.
-func TestGroupedFold_ZAllTogglesEveryGroup(t *testing.T) {
+func TestGroupedFold_FoldAllTogglesEveryGroup(t *testing.T) {
 	m := groupedScreenModel(svcGroupOf("web", "api"), svcGroupOf("db", "postgres"), unmanagedGroupOf("watchtower"))
 	m.svcGroups[1].folded = true
 	m.setGroups(m.svcGroups)
 	m.svcCursor = 1 // the "api" row
 
-	m = pressGroupKey(m, "Z")
+	m = pressGroupKey(m, "z")
 	if got := foldedCount(m); got != 3 {
 		t.Fatalf("%d of 3 groups folded, want all — one open group means fold all", got)
 	}
@@ -1836,7 +1836,7 @@ func TestGroupedFold_ZAllTogglesEveryGroup(t *testing.T) {
 		t.Errorf("svcCursor = %d, want 0 (the cursor group's header)", m.svcCursor)
 	}
 
-	m = pressGroupKey(m, "Z")
+	m = pressGroupKey(m, "z")
 	if got := foldedCount(m); got != 0 {
 		t.Errorf("%d groups still folded, want 0 — all closed means unfold all", got)
 	}
@@ -1878,31 +1878,34 @@ func TestGroupedFold_ArrowsAreDirectional(t *testing.T) {
 	}
 }
 
-// Lowercase z was the toggle the arrows replaced; uppercase Z is the fold-all
-// key that stayed. z must now reach the row list as an ordinary unbound rune —
-// the `?` overlay names it nowhere, and a key that reshapes the list while
-// being advertised nowhere is the no-op rule in reverse.
-func TestGroupedFold_LowercaseZIsNotBound(t *testing.T) {
-	// Both directions: a z re-added to the arrow case label inherits whichever
-	// branch the directional expression falls into, so only asserting one of
-	// them leaves the other rebindable in silence.
+// The fold-all key moved from uppercase Z to lowercase z, so this guard points
+// the other way now: it used to pin z as unbound, and pins Z as unbound since.
+// The rename is what the guard is for — a half-finished one that leaves the old
+// case label behind gives the host view two fold-all keys, one of which the `?`
+// overlay names nowhere, which is the no-op rule in reverse.
+func TestGroupedFold_UppercaseZIsNotBound(t *testing.T) {
+	// Both fold-all directions: the key it used to be reads anyGroupUnfolded()
+	// to choose between them, and a Z left on the arrow case label inherits
+	// whichever branch the directional expression falls into — so only
+	// asserting one of them leaves the other rebindable in silence.
 	open := groupedScreenModel(svcGroupOf("web", "api", "nginx"), svcGroupOf("db", "postgres"))
 	open.svcCursor = 2 // the "nginx" row, inside the open web group
-	open = pressGroupKey(open, "z")
+	open = pressGroupKey(open, "Z")
 	if foldedCount(open) != 0 || len(open.svcEntries) != 5 {
-		t.Errorf("z folds: %d groups folded, %d rows", foldedCount(open), len(open.svcEntries))
+		t.Errorf("Z folds: %d groups folded, %d rows", foldedCount(open), len(open.svcEntries))
 	}
 	if open.svcCursor != 2 {
-		t.Errorf("z moved the cursor to row %d", open.svcCursor)
+		t.Errorf("Z moved the cursor to row %d", open.svcCursor)
 	}
 
 	folded := groupedScreenModel(svcGroupOf("web", "api", "nginx"), svcGroupOf("db", "postgres"))
 	folded.svcGroups[0].folded = true
+	folded.svcGroups[1].folded = true
 	folded.setGroups(folded.svcGroups)
 	folded.svcCursor = 0 // the folded web header
-	folded = pressGroupKey(folded, "z")
-	if !folded.svcGroups[0].folded {
-		t.Error("z unfolds")
+	folded = pressGroupKey(folded, "Z")
+	if foldedCount(folded) != 2 || len(folded.svcEntries) != 2 {
+		t.Errorf("Z unfolds: %d of 2 groups folded, %d rows", foldedCount(folded), len(folded.svcEntries))
 	}
 }
 
@@ -1910,11 +1913,11 @@ func TestGroupedFold_LowercaseZIsNotBound(t *testing.T) {
 // group and no header to fold, and a read-only host must advertise no no-op.
 //
 // Each key is driven against the state it would actually change — right only
-// ever unfolds, so it needs a FOLDED group, while left and Z need an open one.
+// ever unfolds, so it needs a FOLDED group, while left and z need an open one.
 // A fixture already in the state the key moves it to cannot fail, gate or no
 // gate.
 func TestGroupedFold_KeysAreInertDrilledAndReadOnly(t *testing.T) {
-	keys := []string{"Z", "left", "right"}
+	keys := []string{"z", "left", "right"}
 
 	// foldForKey puts the group the key addresses in the state that makes the
 	// keypress a real change, and returns the fold flags it must still hold.
@@ -1957,7 +1960,7 @@ func TestGroupedFold_KeysAreInertDrilledAndReadOnly(t *testing.T) {
 // A fold renumbers every row, and searchMatches holds ROW indices — the new
 // keys owe the same re-derive the space path already does.
 func TestGroupedFold_KeysRecomputeSearchMatches(t *testing.T) {
-	for _, key := range []string{"Z", "left"} {
+	for _, key := range []string{"z", "left"} {
 		m := groupedScreenModel(svcGroupOf("web", "api", "nginx"), svcGroupOf("db", "api-db"))
 		m.searchQuery = "api"
 		m.searchMatches = computeMatches(m.svcEntries, m.searchQuery)
@@ -1969,7 +1972,7 @@ func TestGroupedFold_KeysRecomputeSearchMatches(t *testing.T) {
 		m = pressGroupKey(m, key)
 
 		want := []int{2}
-		if key == "Z" {
+		if key == "z" {
 			want = nil
 		}
 		if !slices.Equal(m.searchMatches, want) {
@@ -1982,7 +1985,7 @@ func TestGroupedFold_KeysRecomputeSearchMatches(t *testing.T) {
 // header on screen: closing the SECOND project from one of its rows must leave
 // the cursor on that project, or every fold jumps to the top of the host.
 func TestGroupedFold_AimsAtTheCursorsOwnGroupHeader(t *testing.T) {
-	for _, key := range []string{"left", "Z"} {
+	for _, key := range []string{"left", "z"} {
 		m := groupedScreenModel(svcGroupOf("web", "api", "nginx"), svcGroupOf("db", "postgres", "redis"))
 		m.svcCursor = 5 // "redis", the last row of the SECOND group
 
@@ -1992,7 +1995,7 @@ func TestGroupedFold_AimsAtTheCursorsOwnGroupHeader(t *testing.T) {
 			t.Fatalf("%q did not fold the cursor's group", key)
 		}
 		want := 3 // the db header, still row 3 with web open
-		if key == "Z" {
+		if key == "z" {
 			want = 1 // both folded: the web header, then db's
 		}
 		if m.svcCursor != want {
@@ -2018,7 +2021,7 @@ func TestGroupedFold_ReclampsTheScrollWindow(t *testing.T) {
 		return m
 	}
 
-	for _, key := range []string{"Z", "left"} {
+	for _, key := range []string{"z", "left"} {
 		m := build()
 		if m.svcOffset == 0 {
 			t.Fatalf("%q: precondition: the list must scroll at this height", key)
@@ -2040,8 +2043,8 @@ func TestGroupedFold_ReclampsTheScrollWindow(t *testing.T) {
 	}
 }
 
-// The typing intercept sits ABOVE the key switch, so Z is a literal rune while
-// the search bar is open — a query naming Zabbix has to be typable. The arrows
+// The typing intercept sits ABOVE the key switch, so z is a literal rune while
+// the search bar is open — a query naming zabbix has to be typable. The arrows
 // reach the text input instead of the fold path, so they too must leave the
 // rows alone.
 func TestGroupedFold_KeysAreLiteralWhileSearching(t *testing.T) {
@@ -2053,15 +2056,15 @@ func TestGroupedFold_KeysAreLiteralWhileSearching(t *testing.T) {
 		return m
 	}
 
-	m := pressGroupKey(searchModel(), "Z")
-	if m.searchQuery != "Z" {
+	m := pressGroupKey(searchModel(), "z")
+	if m.searchQuery != "z" {
 		t.Errorf("searchQuery = %q, want the keystroke in the bar", m.searchQuery)
 	}
 	if foldedCount(m) != 0 {
-		t.Error("Z folded a group instead of typing")
+		t.Error("z folded a group instead of typing")
 	}
 	if !m.searching {
-		t.Error("Z closed the search bar")
+		t.Error("z closed the search bar")
 	}
 
 	// Each arrow is driven against the state it would actually change: left
@@ -2095,14 +2098,14 @@ func TestGroupedFold_KeysAreLiteralWhileSearching(t *testing.T) {
 //
 // web stays open and db stays folded, and the cursor moves per key so each one
 // addresses a group it would really change: left from inside the open web
-// group, right from the folded db header, Z from anywhere (web is open, so it
+// group, right from the folded db header, z from anywhere (web is open, so it
 // folds).
 func TestGroupedFold_KeysInertOnTheErrorScreen(t *testing.T) {
 	for _, tc := range []struct {
 		key    string
 		cursor int
 	}{
-		{"Z", 1},     // "api", inside the open web group
+		{"z", 1},     // "api", inside the open web group
 		{"left", 1},  // same row: left folds web
 		{"right", 3}, // the folded db header: right opens it
 	} {
@@ -2125,12 +2128,12 @@ func TestGroupedFold_KeysInertOnTheErrorScreen(t *testing.T) {
 // a batch that enter resolves AGAIN from the cursor, and a fold re-aims the
 // cursor at a group header — so folding behind the prompt edits its target.
 //
-// Each key arms over the state it would really change: left and Z from an
+// Each key arms over the state it would really change: left and z from an
 // open shop with the cursor inside it, right from a folded shop with the
 // cursor on its header — the row that survives that fold and still arms the
 // same batch.
 func TestGroupedFold_KeysInertWhileAConfirmationIsArmed(t *testing.T) {
-	for _, key := range []string{"Z", "left", "right"} {
+	for _, key := range []string{"z", "left", "right"} {
 		m := groupedOpModel(t)
 		m.width, m.height = 100, 24
 		m.svcCursor = 3 // shop/api, a service row inside the second group

@@ -2602,7 +2602,7 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			// unfolds, so a held key settles instead of oscillating.
 			m.foldGroupAt(gi, key == "left")
 			return m, nil
-		case "Z":
+		case "z":
 			// One key with the shape `a` already uses for the selection: any
 			// group still open means fold everything, otherwise unfold.
 			if m.readOnly() || !m.grouped {

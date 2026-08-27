@@ -168,7 +168,7 @@ func findGroup() helpGroup {
 // the description name both. A key bound in a sub-state must name that state,
 // and "a group header" is exactly that state.
 //
-// The arrows and Z are grouped-only for the same reason space's second meaning
+// The arrows and z are grouped-only for the same reason space's second meaning
 // is: the drilled screen is one group and draws no header to fold. They live
 // here and in no footer — the grouped idle pair already carries six tokens.
 //
@@ -187,7 +187,7 @@ func selectGroup(grouped bool) helpGroup {
 			// Not "fold · unfold": everywhere else in this table `·` joins
 			// two MEANINGS of one key, and here the two keys have one each.
 			{"← →", "fold, unfold"},
-			{"Z", "fold or unfold every group"},
+			{"z", "fold or unfold every group"},
 			{"enter", "drill into the project · confirm the prompt"},
 		}}
 	}

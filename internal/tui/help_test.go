@@ -138,7 +138,7 @@ func TestHelpGroups_NamesEveryBoundKey(t *testing.T) {
 	bound := map[screen][]string{
 		screenSelectServer: {"q", "ctrl+c", "up", "k", "down", "j", "enter", "s"},
 		// The named variant is the DRILLED one (see the helpKeyTokens call
-		// below), so the grouped-only fold keys — Z, ← and → — are not in
+		// below), so the grouped-only fold keys — z, ← and → — are not in
 		// this set; TestHelpGroups_GroupedNamesTheSameKeys pins those.
 		screenSelectContainers: {
 			"q", "ctrl+c", "esc", "enter", "up", "k", "down", "j", " ", "a",
@@ -725,7 +725,7 @@ func TestViewHelp_NarrowTerminalKeepsActionKeys(t *testing.T) {
 // sacrifices — and i lives nowhere but the overlay.
 //
 // The thresholds are VARIANT-DEPENDENT and both are pinned. The grouped SELECT
-// group carries two rows the drilled one does not (`← →`, `Z`), and
+// group carries two rows the drilled one does not (`← →`, `z`), and
 // singleColumnOrder emits SELECT before INSPECT, so every grouped threshold
 // sits two notches higher. Re-measured single-column tables (widths 30-59,
 // identical across them; the layout goes two-column at 65 drilled / 77 grouped):
@@ -1568,7 +1568,7 @@ func TestHelpOverlay_SwallowsEveryActionKey(t *testing.T) {
 			build: func() Model {
 				return groupedScreenModel(svcGroupOf("web", "api", "nginx"), svcGroupOf("db", "postgres"))
 			},
-			keys: append(append([]string{}, shared...), "Z", "left", "right"),
+			keys: append(append([]string{}, shared...), "z", "left", "right"),
 		},
 	} {
 		for _, key := range tc.keys {
@@ -1771,7 +1771,7 @@ func TestHelpGroups_GroupedSelectNamesFold(t *testing.T) {
 // grouped-only key added to the table without a binding (or bound without a
 // row) still fails.
 func TestHelpGroups_GroupedNamesTheSameKeys(t *testing.T) {
-	groupedOnly := map[string]bool{"Z": true, "left": true, "right": true}
+	groupedOnly := map[string]bool{"z": true, "left": true, "right": true}
 	for _, canGoBack := range []bool{true, false} {
 		drilled := helpKeyTokensCtx(screenSelectContainers, helpContext{canGoBack: canGoBack})
 		grouped := helpKeyTokensCtx(screenSelectContainers, helpContext{canGoBack: canGoBack, grouped: true})
