@@ -141,6 +141,24 @@ func leaveGroup(canGoBack bool) helpGroup {
 	}}
 }
 
+// moveGroup is the container screen's cursor table, shared by both variants —
+// the row keys move the cursor and write nothing, so they are live whether or
+// not the composer accepts writes. It is the same one-home rule findGroup and
+// inspectGroup carry: the two container tables held byte-identical literals,
+// and a key added to one of them only is a key the other variant binds and
+// never names.
+//
+// The other screens' MOVE groups stay literals: their contents differ (a
+// viewport scrolls sideways, the service list does not), so folding them into
+// one helper would need a parameter per screen.
+func moveGroup() helpGroup {
+	return helpGroup{title: "MOVE", entries: []helpEntry{
+		{"↑ k", "up"},
+		{"↓ j", "down"},
+		{"pgup pgdown", "page"},
+	}}
+}
+
 // findGroup is the container screen's search table, shared by both variants —
 // `/` and `n N` work the same whether or not the composer accepts writes.
 //
@@ -244,11 +262,7 @@ func inspectGroup(readOnly, grouped bool) helpGroup {
 // drive singleColumnOrder's truncation order.
 func readOnlyContainerGroups(canGoBack, grouped bool) []helpGroup {
 	return []helpGroup{
-		{title: "MOVE", entries: []helpEntry{
-			{"↑ k", "up"},
-			{"↓ j", "down"},
-			{"pgup pgdown", "page"},
-		}},
+		moveGroup(),
 		findGroup(),
 		leaveGroup(canGoBack),
 		inspectGroup(true, grouped),
@@ -263,8 +277,19 @@ func readOnlyContainerGroups(canGoBack, grouped bool) []helpGroup {
 // Group ORDER is load-bearing, not cosmetic: splitHelpGroups cuts the slice
 // sequentially, so where a group sits decides which column it lands in. LEAVE
 // is 4th of 6 on screenSelectContainers, 3rd of 4 in readOnlyContainerGroups
-// and 3rd of 4 on screenLogs to keep it in the left column; every other screen
-// ends with it. Reordering a group for readability changes the rendered layout.
+// and 3rd of 4 on screenLogs; every other screen ends with it. Reordering a
+// group for readability changes the rendered layout.
+//
+// The left-column guarantee that position used to buy is now DRILLED-ONLY on
+// this screen, and the pgup pgdown row is what ended it. splitHelpGroups cuts
+// at half the estimated height; the grouped SELECT group already carried three
+// rows the drilled one does not (`← →`, `z` and its own enter), which is why the
+// grouped cut sat closest to the edge, and one more MOVE row pushed it a group
+// up. Grouped ran MOVE FIND SELECT LEAVE | OPERATE INSPECT (19/12) before that
+// row and now splits MOVE FIND SELECT | LEAVE OPERATE INSPECT (16/16), so it
+// renders LEAVE at the top of the RIGHT column; drilled still splits after
+// LEAVE (17/13) and both read-only variants still keep it left (13/6). The
+// column membership is pinned by TestSplitHelpGroups_Balances.
 func helpGroupsFor(s screen, hc helpContext) []helpGroup {
 	canGoBack := hc.canGoBack
 	switch s {
@@ -305,11 +330,7 @@ func helpGroupsFor(s screen, hc helpContext) []helpGroup {
 			operate.entries = append(operate.entries, helpEntry{"enter", "confirm the prompt"})
 		}
 		return []helpGroup{
-			{title: "MOVE", entries: []helpEntry{
-				{"↑ k", "up"},
-				{"↓ j", "down"},
-				{"pgup pgdown", "page"},
-			}},
+			moveGroup(),
 			findGroup(),
 			selectGroup(hc.grouped),
 			leaveGroup(canGoBack),

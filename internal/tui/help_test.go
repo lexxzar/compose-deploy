@@ -3,6 +3,7 @@ package tui
 import (
 	"errors"
 	"io"
+	"slices"
 	"strings"
 	"testing"
 
@@ -833,9 +834,6 @@ func TestViewHelp_KeyColumnClampsOnlyTheNarrowestPane(t *testing.T) {
 				hc.readOnly, hc.grouped, widest, keyw, widestKey, ansi.StringWidth(widestKey))
 		}
 	}
-	if budget := 30 - 4 - ansi.StringWidth(widestKey) - 2; budget != 13 {
-		t.Fatalf("width-30 description budget is %d cells, want 13", budget)
-	}
 
 	for _, tc := range []struct {
 		name string
@@ -868,16 +866,33 @@ func TestViewHelp_KeyColumnClampsOnlyTheNarrowestPane(t *testing.T) {
 	}
 }
 
-// helpOverlayTitles are every group title the container tables use. Two of
-// them on ONE physical line is what a two-column render looks like:
-// lipgloss.JoinHorizontal pairs left row i with right row i, and row 0 of each
-// column is its first group's title, so the pairing survives the height budget.
-var helpOverlayTitles = []string{"MOVE", "FIND", "SELECT", "OPERATE", "INSPECT", "LEAVE"}
+// helpGroupTitles lists the titles of a group slice, so a test names the
+// screen's declared groups rather than a hand-maintained copy of them.
+func helpGroupTitles(groups []helpGroup) []string {
+	titles := make([]string, 0, len(groups))
+	for _, g := range groups {
+		titles = append(titles, g.title)
+	}
+	return titles
+}
 
-func helpRendersTwoColumns(view string) bool {
+func hasHelpGroup(groups []helpGroup, title string) bool {
+	return slices.Contains(helpGroupTitles(groups), title)
+}
+
+// helpRendersTwoColumns answers whether a rendered overlay is two-up. Two group
+// titles on ONE physical line is what that looks like: lipgloss.JoinHorizontal
+// pairs left row i with right row i, and row 0 of each column is its first
+// group's title, so the pairing survives the height budget.
+//
+// The titles come from the groups the SCREEN declares, never a list kept here:
+// a renamed or added group would leave a hand-maintained copy silently blind,
+// and this helper decides the two-column thresholds the overlay is pinned on.
+func helpRendersTwoColumns(view string, groups []helpGroup) bool {
+	titles := helpGroupTitles(groups)
 	for _, line := range strings.Split(view, "\n") {
 		n := 0
-		for _, title := range helpOverlayTitles {
+		for _, title := range titles {
 			if strings.Contains(line, title) {
 				n++
 			}
@@ -965,7 +980,8 @@ func TestViewHelp_TwoColumnThresholdPerVariant(t *testing.T) {
 			// this fails whichever way it moves.
 			got := 0
 			for w := 20; w <= 200; w++ {
-				if helpRendersTwoColumns(ansi.Strip(tc.model(w, 24).View())) {
+				probe := tc.model(w, 24)
+				if helpRendersTwoColumns(ansi.Strip(probe.View()), probe.helpGroups()) {
 					got = w
 					break
 				}
@@ -976,7 +992,8 @@ func TestViewHelp_TwoColumnThresholdPerVariant(t *testing.T) {
 			}
 			// Wider must stay two-column: the fallback is a floor, not a band.
 			for _, w := range []int{tc.threshold + 10, 200} {
-				if !helpRendersTwoColumns(ansi.Strip(tc.model(w, 24).View())) {
+				wide := tc.model(w, 24)
+				if !helpRendersTwoColumns(ansi.Strip(wide.View()), wide.helpGroups()) {
 					t.Errorf("width %d stacked to one column", w)
 				}
 			}
@@ -1023,6 +1040,14 @@ func TestLayoutHelpColumns_Empty(t *testing.T) {
 // BOTH container variants run: the grouped table carries three SELECT rows the
 // drilled one does not, and covering the drilled context alone hid a 19/12
 // split there — a 7-row imbalance this test's own limit would have failed.
+//
+// leaveLeft pins WHICH column LEAVE lands in, which the totals and the balance
+// limit above cannot see. helpGroupsFor's group-order comment used to promise
+// the left one unconditionally; the third grouped SELECT row moved the cut, so
+// the promise now holds for the drilled table only and the split reads
+// MOVE FIND SELECT | LEAVE OPERATE INSPECT there. That is recorded rather than
+// corrected, so a future row that moves the cut again fails here instead of
+// silently re-laying-out the overlay.
 func TestSplitHelpGroups_Balances(t *testing.T) {
 	for _, tc := range []struct {
 		name string
@@ -1030,14 +1055,24 @@ func TestSplitHelpGroups_Balances(t *testing.T) {
 		// Rendered rows once split: the two columns each drop their own
 		// trailing separator, so the total sits one under helpRows(_, true).
 		total int
+		// Whether the LEAVE group renders in the LEFT column.
+		leaveLeft bool
 	}{
-		{name: "drilled", hc: helpContext{canGoBack: true}, total: 30},
+		{name: "drilled", hc: helpContext{canGoBack: true}, total: 30, leaveLeft: true},
 		{name: "grouped", hc: helpContext{canGoBack: true, grouped: true}, total: 32},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			left, right := splitHelpGroups(helpGroupsFor(screenSelectContainers, tc.hc))
 			if len(left) == 0 || len(right) == 0 {
 				t.Fatalf("container groups should split into two columns, got %d/%d", len(left), len(right))
+			}
+			if got := hasHelpGroup(left, "LEAVE"); got != tc.leaveLeft {
+				t.Errorf("LEAVE in the left column = %v, want %v — the cut moved, so re-measure the split in helpGroupsFor's group-order comment: left %v, right %v",
+					got, tc.leaveLeft, helpGroupTitles(left), helpGroupTitles(right))
+			}
+			if hasHelpGroup(right, "LEAVE") == tc.leaveLeft {
+				t.Errorf("LEAVE renders in both columns or in neither: left %v, right %v",
+					helpGroupTitles(left), helpGroupTitles(right))
 			}
 			lh, rh := len(helpColumnRows(left)), len(helpColumnRows(right))
 			if lh+rh != tc.total {

@@ -66,6 +66,17 @@ func qk(m Model, service string) string {
 	return svcKey(m.ownerProjName(), service)
 }
 
+// assertCursorVisible pins the invariant every cursor move owes fixSvcOffset:
+// the window holds the cursor. It sits in this shared block because
+// grouped_test.go consumes it too.
+func assertCursorVisible(t *testing.T, m Model) {
+	t.Helper()
+	visible := m.svcVisibleCount()
+	if m.svcCursor < m.svcOffset || m.svcCursor >= m.svcOffset+visible {
+		t.Errorf("cursor %d outside the visible window [%d, %d)", m.svcCursor, m.svcOffset, m.svcOffset+visible)
+	}
+}
+
 func mockFactory(mc *mockComposer) ComposerFactory {
 	return func(compose.Project) runner.Composer { return mc }
 }
@@ -6298,20 +6309,9 @@ func TestScrollUp_PastTopOfWindow(t *testing.T) {
 	}
 }
 
-// assertCursorVisible pins the invariant every cursor move owes fixSvcOffset:
-// the window holds the cursor.
-func assertCursorVisible(t *testing.T, m Model) {
-	t.Helper()
-	visible := m.svcVisibleCount()
-	if m.svcCursor < m.svcOffset || m.svcCursor >= m.svcOffset+visible {
-		t.Errorf("cursor %d outside the visible window [%d, %d)", m.svcCursor, m.svcOffset, m.svcOffset+visible)
-	}
-}
-
 // pageKeyModel is a drilled container screen sized so one page is 3 rows:
 // height 9 minus 3 header lines minus 3 footer lines.
-func pageKeyModel(t *testing.T, services []string) Model {
-	t.Helper()
+func pageKeyModel(services []string) Model {
 	m := singleGroupModel(services)
 	m.screen = screenSelectContainers
 	m.width, m.height = 200, 9
@@ -6322,7 +6322,7 @@ func pageKeyModel(t *testing.T, services []string) Model {
 // screen: one press moves svcVisibleCount() rows, neither key leaves
 // svcEntries, and svcOffset follows so the cursor stays on screen.
 func TestPageKeys_MoveAFullPageAndClamp(t *testing.T) {
-	m := pageKeyModel(t, []string{"a", "b", "c", "d", "e", "f", "g", "h", "i", "j"})
+	m := pageKeyModel([]string{"a", "b", "c", "d", "e", "f", "g", "h", "i", "j"})
 	if got := m.svcVisibleCount(); got != 3 {
 		t.Fatalf("svcVisibleCount() = %d, want 3", got)
 	}
@@ -6355,7 +6355,7 @@ func TestPageKeys_MoveAFullPageAndClamp(t *testing.T) {
 // answers 0 for: the step moves nothing, and clampSvcCursor holds the cursor at
 // 0 rather than letting it sit at -1 on a list with no rows.
 func TestPageKeys_EmptyListStaysInRange(t *testing.T) {
-	m := pageKeyModel(t, nil)
+	m := pageKeyModel(nil)
 	if len(m.svcEntries) != 0 {
 		t.Fatalf("fixture has %d rows, want 0", len(m.svcEntries))
 	}
@@ -6370,7 +6370,7 @@ func TestPageKeys_EmptyListStaysInRange(t *testing.T) {
 // TestPageKeys_WorkOnTheReadOnlyScreen pins that paging is not gated on
 // readOnly(): moving the cursor writes nothing to docker, exactly like up/down.
 func TestPageKeys_WorkOnTheReadOnlyScreen(t *testing.T) {
-	m := pageKeyModel(t, []string{"a", "b", "c", "d", "e", "f"})
+	m := pageKeyModel([]string{"a", "b", "c", "d", "e", "f"})
 	m.composer = &readOnlyMockComposer{}
 	if !m.readOnly() {
 		t.Fatal("fixture is not read-only")
@@ -6413,6 +6413,11 @@ func TestPageKeys_InertWhereTheOtherMovementKeysAre(t *testing.T) {
 			arm: func(m *Model) {
 				m.searching = true
 				m.searchInput = textinput.New()
+				// Focused, like the / handler leaves it:
+				// textinput.Model.Update returns immediately when it is not,
+				// so an unfocused bar freezes the Value() assertion below
+				// whether or not the key was routed to it.
+				m.searchInput.Focus()
 				m.searchInput.SetValue("e")
 				m.searchQuery = "e"
 				m.searchMatches = computeMatches(m.svcEntries, "e")
@@ -6432,7 +6437,7 @@ func TestPageKeys_InertWhereTheOtherMovementKeysAre(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			for _, key := range []string{"pgdown", "pgup"} {
-				m := pageKeyModel(t, []string{"a", "b", "c", "d", "e", "f", "g", "h", "i", "j"})
+				m := pageKeyModel([]string{"a", "b", "c", "d", "e", "f", "g", "h", "i", "j"})
 				m.svcCursor = start
 				tc.arm(&m)
 				if got := m.svcVisibleCount(); got != 3 {
@@ -6468,7 +6473,7 @@ func TestPageKeys_PageIsTheWholeListWhenItFits(t *testing.T) {
 			// height 9 budgets 3 rows, the list holds 2, so the clamp at the
 			// bottom of svcVisibleCount decides the page.
 			name:  "list shorter than the pane",
-			build: func() Model { return pageKeyModel(t, []string{"a", "b"}) },
+			build: func() Model { return pageKeyModel([]string{"a", "b"}) },
 			last:  1,
 		},
 		{
@@ -6541,7 +6546,7 @@ func TestPageKeys_PageSizeFollowsTheVisibleCount(t *testing.T) {
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			m := pageKeyModel(t, services)
+			m := pageKeyModel(services)
 			tc.arm(&m)
 			if got := m.svcVisibleCount(); got != tc.want {
 				t.Fatalf("fixture: svcVisibleCount() = %d, want %d", got, tc.want)
