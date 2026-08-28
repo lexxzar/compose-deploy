@@ -5758,9 +5758,12 @@ func (m Model) loadServices() tea.Cmd {
 }
 
 // allSelected is the toggle DIRECTION for `a`, so it reads the same fold-aware
-// walk that key writes. Measured host-wide it inverts wrongly: a service still
-// selected inside a folded group would report "all selected" and turn the next
-// `a` into a clear of the visible rows the user was aiming to tick.
+// walk that key writes. Measured host-wide the key goes DEAD: one unselected
+// service inside a folded group holds the answer at false while every visible
+// row is already ticked, so `a` re-ticks them instead of clearing, and nothing
+// short of unfolding that group can undo the selection. The mirror failure
+// cannot happen — a host-wide true implies a fold-aware true, since the second
+// walk is a subset of the first.
 func (m Model) allSelected() bool {
 	any, all := false, true
 	m.eachUnfoldedSelectableRef(func(r svcRef) bool {
