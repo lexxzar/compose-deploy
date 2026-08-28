@@ -407,6 +407,43 @@ func TestSelectContainers_SelectAll(t *testing.T) {
 	}
 }
 
+// `a` is fold-aware on the grouped host view, and the drilled screen must be
+// byte-identical anyway: the fold keys are gated on m.grouped, so nothing here
+// can hide a row from select-all.
+func TestSelectContainers_SelectAllDrilledIgnoresTheFoldRule(t *testing.T) {
+	m := singleGroupModel([]string{"nginx", "postgres", "redis"})
+	m.screen = screenSelectContainers
+	m.width, m.height = 100, 30
+
+	for _, key := range []string{"left", "z"} {
+		m = pressGroupKey(m, key)
+		if m.svcGroups[0].folded {
+			t.Fatalf("%q folded the drilled group", key)
+		}
+	}
+
+	m = pressGroupKey(m, "a")
+
+	if got := m.selectedCount(); got != 3 {
+		t.Errorf("selectedCount = %d, want 3: %v", got, m.selected)
+	}
+	if !m.allVisibleSelected() {
+		t.Error("allVisibleSelected = false after `a` on the drilled screen")
+	}
+	if m.warning != "" {
+		t.Errorf("warning = %q, want none on the drilled screen", m.warning)
+	}
+
+	m = pressGroupKey(m, "a")
+
+	if got := m.selectedCount(); got != 0 {
+		t.Errorf("a second `a` left %d selected: %v", got, m.selected)
+	}
+	if m.warning != "" {
+		t.Errorf("warning = %q, want none after the second `a`", m.warning)
+	}
+}
+
 func TestSelectContainers_EnterIgnoredWhenNotConfirming(t *testing.T) {
 	mc := &mockComposer{services: []string{"nginx"}}
 	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
@@ -530,13 +567,13 @@ func TestAllSelected(t *testing.T) {
 	m := Model{}
 	m.setSingleGroup([]string{"a", "b"})
 	m.selected = selectedIdx(m, 0, 1)
-	if !m.allSelected() {
-		t.Error("allSelected() = false, want true")
+	if !m.allVisibleSelected() {
+		t.Error("allVisibleSelected() = false, want true")
 	}
 
 	m.selected[m.svcKeyAt(1)] = false
-	if m.allSelected() {
-		t.Error("allSelected() = true, want false")
+	if m.allVisibleSelected() {
+		t.Error("allVisibleSelected() = true, want false")
 	}
 }
 
@@ -5076,8 +5113,8 @@ func TestSortServices_TieBreaker(t *testing.T) {
 func TestAllSelected_Empty(t *testing.T) {
 	m := singleGroupModel(nil)
 	m.selected = nil
-	if m.allSelected() {
-		t.Error("allSelected() = true for empty services, want false")
+	if m.allVisibleSelected() {
+		t.Error("allVisibleSelected() = true for empty services, want false")
 	}
 }
 
@@ -5085,8 +5122,8 @@ func TestAllSelected_AllTrue(t *testing.T) {
 	m := Model{}
 	m.setSingleGroup([]string{"web", "db"})
 	m.selected = selectedIdx(m, 0, 1)
-	if !m.allSelected() {
-		t.Error("allSelected() = false, want true")
+	if !m.allVisibleSelected() {
+		t.Error("allVisibleSelected() = false, want true")
 	}
 }
 
@@ -5094,8 +5131,8 @@ func TestAllSelected_SomeFalse(t *testing.T) {
 	m := Model{}
 	m.setSingleGroup([]string{"web", "db", "redis"})
 	m.selected = selectedIdx(m, 0, 2)
-	if m.allSelected() {
-		t.Error("allSelected() = true, want false")
+	if m.allVisibleSelected() {
+		t.Error("allVisibleSelected() = true, want false")
 	}
 }
 

@@ -618,6 +618,71 @@ func TestGroupCounts(t *testing.T) {
 	}
 }
 
+// groupSelected counts over the group's OWN service list, never over the
+// selection map: a stale key naming a service the group does not own — what a
+// renamed project leaves behind — must contribute nothing, and an empty group
+// must stay at (0, 0) rather than report a numerator over a zero total.
+func TestGroupSelected(t *testing.T) {
+	web := svcGroup{proj: compose.Project{Name: "web"}, services: []string{"api", "nginx", "cache"}}
+	tests := []struct {
+		name      string
+		g         svcGroup
+		selected  map[string]bool
+		wantN     int
+		wantTotal int
+	}{
+		{
+			name: "unmanaged answers (0, 0)",
+			g: svcGroup{
+				proj:     compose.Project{Name: compose.UnmanagedProjectName, Unmanaged: true},
+				services: []string{"watchtower", "portainer"},
+			},
+			selected: map[string]bool{
+				svcKey(compose.UnmanagedProjectName, "watchtower"): true,
+			},
+		},
+		{
+			name:      "a key the group does not own counts for nothing",
+			g:         web,
+			selected:  map[string]bool{svcKey("web", "ghost"): true, svcKey("db", "api"): true},
+			wantTotal: 3,
+		},
+		{
+			name:      "an empty group stays bare under a stale key",
+			g:         svcGroup{proj: compose.Project{Name: "empty"}},
+			selected:  map[string]bool{svcKey("empty", "no"): true},
+			wantTotal: 0,
+		},
+		{
+			name:      "partial",
+			g:         web,
+			selected:  map[string]bool{svcKey("web", "api"): true},
+			wantN:     1,
+			wantTotal: 3,
+		},
+		{
+			name: "full",
+			g:    web,
+			selected: map[string]bool{
+				svcKey("web", "api"):   true,
+				svcKey("web", "nginx"): true,
+				svcKey("web", "cache"): true,
+			},
+			wantN:     3,
+			wantTotal: 3,
+		},
+		{name: "no selection at all", g: web, wantTotal: 3},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			n, total := groupSelected(tt.g, tt.selected)
+			if n != tt.wantN || total != tt.wantTotal {
+				t.Errorf("groupSelected = (%d, %d), want (%d, %d)", n, total, tt.wantN, tt.wantTotal)
+			}
+		})
+	}
+}
+
 // eachSelectableRef drops the unmanaged bucket: those rows draw no checkbox, so
 // nothing that reads a selection may count them.
 func TestSelectableRefs_DropsUnmanaged(t *testing.T) {
@@ -648,6 +713,49 @@ func TestSelectableRefs_DropsUnmanaged(t *testing.T) {
 		if m.groupUnmanaged(gi) {
 			t.Errorf("groupUnmanaged(%d) = true, want false", gi)
 		}
+	}
+}
+
+// eachUnfoldedSelectableRef drops what a FOLD hides on top of what
+// eachSelectableRef already drops: `a` and allVisibleSelected must read only the
+// rows the user can see, and the unmanaged bucket stays out either way.
+func TestUnfoldedSelectableRefs_SkipsFoldedGroups(t *testing.T) {
+	m := Model{svcGroups: []svcGroup{
+		{proj: compose.Project{Name: "web"}, services: []string{"api", "nginx"}},
+		{proj: compose.Project{Name: "db"}, services: []string{"postgres"}, folded: true},
+		{proj: compose.Project{Name: compose.UnmanagedProjectName, Unmanaged: true}, services: []string{"watchtower"}},
+	}}
+
+	keys := func() []string {
+		var got []string
+		m.eachUnfoldedSelectableRef(func(r svcRef) bool {
+			got = append(got, r.key)
+			return true
+		})
+		return got
+	}
+
+	want := []string{svcKey("web", "api"), svcKey("web", "nginx")}
+	if got := keys(); !slices.Equal(got, want) {
+		t.Errorf("eachUnfoldedSelectableRef = %v, want %v (db is folded, watchtower unmanaged)", got, want)
+	}
+
+	// Unfolding db yields its services; folding the unmanaged bucket changes
+	// nothing, since it was never selectable to begin with.
+	m.svcGroups[1].folded = false
+	m.svcGroups[2].folded = true
+	want = append(want, svcKey("db", "postgres"))
+	if got := keys(); !slices.Equal(got, want) {
+		t.Errorf("eachUnfoldedSelectableRef = %v, want %v", got, want)
+	}
+
+	// Every group folded: the walk yields nothing, which is the empty answer
+	// allVisibleSelected reports as false and the `a` handler refuses on.
+	for i := range m.svcGroups {
+		m.svcGroups[i].folded = true
+	}
+	if got := keys(); len(got) != 0 {
+		t.Errorf("eachUnfoldedSelectableRef = %v with every group folded, want none", got)
 	}
 }
 

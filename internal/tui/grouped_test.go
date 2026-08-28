@@ -214,7 +214,8 @@ func TestFixSvcOffset_CountsHeaderRows(t *testing.T) {
 
 // TestSelectedContainers_IncludesFoldedGroup pins that folding hides ROWS and
 // nothing else: a service selected before its group folded must still reach the
-// operation, so the selection helpers read svcGroups rather than svcEntries.
+// operation, so selectedContainers and the counters read svcGroups rather than
+// svcEntries — and, unlike allVisibleSelected, ignore fold state entirely.
 func TestSelectedContainers_IncludesFoldedGroup(t *testing.T) {
 	m := groupedModel(svcGroupOf("web", "api"), svcGroupOf("db", "postgres"))
 	m.selected[svcKey("web", "api")] = true
@@ -230,8 +231,11 @@ func TestSelectedContainers_IncludesFoldedGroup(t *testing.T) {
 	if got := m.selectedContainers(); !slices.Equal(got, want) {
 		t.Errorf("selectedContainers = %v, want %v (bare names, folded group included)", got, want)
 	}
-	if !m.allSelected() {
-		t.Error("allSelected = false, want true (every service in every group is selected)")
+	// allVisibleSelected is fold-aware: web is the only UNFOLDED group and its one
+	// service is ticked, so the toggle direction is "clear". It says nothing
+	// about the folded group — the two `a` pins below own that.
+	if !m.allVisibleSelected() {
+		t.Error("allVisibleSelected = false, want true (every VISIBLE selectable row is ticked)")
 	}
 }
 
@@ -2305,8 +2309,9 @@ func TestGroupedSpace_OnUnmanagedHeaderFolds(t *testing.T) {
 	}
 }
 
-// `a` and allSelected go through eachSelectableRef: an unmanaged row draws no
-// checkbox, so select-all must not claim to have ticked it.
+// `a` and allVisibleSelected go through eachUnfoldedSelectableRef, which drops
+// the unmanaged bucket with eachSelectableRef: those rows draw no checkbox, so
+// select-all must not claim to have ticked them.
 func TestGroupedSelectAll_SkipsUnmanagedRows(t *testing.T) {
 	m := groupedScreenModel(svcGroupOf("web", "api", "nginx"), unmanagedGroupOf("watchtower"))
 
@@ -2320,8 +2325,8 @@ func TestGroupedSelectAll_SkipsUnmanagedRows(t *testing.T) {
 			t.Errorf("select-all missed %q", k)
 		}
 	}
-	if !m.allSelected() {
-		t.Error("allSelected = false after `a`; the unmanaged row must not hold it open")
+	if !m.allVisibleSelected() {
+		t.Error("allVisibleSelected = false after `a`; the unmanaged row must not hold it open")
 	}
 
 	m = pressGroupKey(m, "a")
@@ -2330,12 +2335,243 @@ func TestGroupedSelectAll_SkipsUnmanagedRows(t *testing.T) {
 	}
 }
 
-// A host with ONLY unmanaged containers has nothing selectable, so allSelected
+// The grouped host view LANDS FOLDED, so a host-wide `a` ticked every service on
+// the box while the only thing that moved on screen was one digit of the title
+// counter. With every group closed there is nothing to tick, and the key says so
+// rather than going silently inert.
+func TestGroupedSelectAll_EverySelectableFoldedWarns(t *testing.T) {
+	m := groupedScreenModel(svcGroupOf("web", "api", "nginx"), svcGroupOf("db", "postgres"))
+	m = pressGroupKey(m, "z") // the landing shape: every group folded
+	for _, g := range m.svcGroups {
+		if !g.folded {
+			t.Fatalf("fixture: %q is not folded", g.proj.Name)
+		}
+	}
+
+	m = pressGroupKey(m, "a")
+
+	if m.selectedCount() != 0 {
+		t.Errorf("`a` selected %d services behind a fold: %v", m.selectedCount(), m.selected)
+	}
+	if m.warning != warnAllSelectableFolded {
+		t.Errorf("warning = %q, want %q", m.warning, warnAllSelectableFolded)
+	}
+	if m.screen != screenSelectContainers {
+		t.Errorf("`a` navigated away; screen = %v", m.screen)
+	}
+}
+
+// The warning consumes a footer row, which shrinks svcVisibleCount, so the
+// refusal owes fixSvcOffset the same re-clamp every other gated key on this
+// screen pays.
+func TestGroupedSelectAll_FoldedRefusalFixesTheOffset(t *testing.T) {
+	groups := make([]svcGroup, 8)
+	for i := range groups {
+		groups[i] = testGroup(fmt.Sprintf("p%d", i), true, "web")
+	}
+	m := groupedScreenModel(groups...)
+	m.height = 10
+	m.svcCursor = len(m.svcEntries) - 1
+	m.fixSvcOffset()
+	before := m.svcVisibleCount()
+	if before >= len(m.svcEntries) {
+		t.Fatalf("fixture: %d rows fit in the window, want a scrolled list", before)
+	}
+
+	m = pressGroupKey(m, "a")
+
+	if m.warning != warnAllSelectableFolded {
+		t.Fatalf("warning = %q, want %q", m.warning, warnAllSelectableFolded)
+	}
+	if got := m.svcVisibleCount(); got != before-1 {
+		t.Fatalf("fixture: visible rows %d -> %d, want the warning to cost exactly one", before, got)
+	}
+	assertCursorVisible(t, m)
+}
+
+// `a` ticks what the user can SEE, so a folded group's services are left alone.
+// The title's denominator stays host-wide: that "(2/3 selected)" is the signal
+// that a selection exists beyond the fold.
+func TestGroupedSelectAll_ScopedToTheUnfoldedGroups(t *testing.T) {
+	m := groupedScreenModel(svcGroupOf("web", "api", "nginx"), testGroup("db", true, "postgres"))
+
+	m = pressGroupKey(m, "a")
+
+	for _, name := range []string{"api", "nginx"} {
+		if !m.selected[svcKey("web", name)] {
+			t.Errorf("`a` missed %q, a row the user can see", name)
+		}
+	}
+	if m.selected[svcKey("db", "postgres")] {
+		t.Error("`a` selected a service inside a folded group")
+	}
+	if m.selectedCount() != 2 {
+		t.Errorf("selectedCount = %d, want 2: %v", m.selectedCount(), m.selected)
+	}
+	if m.warning != "" {
+		t.Errorf("warning = %q, want none — `a` had rows to tick", m.warning)
+	}
+	if got := ansi.Strip(m.viewSelectContainers()); !strings.Contains(got, "(2/3 selected)") {
+		t.Errorf("the title must keep the host-wide denominator (2/3 selected); got:\n%s", got)
+	}
+}
+
+// The row-3 contract: selectedContainers() stays host-wide. A service selected
+// BEFORE its group folded still reaches the runner — folding hides rows, never
+// state — or `d` would deploy fewer services than its own prompt named.
+func TestGroupedSelectAll_FoldedSelectionStillReachesTheRunner(t *testing.T) {
+	m := groupedScreenModel(svcGroupOf("web", "api"), svcGroupOf("db", "postgres"))
+	m.svcCursor = 3 // db's postgres row
+	if name, ok := m.cursorService(); !ok || name != "postgres" {
+		t.Fatalf("fixture: row 3 is %q (service %v), want postgres", name, ok)
+	}
+
+	m = pressGroupKey(m, " ")    // select it while its group is open
+	m = pressGroupKey(m, "left") // then fold the group from that same row
+
+	if !m.svcGroups[1].folded {
+		t.Fatal("fixture: db did not fold")
+	}
+	if !m.selected[svcKey("db", "postgres")] {
+		t.Error("folding dropped the selection; a fold hides ROWS, never state")
+	}
+	if got := m.selectedContainers(); !slices.Equal(got, []string{"postgres"}) {
+		t.Errorf("selectedContainers = %v, want [postgres] — scoping it would shrink the batch", got)
+	}
+	if got := m.selectedCount(); got != 1 {
+		t.Errorf("selectedCount = %d, want 1 (the numerator reports what will run)", got)
+	}
+	if got := m.selectableCount(); got != 2 {
+		t.Errorf("selectableCount = %d, want 2 (the denominator stays host-wide)", got)
+	}
+}
+
+// allVisibleSelected is the toggle direction for `a`, so it reads the same fold-aware
+// walk: `a` ticks the visible rows, a second `a` clears them, and a selection
+// hidden behind a fold survives both presses.
+func TestGroupedSelectAll_ToggleRoundTripKeepsAFoldedSelection(t *testing.T) {
+	m := groupedScreenModel(svcGroupOf("web", "api", "nginx"), testGroup("db", true, "postgres"))
+	m.selected[svcKey("db", "postgres")] = true // set before the group closed
+
+	m = pressGroupKey(m, "a")
+
+	if !m.allVisibleSelected() {
+		t.Error("allVisibleSelected = false after `a`; every VISIBLE selectable row is ticked")
+	}
+	if got := m.selectedCount(); got != 3 {
+		t.Errorf("selectedCount = %d, want 3 (two visible plus the folded one): %v", got, m.selected)
+	}
+
+	m = pressGroupKey(m, "a")
+
+	for _, name := range []string{"api", "nginx"} {
+		if m.selected[svcKey("web", name)] {
+			t.Errorf("the second `a` left %q selected", name)
+		}
+	}
+	if !m.selected[svcKey("db", "postgres")] {
+		t.Error("the second `a` cleared a selection hidden behind a fold")
+	}
+	if got := m.selectedCount(); got != 1 {
+		t.Errorf("selectedCount = %d, want 1: %v", got, m.selected)
+	}
+	if m.warning != "" {
+		t.Errorf("warning = %q, want none across the round trip", m.warning)
+	}
+}
+
+// The other half of the toggle direction, and the one the round trip above
+// cannot reach: its folded group is FULLY selected, so a host-wide allVisibleSelected
+// and a fold-aware one agree. They disagree the moment the folded group holds
+// an UNSELECTED service while every visible row is ticked — host-wide reads
+// "not all selected", so `a` re-ticks rows that are already ticked and the key
+// goes dead, with no way to clear the selection short of unfolding the group
+// that is suppressing it.
+func TestGroupedSelectAll_SecondPressClearsDespiteAnUnselectedFoldedGroup(t *testing.T) {
+	m := groupedScreenModel(svcGroupOf("web", "api", "nginx"), svcGroupOf("db", "postgres"))
+
+	m = pressGroupKey(m, "a") // every row is open, so this ticks all three
+	if got := m.selectedCount(); got != 3 {
+		t.Fatalf("fixture: selectedCount = %d after the first `a`, want 3", got)
+	}
+
+	m.svcCursor = 4
+	if name, ok := m.cursorService(); !ok || name != "postgres" {
+		t.Fatalf("fixture: row 4 is %q (service %v), want postgres", name, ok)
+	}
+	m = pressGroupKey(m, " ")    // untick it
+	m = pressGroupKey(m, "left") // then fold db from that same row
+
+	if m.selected[svcKey("db", "postgres")] {
+		t.Fatal("fixture: postgres survived the untick")
+	}
+	if !m.svcGroups[1].folded {
+		t.Fatal("fixture: db did not fold")
+	}
+
+	m = pressGroupKey(m, "a")
+
+	for _, name := range []string{"api", "nginx"} {
+		if m.selected[svcKey("web", name)] {
+			t.Errorf("`a` left %q ticked; every visible row was ticked, so it must clear them", name)
+		}
+	}
+	if got := m.selectedCount(); got != 0 {
+		t.Errorf("selectedCount = %d, want 0: %v", got, m.selected)
+	}
+	if m.warning != "" {
+		t.Errorf("warning = %q, want none — `a` had rows to clear", m.warning)
+	}
+}
+
+// partitionSelection never consulted fold state and still must not: the batches
+// and the prompt name every selected service, folded groups included.
+func TestGroupedSelectAll_ConfirmPromptNamesTheFoldedSelection(t *testing.T) {
+	m := groupedScreenModel(
+		svcGroup{proj: compose.Project{Name: "web", ConfigDir: "/srv/web"}, services: []string{"api", "nginx"}},
+		svcGroup{proj: compose.Project{Name: "db", ConfigDir: "/srv/db"}, services: []string{"postgres"}, folded: true},
+	)
+	m.selected[svcKey("db", "postgres")] = true
+
+	m = pressGroupKey(m, "a")
+
+	want := "web (api, nginx) → db (postgres)"
+	if got := formatBatchTargets(m.partitionSelection()); got != want {
+		t.Errorf("batches = %q, want %q", got, want)
+	}
+
+	m = pressGroupKey(m, "d")
+
+	if !m.confirming {
+		t.Fatalf("`d` did not arm the prompt; warning = %q", m.warning)
+	}
+	if got := ansi.Strip(m.viewSelectContainers()); !strings.Contains(got, want) {
+		t.Errorf("the prompt must name the folded service; got:\n%s", got)
+	}
+}
+
+// The refusal names a FOLD, so it fires only when a fold is what suppressed the
+// selection. A host with nothing selectable at all keeps the silent no-op: an
+// empty group has no fold to blame and nothing to unfold.
+func TestGroupedSelectAll_NothingSelectableStaysSilent(t *testing.T) {
+	m := groupedScreenModel(svcGroupOf("web")) // a project whose containers are all gone
+
+	m = pressGroupKey(m, "a")
+
+	if m.warning != "" {
+		t.Errorf("warning = %q, want none: there is no fold to blame", m.warning)
+	}
+	if m.selectedCount() != 0 {
+		t.Errorf("`a` selected %d rows on a host with nothing selectable", m.selectedCount())
+	}
+}
+
+// A host with ONLY unmanaged containers has nothing selectable, so allVisibleSelected
 // must stay false rather than report an empty set as fully selected.
 func TestAllSelected_UnmanagedOnlyHostIsFalse(t *testing.T) {
 	m := groupedScreenModel(unmanagedGroupOf("watchtower", "portainer"))
-	if m.allSelected() {
-		t.Error("allSelected = true on a host with no selectable rows")
+	if m.allVisibleSelected() {
+		t.Error("allVisibleSelected = true on a host with no selectable rows")
 	}
 }
 
@@ -2442,6 +2678,184 @@ func TestGroupHeaderLine_OutOfRange(t *testing.T) {
 	m := groupedScreenModel(svcGroupOf("web", "api"))
 	if got := m.groupHeaderLine(7); got != "" {
 		t.Errorf("groupHeaderLine(7) = %q, want the empty string", got)
+	}
+}
+
+// The selection cell is the reason the header carries aggregates at all for a
+// FOLDED group: folding hides the rows, not the selection, so without it a
+// selection made before the fold reaches the runner with nothing on screen
+// saying so. It reads `[x] n/m` over the group's SELECTABLE total.
+func TestGroupHeaderLine_SelectionCount(t *testing.T) {
+	tests := []struct {
+		name   string
+		rows   []int
+		folded bool
+		want   string
+	}{
+		{name: "partial, unfolded", rows: []int{1}, want: "[x] 1/3"},
+		{name: "partial, folded", rows: []int{1, 2}, folded: true, want: "[x] 2/3"},
+		{name: "all selected", rows: []int{1, 2, 3}, want: "[x] 3/3"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			m := groupedScreenModel(svcGroupOf("web", "api", "nginx", "cache"), svcGroupOf("db", "postgres"))
+			m.svcStatus = map[string]runner.ServiceStatus{svcKey("web", "api"): {Running: true}}
+			// The selection is built from ROW indices, so it must be taken
+			// before the fold removes those rows.
+			m.selected = selectedIdx(m, tt.rows...)
+			m.svcGroups[0].folded = tt.folded
+			m.svcEntries = rebuildSvcEntries(m.svcGroups)
+
+			got := ansi.Strip(m.groupHeaderLine(0))
+			if !strings.Contains(got, tt.want) {
+				t.Errorf("header = %q, want the selection cell %q", got, tt.want)
+			}
+			// The live aggregates keep their place: the cell is appended last.
+			if !strings.Contains(got, "● 1 up") {
+				t.Errorf("header = %q, want the running count untouched", got)
+			}
+			if i, j := strings.Index(got, "● 1 up"), strings.Index(got, "[x]"); i > j {
+				t.Errorf("header = %q, want the selection cell AFTER the aggregates", got)
+			}
+			// The other group holds nothing, so it draws no cell.
+			if other := ansi.Strip(m.groupHeaderLine(1)); strings.Contains(other, "[x]") {
+				t.Errorf("db header = %q, want no selection cell for an unselected group", other)
+			}
+		})
+	}
+}
+
+// A group with nothing selected renders BYTE-IDENTICALLY to what it drew before
+// the cell existed — styling included, so this compares the raw string rather
+// than the stripped one.
+func TestGroupHeaderLine_NoSelectionRendersUnchanged(t *testing.T) {
+	m := groupedScreenModel(svcGroupOf("web", "api", "nginx"), svcGroupOf("db", "postgres"))
+	up := true
+	m.svcStatus = map[string]runner.ServiceStatus{
+		svcKey("web", "api"):     {Running: true, Health: "unhealthy", UpdateAvailable: &up},
+		svcKey("web", "nginx"):   {Running: true},
+		svcKey("db", "postgres"): {Running: true},
+	}
+
+	baseline := m.groupHeaderLine(0)
+	if strings.Contains(ansi.Strip(baseline), "[x]") {
+		t.Fatalf("precondition: an unselected header already draws a selection cell: %q", baseline)
+	}
+
+	// A selection in ANOTHER group must not leak into this one.
+	m.selected = selectedIdx(m, 4)
+	if got := m.groupHeaderLine(0); got != baseline {
+		t.Errorf("web header changed for a db-only selection:\n got %q\nwant %q", got, baseline)
+	}
+	if got := ansi.Strip(m.groupHeaderLine(1)); !strings.Contains(got, "[x] 1/1") {
+		t.Errorf("db header = %q, want its own selection cell", got)
+	}
+}
+
+// The unmanaged bucket draws no checkbox and cannot hold a selection, so its
+// header must never claim one — even when something contrived puts a key for it
+// in the map, which is exactly what a stale entry from a renamed project is.
+func TestGroupHeaderLine_UnmanagedNeverShowsSelection(t *testing.T) {
+	m := groupedScreenModel(svcGroupOf("web", "api"), unmanagedGroupOf("stray", "orphan"))
+	bare := m.groupHeaderLine(1)
+
+	m.selected = map[string]bool{
+		svcKey(compose.UnmanagedProjectName, "stray"):  true,
+		svcKey(compose.UnmanagedProjectName, "orphan"): true,
+	}
+	got := m.groupHeaderLine(1)
+	if strings.Contains(ansi.Strip(got), "[x]") {
+		t.Errorf("unmanaged header = %q, want no selection cell", ansi.Strip(got))
+	}
+	if got != bare {
+		t.Errorf("unmanaged header changed:\n got %q\nwant %q", got, bare)
+	}
+	if n, total := groupSelected(m.svcGroups[1], m.selected); n != 0 || total != 0 {
+		t.Errorf("groupSelected(unmanaged) = (%d, %d), want (0, 0)", n, total)
+	}
+}
+
+// The selection cell must not cost the list a row: the screen emits the same
+// number of physical lines with the cell as without, and a header long enough
+// to overrun a narrow pane still clamps to ONE line rather than wrapping into
+// the row svcVisibleCount already spent on it.
+func TestGroupHeaderLine_SelectionCellKeepsTheRowBudget(t *testing.T) {
+	long := strings.Repeat("verylongproject", 6)
+	m := groupedScreenModel(svcGroupOf(long, "api", "nginx"), svcGroupOf("blog", "web"))
+	m.width = 40
+	m.svcStatus = map[string]runner.ServiceStatus{svcKey(long, "api"): {Running: true}}
+
+	// Measured on the RENDER, not on svcVisibleCount(): that helper reads
+	// m.height, the captions, the footer and the warning slots and nothing of
+	// m.selected, so comparing it across a selection is an equality that holds
+	// by construction. What can actually cost the list a row is the header
+	// block emitting a second physical line — an aggregate pushed onto its own
+	// line, or a newline inside the cell that clampToWidth carries through.
+	before := strings.Split(ansi.Strip(m.viewSelectContainers()), "\n")
+	m.selected = selectedIdx(m, 1, 2, 4)
+	lines := strings.Split(ansi.Strip(m.viewSelectContainers()), "\n")
+	if len(lines) != len(before) {
+		t.Errorf("viewSelectContainers() emits %d lines with a selection, %d without:\n%s",
+			len(lines), len(before), strings.Join(lines, "\n"))
+	}
+	// Without this the comparison above is vacuous: the long project name
+	// clamps its own cell off at width 40, so a cell that stopped rendering at
+	// all would keep the line counts equal. blog's header is short enough to
+	// carry it.
+	if !strings.Contains(strings.Join(lines, "\n"), "[x] 1/1") {
+		t.Fatalf("no selection cell in the render, so the row budget is untested:\n%s", strings.Join(lines, "\n"))
+	}
+
+	headers := 0
+	for _, l := range lines {
+		if !strings.Contains(l, "▼") && !strings.Contains(l, "▶") {
+			continue
+		}
+		headers++
+		if w := ansi.StringWidth(l); w > m.width {
+			t.Errorf("header overruns width %d (%d cells): %q", m.width, w, l)
+		}
+	}
+	if headers != 2 {
+		t.Fatalf("rendered %d header lines, want 2 — a wrapped header costs the list a row", headers)
+	}
+}
+
+// The end-to-end promise: a selection hidden behind a fold is visible on the
+// SCREEN, not merely in groupHeaderLine's return value. Every other pin on the
+// cell calls that helper directly, so nothing but this one fails when the cell
+// stops reaching the render — and being the rightmost thing on the row makes it
+// the first casualty of anything that shortens a header line.
+func TestViewSelectContainers_FoldedGroupShowsItsHiddenSelection(t *testing.T) {
+	m := groupedScreenModel(svcGroupOf("web", "api", "nginx"), svcGroupOf("db", "postgres"))
+	m.svcCursor = 4
+	m = pressGroupKey(m, " ")    // tick postgres while its row is on screen
+	m = pressGroupKey(m, "left") // then fold db from that same row
+
+	out := ansi.Strip(m.viewSelectContainers())
+	var dbLine, webLine string
+	for _, l := range strings.Split(out, "\n") {
+		switch {
+		case strings.Contains(l, "db"):
+			dbLine = l
+		case strings.Contains(l, "web"):
+			webLine = l
+		}
+	}
+	if dbLine == "" || webLine == "" {
+		t.Fatalf("both group headers must render:\n%s", out)
+	}
+	if !strings.Contains(dbLine, "[x] 1/1") {
+		t.Errorf("folded db header = %q, want the hidden selection on screen", dbLine)
+	}
+	if strings.Contains(webLine, "[x]") {
+		t.Errorf("web header = %q, want no selection cell — nothing in it is ticked", webLine)
+	}
+	if strings.Contains(out, "postgres") {
+		t.Errorf("the fold must still hide the row itself:\n%s", out)
+	}
+	if !strings.Contains(out, "(1/3 selected)") {
+		t.Errorf("the title must stay host-wide (1/3 selected):\n%s", out)
 	}
 }
 

@@ -222,6 +222,17 @@ const warnRollbackCrossProject = "Rollback covers one project at a time"
 // the disagreement, so the refusal names retrying rather than a dead end.
 const warnNoComposeDir = "No compose directory for this project yet — try again after the next refresh"
 
+// warnAllSelectableFolded answers `a` when every selectable service sits inside
+// a folded group. The grouped view lands folded, so scoping select-all to the
+// unfolded groups makes the key inert there; going silent would only move the
+// original invisible-selection surprise one keystroke along, so the refusal
+// names the way out. It stays quiet when nothing is selectable at all — a
+// loading or empty host has no fold to blame.
+//
+// SELECTABLE, not visible: an unfolded `(unmanaged)` bucket can be drawing rows
+// while every compose group is closed, and those rows carry no checkbox.
+const warnAllSelectableFolded = "No selectable service is visible — unfold a group to select one"
+
 // serverEntryKind distinguishes selectable items from visual group headers.
 type serverEntryKind int
 
@@ -2628,11 +2639,12 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 				m.fixSvcOffset()
 				return m, nil
 			}
-			allSel := m.allSelected()
-			m.eachSelectableRef(func(r svcRef) bool {
-				m.selected[r.key] = !allSel
-				return true
-			})
+			// Fold-aware: see eachUnfoldedSelectableRef.
+			if !m.toggleSelectAll() && m.selectableCount() > 0 {
+				m.warning = warnAllSelectableFolded
+				m.fixSvcOffset()
+				return m, nil
+			}
 		case "r":
 			if m.readOnly() {
 				m.fixSvcOffset()
@@ -5738,9 +5750,15 @@ func (m Model) loadServices() tea.Cmd {
 	}
 }
 
-func (m Model) allSelected() bool {
+// allVisibleSelected reports whether every UNFOLDED selectable row is ticked. It
+// is the toggle DIRECTION for `a`, so it walks exactly what that key writes.
+//
+// Fold every group and the walk yields nothing, so this returns false. That
+// costs nothing: the `a` handler runs the same empty walk and refuses with
+// warnAllSelectableFolded instead of writing.
+func (m Model) allVisibleSelected() bool {
 	any, all := false, true
-	m.eachSelectableRef(func(r svcRef) bool {
+	m.eachUnfoldedSelectableRef(func(r svcRef) bool {
 		any = true
 		if !m.selected[r.key] {
 			all = false
@@ -6555,6 +6573,21 @@ func (m *Model) foldAllGroups(folded bool) {
 	m.settleFold(aim)
 }
 
+// toggleSelectAll ticks every unfolded selectable row, or clears them when they
+// are already ticked, and reports whether it wrote anything. A false means the
+// walk was empty — every selectable row is folded away — which is the caller's
+// cue to refuse rather than report a selection it did not make.
+func (m *Model) toggleSelectAll() bool {
+	selecting := !m.allVisibleSelected()
+	wrote := false
+	m.eachUnfoldedSelectableRef(func(r svcRef) bool {
+		wrote = true
+		m.selected[r.key] = selecting
+		return true
+	})
+	return wrote
+}
+
 // anyGroupUnfolded reports whether any group is currently open.
 func (m Model) anyGroupUnfolded() bool {
 	for _, g := range m.svcGroups {
@@ -6982,8 +7015,10 @@ func (m Model) containerFooter() string {
 // the caller's). The fold marker points down on an open group and right on a
 // folded one, mirroring the convention every tree view uses.
 //
-// The aggregates are what make a FOLDED group still worth looking at: `● n up`
-// and, only when something is actually wrong, `✗ n`. A group that owns no
+// The aggregates are what make a FOLDED group still worth looking at: `● n up`,
+// only when something is actually wrong `✗ n`, and `[x] n/m` only when the group
+// holds a selection — folding hides the rows, not the selection, so the header is
+// the one place a hidden selection can still be seen. A group that owns no
 // services renders a bare header — "0 up" for a project with nothing to run
 // reads as a fault it is not.
 //
@@ -7013,6 +7048,12 @@ func (m Model) groupHeaderLine(groupIdx int) string {
 	}
 	if updates > 0 {
 		line += fmt.Sprintf("  %s %d", updateGlyphStyle.Render(compose.UpdateGlyph), updates)
+	}
+	// The selection cell is LAST and appears only when the group holds one, so
+	// a group with nothing ticked renders exactly as it did before this cell
+	// existed and pressing `space` never shifts the aggregates left of it.
+	if sel, total := groupSelected(g, m.selected); sel > 0 {
+		line += fmt.Sprintf("  %s %d/%d", checkboxOn.Render("[x]"), sel, total)
 	}
 	return line
 }

@@ -230,12 +230,30 @@ func (m Model) eachSvcRef(fn func(svcRef) bool) {
 
 // eachSelectableRef is eachSvcRef minus the unmanaged bucket. Selection feeds
 // the compose pipelines, and an unmanaged container has no compose project to
-// run one against, so `a`, allSelected and the title's denominator all go
-// through it — otherwise `a` would appear to select rows whose checkbox is not
-// even drawn.
+// run one against, so no selection question may be answered over a row whose
+// checkbox is not even drawn.
 func (m Model) eachSelectableRef(fn func(svcRef) bool) {
 	m.eachSvcRef(func(r svcRef) bool {
 		if m.groupUnmanaged(r.groupIdx) {
+			return true
+		}
+		return fn(r)
+	})
+}
+
+// eachUnfoldedSelectableRef is eachSelectableRef minus the services a FOLD
+// hides. The grouped host view LANDS folded, so a host-wide `a` ticked every
+// service on the box while the only thing that moved on screen was one digit of
+// the title counter — a folded header renders byte-identically either way.
+//
+// Exactly two callers: the `a` handler and allVisibleSelected(), which is the
+// toggle direction for that same key. selectedContainers() and the counters
+// stay host-wide on purpose — scoping them would drop a service the user
+// genuinely selected before folding its group, so the operation would touch
+// fewer services than the confirmation prompt just named.
+func (m Model) eachUnfoldedSelectableRef(fn func(svcRef) bool) {
+	m.eachSelectableRef(func(r svcRef) bool {
+		if m.svcGroups[r.groupIdx].folded {
 			return true
 		}
 		return fn(r)
@@ -336,6 +354,29 @@ func groupCounts(g svcGroup, status map[string]runner.ServiceStatus) (up, unheal
 		}
 	}
 	return up, unhealthy, updates
+}
+
+// groupSelected totals one group's selection for its header row: how many of
+// its services are ticked, out of how many could be. It is a sibling of
+// groupCounts rather than a fifth return value on it, because the two read
+// different things — groupCounts summarises live docker state off svcStatus,
+// this reads the UI selection the user built — and only this one needs the
+// unmanaged gate below.
+//
+// The unmanaged bucket answers (0, 0), by the same rule eachSelectableRef skips
+// it: those rows draw no checkbox and can hold no selection, so a count there
+// would advertise state that cannot exist.
+func groupSelected(g svcGroup, selected map[string]bool) (n, total int) {
+	if g.proj.Unmanaged {
+		return 0, 0
+	}
+	total = len(g.services)
+	for _, name := range g.services {
+		if selected[svcKey(g.proj.Name, name)] {
+			n++
+		}
+	}
+	return n, total
 }
 
 // buildSvcGroups folds the grouped payload — the project list from the
