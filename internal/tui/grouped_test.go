@@ -1878,11 +1878,9 @@ func TestGroupedFold_ArrowsAreDirectional(t *testing.T) {
 	}
 }
 
-// The fold-all key moved from uppercase Z to lowercase z, so this guard points
-// the other way now: it used to pin z as unbound, and pins Z as unbound since.
-// The rename is what the guard is for — a half-finished one that leaves the old
-// case label behind gives the host view two fold-all keys, one of which the `?`
-// overlay names nowhere, which is the no-op rule in reverse.
+// Fold-all is z, so uppercase Z must stay unbound: a half-finished rename that
+// leaves the old case label behind gives the host view two fold-all keys, one of
+// which the `?` overlay names nowhere — the no-op rule in reverse.
 func TestGroupedFold_UppercaseZIsNotBound(t *testing.T) {
 	// Both fold-all directions: the key it used to be reads anyGroupUnfolded()
 	// to choose between them, and a Z left on the arrow case label inherits
@@ -1899,6 +1897,9 @@ func TestGroupedFold_UppercaseZIsNotBound(t *testing.T) {
 	}
 
 	folded := groupedScreenModel(svcGroupOf("web", "api", "nginx"), svcGroupOf("db", "postgres"))
+	// EVERY group, not just one: anyGroupUnfolded() reads a single open group as
+	// "fold all", so against a partly-folded host a bound Z would FOLD, leave this
+	// group folded, and satisfy the unfold assertion below.
 	folded.svcGroups[0].folded = true
 	folded.svcGroups[1].folded = true
 	folded.setGroups(folded.svcGroups)
