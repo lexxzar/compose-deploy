@@ -30,7 +30,15 @@ type helpGroup struct {
 type helpContext struct {
 	canGoBack bool
 	readOnly  bool
-	phase     progressPhase
+	// grouped marks the host-wide container screen, where space carries a
+	// second meaning (fold a group) that the drilled screen has no row for.
+	grouped bool
+	phase   progressPhase
+	// midSequence marks a health gate with another batch still to come, where
+	// esc STOPS the sequence and enter releases it. With no batch behind it
+	// the two keys do the same thing (end the wait), so the table says so
+	// once instead of promising a choice that does not exist.
+	midSequence bool
 }
 
 // helpGroups returns the key reference for the current screen, with the LEAVE
@@ -39,15 +47,19 @@ type helpContext struct {
 // write keys, and the progress table resolved from the operation's phase.
 func (m Model) helpGroups() []helpGroup {
 	return helpGroupsFor(m.screen, helpContext{
-		canGoBack: m.canGoBack(),
-		readOnly:  m.readOnly(),
-		phase:     m.progressPhase(),
+		canGoBack:   m.canGoBack(),
+		readOnly:    m.readOnly(),
+		grouped:     m.grouped,
+		phase:       m.progressPhase(),
+		midSequence: m.midSequence(),
 	})
 }
 
 // progressPhase names the three key regimes of screenProgress. The predicate
-// order below mirrors viewProgress's footer switch (waiting first, because
-// waiting implies done), so the overlay and the footer cannot disagree about
+// order below mirrors viewProgress's footer switch — waiting FIRST, because a
+// health gate can be open with done already set (the last batch) or with
+// neither set (a mid-sequence batch), and only the waiting-first order names
+// esc correctly in both. So the overlay and the footer cannot disagree about
 // which keys are live.
 type progressPhase int
 
@@ -70,16 +82,27 @@ func (m Model) progressPhase() progressPhase {
 // progressGroups is the screenProgress key table. Unlike every other screen it
 // varies by sub-state, because esc changes MEANING across the three phases:
 // while the pipeline runs it CANCELS the operation, during the health gate it
-// skips the wait, and once finished it navigates back. A static table would
-// name the wrong action in the highest-risk phase. The key tokens are the same
-// three in every phase, so the drift pin holds whichever phase it samples.
-func progressGroups(phase progressPhase) []helpGroup {
+// stops the sequence, and once finished it navigates back. A static table would
+// name the wrong action in the highest-risk phase.
+//
+// The waiting phase names TWO outcomes when a batch is still to come, because
+// the gate binds two: esc stops, enter skips the wait and lets the next project
+// start. Naming only "skip health wait" there under-described a key that
+// launched a whole project's pipeline — the exact failure the footer/overlay
+// rules exist to prevent. With nothing left to release the two keys do the same
+// thing, and the table says so on one row.
+func progressGroups(phase progressPhase, midSequence bool) []helpGroup {
 	switch phase {
 	case progressWaiting:
+		wait := []helpEntry{{"enter q esc", "skip health wait"}}
+		if midSequence {
+			wait = []helpEntry{
+				{"enter", "skip health wait, start the next project"},
+				{"q esc", "stop, skip the projects left"},
+			}
+		}
 		return []helpGroup{
-			{title: "WAIT", entries: []helpEntry{
-				{"q esc", "skip health wait"},
-			}},
+			{title: "WAIT", entries: wait},
 			{title: "LEAVE", entries: []helpEntry{
 				{"ctrl+c", "quit"},
 			}},
@@ -100,10 +123,10 @@ func progressGroups(phase progressPhase) []helpGroup {
 	}
 }
 
-// leaveGroup is the LEAVE group for the two screens whose back binding is
-// conditional (project and containers). With a parent screen, q and esc both
-// navigate back; without one, q quits and esc does nothing — so the overlay
-// must not advertise a back key that exits the program. canGoBack comes from
+// leaveGroup is the LEAVE group for the container screen, the one screen whose
+// back binding is conditional. With a parent screen, q and esc both navigate
+// back; without one, q quits and esc does nothing — so the overlay must not
+// advertise a back key that exits the program. canGoBack comes from
 // Model.canGoBack(), the predicate that also picks the footer's back label.
 func leaveGroup(canGoBack bool) helpGroup {
 	if !canGoBack {
@@ -136,6 +159,44 @@ func findGroup() helpGroup {
 	}}
 }
 
+// selectGroup is the container screen's multi-select table. It is flagged as
+// actions for the same reason FIND is: the footer trim left `a` with no other
+// home.
+//
+// space is the one binding whose MEANING depends on the row under the cursor,
+// and only the grouped host view has the second row kind — so only there does
+// the description name both. A key bound in a sub-state must name that state,
+// and "a group header" is exactly that state.
+//
+// The arrows and z are grouped-only for the same reason space's second meaning
+// is: the drilled screen is one group and draws no header to fold. They live
+// here and in no footer — the grouped idle pair already carries six tokens.
+//
+// enter joins the group in grouped mode and carries BOTH its meanings on that
+// one row, the way inspectGroup's read-only enter does: the drill-in is
+// grouped-mode-only, the confirmation is not, and one key cannot occupy two
+// rows of one table. So OPERATE drops its own enter row while grouped (see
+// helpGroupsFor) and this row names the pair. The drill-in half answers on
+// EVERY row — a header and a service row name the same project — so it names
+// no sub-state it is not restricted to.
+func selectGroup(grouped bool) helpGroup {
+	if grouped {
+		return helpGroup{title: "SELECT", actions: true, entries: []helpEntry{
+			{"space", "toggle a service · fold a group"},
+			{"a", "all"},
+			// Not "fold · unfold": everywhere else in this table `·` joins
+			// two MEANINGS of one key, and here the two keys have one each.
+			{"← →", "fold, unfold"},
+			{"z", "fold or unfold every group"},
+			{"enter", "drill into the project · confirm the prompt"},
+		}}
+	}
+	return helpGroup{title: "SELECT", actions: true, entries: []helpEntry{
+		{"space", "toggle"},
+		{"a", "all"},
+	}}
+}
+
 // inspectGroup is the container screen's read-path table. The read-only variant
 // drops c (config needs a compose file) and gains enter, because the x prompt
 // still binds it and OPERATE — enter's only home on the writable table — is
@@ -150,14 +211,24 @@ func findGroup() helpGroup {
 // one of them), so appending it after U would make it the first key dropped.
 // Second keeps the existing sacrifice order (U, then x, then c) unchanged, and
 // TestViewHelp_InspectSurvivesTheFirstTruncation pins that.
-func inspectGroup(readOnly bool) helpGroup {
+//
+// The read-only enter row names TWO meanings in the GROUPED host view, on one
+// row, the way `space` does on the writable grouped table. enter is not gated
+// on readOnly, so on a host whose only group is the unmanaged bucket it still
+// drills into that group — and the read-only table, which drops SELECT whole,
+// had no other row to say so.
+func inspectGroup(readOnly, grouped bool) helpGroup {
 	entries := []helpEntry{{"l", "logs"}, {"i", "inspect"}}
 	if !readOnly {
 		entries = append(entries, helpEntry{"c", "config"})
 	}
 	entries = append(entries, helpEntry{"x", "exec"}, helpEntry{"U", "check updates"})
 	if readOnly {
-		entries = append(entries, helpEntry{"enter", "confirm the exec prompt"})
+		desc := "confirm the exec prompt"
+		if grouped {
+			desc = "drill into the project · confirm the exec prompt"
+		}
+		entries = append(entries, helpEntry{"enter", desc})
 	}
 	return helpGroup{title: "INSPECT", actions: true, entries: entries}
 }
@@ -171,7 +242,7 @@ func inspectGroup(readOnly bool) helpGroup {
 // Group ORDER carries the same load as the writable table: LEAVE sits 3rd of 4
 // so splitHelpGroups leaves it in the left column, and the actions flags still
 // drive singleColumnOrder's truncation order.
-func readOnlyContainerGroups(canGoBack bool) []helpGroup {
+func readOnlyContainerGroups(canGoBack, grouped bool) []helpGroup {
 	return []helpGroup{
 		{title: "MOVE", entries: []helpEntry{
 			{"↑ k", "up"},
@@ -179,7 +250,7 @@ func readOnlyContainerGroups(canGoBack bool) []helpGroup {
 		}},
 		findGroup(),
 		leaveGroup(canGoBack),
-		inspectGroup(true),
+		inspectGroup(true, grouped),
 	}
 }
 
@@ -212,21 +283,25 @@ func helpGroupsFor(s screen, hc helpContext) []helpGroup {
 			}},
 		}
 
-	case screenSelectProject:
-		return []helpGroup{
-			{title: "MOVE", entries: []helpEntry{
-				{"↑ k", "up"},
-				{"↓ j", "down"},
-			}},
-			{title: "ACT", actions: true, entries: []helpEntry{
-				{"enter", "select"},
-			}},
-			leaveGroup(canGoBack),
-		}
-
 	case screenSelectContainers:
 		if hc.readOnly {
-			return readOnlyContainerGroups(canGoBack)
+			return readOnlyContainerGroups(canGoBack, hc.grouped)
+		}
+		operate := helpGroup{title: "OPERATE", actions: true, entries: []helpEntry{
+			{"d", "deploy"},
+			{"r", "restart"},
+			{"s", "stop"},
+			{"R", "rollback"},
+		}}
+		// enter is bound only while the confirmation prompt is up, so the
+		// description names that state: the overlay itself can only be opened
+		// from the idle screen, where enter does nothing.
+		//
+		// In GROUPED mode the row moves to SELECT instead, folded into the
+		// drill-in row, because enter carries both meanings there and one key
+		// must not occupy two rows of one table.
+		if !hc.grouped {
+			operate.entries = append(operate.entries, helpEntry{"enter", "confirm the prompt"})
 		}
 		return []helpGroup{
 			{title: "MOVE", entries: []helpEntry{
@@ -234,28 +309,14 @@ func helpGroupsFor(s screen, hc helpContext) []helpGroup {
 				{"↓ j", "down"},
 			}},
 			findGroup(),
-			// SELECT is flagged for the same reason FIND is: the footer trim
-			// left `a` with no other home.
-			{title: "SELECT", actions: true, entries: []helpEntry{
-				{"space", "toggle"},
-				{"a", "all"},
-			}},
+			selectGroup(hc.grouped),
 			leaveGroup(canGoBack),
-			{title: "OPERATE", actions: true, entries: []helpEntry{
-				{"d", "deploy"},
-				{"r", "restart"},
-				{"s", "stop"},
-				{"R", "rollback"},
-				// enter is bound only while the confirmation prompt is up, so
-				// the description names that state: the overlay itself can only
-				// be opened from the idle screen, where enter does nothing.
-				{"enter", "confirm the prompt"},
-			}},
-			inspectGroup(false),
+			operate,
+			inspectGroup(false, hc.grouped),
 		}
 
 	case screenProgress:
-		return progressGroups(hc.phase)
+		return progressGroups(hc.phase, hc.midSequence)
 
 	case screenLogs:
 		return []helpGroup{
@@ -357,8 +418,6 @@ func screenName(s screen) string {
 	switch s {
 	case screenSelectServer:
 		return "servers"
-	case screenSelectProject:
-		return "projects"
 	case screenSelectContainers:
 		return "services"
 	case screenProgress:
@@ -417,9 +476,11 @@ func helpStackedRows(groups []helpGroup) []string {
 // with the descriptions aligned on the widest key across ALL the groups passed
 // in. separate adds a blank line BETWEEN groups — the two-column layout keeps
 // it, the single-column fallback drops it because that is where the height
-// budget bites. Those five blanks are the container table's 29-versus-24 rows,
-// and 24 is what makes its 18 action rows fit the 19 a 24-line pane keeps.
-// Every other row-count claim in this file refers back to those numbers.
+// budget bites. Those five blanks are the drilled container table's
+// 30-versus-25 rows, and 25 is what makes its 19 action rows fit the 19 a
+// 24-line pane keeps. The grouped variant runs 32/27 with 21 action rows, so
+// the two rows past that budget (x, U) fall off a narrow 24-line pane. Every
+// other row-count claim in this file refers back to those numbers.
 func helpRows(groups []helpGroup, separate bool) []string {
 	keyw := 0
 	for _, g := range groups {

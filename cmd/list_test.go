@@ -677,7 +677,7 @@ func TestCollectMultiProject_Success(t *testing.T) {
 		{Name: "app2", ConfigDir: "/app2"},
 	}
 
-	factory := func(dir string) runner.Composer { return mocks[dir] }
+	factory := func(proj compose.Project) runner.Composer { return mocks[proj.ConfigDir] }
 	result := collectMultiProject(context.Background(), projects, factory)
 
 	if len(result) != 2 {
@@ -710,7 +710,7 @@ func TestCollectMultiProject_SkipsFailedProject(t *testing.T) {
 		{Name: "bad", ConfigDir: "/bad"},
 	}
 
-	factory := func(dir string) runner.Composer { return mocks[dir] }
+	factory := func(proj compose.Project) runner.Composer { return mocks[proj.ConfigDir] }
 	result := collectMultiProject(context.Background(), projects, factory)
 
 	if len(result) != 1 {
@@ -1775,7 +1775,7 @@ func TestFormatJSON_IncludesPorts(t *testing.T) {
 			{Host: "0.0.0.0", HostPort: 80, ContainerPort: 80, Protocol: "tcp"},
 			{Host: "0.0.0.0", HostPort: 443, ContainerPort: 443, Protocol: "tcp"},
 		}},
-		{Name: "nilports", Running: true},                       // nil slice → omitempty
+		{Name: "nilports", Running: true},                           // nil slice → omitempty
 		{Name: "emptyports", Running: true, Ports: []runner.Port{}}, // explicit empty slice → omitempty too
 	}
 
@@ -2127,7 +2127,7 @@ func TestListCmd_multiProjectStatsFailure(t *testing.T) {
 		{Name: "app1", ConfigDir: "/app1"},
 		{Name: "app2", ConfigDir: "/app2"},
 	}
-	factory := func(dir string) runner.Composer { return mocks[dir] }
+	factory := func(proj compose.Project) runner.Composer { return mocks[proj.ConfigDir] }
 
 	oldStderr := os.Stderr
 	rErr, wErr, err := os.Pipe()
@@ -2353,7 +2353,7 @@ func TestCollectMultiProjectStats_PopulatesStats(t *testing.T) {
 		},
 	}
 	projects := []compose.Project{{Name: "a", ConfigDir: "/a"}}
-	factory := func(dir string) runner.Composer { return mocks[dir] }
+	factory := func(proj compose.Project) runner.Composer { return mocks[proj.ConfigDir] }
 
 	result := collectMultiProjectStats(context.Background(), projects, factory, true, nil, false)
 	if len(result) != 1 || len(result[0].Services) != 1 {
@@ -2375,7 +2375,7 @@ func TestCollectMultiProjectStats_NotRequestedSkipsStatsCall(t *testing.T) {
 		statsErr: fmt.Errorf("stats should not have been called"),
 	}
 	projects := []compose.Project{{Name: "a", ConfigDir: "/a"}}
-	factory := func(_ string) runner.Composer { return mock }
+	factory := func(_ compose.Project) runner.Composer { return mock }
 
 	// With showStats=false, statsErr must not surface — ContainerStats() not invoked.
 	result := collectMultiProjectStats(context.Background(), projects, factory, false, nil, false)
@@ -2384,6 +2384,37 @@ func TestCollectMultiProjectStats_NotRequestedSkipsStatsCall(t *testing.T) {
 	}
 	if result[0].Services[0].CPUPercent != nil {
 		t.Errorf("CPUPercent must be nil without --stats, got %v", result[0].Services[0].CPUPercent)
+	}
+}
+
+// TestCollectMultiProjectStats_SkipsProjectWithNoConfigDir pins the sibling of
+// the TUI's operableProject guard. docker reports an empty ConfigFiles for any
+// project it discovers from the com.docker.compose.project label alone, and
+// parseProjects keeps that as an empty ConfigDir. The factory would then build
+// a composer rooted at cdeploy's own cwd, and every service it listed would be
+// printed under THIS project's header.
+func TestCollectMultiProjectStats_SkipsProjectWithNoConfigDir(t *testing.T) {
+	mock := &mockComposer{
+		services: []string{"cwd-service"},
+		status:   map[string]runner.ServiceStatus{"cwd-service": {Running: true}},
+	}
+	calls := 0
+	factory := func(_ compose.Project) runner.Composer { calls++; return mock }
+	projects := []compose.Project{
+		{Name: "ghost"}, // no ConfigDir
+		{Name: "real", ConfigDir: "/srv/real"},
+	}
+
+	result := collectMultiProjectStats(context.Background(), projects, factory, false, nil, false)
+
+	if calls != 1 {
+		t.Errorf("factory called %d times, want 1 — the dirless project must never get a composer", calls)
+	}
+	if len(result) != 1 {
+		t.Fatalf("got %d projects, want 1: %+v", len(result), result)
+	}
+	if result[0].Name != "real" {
+		t.Errorf("project = %q, want %q", result[0].Name, "real")
 	}
 }
 
@@ -2405,7 +2436,7 @@ func TestCollectMultiProjectStats_UsesBulkAggregator(t *testing.T) {
 		bulkStats: map[string]runner.ServiceStats{"web": {CPUPercent: 7.7}},
 	}
 	projects := []compose.Project{{Name: "a", ConfigDir: "/a"}}
-	factory := func(_ string) runner.Composer { return mock }
+	factory := func(_ compose.Project) runner.Composer { return mock }
 	bulk := map[string]runner.ServiceStats{"deadbeef0000": {CPUPercent: 0}} // contents irrelevant; presence triggers the bulk path
 
 	result := collectMultiProjectStats(context.Background(), projects, factory, true, bulk, false)
@@ -2446,7 +2477,7 @@ func TestCollectMultiProjectStats_EmptyBulkSkipsPerProjectRetry(t *testing.T) {
 		bulkStats: map[string]runner.ServiceStats{},
 	}
 	projects := []compose.Project{{Name: "a", ConfigDir: "/a"}}
-	factory := func(_ string) runner.Composer { return mock }
+	factory := func(_ compose.Project) runner.Composer { return mock }
 
 	// Non-nil empty bulk map — the contract for "bulk fetch failed".
 	result := collectMultiProjectStats(context.Background(), projects, factory, true, map[string]runner.ServiceStats{}, false)
@@ -2475,7 +2506,7 @@ func TestCollectMultiProjectStats_FallsBackWhenBulkNil(t *testing.T) {
 		bulkStats: map[string]runner.ServiceStats{"web": {CPUPercent: 99}}, // would be used if bulk path taken
 	}
 	projects := []compose.Project{{Name: "a", ConfigDir: "/a"}}
-	factory := func(_ string) runner.Composer { return mock }
+	factory := func(_ compose.Project) runner.Composer { return mock }
 
 	result := collectMultiProjectStats(context.Background(), projects, factory, true, nil, false)
 	if len(result) != 1 || len(result[0].Services) != 1 {
@@ -2509,9 +2540,9 @@ func TestFormatCPUCell_BlankWhenStopped(t *testing.T) {
 func TestFormatMemCell_BlankWhenNil(t *testing.T) {
 	used := int64(100)
 	cases := []serviceStatus{
-		{Name: "a", Running: true},                                          // both nil
-		{Name: "b", Running: true, MemoryUsed: &used},                       // limit nil
-		{Name: "c", Running: false, MemoryUsed: &used, MemoryLimit: &used},  // not running
+		{Name: "a", Running: true},                                         // both nil
+		{Name: "b", Running: true, MemoryUsed: &used},                      // limit nil
+		{Name: "c", Running: false, MemoryUsed: &used, MemoryLimit: &used}, // not running
 	}
 	for _, c := range cases {
 		if got := formatMemCell(c); got != "" {
@@ -2924,7 +2955,7 @@ func TestCollectMultiProjectStats_PopulatesUpdates(t *testing.T) {
 		},
 	}
 	projects := []compose.Project{{Name: "a", ConfigDir: "/a"}}
-	factory := func(dir string) runner.Composer { return mocks[dir] }
+	factory := func(proj compose.Project) runner.Composer { return mocks[proj.ConfigDir] }
 
 	result := collectMultiProjectStats(context.Background(), projects, factory, false, nil, true)
 	if len(result) != 1 || len(result[0].Services) != 1 {
@@ -2949,7 +2980,7 @@ func TestCollectMultiProjectStats_UpdatesGatedByFlag(t *testing.T) {
 		updatesErr: fmt.Errorf("CheckUpdates must not be called when checkUpdates=false"),
 	}
 	projects := []compose.Project{{Name: "a", ConfigDir: "/a"}}
-	factory := func(_ string) runner.Composer { return mock }
+	factory := func(_ compose.Project) runner.Composer { return mock }
 
 	result := collectMultiProjectStats(context.Background(), projects, factory, false, nil, false)
 	if len(result) != 1 || len(result[0].Services) != 1 {
@@ -2984,7 +3015,7 @@ func TestCollectMultiProjectStats_UpdatesFailureNonFatal(t *testing.T) {
 		{Name: "app1", ConfigDir: "/app1"},
 		{Name: "app2", ConfigDir: "/app2"},
 	}
-	factory := func(dir string) runner.Composer { return mocks[dir] }
+	factory := func(proj compose.Project) runner.Composer { return mocks[proj.ConfigDir] }
 
 	oldStderr := os.Stderr
 	rErr, wErr, err := os.Pipe()
@@ -3027,5 +3058,49 @@ func TestCollectMultiProjectStats_UpdatesFailureNonFatal(t *testing.T) {
 				t.Errorf("app1/web UpdateAvailable should be nil on updates failure (blank cell), got %v", *p.Services[0].UpdateAvailable)
 			}
 		}
+	}
+}
+
+// The multi-project factory keyed on the DIRECTORY alone, so two `-p` projects
+// sharing one ConfigDir printed the SAME containers under both headers — in text
+// and in --json — while the TUI showed them apart on the same host. Widening the
+// factory to the whole compose.Project is what lets it build a per-project
+// composer, mirroring tui.ComposerFactory.
+func TestCollectMultiProject_TwoNamedProjectsInOneDir(t *testing.T) {
+	mocks := map[string]*mockComposer{
+		"blue": {
+			services: []string{"web"},
+			status:   map[string]runner.ServiceStatus{"web": {Running: true}},
+		},
+		"green": {
+			services: []string{"worker"},
+			status:   map[string]runner.ServiceStatus{"worker": {Running: false}},
+		},
+	}
+	projects := []compose.Project{
+		{Name: "blue", ConfigDir: "/srv/app", ConfigFiles: []string{"/srv/app/blue.yml"}},
+		{Name: "green", ConfigDir: "/srv/app", ConfigFiles: []string{"/srv/app/green.yml"}},
+	}
+
+	var sawFiles [][]string
+	factory := func(proj compose.Project) runner.Composer {
+		sawFiles = append(sawFiles, proj.ConfigFiles)
+		return mocks[proj.Name]
+	}
+	result := collectMultiProject(context.Background(), projects, factory)
+
+	if len(result) != 2 {
+		t.Fatalf("got %d projects, want 2", len(result))
+	}
+	if len(result[0].Services) != 1 || result[0].Services[0].Name != "web" {
+		t.Errorf("blue services = %+v, want [web]", result[0].Services)
+	}
+	if len(result[1].Services) != 1 || result[1].Services[0].Name != "worker" {
+		t.Errorf("green services = %+v, want [worker]", result[1].Services)
+	}
+	// The factory sees the file set too, so the composer it builds loads the
+	// files the project was created from.
+	if len(sawFiles) != 2 || sawFiles[0][0] != "/srv/app/blue.yml" || sawFiles[1][0] != "/srv/app/green.yml" {
+		t.Errorf("factory saw %v, want each project's own files", sawFiles)
 	}
 }

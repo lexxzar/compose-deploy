@@ -37,28 +37,48 @@ type portKey struct {
 //
 // Unmanaged marks the synthetic row that stands for the host containers carrying no
 // com.docker.compose.project label. That row has no compose file, so ConfigDir is
-// empty and Desc carries the container count the picker shows instead of a path.
+// empty and no compose command reports on it.
 type Project struct {
 	Name string
 	// Status is the compose lifecycle status from `docker compose ls`, e.g.
 	// "running(3)". It is empty on the Unmanaged row, which no compose command
 	// reports on.
 	Status string
-	// ConfigDir is the directory containing the compose file; empty when Unmanaged.
+	// ConfigDir is the directory containing the compose file. Empty when the
+	// project has none: the Unmanaged row, and any project docker reports with
+	// no config_files label. Empty is the single "no directory behind this
+	// project" sentinel every consumer tests against.
 	ConfigDir string
-	// Desc overrides the project picker's description column. Empty on a compose
-	// project, where the picker shows the shortened ConfigDir.
-	Desc      string
-	Unmanaged bool
+	// ConfigFiles is the project's own compose file set, exactly as docker
+	// reports it in the com.docker.compose.project.config_files label — the
+	// FULL list, in order, not just the first entry. ConfigDir is only
+	// filepath.Dir of the first one, and a directory does not name a file:
+	// `docker compose -f prod.yml -p prod up` and a sibling docker-compose.yml
+	// share one directory, so a composer that re-discovered a file by the four
+	// canonical names loaded the wrong service definitions under the right
+	// project label. Empty when docker reports no config_files (the Unmanaged
+	// row, and any label-only project), which is the same "auto-discover"
+	// sentinel the pre-ConfigFiles behavior had.
+	ConfigFiles []string
+	Unmanaged   bool
 }
 
 // Compile-time interface satisfaction checks.
 var _ runner.Composer = (*Compose)(nil)
 
-// composeFile candidates for HasComposeFile detection.
+// composeFiles are the default main-file names compose's auto-discovery probes,
+// IN COMPOSE'S OWN PRECEDENCE ORDER (compose-go DefaultFileNames).
+//
+// The ORDER is load-bearing: compose does not load every default name it finds,
+// it takes the FIRST that exists and warns about the rest. Verified against
+// compose v2.40.3 — a directory holding all four logs `Using .../compose.yaml`
+// and loads that one alone. findComposeFile probes this slice in order to pick
+// the main file for the config screen and for rollback prep, and
+// composeDiscoveredFiles resolves the PinComposeFilesLocal decision from it, so
+// a reordering here silently points both at the wrong file.
 var composeFiles = []string{
-	"compose.yml",
 	"compose.yaml",
+	"compose.yml",
 	"docker-compose.yml",
 	"docker-compose.yaml",
 }
@@ -76,7 +96,7 @@ func HasComposeFile(dir string) bool {
 // ListProjects returns all Docker Compose projects on the system, including stopped ones.
 // It respects the Standalone field to use the correct binary.
 func (c *Compose) ListProjects(ctx context.Context) ([]Project, error) {
-	cmd := c.command(ctx, "ls", "-a", "--format", "json")
+	cmd := c.hostCommand(ctx, "ls", "-a", "--format", "json")
 	var out []byte
 	var err error
 	if c.outputCmd != nil {
@@ -111,19 +131,41 @@ func parseProjects(data []byte) ([]Project, error) {
 
 	projects := make([]Project, 0, len(entries))
 	for _, e := range entries {
-		configFile := e.ConfigFiles
-		if i := strings.Index(configFile, ","); i >= 0 {
-			configFile = configFile[:i]
+		files := splitConfigFiles(e.ConfigFiles)
+		// filepath.Dir("") returns ".", not "" — and docker reports an empty
+		// ConfigFiles for any project it discovers from the
+		// com.docker.compose.project label alone (the sibling config_files
+		// label absent). Passing "." on would make every "no directory"
+		// consumer resolve to cdeploy's own working directory instead of
+		// refusing, so the empty sentinel is preserved here.
+		configDir := ""
+		if len(files) > 0 {
+			configDir = filepath.Dir(files[0])
 		}
 		projects = append(projects, Project{
-			Name:      e.Name,
-			Status:    e.Status,
-			ConfigDir: filepath.Dir(configFile),
+			Name:        e.Name,
+			Status:      e.Status,
+			ConfigDir:   configDir,
+			ConfigFiles: files,
 		})
 	}
 
 	sortProjects(projects)
 	return projects, nil
+}
+
+// splitConfigFiles turns docker's comma-separated config_files value into the
+// ordered file list. Blank entries are dropped so a trailing comma or an empty
+// label yields nil — the "docker reported no compose file" sentinel every
+// consumer tests with len() == 0.
+func splitConfigFiles(s string) []string {
+	var files []string
+	for _, f := range strings.Split(s, ",") {
+		if f = strings.TrimSpace(f); f != "" {
+			files = append(files, f)
+		}
+	}
+	return files
 }
 
 // sortProjects sorts projects by name, case-insensitive.
@@ -135,9 +177,18 @@ func sortProjects(projects []Project) {
 	}
 }
 
-// findComposeFile returns the path to the first recognized compose file in ProjectDir.
-// It probes the same candidates as HasComposeFile but returns the full path.
+// findComposeFile returns the path to this project's main compose file.
+//
+// When docker reported the project's own file set (ComposeFiles) that first
+// entry IS the main file — probing the four canonical names instead would show
+// and edit a sibling project's docker-compose.yml, and would report "no compose
+// file found" for a project whose only file is named stack.yml. The probe stays
+// as the fallback for a composer built from a bare directory (the local fast
+// track, every CLI verb).
 func (c *Compose) findComposeFile() (string, error) {
+	if len(c.ComposeFiles) > 0 {
+		return c.ComposeFiles[0], nil
+	}
 	for _, name := range composeFiles {
 		p := filepath.Join(c.ProjectDir, name)
 		if _, err := os.Stat(p); err == nil {
@@ -228,6 +279,27 @@ type Compose struct {
 	// compose file MUST be first in this slice. Default nil = no `-f` flags,
 	// producing byte-identical argv to the pre-ExtraComposeFiles behavior.
 	ExtraComposeFiles []string
+
+	// ComposeFiles is the project's OWN compose file set (Project.ConfigFiles,
+	// as docker reported it). When non-empty and ExtraComposeFiles is not set,
+	// it supplies the `-f` pairs, so the composer loads the files the project
+	// was actually created from instead of whatever default-named file the
+	// directory happens to hold. ProjectName pins WHICH project a command
+	// addresses; this pins WHICH FILES define it — without both, a project
+	// created from `-f prod.yml -p prod` was recreated from a sibling
+	// docker-compose.yml under the right label. Default nil = auto-discovery,
+	// byte-identical argv to the pre-ComposeFiles behavior.
+	ComposeFiles []string
+
+	// ProjectName, when non-empty, is spliced into every compose invocation as
+	// `-p <name>` before the subcommand. Compose otherwise derives the project
+	// from the working directory (or the compose file's `name:`), which is NOT
+	// the project a `docker compose -p other` / COMPOSE_PROJECT_NAME deployment
+	// runs under: several projects can share one directory, so a composer built
+	// from ConfigDir alone would stop and remove another project's containers.
+	// Default "" = no `-p` flag, producing byte-identical argv to the
+	// pre-ProjectName behavior.
+	ProjectName string
 
 	detected bool // true after Detect() or SetStandalone() has been called
 
@@ -356,7 +428,21 @@ func withStderr(err error) error {
 }
 
 func (c *Compose) command(ctx context.Context, args ...string) *exec.Cmd {
-	fileArgs := composeFileArgs(c.ExtraComposeFiles)
+	fileArgs := append(composeFileArgs(c.composeFileList()), projectNameArgs(c.ProjectName)...)
+	return c.buildCommand(ctx, fileArgs, args)
+}
+
+// hostCommand builds a compose invocation carrying NO `-f` and NO `-p` flags.
+// `docker compose ls` enumerates every project on the host, so neither flag
+// selects anything there — and `-f` would point compose at a file it must
+// parse, making host-wide discovery fail for a project whose files are not
+// readable from here. `cdeploy list` runs the host-wide discovery on a composer
+// that may already carry both, which is exactly when the difference matters.
+func (c *Compose) hostCommand(ctx context.Context, args ...string) *exec.Cmd {
+	return c.buildCommand(ctx, nil, args)
+}
+
+func (c *Compose) buildCommand(ctx context.Context, fileArgs, args []string) *exec.Cmd {
 	var cmd *exec.Cmd
 	if c.Standalone {
 		cmd = exec.CommandContext(ctx, "docker-compose", append(fileArgs, args...)...)
@@ -372,6 +458,18 @@ func (c *Compose) command(ctx context.Context, args ...string) *exec.Cmd {
 	return cmd
 }
 
+// composeFileList returns the `-f` file set for the next invocation.
+// ExtraComposeFiles wins when set because it is the ROLLBACK override stack,
+// which PrepareRollback already seeds with this project's own files followed by
+// the generated digest pin — so the two are never both needed at once, and the
+// override must stay last for the compose merge to pin the image.
+func (c *Compose) composeFileList() []string {
+	if len(c.ExtraComposeFiles) > 0 {
+		return c.ExtraComposeFiles
+	}
+	return c.ComposeFiles
+}
+
 // composeFileArgs expands a list of compose files into `-f <file>` argv pairs.
 // It returns nil for an empty/nil slice so callers emit byte-identical argv to
 // the pre-ExtraComposeFiles behavior. Because `-f` disables compose's file
@@ -385,6 +483,19 @@ func composeFileArgs(files []string) []string {
 		out = append(out, "-f", f)
 	}
 	return out
+}
+
+// projectNameArgs expands a project name into the `-p <name>` argv pair. It
+// returns nil for an empty name so callers emit byte-identical argv to the
+// pre-ProjectName behavior. It sits AFTER the `-f` pairs and before the
+// subcommand: both are compose top-level flags, and keeping `-f` first leaves
+// the ExtraComposeFiles splice rule (main file first, immediately after the
+// compose binary) exactly as it was.
+func projectNameArgs(name string) []string {
+	if name == "" {
+		return nil
+	}
+	return []string{"-p", name}
 }
 
 // psEntry matches the JSON schema of `docker compose ps --format json`.
@@ -866,81 +977,33 @@ func parseContainerStatus(data []byte) (map[string]runner.ServiceStatus, error) 
 		}
 	}
 
-	// Track aggregation state for scaled services.
-	type svcAgg struct {
-		oldestCreated      time.Time     // oldest CreatedAt across all replicas
-		oldestCreatedValid bool          //
-		longestUpDur       time.Duration // longest actual uptime among running replicas
-		longestUpStr       string        // uptime string of the longest-running replica
-		longestFromRunning bool          // true if longestUpStr came from a running replica
-		ports              []runner.Port // accumulated published ports across all replicas (deduped/sorted later)
-	}
+	// Scaled services aggregate through the shared svcAgg, the single home of
+	// the replica merge rules (see svcagg.go) — the host-wide grouper feeds the
+	// same type, so the two views cannot drift.
 	agg := make(map[string]*svcAgg)
-
-	status := make(map[string]runner.ServiceStatus)
+	order := make([]string, 0, len(entries))
 	for _, entry := range entries {
 		if entry.Service == "" {
 			continue
 		}
-		prev := status[entry.Service]
-		prev.Running = prev.Running || entry.State == "running"
-		if healthPriority(entry.Health) > healthPriority(prev.Health) {
-			prev.Health = entry.Health
-		}
-
-		// Initialize aggregation tracking for this service.
 		a := agg[entry.Service]
 		if a == nil {
 			a = &svcAgg{}
 			agg[entry.Service] = a
+			order = append(order, entry.Service)
 		}
-
-		// Parse CreatedAt for this replica.
-		entryCreated, entryValid := parseCreatedAt(entry.CreatedAt)
-		entryUptime := formatUptime(entry.Status)
-
-		// Track oldest CreatedAt across all replicas (for the Created column).
-		if entryValid {
-			if !a.oldestCreatedValid || entryCreated.Before(a.oldestCreated) {
-				a.oldestCreated = entryCreated
-				a.oldestCreatedValid = true
-			}
+		// Prefer the structured Publishers field (Compose v2); fall back to the
+		// Ports text string when Publishers is empty.
+		ports := extractPorts(entry)
+		if len(ports) == 0 && entry.Ports != "" {
+			ports = parsePortsString(entry.Ports)
 		}
-
-		// Track longest-running replica (for the Uptime column).
-		// Use entry.State to determine running status rather than parsing Status text.
-		// Running replicas always take priority over restarting ones.
-		if entry.State == "running" && entryUptime != "" {
-			dur := parseUptimeDuration(entryUptime)
-			if !a.longestFromRunning || dur > a.longestUpDur {
-				a.longestUpDur = dur
-				a.longestUpStr = entryUptime
-				a.longestFromRunning = true
-			}
-		} else if entryUptime == "restarting" && a.longestUpStr == "" {
-			a.longestUpStr = entryUptime
-		}
-
-		// Accumulate ports for this replica. Prefer the structured Publishers field
-		// (Compose v2); fall back to the Ports text string when Publishers is empty.
-		if replicaPorts := extractPorts(entry); len(replicaPorts) > 0 {
-			a.ports = append(a.ports, replicaPorts...)
-		} else if entry.Ports != "" {
-			a.ports = append(a.ports, parsePortsString(entry.Ports)...)
-		}
-
-		status[entry.Service] = prev
+		a.merge(entry.State == "running", entry.Health, entry.CreatedAt, entry.Status, ports)
 	}
 
-	// Apply aggregated Created, Uptime, and Ports to final status.
-	for svc, a := range agg {
-		st := status[svc]
-		if a.oldestCreatedValid {
-			st.Created = a.oldestCreated.Format("2006-01-02 15:04")
-		}
-		st.Uptime = a.longestUpStr
-		st.Ports = dedupAndSortPorts(a.ports)
-		status[svc] = st
+	status := make(map[string]runner.ServiceStatus, len(agg))
+	for _, svc := range order {
+		status[svc] = agg[svc].status()
 	}
 
 	return status, nil

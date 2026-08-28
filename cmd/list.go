@@ -477,9 +477,18 @@ func listSingleProject(ctx context.Context, c runner.Composer, jsonOutput, showS
 	return nil
 }
 
+// listComposerFactory builds the read-only composer one discovered project is
+// listed through. It takes the WHOLE project, not just its directory, mirroring
+// tui.ComposerFactory: a directory does not identify a project. Two projects
+// deployed with `docker compose -p blue` / `-p green` in one tree share a
+// ConfigDir, so a directory-keyed composer listed the SAME container set under
+// both headers — identical services, status, stats and update verdicts, in text
+// and in --json — while the TUI showed the two apart on the same host.
+type listComposerFactory func(proj compose.Project) runner.Composer
+
 // collectMultiProject gathers service statuses for each project using the factory to create composers.
 // Per-project errors are non-fatal: a warning is printed to stderr and the project is skipped.
-func collectMultiProject(ctx context.Context, projects []compose.Project, factory func(dir string) runner.Composer) []projectServices {
+func collectMultiProject(ctx context.Context, projects []compose.Project, factory listComposerFactory) []projectServices {
 	return collectMultiProjectStats(ctx, projects, factory, false, nil, false)
 }
 
@@ -510,10 +519,19 @@ type bulkStatsAggregator interface {
 // nil, the composer's ContainerStats() runs per project as a fallback —
 // reserved for callers that didn't request bulk sharing at all (e.g. test
 // mocks that don't implement bulkStatsAggregator).
-func collectMultiProjectStats(ctx context.Context, projects []compose.Project, factory func(dir string) runner.Composer, showStats bool, bulkStats map[string]runner.ServiceStats, checkUpdates bool) []projectServices {
+func collectMultiProjectStats(ctx context.Context, projects []compose.Project, factory listComposerFactory, showStats bool, bulkStats map[string]runner.ServiceStats, checkUpdates bool) []projectServices {
 	var result []projectServices
 	for _, proj := range projects {
-		c := factory(proj.ConfigDir)
+		// An empty ConfigDir means docker reported no compose file for this
+		// project, so there is no directory to run compose in. The factory
+		// would hand back a composer rooted at cdeploy's own cwd, and every
+		// service it then listed would be printed under THIS project's header.
+		// Skipping matches the per-project warn-and-continue rule below.
+		if proj.ConfigDir == "" {
+			fmt.Fprintf(os.Stderr, "warning: skipping project %q: no compose file reported for it\n", proj.Name)
+			continue
+		}
+		c := factory(proj)
 
 		services, err := c.ListServices(ctx)
 		if err != nil {
@@ -595,6 +613,14 @@ func runList(ctx context.Context, jsonOutput, showStats, showUpdates bool) error
 		return err
 	}
 
+	// `list` without -C is host-wide discovery: it builds one composer per
+	// project it finds, each already carrying that project's own name, so there
+	// is nothing for --project-name to select. Refusing beats silently ignoring
+	// a flag the user spelled to narrow the output.
+	if projectName != "" && projectDir == "" {
+		return fmt.Errorf("--project-name requires --project-dir (list without -C discovers every project)")
+	}
+
 	ctx, stop := signal.NotifyContext(ctx, os.Interrupt)
 	defer stop()
 
@@ -602,7 +628,7 @@ func runList(ctx context.Context, jsonOutput, showStats, showUpdates bool) error
 		// --ssh always implies a single project (resolveSSHRemote requires --project-dir).
 		// Update check is opt-in via --updates because each service costs one
 		// SSH round-trip to buildx/manifest-inspect — 20+ services adds 10s+.
-		rc, cleanup, err := resolveSSHRemote(ctx, sshTarget, projectDir, identityFile, listNewRemote)
+		rc, cleanup, err := resolveSSHRemote(ctx, sshTarget, projectDir, projectName, identityFile, listNewRemote)
 		if err != nil {
 			return err
 		}
@@ -628,6 +654,10 @@ func runList(ctx context.Context, jsonOutput, showStats, showUpdates bool) error
 		projDir := projectDir
 
 		rc := listNewRemote(server.Host, projDir)
+		// Only the single-project path (projDir set) reads this; multi-project
+		// discovery is refused above when --project-name is set, and the
+		// per-project factory names each composer from its own row.
+		rc.ProjectName = projectName
 		if err := rc.Connect(ctx); err != nil {
 			return fmt.Errorf("connecting to %s: %w", serverName, err)
 		}
@@ -654,8 +684,14 @@ func runList(ctx context.Context, jsonOutput, showStats, showUpdates bool) error
 			return nil
 		}
 
-		factory := func(d string) runner.Composer {
-			rc2 := listNewRemote(server.Host, d)
+		// The remote rows keep the pure PinComposeFiles: resolving compose's
+		// discovery precedence needs the project directory read, which is an
+		// SSH round trip per project here. See remoteComposerFor in root.go.
+		factory := func(proj compose.Project) runner.Composer {
+			rc2 := listNewRemote(server.Host, proj.ConfigDir)
+			rc2.ProjectName = proj.Name
+			rc2.ComposeFiles = compose.PinComposeFiles(proj.ConfigDir, proj.ConfigFiles)
+			rc2.SSHExtraArgs = rc.SSHExtraArgs
 			rc2.SetStandalone(rc.Standalone)
 			return rc2
 		}
@@ -689,10 +725,14 @@ func runList(ctx context.Context, jsonOutput, showStats, showUpdates bool) error
 	if projectDir != "" {
 		// Single-project mode. Update check is opt-in via --updates because
 		// each service costs one registry round-trip to buildx/manifest-inspect.
+		//
+		// Same split as the remote branch: only this path carries a name and
+		// resolves an identity; the multi-project factory below names each
+		// composer from its own row.
 		if !listHasCompose(dir) {
 			return fmt.Errorf("no compose file found in %s", dir)
 		}
-		if err := c.Detect(ctx); err != nil {
+		if err := prepareLocalComposer(ctx, c, projectName); err != nil {
 			return err
 		}
 		return listSingleProject(ctx, c, jsonOutput, showStats, showUpdates)
@@ -710,8 +750,10 @@ func runList(ctx context.Context, jsonOutput, showStats, showUpdates bool) error
 		return fmt.Errorf("no compose projects found (use -C to specify a project directory)")
 	}
 
-	factory := func(d string) runner.Composer {
-		lc := listNewLocal(d)
+	factory := func(proj compose.Project) runner.Composer {
+		lc := listNewLocal(proj.ConfigDir)
+		lc.ProjectName = proj.Name
+		lc.ComposeFiles = compose.PinComposeFilesLocal(proj.ConfigDir, proj.ConfigFiles)
 		lc.SetStandalone(c.Standalone)
 		return lc
 	}

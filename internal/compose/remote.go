@@ -110,10 +110,13 @@ func classifySSHError(err error, stderrText string) error {
 // Compile-time interface satisfaction checks.
 var _ runner.Composer = (*RemoteCompose)(nil)
 
-// remoteComposeFiles lists the compose file candidates to probe on the remote host.
+// remoteComposeFiles lists the compose file candidates to probe on the remote
+// host, in compose's own precedence order — the remote twin of composeFiles,
+// and load-bearing for the same reason: findRemoteComposeFile probes it in
+// order and returns the FIRST hit as the project's main file.
 var remoteComposeFiles = []string{
-	"compose.yml",
 	"compose.yaml",
+	"compose.yml",
 	"docker-compose.yml",
 	"docker-compose.yaml",
 }
@@ -142,6 +145,24 @@ type RemoteCompose struct {
 	// no `-f` flags, producing a byte-identical remote command string to the
 	// pre-ExtraComposeFiles behavior.
 	ExtraComposeFiles []string
+
+	// ComposeFiles is the project's OWN compose file set on the REMOTE host
+	// (Project.ConfigFiles, as docker reported it there). See
+	// Compose.ComposeFiles: when non-empty and ExtraComposeFiles is not set it
+	// supplies the `-f` pairs, so the composer loads the files the project was
+	// created from rather than whatever default-named file the remote directory
+	// happens to hold. Default nil = auto-discovery, byte-identical remote
+	// command string to the pre-ComposeFiles behavior.
+	ComposeFiles []string
+
+	// ProjectName, when non-empty, is spliced into every remote compose
+	// invocation as a shell-escaped `-p <name>` before the subcommand. See
+	// Compose.ProjectName: without it a composer built from ConfigDir alone
+	// targets whatever project the remote directory resolves to by default,
+	// which is the wrong container set for any project deployed with
+	// `-p` / COMPOSE_PROJECT_NAME. Default "" = byte-identical remote command
+	// string to the pre-ProjectName behavior.
+	ProjectName string
 
 	detected bool // true after Detect() or SetStandalone() has been called
 
@@ -309,9 +330,56 @@ func (r *RemoteCompose) Close() error {
 	return cmd.Run()
 }
 
+// projectFlag renders the shell-escaped `-p <name> ` fragment, with the
+// trailing space, or "" when no project name is set. Every remote compose
+// invocation splices it — remoteCommand for the pipeline and the read methods,
+// ExecCommand because it builds its own argv.
+func (r *RemoteCompose) projectFlag() string {
+	if r.ProjectName == "" {
+		return ""
+	}
+	return "-p " + shellEscape(r.ProjectName) + " "
+}
+
+// composeFlags renders the shell-escaped top-level flag fragment every remote
+// compose invocation carries: the `-f <file>` pairs first, then `-p <name>`,
+// each with a trailing space so the empty case reproduces the exact
+// byte-identical command string. It is the single home of that ordering, so
+// remoteCommand and ExecCommand — which builds its own argv — cannot disagree
+// about which files and which project a command addresses.
+func (r *RemoteCompose) composeFlags() string {
+	var flags string
+	for _, f := range r.composeFileList() {
+		flags += "-f " + shellEscape(f) + " "
+	}
+	return flags + r.projectFlag()
+}
+
+// composeFileList returns the `-f` file set for the next remote invocation.
+// See Compose.composeFileList — ExtraComposeFiles is the rollback override
+// stack and wins when set.
+func (r *RemoteCompose) composeFileList() []string {
+	if len(r.ExtraComposeFiles) > 0 {
+		return r.ExtraComposeFiles
+	}
+	return r.ComposeFiles
+}
+
 // remoteCommand builds an ssh command that runs a docker compose subcommand
 // on the remote host via the ControlMaster socket.
 func (r *RemoteCompose) remoteCommand(ctx context.Context, args ...string) *exec.Cmd {
+	return r.buildRemoteCommand(ctx, r.composeFlags(), args)
+}
+
+// remoteHostCommand is the remote twin of Compose.hostCommand: a compose
+// invocation carrying NO `-f` and NO `-p` flags, for the host-wide `ls` that
+// `cdeploy list` and the TUI project loader run on a composer which may already
+// carry both.
+func (r *RemoteCompose) remoteHostCommand(ctx context.Context, args ...string) *exec.Cmd {
+	return r.buildRemoteCommand(ctx, "", args)
+}
+
+func (r *RemoteCompose) buildRemoteCommand(ctx context.Context, flags string, args []string) *exec.Cmd {
 	var escaped []string
 	for _, a := range args {
 		escaped = append(escaped, shellEscape(a))
@@ -323,15 +391,10 @@ func (r *RemoteCompose) remoteCommand(ctx context.Context, args ...string) *exec
 	}
 
 	// Splice shell-escaped `-f <file>` pairs immediately after the compose
-	// binary, before the subcommand. fileFlags keeps a trailing space so the
-	// nil case ("") reproduces the exact byte-identical command string.
-	var fileFlags string
-	for _, f := range r.ExtraComposeFiles {
-		fileFlags += "-f " + shellEscape(f) + " "
-	}
-
+	// binary, before the subcommand, then the `-p <name>` pair — see
+	// composeFlags.
 	remoteCmd := fmt.Sprintf("CURRENT_UID=$(id -u):$(id -g) %s %s%s",
-		composeBin, fileFlags, strings.Join(escaped, " "))
+		composeBin, flags, strings.Join(escaped, " "))
 
 	if r.ProjectDir != "" {
 		remoteCmd = fmt.Sprintf("cd %s && %s", shellEscape(r.ProjectDir), remoteCmd)
@@ -501,9 +564,16 @@ func (r *RemoteCompose) ContainerStatsFromBulk(ctx context.Context, bulk map[str
 	return aggregateStatsByService(idToService, bulk), nil
 }
 
-// findRemoteComposeFile runs a single SSH command that probes all compose file
-// candidates and returns the first match. Avoids multiple SSH round-trips.
+// findRemoteComposeFile returns this project's main compose file on the remote
+// host. When docker reported the project's own file set, the first entry IS
+// that file and no probe is needed (nor correct: the four canonical names would
+// find a sibling project's file, or nothing at all for a stack.yml project).
+// Otherwise a single SSH command probes all candidates and returns the first
+// match, avoiding multiple SSH round-trips.
 func (r *RemoteCompose) findRemoteComposeFile(ctx context.Context) (string, error) {
+	if len(r.ComposeFiles) > 0 {
+		return r.ComposeFiles[0], nil
+	}
 	// Build: for f in compose.yml compose.yaml ...; do test -f "$projDir/$f" && echo "$f" && break; done
 	var testExpr string
 	if r.ProjectDir != "" {
@@ -547,8 +617,12 @@ func (r *RemoteCompose) ConfigFile(ctx context.Context) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
+	// findRemoteComposeFile returns a BARE name from the probe (resolved against
+	// ProjectDir) but an ABSOLUTE path when it came from ComposeFiles, which
+	// docker reports absolute. Prefixing an absolute path would build
+	// /srv/app//srv/app/prod.yml.
 	filePath := name
-	if r.ProjectDir != "" {
+	if r.ProjectDir != "" && !strings.HasPrefix(name, "/") {
 		filePath = r.ProjectDir + "/" + name
 	}
 
@@ -630,8 +704,8 @@ func (r *RemoteCompose) ExecCommand(ctx context.Context, service string, command
 		escapedArgs = append(escapedArgs, shellEscape(a))
 	}
 
-	remoteCmd := fmt.Sprintf("CURRENT_UID=$(id -u):$(id -g) %s %s",
-		composeBin, strings.Join(escapedArgs, " "))
+	remoteCmd := fmt.Sprintf("CURRENT_UID=$(id -u):$(id -g) %s %s%s",
+		composeBin, r.composeFlags(), strings.Join(escapedArgs, " "))
 
 	if r.ProjectDir != "" {
 		remoteCmd = fmt.Sprintf("cd %s && %s", shellEscape(r.ProjectDir), remoteCmd)
@@ -665,7 +739,7 @@ func (r *RemoteCompose) ValidateConfig(ctx context.Context) error {
 
 // ListProjects returns all Docker Compose projects on the remote host.
 func (r *RemoteCompose) ListProjects(ctx context.Context) ([]Project, error) {
-	cmd := r.remoteCommand(ctx, "ls", "-a", "--format", "json")
+	cmd := r.remoteHostCommand(ctx, "ls", "-a", "--format", "json")
 	var out []byte
 	var err error
 	if r.outputCmd != nil {
@@ -881,9 +955,10 @@ func (r *RemoteCompose) SnapshotServices(ctx context.Context, services []string)
 	}
 
 	snap := &Snapshot{
-		Schema:     snapshotSchemaVersion,
-		ProjectDir: remoteProjectDir(r.ProjectDir),
-		Services:   map[string]SnapshotEntry{},
+		Schema:      snapshotSchemaVersion,
+		ProjectDir:  remoteProjectDir(r.ProjectDir),
+		ProjectName: r.stateName(),
+		Services:    map[string]SnapshotEntry{},
 	}
 	recordedAt := snapshotClock().Format(time.RFC3339)
 	var warnings []string
@@ -982,10 +1057,11 @@ func (r *RemoteCompose) inspectContainerImageIDs(ctx context.Context, containerI
 // it in DOUBLE quotes) so the remote shell resolves the docker host's home
 // directory — the state must live on the HOST so CI deploys and laptop
 // rollbacks share one authoritative history. The key is derived from the
-// POSIX-normalized project dir so `-C ./app` and its absolute spelling collapse
-// to one file.
+// POSIX-normalized project dir and the CANONICAL project name (see
+// canonicalStateName) so `-C ./app` and its absolute spelling collapse to one
+// file, and so does a composer naming the directory's default project.
 func (r *RemoteCompose) remoteStatePath() string {
-	return "$HOME/" + stateFileRelPath(remoteProjectDir(r.ProjectDir))
+	return "$HOME/" + stateFileRelPath(remoteProjectDir(r.ProjectDir), r.stateName())
 }
 
 // writeRemoteFile writes data to a file on the remote host atomically (temp
@@ -1038,8 +1114,31 @@ func (r *RemoteCompose) writeRemoteFile(ctx context.Context, path string, data [
 // while a present-but-unreadable file surfaces cat's non-zero exit as an error.
 // A non-empty payload is parsed strictly via parseSnapshot (schema/JSON errors
 // are returned typed, distinguishable from not-found).
+//
+// There is NO second path to try: canonicalStateName folds the directory's
+// DEFAULT project onto the dir-only key, so an unnamed composer and one naming
+// that project read the same remote file. The single-file command string is
+// byte-identical to the one every release has sent.
 func (r *RemoteCompose) ReadSnapshot(ctx context.Context) (*Snapshot, error) {
-	remoteCmd := fmt.Sprintf(`f="%s"; if [ -f "$f" ]; then cat "$f"; fi`, r.remoteStatePath())
+	return r.readPrimarySnapshot(ctx)
+}
+
+// readPrimarySnapshot reads this project's remote state file and refuses one
+// recorded for a different project — which is also what stops WriteSnapshot's
+// merge from persisting another project's entries forward.
+func (r *RemoteCompose) readPrimarySnapshot(ctx context.Context) (*Snapshot, error) {
+	snap, err := r.readRemoteSnapshot(ctx, r.remoteStatePath())
+	if err != nil || snap == nil {
+		return nil, err
+	}
+	if err := checkSnapshotProject(snap, r.stateName()); err != nil {
+		return nil, err
+	}
+	return snap, nil
+}
+
+func (r *RemoteCompose) readRemoteSnapshot(ctx context.Context, statePath string) (*Snapshot, error) {
+	remoteCmd := fmt.Sprintf(`f="%s"; if [ -f "$f" ]; then cat "$f"; fi`, statePath)
 	sshArgv := r.sshArgs(
 		[]string{"-S", r.SocketPath, "-o", "ControlMaster=no"},
 		remoteCmd,
@@ -1081,11 +1180,14 @@ func (r *RemoteCompose) ReadSnapshot(ctx context.Context) (*Snapshot, error) {
 // writes are best-effort (a lost entry only means that one service can't be
 // rolled back to the exact digest of an overlapping concurrent deploy).
 func (r *RemoteCompose) WriteSnapshot(ctx context.Context, fresh *Snapshot) error {
-	existing, err := existingForMerge(r.ReadSnapshot(ctx))
+	existing, err := existingForMerge(r.readPrimarySnapshot(ctx))
 	if err != nil {
 		return fmt.Errorf("refusing to overwrite snapshot state: %w", err)
 	}
 	merged := mergeSnapshot(existing, fresh)
+	// Re-derived from the composer, never trusted from fresh — see
+	// Compose.WriteSnapshot.
+	merged.ProjectName = r.stateName()
 	data, err := json.MarshalIndent(merged, "", "  ")
 	if err != nil {
 		return fmt.Errorf("marshaling snapshot: %w", err)
@@ -1133,19 +1235,27 @@ func (r *RemoteCompose) runRemoteDockerCmdStream(ctx context.Context, dockerArgs
 //     remoteRollbackOverridePath) makes the path unique across CLIENTS — the
 //     local PID alone collides when two machines roll back the same project on
 //     the same host.
-//   - the main compose file is discovered via findRemoteComposeFile (a bare
-//     name relative to ProjectDir, which remoteCommand cd's into), placed FIRST
-//     in ExtraComposeFiles so `-f` auto-discovery disabling keeps the right
-//     project.
+//   - the base file set is the project's OWN ComposeFiles when docker reported
+//     them, and only otherwise the findRemoteComposeFile probe (a bare name
+//     relative to ProjectDir, which remoteCommand cd's into). It is placed
+//     FIRST in ExtraComposeFiles, ahead of the override, so `-f`
+//     auto-discovery disabling keeps the right project.
 //
 // cleanup `rm -f`s the remote override file over SSH and RESETS
 // ExtraComposeFiles to nil.
 func (r *RemoteCompose) PrepareRollback(ctx context.Context, entries map[string]SnapshotEntry, services []string, w io.Writer) (func(), error) {
 	targets := rollbackTargets(entries, services)
 
-	main, err := r.findRemoteComposeFile(ctx)
-	if err != nil {
-		return nil, fmt.Errorf("rollback prep: %w", err)
+	// The project's own file set is stacked ahead of the override, in load
+	// order: `-f` disables auto-discovery, so recreating a multi-file project
+	// from its first file alone would drop the rest of its definition.
+	base := r.ComposeFiles
+	if len(base) == 0 {
+		main, err := r.findRemoteComposeFile(ctx)
+		if err != nil {
+			return nil, fmt.Errorf("rollback prep: %w", err)
+		}
+		base = []string{main}
 	}
 
 	// Advisory same-digest check (best-effort, non-fatal).
@@ -1178,7 +1288,7 @@ func (r *RemoteCompose) PrepareRollback(ctx context.Context, entries map[string]
 		return nil, fmt.Errorf("rollback prep: writing override: %w", err)
 	}
 
-	r.ExtraComposeFiles = []string{main, remotePath}
+	r.ExtraComposeFiles = append(append([]string{}, base...), remotePath)
 	cleanup := func() {
 		cctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()

@@ -168,14 +168,14 @@ func runOperationWithPrep(ctx context.Context, op runner.Operation, all bool, co
 	var c runner.Composer
 	switch {
 	case sshTarget != "":
-		rc, cleanup, err := resolveSSHRemote(ctx, sshTarget, projectDir, identityFile, opNewRemote)
+		rc, cleanup, err := resolveSSHRemote(ctx, sshTarget, projectDir, projectName, identityFile, opNewRemote)
 		if err != nil {
 			return err
 		}
 		defer cleanup()
 		c = rc
 	case serverName != "":
-		rc, cleanup, err := resolveServerRemote(ctx, serverName, projectDir, opNewRemote)
+		rc, cleanup, err := resolveServerRemote(ctx, serverName, projectDir, projectName, opNewRemote)
 		if err != nil {
 			return err
 		}
@@ -191,7 +191,7 @@ func runOperationWithPrep(ctx context.Context, op runner.Operation, all bool, co
 			}
 		}
 		lc := opNewLocal(dir)
-		if err := lc.Detect(ctx); err != nil {
+		if err := prepareLocalComposer(ctx, lc, projectName); err != nil {
 			return err
 		}
 		c = lc

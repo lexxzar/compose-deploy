@@ -104,7 +104,7 @@ func stubRemoteFactoryWithCloseCount(runErr, outputErr error) (
 
 func TestResolveSSHRemote_EmptyProjectDir(t *testing.T) {
 	factory, _ := stubRemoteFactory(nil, nil)
-	_, _, err := resolveSSHRemote(context.Background(), "user@host", "", "", factory)
+	_, _, err := resolveSSHRemote(context.Background(), "user@host", "", "", "", factory)
 	if err == nil {
 		t.Fatal("expected error, got nil")
 	}
@@ -115,7 +115,7 @@ func TestResolveSSHRemote_EmptyProjectDir(t *testing.T) {
 
 func TestResolveSSHRemote_MalformedTarget(t *testing.T) {
 	factory, _ := stubRemoteFactory(nil, nil)
-	_, _, err := resolveSSHRemote(context.Background(), "user@", "/srv/app", "", factory)
+	_, _, err := resolveSSHRemote(context.Background(), "user@", "/srv/app", "", "", factory)
 	if err == nil {
 		t.Fatal("expected error, got nil")
 	}
@@ -135,6 +135,7 @@ func TestResolveSSHRemote_HappyPath(t *testing.T) {
 		context.Background(),
 		"user@host:2222",
 		"/srv/app",
+		"",
 		"",
 		factory,
 	)
@@ -180,6 +181,7 @@ func TestResolveSSHRemote_HappyPathNoPort(t *testing.T) {
 		"host",
 		"/srv/app",
 		"",
+		"",
 		factory,
 	)
 	if err != nil {
@@ -202,6 +204,7 @@ func TestResolveSSHRemote_ConnectFailure(t *testing.T) {
 		context.Background(),
 		"user@host",
 		"/srv/app",
+		"",
 		"",
 		factory,
 	)
@@ -232,6 +235,7 @@ func TestResolveSSHRemote_DetectFailure(t *testing.T) {
 		context.Background(),
 		"user@host",
 		"/srv/app",
+		"",
 		"",
 		factory,
 	)
@@ -267,6 +271,7 @@ func TestResolveSSHRemote_WithIdentity_HappyPath(t *testing.T) {
 		context.Background(),
 		"user@host:2222",
 		"/srv/app",
+		"",
 		keyPath,
 		factory,
 	)
@@ -300,6 +305,7 @@ func TestResolveSSHRemote_WithIdentity_NoPort(t *testing.T) {
 		context.Background(),
 		"user@host",
 		"/srv/app",
+		"",
 		keyPath,
 		factory,
 	)
@@ -326,6 +332,7 @@ func TestResolveSSHRemote_WithIdentity_InvalidPath(t *testing.T) {
 		context.Background(),
 		"user@host",
 		"/srv/app",
+		"",
 		"/nonexistent/key",
 		factory,
 	)
@@ -360,6 +367,7 @@ func TestResolveSSHRemote_WithIdentity_TildeExpansion(t *testing.T) {
 		context.Background(),
 		"user@host",
 		"/srv/app",
+		"",
 		"~/.ssh/id_test",
 		factory,
 	)

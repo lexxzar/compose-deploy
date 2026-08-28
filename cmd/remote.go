@@ -28,6 +28,20 @@ func checkRemoteMutex(serverName, sshTarget, identityFile string) error {
 	return nil
 }
 
+// prepareLocalComposer readies a LOCAL composer for a subcommand: it stamps the
+// `--project-name` override and detects the docker compose variant.
+//
+// It deliberately performs NO project lookup. The identity is exactly what the
+// caller typed — `-C` says where, `-p` says which — so `deploy -C /opt/appA -p
+// web` addresses /opt/appA and never a directory docker happens to report for
+// some other project called web, and `deploy -p brand-new -a` can create a
+// project that does not exist yet. Convergence with the TUI's named rows comes
+// from canonicalStateName instead, which needs no host state at all.
+func prepareLocalComposer(ctx context.Context, lc *compose.Compose, projectName string) error {
+	lc.ProjectName = projectName
+	return lc.Detect(ctx)
+}
+
 // resolveSSHRemote parses an ad-hoc SSH connection string and builds a
 // connected, detected RemoteCompose ready to run docker compose commands.
 //
@@ -39,6 +53,13 @@ func checkRemoteMutex(serverName, sshTarget, identityFile string) error {
 // and appended to SSHExtraArgs as `-i <cleanPath>`, alongside any port args
 // from the SSH target.
 //
+// projectName is stamped onto the composer as the `-p` compose flag. It is a
+// PARAMETER rather than a read of the package-level flag var so a new
+// subcommand cannot forget it: a directory does not identify a project, and a
+// composer built from the directory alone addresses whatever project that
+// directory resolves to — the wrong container set for anything deployed with
+// `docker compose -p` or COMPOSE_PROJECT_NAME.
+//
 // The returned cleanup is always non-nil; on the error path it is a no-op so
 // callers can write `defer cleanup()` immediately after the call without
 // nil-checking. On Detect failure the helper closes the ControlMaster
@@ -46,7 +67,7 @@ func checkRemoteMutex(serverName, sshTarget, identityFile string) error {
 // when err is non-nil (it is a no-op anyway).
 func resolveSSHRemote(
 	ctx context.Context,
-	sshTarget, projectDir, identityFile string,
+	sshTarget, projectDir, projectName, identityFile string,
 	newRemote func(host, projDir string) *compose.RemoteCompose,
 ) (*compose.RemoteCompose, func(), error) {
 	if projectDir == "" {
@@ -69,6 +90,7 @@ func resolveSSHRemote(
 
 	rc := newRemote(target.SSHHost(), projectDir)
 	rc.SSHExtraArgs = extraArgs
+	rc.ProjectName = projectName
 
 	if err := rc.Connect(ctx); err != nil {
 		return nil, noopCleanup, fmt.Errorf("connecting to %s: %w", target.SSHHost(), err)
@@ -92,7 +114,7 @@ func resolveSSHRemote(
 // the error path so callers can `defer cleanup()` immediately after the call.
 func resolveServerRemote(
 	ctx context.Context,
-	serverName, projectDirOverride string,
+	serverName, projectDirOverride, projectName string,
 	newRemote func(host, projDir string) *compose.RemoteCompose,
 ) (*compose.RemoteCompose, func(), error) {
 	cfg, err := config.Load(config.DefaultPath())
@@ -116,6 +138,7 @@ func resolveServerRemote(
 	}
 
 	rc := newRemote(server.Host, projDir)
+	rc.ProjectName = projectName
 	if err := rc.Connect(ctx); err != nil {
 		return nil, noopCleanup, fmt.Errorf("connecting to %s: %w", serverName, err)
 	}

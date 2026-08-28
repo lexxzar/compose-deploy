@@ -26,6 +26,46 @@ import (
 	"github.com/muesli/termenv"
 )
 
+// singleGroupModel returns a container-screen Model in the degenerate
+// one-group shape that setSingleGroup installs in production: the flat services
+// list plus the derived svcGroups/svcEntries. A single group emits no header
+// rows, so its rows are index-parallel to its services — that property, not a
+// temporary seam, is what keeps every index-keyed assertion in this file
+// meaning what it did before grouping existed.
+func singleGroupModel(services []string) Model {
+	m := Model{selected: make(map[string]bool)}
+	m.setSingleGroup(services)
+	return m
+}
+
+// selectedIdx builds a selection map from ROW indices. Tests address rows by
+// index; the Model keys m.selected by svcKey, and this is the one converter
+// between the two — the model must already carry its group (singleGroupModel or
+// setSingleGroup) before it is called.
+func selectedIdx(m Model, idx ...int) map[string]bool {
+	sel := make(map[string]bool, len(idx))
+	for _, i := range idx {
+		sel[m.svcKeyAt(i)] = true
+	}
+	return sel
+}
+
+// qStatus qualifies a bare-name status map exactly as the servicesMsg/statusMsg
+// handlers do, so a test can keep writing the names docker compose reports.
+func qStatus(m Model, status map[string]runner.ServiceStatus) map[string]runner.ServiceStatus {
+	return qualifyMap(m.ownerProjName(), status)
+}
+
+// qStats is qStatus for the resource-usage map.
+func qStats(m Model, stats map[string]runner.ServiceStats) map[string]runner.ServiceStats {
+	return qualifyMap(m.ownerProjName(), stats)
+}
+
+// qk resolves a bare service name to the key the Model stores it under.
+func qk(m Model, service string) string {
+	return svcKey(m.ownerProjName(), service)
+}
+
 func mockFactory(mc *mockComposer) ComposerFactory {
 	return func(compose.Project) runner.Composer { return mc }
 }
@@ -169,33 +209,45 @@ func TestNewModel_SkipsPickerWhenComposerProvided(t *testing.T) {
 	if m.screen != screenSelectContainers {
 		t.Errorf("screen = %d, want %d (screenSelectContainers)", m.screen, screenSelectContainers)
 	}
-	if m.showPicker {
-		t.Error("showPicker should be false when composer is provided")
+	if m.drilledFromHost {
+		t.Error("drilledFromHost should be false: a standalone drilled screen is a root")
 	}
 	if m.composer == nil {
 		t.Error("composer should be set")
 	}
 }
 
-func TestNewModel_ShowsPickerWhenNoComposer(t *testing.T) {
+func TestNewModel_LandsOnGroupedWhenNoComposer(t *testing.T) {
 	mc := &mockComposer{}
 	m := NewModel(nil, io.Discard, mockFactory(mc), nil, nil)
 
-	if m.screen != screenSelectProject {
-		t.Errorf("screen = %d, want %d (screenSelectProject)", m.screen, screenSelectProject)
+	if m.screen != screenSelectContainers {
+		t.Errorf("screen = %d, want %d (screenSelectContainers)", m.screen, screenSelectContainers)
 	}
-	if !m.showPicker {
-		t.Error("showPicker should be true when no composer")
+	if !m.grouped {
+		t.Error("grouped should be true when no cwd compose file")
+	}
+	if m.drilledFromHost {
+		t.Error("drilledFromHost must stay false: the grouped view is the landing screen")
+	}
+	if !m.refreshInFlight {
+		t.Error("refreshInFlight should be armed for the stats fetch Init() fires")
+	}
+	if m.updateInFlight {
+		t.Error("updateInFlight must stay clear: grouped mode never scans automatically")
+	}
+	if m.autoUpdatesAllowed() {
+		t.Error("autoUpdatesAllowed must be false in grouped mode")
 	}
 }
 
-func TestInit_LoadsProjectsWhenPickerShown(t *testing.T) {
+func TestInit_LoadsGroupsWhenNoComposer(t *testing.T) {
 	mc := &mockComposer{}
 	m := NewModel(nil, io.Discard, mockFactory(mc), nil, nil)
 
 	cmd := m.Init()
 	if cmd == nil {
-		t.Error("Init() should return a command when picker is shown")
+		t.Error("Init() should return a command for the grouped landing screen")
 	}
 }
 
@@ -215,18 +267,17 @@ func TestWithLocalProjectLoader(t *testing.T) {
 		t.Fatal("projectLoader should be set by WithLocalProjectLoader")
 	}
 
-	// Execute the loader via loadProjects
-	cmd := m.loadProjects()
-	msg := cmd()
-	pm := msg.(projectsMsg)
-	if pm.err != nil {
-		t.Fatalf("unexpected error: %v", pm.err)
+	// Execute the loader through the grouped loader, its only consumer now
+	// that the project picker is gone.
+	sm := m.loadGroups()().(servicesMsg)
+	if sm.err != nil {
+		t.Fatalf("unexpected error: %v", sm.err)
 	}
 	if !called {
 		t.Error("local loader should have been called")
 	}
-	if len(pm.projects) != 1 || pm.projects[0].Name != "test" {
-		t.Errorf("projects = %v, want [{test /test}]", pm.projects)
+	if len(sm.projects) != 1 || sm.projects[0].Name != "test" {
+		t.Errorf("projects = %v, want [{test /test}]", sm.projects)
 	}
 }
 
@@ -249,23 +300,6 @@ func TestWithConfig(t *testing.T) {
 	}
 	if len(m.config.Servers) != 1 || m.config.Servers[0].Name != "test" {
 		t.Errorf("config.Servers = %v, want [{test user@host}]", m.config.Servers)
-	}
-}
-
-func TestLoadProjects_NilLoader_ReturnsError(t *testing.T) {
-	mc := &mockComposer{}
-	m := NewModel(nil, io.Discard, mockFactory(mc), nil, nil)
-	// Ensure no loader is set
-	m.projectLoader = nil
-
-	cmd := m.loadProjects()
-	msg := cmd()
-	pm := msg.(projectsMsg)
-	if pm.err == nil {
-		t.Fatal("expected error when no loader configured")
-	}
-	if !strings.Contains(pm.err.Error(), "no project loader") {
-		t.Errorf("error = %q, want it to contain 'no project loader'", pm.err.Error())
 	}
 }
 
@@ -305,12 +339,13 @@ func TestServicesMsg_SortsServicesCaseInsensitive(t *testing.T) {
 	m = updated.(Model)
 
 	want := []string{"Alpha", "beta", "zebra"}
-	if len(m.services) != len(want) {
-		t.Fatalf("got %d services, want %d", len(m.services), len(want))
+	got := modelServices(m)
+	if len(got) != len(want) {
+		t.Fatalf("got %d services, want %d", len(got), len(want))
 	}
 	for i, svc := range want {
-		if m.services[i] != svc {
-			t.Fatalf("service[%d] = %q, want %q", i, m.services[i], svc)
+		if got[i] != svc {
+			t.Fatalf("service[%d] = %q, want %q", i, got[i], svc)
 		}
 	}
 }
@@ -319,19 +354,19 @@ func TestSelectContainers_Toggle(t *testing.T) {
 	mc := &mockComposer{services: []string{"nginx", "postgres"}}
 	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
 	m.screen = screenSelectContainers
-	m.services = mc.services
+	m.setSingleGroup(mc.services)
 
 	// Toggle first item
 	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{' '}})
 	m = updated.(Model)
-	if !m.selected[0] {
+	if !m.selected[m.svcKeyAt(0)] {
 		t.Error("item 0 should be selected after space")
 	}
 
 	// Toggle off
 	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{' '}})
 	m = updated.(Model)
-	if m.selected[0] {
+	if m.selected[m.svcKeyAt(0)] {
 		t.Error("item 0 should be deselected after second space")
 	}
 }
@@ -340,13 +375,13 @@ func TestSelectContainers_SelectAll(t *testing.T) {
 	mc := &mockComposer{services: []string{"nginx", "postgres", "redis"}}
 	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
 	m.screen = screenSelectContainers
-	m.services = mc.services
+	m.setSingleGroup(mc.services)
 
 	// Select all
 	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'a'}})
 	m = updated.(Model)
-	for i := range m.services {
-		if !m.selected[i] {
+	for i := range modelServices(m) {
+		if !m.selected[m.svcKeyAt(i)] {
 			t.Errorf("item %d should be selected after 'a'", i)
 		}
 	}
@@ -354,8 +389,8 @@ func TestSelectContainers_SelectAll(t *testing.T) {
 	// Deselect all
 	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'a'}})
 	m = updated.(Model)
-	for i := range m.services {
-		if m.selected[i] {
+	for i := range modelServices(m) {
+		if m.selected[m.svcKeyAt(i)] {
 			t.Errorf("item %d should be deselected after second 'a'", i)
 		}
 	}
@@ -365,8 +400,8 @@ func TestSelectContainers_EnterIgnoredWhenNotConfirming(t *testing.T) {
 	mc := &mockComposer{services: []string{"nginx"}}
 	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
 	m.screen = screenSelectContainers
-	m.services = mc.services
-	m.selected[0] = true
+	m.setSingleGroup(mc.services)
+	m.selected[m.svcKeyAt(0)] = true
 
 	// Enter with selection but not in confirming state should do nothing
 	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyEnter})
@@ -376,82 +411,77 @@ func TestSelectContainers_EnterIgnoredWhenNotConfirming(t *testing.T) {
 	}
 }
 
-func TestSelectContainers_EscGoesBackWhenPickerShown(t *testing.T) {
+// esc out of a drilled project lands on the grouped host view — the screen that
+// sits above a single project now that the picker is gone.
+func TestSelectContainers_EscDrillsOutToGroupedView(t *testing.T) {
 	mc := &mockComposer{services: []string{"nginx"}}
 	m := NewModel(nil, io.Discard, mockFactory(mc), nil, nil)
+	installFakeTick(&m)
 	m.screen = screenSelectContainers
-	m.showPicker = true
-	m.services = mc.services
-	m.selected[0] = true
+	m.drilledFromHost = true
+	m.grouped = false // drilled mode: NewModel now starts grouped
+	m.projName = "app"
+	m.projDir = "/app"
+	m.setSingleGroup(mc.services)
+	m.selected[m.svcKeyAt(0)] = true
 	m.composer = mc
-	m.projects = []compose.Project{{Name: "app", ConfigDir: "/app"}}
-	m.projCursor = 0
 
 	updated, cmd := m.Update(tea.KeyMsg{Type: tea.KeyEsc})
 	m = updated.(Model)
 
-	if m.screen != screenSelectProject {
-		t.Errorf("screen = %d, want %d", m.screen, screenSelectProject)
+	if m.screen != screenSelectContainers || !m.grouped {
+		t.Errorf("screen = %d grouped = %v, want the grouped container screen", m.screen, m.grouped)
 	}
-	if len(m.services) != 0 {
-		t.Error("services should be cleared on back")
+	if m.composer != nil {
+		t.Error("the drilled project's composer must be dropped on drill-out")
+	}
+	if m.svcGroups != nil || m.svcEntries != nil {
+		t.Error("row state should be cleared on drill-out")
 	}
 	if m.svcStatus != nil {
-		t.Error("svcStatus should be nil after going back")
+		t.Error("svcStatus should be nil after drill-out")
 	}
-	if cmd != nil {
-		t.Error("should not reload projects when already loaded")
+	if len(m.selected) != 0 {
+		t.Error("selection should be dropped on drill-out")
+	}
+	if m.projName != "" || m.projDir != "" {
+		t.Errorf("project identity survived drill-out: %q %q", m.projName, m.projDir)
+	}
+	if cmd == nil {
+		t.Error("drill-out must dispatch the grouped load batch")
 	}
 }
 
-func TestSelectContainers_EscLoadsProjectsWhenNil(t *testing.T) {
+// Drill-out reloads the host view unconditionally: the grouped screen holds no
+// cached project list to fall back on the way the picker did.
+func TestSelectContainers_EscDrillOutBumpsSessions(t *testing.T) {
 	mc := &mockComposer{services: []string{"nginx"}}
 	m := NewModel(nil, io.Discard, mockFactory(mc), nil, nil)
+	installFakeTick(&m)
 	m.screen = screenSelectContainers
-	m.showPicker = true
-	m.services = mc.services
+	m.drilledFromHost = true
+	m.grouped = false
+	m.setSingleGroup(mc.services)
 	m.composer = mc
-	// projects is nil (local fast-path skipped project screen)
+	status, stats, updates := m.statusSession, m.statsSession, m.updatesSession
 
 	updated, cmd := m.Update(tea.KeyMsg{Type: tea.KeyEsc})
 	m = updated.(Model)
 
-	if m.screen != screenSelectProject {
-		t.Errorf("screen = %d, want %d", m.screen, screenSelectProject)
+	if m.statusSession == status || m.statsSession == stats || m.updatesSession == updates {
+		t.Error("drill-out is a composer swap: all three session counters must bump")
 	}
 	if cmd == nil {
-		t.Error("should load projects when projects is nil")
+		t.Error("should dispatch the grouped reload")
 	}
 }
 
-func TestSelectContainers_EscPreservesCursor(t *testing.T) {
-	mc := &mockComposer{services: []string{"nginx"}}
-	m := NewModel(nil, io.Discard, mockFactory(mc), nil, nil)
-	m.screen = screenSelectContainers
-	m.showPicker = true
-	m.services = mc.services
-	m.composer = mc
-	m.projects = []compose.Project{
-		{Name: "alpha", ConfigDir: "/a"},
-		{Name: "beta", ConfigDir: "/b"},
-		{Name: "gamma", ConfigDir: "/c"},
-	}
-	m.projCursor = 2 // user had selected "gamma"
-
-	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyEsc})
-	m = updated.(Model)
-
-	if m.projCursor != 2 {
-		t.Errorf("projCursor = %d, want 2 (should preserve position)", m.projCursor)
-	}
-}
-
-func TestSelectContainers_EscDoesNothingWhenPickerSkipped(t *testing.T) {
+func TestSelectContainers_EscDoesNothingWhenStandalone(t *testing.T) {
 	mc := &mockComposer{services: []string{"nginx"}}
 	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
 	m.screen = screenSelectContainers
-	m.services = mc.services
-	m.svcStatus = map[string]runner.ServiceStatus{"nginx": {Running: true}}
+	m.setSingleGroup(mc.services)
+	m.svcStatus = qStatus(m, map[string]runner.ServiceStatus{"nginx": {Running: true}})
 
 	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyEsc})
 	m = updated.(Model)
@@ -460,7 +490,7 @@ func TestSelectContainers_EscDoesNothingWhenPickerSkipped(t *testing.T) {
 		t.Errorf("screen = %d, want %d (should stay on container select)", m.screen, screenSelectContainers)
 	}
 	if m.svcStatus == nil {
-		t.Error("svcStatus should be preserved when picker is skipped")
+		t.Error("svcStatus should be preserved on a root drilled screen")
 	}
 }
 
@@ -475,10 +505,9 @@ func TestSelectContainers_QuitReturnsQuit(t *testing.T) {
 }
 
 func TestSelectedContainers(t *testing.T) {
-	m := Model{
-		services: []string{"nginx", "postgres", "redis"},
-		selected: map[int]bool{0: true, 2: true},
-	}
+	m := Model{}
+	m.setSingleGroup([]string{"nginx", "postgres", "redis"})
+	m.selected = selectedIdx(m, 0, 2)
 
 	got := m.selectedContainers()
 	if len(got) != 2 || got[0] != "nginx" || got[1] != "redis" {
@@ -487,15 +516,14 @@ func TestSelectedContainers(t *testing.T) {
 }
 
 func TestAllSelected(t *testing.T) {
-	m := Model{
-		services: []string{"a", "b"},
-		selected: map[int]bool{0: true, 1: true},
-	}
+	m := Model{}
+	m.setSingleGroup([]string{"a", "b"})
+	m.selected = selectedIdx(m, 0, 1)
 	if !m.allSelected() {
 		t.Error("allSelected() = false, want true")
 	}
 
-	m.selected[1] = false
+	m.selected[m.svcKeyAt(1)] = false
 	if m.allSelected() {
 		t.Error("allSelected() = true, want false")
 	}
@@ -556,7 +584,9 @@ func TestComputeMatches(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got := computeMatches(tt.services, tt.query)
+			// A single group emits no header rows, so the entry indices the
+			// helper returns are the service indices the table names.
+			got := computeMatches(rebuildSvcEntries([]svcGroup{{services: tt.services}}), tt.query)
 			if len(got) != len(tt.want) {
 				t.Fatalf("computeMatches(%v, %q) = %v, want %v", tt.services, tt.query, got, tt.want)
 			}
@@ -603,13 +633,20 @@ func TestClearSearch(t *testing.T) {
 	}
 }
 
+// progressStep builds the stepState shape enterProgress produces for a
+// single-batch run: the drawn label IS the runner step name when there is only
+// one project. enterProgress is the only production producer and always sets
+// both fields, so a hand-built fixture has to as well.
+func progressStep(name, status string) stepState {
+	return stepState{name: name, label: name, status: status}
+}
+
 func TestHandleStepEvent_Done(t *testing.T) {
 	m := Model{
-		screen: screenProgress,
-		steps: []stepState{
-			{name: runner.StepStopping, status: runner.StatusRunning},
-		},
-		eventCh: make(chan runner.StepEvent),
+		screen:         screenProgress,
+		steps:          []stepState{progressStep(runner.StepStopping, runner.StatusRunning)},
+		batchStepCount: 1,
+		eventCh:        make(chan runner.StepEvent),
 	}
 
 	updated, _ := m.handleStepEvent(runner.StepEvent{
@@ -624,10 +661,9 @@ func TestHandleStepEvent_Done(t *testing.T) {
 
 func TestHandleStepEvent_Failed(t *testing.T) {
 	m := Model{
-		screen: screenProgress,
-		steps: []stepState{
-			{name: runner.StepStopping, status: runner.StatusRunning},
-		},
+		screen:         screenProgress,
+		steps:          []stepState{progressStep(runner.StepStopping, runner.StatusRunning)},
+		batchStepCount: 1,
 	}
 
 	updated, _ := m.handleStepEvent(runner.StepEvent{
@@ -646,8 +682,8 @@ func TestView_AllScreens(t *testing.T) {
 
 	// Container select screen (initial screen when composer provided)
 	m.screen = screenSelectContainers
-	m.services = []string{"nginx", "postgres"}
-	m.selected[1] = true
+	m.setSingleGroup([]string{"nginx", "postgres"})
+	m.selected[m.svcKeyAt(1)] = true
 	v := m.View()
 	if v == "" {
 		t.Error("viewSelectContainers returned empty")
@@ -660,263 +696,51 @@ func TestView_AllScreens(t *testing.T) {
 	m.screen = screenProgress
 	m.pendingOp = runner.Restart
 	m.steps = []stepState{
-		{name: "Stopping", status: runner.StatusDone},
-		{name: "Starting", status: runner.StatusRunning},
+		progressStep("Stopping", runner.StatusDone),
+		progressStep("Starting", runner.StatusRunning),
 	}
+	m.batchStepCount = len(m.steps)
 	v = m.View()
 	if v == "" {
 		t.Error("viewProgress returned empty")
 	}
 }
 
-func TestSelectProject_Navigation(t *testing.T) {
-	mc := &mockComposer{}
-	m := NewModel(nil, io.Discard, mockFactory(mc), nil, nil)
-	m.projects = []compose.Project{
-		{Name: "alpha", ConfigDir: "/a"},
-		{Name: "beta", ConfigDir: "/b"},
-		{Name: "gamma", ConfigDir: "/c"},
+// parkOnGroupedScreen puts the model on the grouped host view holding the
+// given projects, with the cursor on the first project's header row. It is the
+// replacement for the project-picker fixtures: drilling into a header is what
+// picking a project used to be.
+func parkOnGroupedScreen(m *Model, projects ...compose.Project) {
+	m.screen = screenSelectContainers
+	m.grouped = true
+	m.composer = nil
+	m.svcGroups = make([]svcGroup, 0, len(projects))
+	for _, p := range projects {
+		m.svcGroups = append(m.svcGroups, svcGroup{proj: p})
 	}
-
-	// Move down
-	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'j'}})
-	m = updated.(Model)
-	if m.projCursor != 1 {
-		t.Errorf("after j: projCursor = %d, want 1", m.projCursor)
-	}
-
-	// Move down again
-	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'j'}})
-	m = updated.(Model)
-	if m.projCursor != 2 {
-		t.Errorf("after second j: projCursor = %d, want 2", m.projCursor)
-	}
-
-	// Can't go past last item
-	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'j'}})
-	m = updated.(Model)
-	if m.projCursor != 2 {
-		t.Errorf("after third j: projCursor = %d, want 2", m.projCursor)
-	}
-
-	// Move back up
-	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'k'}})
-	m = updated.(Model)
-	if m.projCursor != 1 {
-		t.Errorf("after k: projCursor = %d, want 1", m.projCursor)
-	}
+	m.svcEntries = rebuildSvcEntries(m.svcGroups)
+	m.svcCursor = 0
 }
 
-func TestSelectProject_EnterTransitionsToContainers(t *testing.T) {
-	mc := &mockComposer{}
-	m := NewModel(nil, io.Discard, mockFactory(mc), nil, nil)
-	m.projects = []compose.Project{
-		{Name: "my-app", ConfigDir: "/work/my-app"},
+// headerIndexFor returns the entry index of group gi's header row.
+func headerIndexFor(t *testing.T, entries []svcEntry, gi int) int {
+	t.Helper()
+	for i, e := range entries {
+		if e.kind == entrySvcGroupHeader && e.groupIdx == gi {
+			return i
+		}
 	}
-
-	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyEnter})
-	m = updated.(Model)
-
-	if m.screen != screenSelectContainers {
-		t.Errorf("screen = %d, want %d (screenSelectContainers)", m.screen, screenSelectContainers)
-	}
-	if m.projName != "my-app" {
-		t.Errorf("projName = %q, want %q", m.projName, "my-app")
-	}
-	if m.composer == nil {
-		t.Error("composer should be set after project selection")
-	}
+	t.Fatalf("no header entry for group %d in %+v", gi, entries)
+	return 0
 }
 
-func TestSelectProject_EnterWithNoProjects(t *testing.T) {
-	mc := &mockComposer{}
-	m := NewModel(nil, io.Discard, mockFactory(mc), nil, nil)
-
-	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyEnter})
-	m = updated.(Model)
-
-	if m.screen != screenSelectProject {
-		t.Errorf("screen = %d, want %d (should stay on project select)", m.screen, screenSelectProject)
-	}
-}
-
-func TestSelectProject_QuitReturnsQuit(t *testing.T) {
-	mc := &mockComposer{}
-	m := NewModel(nil, io.Discard, mockFactory(mc), nil, nil)
-
-	_, cmd := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'q'}})
-	if cmd == nil {
-		t.Fatal("expected quit command, got nil")
-	}
-}
-
-func TestProjectsMsg_PopulatesProjects(t *testing.T) {
-	mc := &mockComposer{}
-	m := NewModel(nil, io.Discard, mockFactory(mc), nil, nil)
-
-	projects := []compose.Project{
-		{Name: "alpha", ConfigDir: "/a"},
-		{Name: "beta", ConfigDir: "/b"},
-	}
-	updated, _ := m.Update(projectsMsg{projects: projects})
-	m = updated.(Model)
-
-	if len(m.projects) != 2 {
-		t.Fatalf("got %d projects, want 2", len(m.projects))
-	}
-	if m.projCursor != 0 {
-		t.Errorf("projCursor = %d, want 0", m.projCursor)
-	}
-}
-
-func TestProjectsMsg_Error(t *testing.T) {
-	mc := &mockComposer{}
-	m := NewModel(nil, io.Discard, mockFactory(mc), nil, nil)
-
-	updated, _ := m.Update(projectsMsg{err: io.ErrUnexpectedEOF})
-	m = updated.(Model)
-
-	if m.projErr == nil {
-		t.Error("projErr should be set")
-	}
-}
-
-func TestViewSelectProject_WithProjects(t *testing.T) {
-	mc := &mockComposer{}
-	m := NewModel(nil, io.Discard, mockFactory(mc), nil, nil)
-	m.projects = []compose.Project{
-		{Name: "api-proxy", ConfigDir: "/Work/docker/api-proxy"},
-		{Name: "forms-app", ConfigDir: "/Work/docker/forms-app"},
-	}
-
-	v := m.View()
-	if !strings.Contains(v, "select project") {
-		t.Error("view should contain 'select project'")
-	}
-	if !strings.Contains(v, "api-proxy") {
-		t.Error("view should contain 'api-proxy'")
-	}
-	if !strings.Contains(v, "forms-app") {
-		t.Error("view should contain 'forms-app'")
-	}
-}
-
-func TestViewSelectProject_Loading(t *testing.T) {
-	mc := &mockComposer{}
-	m := NewModel(nil, io.Discard, mockFactory(mc), nil, nil)
-
-	v := m.View()
-	if !strings.Contains(v, "Loading projects") {
-		t.Error("view should show loading state")
-	}
-}
-
-func TestViewSelectProject_Error(t *testing.T) {
-	mc := &mockComposer{}
-	m := NewModel(nil, io.Discard, mockFactory(mc), nil, nil)
-	m.projErr = fmt.Errorf("connection refused")
-
-	v := m.View()
-	if !strings.Contains(v, "Error") {
-		t.Error("view should show error state")
-	}
-	if !strings.Contains(v, "connection refused") {
-		t.Error("view should show error message")
-	}
-	if strings.Contains(v, "esc back") {
-		t.Error("local-only error should not show 'esc back'")
-	}
-}
-
-func TestViewSelectProject_ErrorWithPicker(t *testing.T) {
-	mc := &mockComposer{}
-	m := NewModel(nil, io.Discard, mockFactory(mc), testServers, nil)
-	m.screen = screenSelectProject
-	m.showPicker = true
-	m.projErr = fmt.Errorf("connection refused")
-
-	v := m.View()
-	if !strings.Contains(v, "q back") {
-		t.Error("error state should show 'q back' when server picker is available")
-	}
-}
-
-func TestViewSelectProject_Empty(t *testing.T) {
-	mc := &mockComposer{}
-	m := NewModel(nil, io.Discard, mockFactory(mc), nil, nil)
-	m.projects = []compose.Project{}
-
-	v := m.View()
-	if !strings.Contains(v, "No Docker Compose projects found") {
-		t.Error("view should show empty state message")
-	}
-	if strings.Contains(v, "esc back") {
-		t.Error("local-only empty should not show 'esc back'")
-	}
-}
-
-func TestViewSelectProject_EmptyWithPicker(t *testing.T) {
-	mc := &mockComposer{}
-	m := NewModel(nil, io.Discard, mockFactory(mc), testServers, nil)
-	m.screen = screenSelectProject
-	m.showPicker = true
-	m.projects = []compose.Project{}
-
-	v := m.View()
-	if !strings.Contains(v, "q back") {
-		t.Error("empty state should show 'q back' when server picker is available")
-	}
-}
-
-func TestViewSelectProject_UnmanagedRow(t *testing.T) {
-	mc := &mockComposer{}
-	m := NewModel(nil, io.Discard, mockFactory(mc), nil, nil)
-	m.projects = []compose.Project{
-		{Name: "my-app", Status: "running(3)", ConfigDir: "/srv/my-app"},
-		{Name: compose.UnmanagedProjectName, Desc: "3 containers", Unmanaged: true},
-	}
-
-	v := m.View()
-	if !strings.Contains(v, compose.UnmanagedProjectName) {
-		t.Errorf("view should show %q:\n%s", compose.UnmanagedProjectName, v)
-	}
-	if !strings.Contains(v, "3 containers") {
-		t.Errorf("unmanaged row should show its count in the description column:\n%s", v)
-	}
-	if !strings.Contains(v, shortenPath("/srv/my-app")) {
-		t.Errorf("compose row should still show its config dir:\n%s", v)
-	}
-}
-
-func TestViewSelectProject_UnmanagedRowIsLast(t *testing.T) {
-	mc := &mockComposer{}
-	m := NewModel(nil, io.Discard, mockFactory(mc), nil, nil)
-	m.projects = []compose.Project{
-		{Name: "zebra", Status: "running(1)", ConfigDir: "/srv/zebra"},
-		{Name: compose.UnmanagedProjectName, Desc: "1 container", Unmanaged: true},
-	}
-
-	v := m.View()
-	// strings.Index returns -1 for an absent needle, and -1 is less than every
-	// valid index — so both rows must be proven present before the comparison
-	// means anything.
-	composeIdx := strings.Index(v, "zebra")
-	unmanagedIdx := strings.Index(v, compose.UnmanagedProjectName)
-	if composeIdx < 0 {
-		t.Fatalf("compose row missing from the render:\n%s", v)
-	}
-	if unmanagedIdx < 0 {
-		t.Fatalf("unmanaged row missing from the render:\n%s", v)
-	}
-	if composeIdx > unmanagedIdx {
-		t.Errorf("unmanaged row should render last:\n%s", v)
-	}
-}
-
+// TestComposerFactory_ReceivesWholeProject pins that drill-in hands the factory
+// the WHOLE compose.Project — the Unmanaged flag included, since that is the
+// branch that picks the read-only host composer.
 func TestComposerFactory_ReceivesWholeProject(t *testing.T) {
 	projects := []compose.Project{
 		{Name: "my-app", Status: "running(3)", ConfigDir: "/srv/my-app"},
-		{Name: compose.UnmanagedProjectName, Desc: "3 containers", Unmanaged: true},
+		{Name: compose.UnmanagedProjectName, Unmanaged: true},
 	}
 
 	tests := []struct {
@@ -938,9 +762,11 @@ func TestComposerFactory_ReceivesWholeProject(t *testing.T) {
 				return mc
 			}
 			m := NewModel(nil, io.Discard, factory, nil, nil)
-			m.screen = screenSelectProject
-			m.projects = projects
-			m.projCursor = tt.cursor
+			m.screen = screenSelectContainers
+			m.grouped = true
+			m.svcGroups = []svcGroup{{proj: projects[0]}, {proj: projects[1]}}
+			m.svcEntries = rebuildSvcEntries(m.svcGroups)
+			m.svcCursor = headerIndexFor(t, m.svcEntries, tt.cursor)
 
 			updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyEnter})
 			m = updated.(Model)
@@ -968,7 +794,7 @@ func TestBreadcrumb_WithProjectName(t *testing.T) {
 
 	// Container select screen
 	m.screen = screenSelectContainers
-	m.services = []string{"nginx"}
+	m.setSingleGroup([]string{"nginx"})
 	v := m.View()
 	if !strings.Contains(v, "cdeploy > api-proxy") {
 		t.Errorf("container select breadcrumb should contain project name, got: %q", v)
@@ -976,9 +802,10 @@ func TestBreadcrumb_WithProjectName(t *testing.T) {
 
 	// Progress screen
 	m.screen = screenProgress
-	m.selected[0] = true
+	m.selected[m.svcKeyAt(0)] = true
 	m.pendingOp = runner.Restart
-	m.steps = []stepState{{name: "Stopping", status: runner.StatusRunning}}
+	m.steps = []stepState{progressStep("Stopping", runner.StatusRunning)}
+	m.batchStepCount = len(m.steps)
 	v = m.View()
 	if !strings.Contains(v, "cdeploy > api-proxy") {
 		t.Errorf("progress breadcrumb should contain project name, got: %q", v)
@@ -988,11 +815,171 @@ func TestBreadcrumb_WithProjectName(t *testing.T) {
 func TestBreadcrumb_WithoutProjectName(t *testing.T) {
 	mc := &mockComposer{}
 	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
-	m.services = []string{"nginx"}
+	m.setSingleGroup([]string{"nginx"})
 
 	v := m.View()
 	if !strings.Contains(v, "cdeploy") {
 		t.Error("breadcrumb should contain 'cdeploy'")
+	}
+}
+
+func TestSetSingleGroup(t *testing.T) {
+	t.Run("installs one group and derives the entries", func(t *testing.T) {
+		var m Model
+		m.projName = "web"
+		m.projDir = "/srv/web"
+		m.setSingleGroup([]string{"api", "db"})
+
+		if len(m.svcGroups) != 1 {
+			t.Fatalf("svcGroups has %d groups, want 1", len(m.svcGroups))
+		}
+		g := m.svcGroups[0]
+		if g.proj.Name != "web" || g.proj.ConfigDir != "/srv/web" {
+			t.Errorf("group project = %+v, want the current project", g.proj)
+		}
+		if g.folded {
+			t.Error("a freshly installed group must not be folded")
+		}
+		if len(m.svcEntries) != 2 || m.svcEntries[0].name != "api" || m.svcEntries[1].name != "db" {
+			t.Errorf("svcEntries = %+v, want two service rows in order", m.svcEntries)
+		}
+	})
+
+	t.Run("an empty but non-nil slice is a project with no services", func(t *testing.T) {
+		var m Model
+		m.setSingleGroup([]string{})
+
+		if len(m.svcGroups) != 1 {
+			t.Fatalf("svcGroups has %d groups, want 1", len(m.svcGroups))
+		}
+		if m.svcGroups == nil {
+			t.Error("services must stay non-nil, or the screen renders its loading state")
+		}
+		// It draws its header and nothing else: a screen with zero rows has no
+		// cursor and names no project (see groupsHaveHeaders).
+		if len(m.svcEntries) != 1 || m.svcEntries[0].kind != entrySvcGroupHeader {
+			t.Errorf("svcEntries = %+v, want a lone group header", m.svcEntries)
+		}
+	})
+
+	t.Run("nil clears the group state", func(t *testing.T) {
+		var m Model
+		m.setSingleGroup([]string{"api"})
+		m.setSingleGroup(nil)
+
+		if m.svcGroups != nil || m.svcEntries != nil {
+			t.Errorf("groups=%v entries=%v, want both nil", m.svcGroups, m.svcEntries)
+		}
+	})
+
+	t.Run("a read-only composer marks the group unmanaged", func(t *testing.T) {
+		var m Model
+		m.composer = &readOnlyMockComposer{}
+		m.setSingleGroup([]string{"portainer"})
+
+		if !m.svcGroups[0].proj.Unmanaged {
+			t.Error("a read-only composer must produce an unmanaged group")
+		}
+	})
+}
+
+func TestClearSvcGroups(t *testing.T) {
+	var m Model
+	m.setSingleGroup([]string{"api", "db"})
+	m.clearSvcGroups()
+
+	if m.svcGroups != nil || m.svcEntries != nil {
+		t.Errorf("groups=%v entries=%v, want both nil", m.svcGroups, m.svcEntries)
+	}
+}
+
+// servicesMsg is the production writer of the single-group shape: the entries
+// must be derived from the SORTED list the handler installs.
+func TestServicesMsg_InstallsSingleGroup(t *testing.T) {
+	mc := &mockComposer{}
+	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
+
+	updated, _ := m.Update(servicesMsg{services: []string{"zebra", "Alpha"}})
+	m = updated.(Model)
+
+	if len(m.svcGroups) != 1 {
+		t.Fatalf("svcGroups has %d groups, want 1", len(m.svcGroups))
+	}
+	want := []string{"Alpha", "zebra"}
+	for i, name := range want {
+		if m.svcEntries[i].name != name {
+			t.Errorf("entry %d = %q, want %q (entries follow the sorted order)", i, m.svcEntries[i].name, name)
+		}
+	}
+}
+
+// Departure-site pin: esc back to the grouped host view drops the service list, so
+// the derived group state must go with it — a group that outlived its services
+// would feed the next project's screen stale rows.
+func TestEscFromContainerScreen_ClearsSvcGroups(t *testing.T) {
+	mc := &mockComposer{services: []string{"nginx"}}
+	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
+	m.screen = screenSelectContainers
+	m.drilledFromHost = true
+	m.setSingleGroup(mc.services)
+
+	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyEsc})
+	m = updated.(Model)
+
+	if m.svcGroups != nil || m.svcEntries != nil {
+		t.Errorf("groups=%v entries=%v, want both nil after esc", m.svcGroups, m.svcEntries)
+	}
+}
+
+// Phase-1 pin for the grouped entry model: a single group must render exactly
+// the pre-grouping screen. rebuildSvcEntries emits NO header for one group, so
+// svcEntries stays index-parallel to services, and the rows keep the
+// cursor-column + checkbox prefix with no group indent in front of it.
+func TestViewSelectContainers_SingleGroupHasNoHeaderOrIndent(t *testing.T) {
+	m := singleGroupModel([]string{"api", "web"})
+	m.screen = screenSelectContainers
+	m.width = 80
+	m.height = 20
+	m.svcStatus = qStatus(m, map[string]runner.ServiceStatus{
+		"api": {Running: true, Uptime: "3h"},
+		"web": {},
+	})
+
+	flat := modelServices(m)
+	if len(m.svcEntries) != len(flat) {
+		t.Fatalf("svcEntries has %d rows, want %d (a single group emits no header)", len(m.svcEntries), len(flat))
+	}
+	for i, e := range m.svcEntries {
+		if e.kind != entryService {
+			t.Errorf("entry %d kind = %v, want a service row", i, e.kind)
+		}
+		if e.name != flat[i] {
+			t.Errorf("entry %d name = %q, want %q (entries must stay index-parallel)", i, e.name, flat[i])
+		}
+	}
+
+	out := ansi.Strip(m.viewSelectContainers())
+	for _, glyph := range []string{"\u25bc", "\u25b6"} {
+		if strings.Contains(out, glyph) {
+			t.Errorf("single group rendered a group header glyph %q:\n%s", glyph, out)
+		}
+	}
+
+	rowRe := regexp.MustCompile(`^[> ] \[[ x]\]`)
+	for _, name := range modelServices(m) {
+		var row string
+		for _, line := range strings.Split(out, "\n") {
+			if strings.Contains(line, name) && strings.Contains(line, "[") {
+				row = line
+				break
+			}
+		}
+		if row == "" {
+			t.Fatalf("no row rendered for %q in:\n%s", name, out)
+		}
+		if !rowRe.MatchString(row) {
+			t.Errorf("row for %q = %q, want the un-indented cursor+checkbox prefix", name, row)
+		}
 	}
 }
 
@@ -1008,8 +995,8 @@ func TestViewSelectContainers_HealthIcons(t *testing.T) {
 	}
 	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
 	m.screen = screenSelectContainers
-	m.services = []string{"api", "db", "web", "worker"}
-	m.svcStatus = mc.status
+	m.setSingleGroup([]string{"api", "db", "web", "worker"})
+	m.svcStatus = qStatus(m, mc.status)
 
 	v := m.View()
 
@@ -1037,8 +1024,8 @@ func TestViewSelectContainers_HealthAlignment(t *testing.T) {
 	}
 	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
 	m.screen = screenSelectContainers
-	m.services = mc.services
-	m.svcStatus = mc.status
+	m.setSingleGroup(mc.services)
+	m.svcStatus = qStatus(m, mc.status)
 
 	v := m.View()
 	lines := strings.Split(v, "\n")
@@ -1072,8 +1059,8 @@ func TestViewSelectContainers_StatusDots(t *testing.T) {
 	}
 	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
 	m.screen = screenSelectContainers
-	m.services = mc.services
-	m.svcStatus = mc.status
+	m.setSingleGroup(mc.services)
+	m.svcStatus = qStatus(m, mc.status)
 
 	v := m.View()
 	if !strings.Contains(v, "●") {
@@ -1104,10 +1091,10 @@ func TestServicesMsg_StoresRunningStatus(t *testing.T) {
 	if m.svcStatus == nil {
 		t.Fatal("svcStatus should be set")
 	}
-	if !m.svcStatus["nginx"].Running {
+	if !m.svcStatus[qk(m, "nginx")].Running {
 		t.Error("nginx should be running")
 	}
-	if m.svcStatus["postgres"].Running {
+	if m.svcStatus[qk(m, "postgres")].Running {
 		t.Error("postgres should not be running")
 	}
 }
@@ -1117,7 +1104,7 @@ func TestEscFromProgress_GoesToContainers(t *testing.T) {
 	m := NewModel(nil, io.Discard, mockFactory(mc), nil, nil)
 	m.screen = screenProgress
 	m.done = true
-	m.showPicker = true
+	m.drilledFromHost = true
 	m.projName = "my-app"
 	m.composer = mc
 
@@ -1146,6 +1133,8 @@ func TestEscFromProgress_InvalidatesUpdateCache_OnDeploy(t *testing.T) {
 	m.done = true
 	m.pendingOp = runner.Deploy
 	m.composer = mc
+	// enterProgress always installs a batch sequence; the invalidation walks it.
+	m.batches = []opBatch{{proj: m.currentProject()}}
 	installFakeTick(&m)
 	// Prime the cache with a fresh entry for the current context.
 	key := m.updatesCacheKey()
@@ -1177,6 +1166,7 @@ func TestEscFromProgress_InvalidatesUpdateCache_OnRestart(t *testing.T) {
 	m.done = true
 	m.pendingOp = runner.Restart
 	m.composer = mc
+	m.batches = []opBatch{{proj: m.currentProject()}}
 	installFakeTick(&m)
 	key := m.updatesCacheKey()
 	avail := true
@@ -1250,8 +1240,8 @@ func TestActionKey_EntersConfirmation(t *testing.T) {
 	mc := &mockComposer{services: []string{"nginx", "postgres"}}
 	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
 	m.screen = screenSelectContainers
-	m.services = mc.services
-	m.selected[0] = true
+	m.setSingleGroup(mc.services)
+	m.selected[m.svcKeyAt(0)] = true
 
 	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'d'}})
 	m = updated.(Model)
@@ -1268,7 +1258,7 @@ func TestActionKey_IgnoredWithNoSelection(t *testing.T) {
 	mc := &mockComposer{services: []string{"nginx"}}
 	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
 	m.screen = screenSelectContainers
-	m.services = mc.services
+	m.setSingleGroup(mc.services)
 
 	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'d'}})
 	m = updated.(Model)
@@ -1284,7 +1274,7 @@ func TestWarning_ShownWhenNoSelection(t *testing.T) {
 			mc := &mockComposer{services: []string{"nginx", "redis"}}
 			m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
 			m.screen = screenSelectContainers
-			m.services = mc.services
+			m.setSingleGroup(mc.services)
 
 			updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{key}})
 			m = updated.(Model)
@@ -1300,7 +1290,7 @@ func TestWarning_ClearedOnNextKeypress(t *testing.T) {
 	mc := &mockComposer{services: []string{"nginx"}}
 	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
 	m.screen = screenSelectContainers
-	m.services = mc.services
+	m.setSingleGroup(mc.services)
 	m.warning = warnNoSelection
 
 	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'j'}})
@@ -1315,8 +1305,8 @@ func TestConfirmation_EnterProceeds(t *testing.T) {
 	mc := &mockComposer{services: []string{"nginx"}}
 	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
 	m.screen = screenSelectContainers
-	m.services = mc.services
-	m.selected[0] = true
+	m.setSingleGroup(mc.services)
+	m.selected[m.svcKeyAt(0)] = true
 	m.confirming = true
 	m.pendingOp = runner.Deploy
 	m.width = 80
@@ -1334,8 +1324,8 @@ func TestConfirmation_EscCancels(t *testing.T) {
 	mc := &mockComposer{services: []string{"nginx"}}
 	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
 	m.screen = screenSelectContainers
-	m.services = mc.services
-	m.selected[0] = true
+	m.setSingleGroup(mc.services)
+	m.selected[m.svcKeyAt(0)] = true
 	m.confirming = true
 	m.pendingOp = runner.Deploy
 
@@ -1354,8 +1344,8 @@ func TestConfirmation_NavigationLocked(t *testing.T) {
 	mc := &mockComposer{services: []string{"nginx", "postgres"}}
 	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
 	m.screen = screenSelectContainers
-	m.services = mc.services
-	m.selected[0] = true
+	m.setSingleGroup(mc.services)
+	m.selected[m.svcKeyAt(0)] = true
 	m.confirming = true
 	m.pendingOp = runner.Deploy
 
@@ -1379,8 +1369,8 @@ func TestConfirmation_QCancelsConfirming(t *testing.T) {
 	mc := &mockComposer{services: []string{"nginx"}}
 	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
 	m.screen = screenSelectContainers
-	m.services = mc.services
-	m.selected[0] = true
+	m.setSingleGroup(mc.services)
+	m.selected[m.svcKeyAt(0)] = true
 	m.confirming = true
 	m.pendingOp = runner.Deploy
 
@@ -1398,8 +1388,8 @@ func TestConfirmation_CtrlCStillQuits(t *testing.T) {
 	mc := &mockComposer{services: []string{"nginx"}}
 	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
 	m.screen = screenSelectContainers
-	m.services = mc.services
-	m.selected[0] = true
+	m.setSingleGroup(mc.services)
+	m.selected[m.svcKeyAt(0)] = true
 	m.confirming = true
 	m.pendingOp = runner.Deploy
 
@@ -1424,8 +1414,8 @@ func TestConfirmation_AllOperationKeys(t *testing.T) {
 			mc := &mockComposer{services: []string{"nginx"}}
 			m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
 			m.screen = screenSelectContainers
-			m.services = mc.services
-			m.selected[0] = true
+			m.setSingleGroup(mc.services)
+			m.selected[m.svcKeyAt(0)] = true
 
 			updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{tt.key}})
 			m = updated.(Model)
@@ -1444,7 +1434,7 @@ func TestStatusMsg_ErrorSetsSvcErr(t *testing.T) {
 	mc := &mockComposer{services: []string{"nginx"}}
 	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
 	m.screen = screenSelectContainers
-	m.services = mc.services
+	m.setSingleGroup(mc.services)
 
 	updated, _ := m.Update(statusMsg{err: fmt.Errorf("daemon not running")})
 	m = updated.(Model)
@@ -1461,7 +1451,7 @@ func TestStatusMsg_SuccessClearsSvcErr(t *testing.T) {
 	mc := &mockComposer{services: []string{"nginx"}}
 	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
 	m.screen = screenSelectContainers
-	m.services = mc.services
+	m.setSingleGroup(mc.services)
 	m.svcErr = fmt.Errorf("previous error")
 
 	updated, _ := m.Update(statusMsg{status: map[string]runner.ServiceStatus{"nginx": {Running: true}}})
@@ -1470,7 +1460,7 @@ func TestStatusMsg_SuccessClearsSvcErr(t *testing.T) {
 	if m.svcErr != nil {
 		t.Errorf("svcErr should be nil after successful statusMsg, got %v", m.svcErr)
 	}
-	if !m.svcStatus["nginx"].Running {
+	if !m.svcStatus[qk(m, "nginx")].Running {
 		t.Error("svcStatus should be updated after successful statusMsg")
 	}
 }
@@ -1479,9 +1469,9 @@ func TestConfirmation_ViewShowsOperationAndServices(t *testing.T) {
 	mc := &mockComposer{services: []string{"nginx", "postgres"}}
 	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
 	m.screen = screenSelectContainers
-	m.services = mc.services
-	m.selected[0] = true
-	m.selected[1] = true
+	m.setSingleGroup(mc.services)
+	m.selected[m.svcKeyAt(0)] = true
+	m.selected[m.svcKeyAt(1)] = true
 	m.confirming = true
 	m.pendingOp = runner.Deploy
 
@@ -1531,7 +1521,7 @@ func TestNewModel_StartScreenDecisionTable(t *testing.T) {
 		servers    []config.Server
 		wantScreen screen
 	}{
-		{"no servers, no composer -> project", nil, nil, screenSelectProject},
+		{"no servers, no composer -> grouped containers", nil, nil, screenSelectContainers},
 		{"no servers, composer -> containers", mc, nil, screenSelectContainers},
 		{"servers, no composer -> server", nil, testServers, screenSelectServer},
 		{"servers, composer -> server", mc, testServers, screenSelectServer},
@@ -1556,10 +1546,10 @@ func TestNewModel_BackwardCompat_NilServers(t *testing.T) {
 		t.Errorf("screen = %d, want %d", m.screen, screenSelectContainers)
 	}
 
-	// Without composer
+	// Without composer: the grouped host view, not the deleted picker.
 	m = NewModel(nil, io.Discard, mockFactory(mc), nil, nil)
-	if m.screen != screenSelectProject {
-		t.Errorf("screen = %d, want %d", m.screen, screenSelectProject)
+	if m.screen != screenSelectContainers || !m.grouped {
+		t.Errorf("screen = %d grouped = %v, want %d true", m.screen, m.grouped, screenSelectContainers)
 	}
 }
 
@@ -1623,8 +1613,11 @@ func TestServerScreen_LocalSelection(t *testing.T) {
 	updated, cmd := m.Update(tea.KeyMsg{Type: tea.KeyEnter})
 	m = updated.(Model)
 
-	if m.screen != screenSelectProject {
-		t.Errorf("screen = %d, want %d (screenSelectProject)", m.screen, screenSelectProject)
+	if m.screen != screenSelectContainers {
+		t.Errorf("screen = %d, want %d (screenSelectContainers)", m.screen, screenSelectContainers)
+	}
+	if !m.grouped {
+		t.Error("Local with no cwd compose file lands on the grouped host view")
 	}
 	if m.serverName != "" {
 		t.Errorf("serverName should be empty for local, got %q", m.serverName)
@@ -1635,11 +1628,11 @@ func TestServerScreen_LocalSelection(t *testing.T) {
 	if m.projectLoader == nil {
 		t.Error("projectLoader should be restored to localProjectLoader for local")
 	}
-	if !m.showPicker {
-		t.Error("showPicker should be true after local selection")
+	if m.drilledFromHost {
+		t.Error("drilledFromHost must stay false on the grouped view")
 	}
 	if cmd == nil {
-		t.Error("should return loadProjects command")
+		t.Error("should return the grouped load batch")
 	}
 }
 
@@ -1662,8 +1655,8 @@ func TestServerScreen_LocalSelection_WithComposer(t *testing.T) {
 	if m.composer != mc {
 		t.Error("composer should be the local composer")
 	}
-	if !m.showPicker {
-		t.Error("showPicker should be true so esc navigates back")
+	if !m.drilledFromHost {
+		t.Error("drilledFromHost should be true so esc drills back out")
 	}
 	if cmd == nil {
 		t.Error("should return loadServices command")
@@ -1723,17 +1716,20 @@ func TestServerScreen_ConnectSuccess(t *testing.T) {
 	updated, cmd := m.Update(connectResultMsg{err: nil})
 	m = updated.(Model)
 
-	if m.screen != screenSelectProject {
-		t.Errorf("screen = %d, want %d (screenSelectProject)", m.screen, screenSelectProject)
+	if m.screen != screenSelectContainers {
+		t.Errorf("screen = %d, want %d (screenSelectContainers)", m.screen, screenSelectContainers)
+	}
+	if !m.grouped {
+		t.Error("a successful connect lands on the grouped host view")
 	}
 	if m.serverErr != nil {
 		t.Errorf("serverErr = %v, want nil", m.serverErr)
 	}
-	if !m.showPicker {
-		t.Error("showPicker should be true after successful connect")
+	if m.drilledFromHost {
+		t.Error("drilledFromHost must stay false on the grouped view")
 	}
 	if cmd == nil {
-		t.Error("should return loadProjects command")
+		t.Error("should return the grouped load batch")
 	}
 }
 
@@ -1774,62 +1770,6 @@ func TestServerScreen_QuitReturnsQuit(t *testing.T) {
 	_, cmd := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'q'}})
 	if cmd == nil {
 		t.Fatal("expected quit command, got nil")
-	}
-}
-
-func TestEscFromProjectScreen_WithServers_GoesToServerScreen(t *testing.T) {
-	mc := &mockComposer{}
-	localLoader := func(ctx context.Context) ([]compose.Project, error) { return nil, nil }
-	m := NewModel(nil, io.Discard, mockFactory(mc), testServers, mockConnectCb(mc),
-		WithLocalProjectLoader(localLoader))
-	// Simulate state after connecting to remote server and being on project screen
-	m.screen = screenSelectProject
-	m.serverName = "prod"
-	m.showPicker = true
-	disconnectCalled := false
-	m.disconnectFunc = func() error { disconnectCalled = true; return nil }
-	m.projectLoader = func(ctx context.Context) ([]compose.Project, error) {
-		return nil, fmt.Errorf("remote loader")
-	}
-
-	updated, cmd := m.Update(tea.KeyMsg{Type: tea.KeyEsc})
-	m = updated.(Model)
-
-	if m.screen != screenSelectServer {
-		t.Errorf("screen = %d, want %d (screenSelectServer)", m.screen, screenSelectServer)
-	}
-	if m.serverName != "" {
-		t.Errorf("serverName should be cleared, got %q", m.serverName)
-	}
-	if m.disconnectFunc != nil {
-		t.Error("disconnectFunc should be nil after going back")
-	}
-	if m.projectLoader == nil {
-		t.Error("projectLoader should be restored to localProjectLoader after going back")
-	}
-
-	// Disconnect is called async via tea.Cmd
-	if cmd != nil {
-		// Execute the command to trigger disconnect
-		msg := cmd()
-		_ = msg
-		if !disconnectCalled {
-			t.Error("disconnect should have been called")
-		}
-	}
-}
-
-func TestEscFromProjectScreen_WithoutServers_DoesNothing(t *testing.T) {
-	mc := &mockComposer{}
-	m := NewModel(nil, io.Discard, mockFactory(mc), nil, nil)
-	m.screen = screenSelectProject
-	m.showPicker = true
-
-	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyEsc})
-	m = updated.(Model)
-
-	if m.screen != screenSelectProject {
-		t.Errorf("screen = %d, want %d (should stay on project screen)", m.screen, screenSelectProject)
 	}
 }
 
@@ -2192,7 +2132,7 @@ func TestLogsKey_TransitionsToScreenLogs(t *testing.T) {
 	mc := &mockComposer{services: []string{"nginx", "postgres"}}
 	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
 	m.screen = screenSelectContainers
-	m.services = mc.services
+	m.setSingleGroup(mc.services)
 	m.svcCursor = 1 // cursor on "postgres"
 	m.width = 80
 	m.height = 24
@@ -2235,7 +2175,7 @@ func TestLogsKey_DoesNothingWhenServicesEmpty(t *testing.T) {
 	mc := &mockComposer{}
 	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
 	m.screen = screenSelectContainers
-	m.services = []string{} // empty
+	m.setSingleGroup([]string{}) // empty
 
 	updated, cmd := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'l'}})
 	m = updated.(Model)
@@ -3054,7 +2994,7 @@ func TestViewSelectContainers_HelpIncludesLogs(t *testing.T) {
 	mc := &mockComposer{services: []string{"nginx"}}
 	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
 	m.screen = screenSelectContainers
-	m.services = mc.services
+	m.setSingleGroup(mc.services)
 	m.width = 200
 
 	v := m.View()
@@ -3119,7 +3059,7 @@ func setupLogsModel() Model {
 	mc := &mockComposer{services: []string{"app"}}
 	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
 	m.screen = screenLogs
-	m.services = mc.services
+	m.setSingleGroup(mc.services)
 	m.composer = mc
 	m.logsService = "app"
 	m.logsRawLines = []string{`app | {"level":"info","msg":"hello"}`}
@@ -3252,8 +3192,8 @@ func TestWaitForEvent_ReturnsStepEventMsg(t *testing.T) {
 	if !ok {
 		t.Fatalf("msg type = %T, want stepEventMsg", msg)
 	}
-	if runner.StepEvent(got) != want {
-		t.Fatalf("step event = %+v, want %+v", runner.StepEvent(got), want)
+	if got.event != want {
+		t.Fatalf("step event = %+v, want %+v", got.event, want)
 	}
 }
 
@@ -3356,7 +3296,7 @@ func TestLogsScreen_EnterLogsDefaultState(t *testing.T) {
 	mc := &mockComposer{services: []string{"app"}}
 	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
 	m.screen = screenSelectContainers
-	m.services = mc.services
+	m.setSingleGroup(mc.services)
 	m.composer = mc
 	m.width = 84
 	m.height = 26
@@ -3545,7 +3485,7 @@ func setupFilterableLogsModel() Model {
 	mc := &mockComposer{services: []string{"app"}}
 	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
 	m.screen = screenLogs
-	m.services = mc.services
+	m.setSingleGroup(mc.services)
 	m.composer = mc
 	m.logsService = "app"
 	m.logsWrap = true
@@ -5123,27 +5063,26 @@ func TestSortServices_TieBreaker(t *testing.T) {
 }
 
 func TestAllSelected_Empty(t *testing.T) {
-	m := Model{services: nil, selected: nil}
+	m := singleGroupModel(nil)
+	m.selected = nil
 	if m.allSelected() {
 		t.Error("allSelected() = true for empty services, want false")
 	}
 }
 
 func TestAllSelected_AllTrue(t *testing.T) {
-	m := Model{
-		services: []string{"web", "db"},
-		selected: map[int]bool{0: true, 1: true},
-	}
+	m := Model{}
+	m.setSingleGroup([]string{"web", "db"})
+	m.selected = selectedIdx(m, 0, 1)
 	if !m.allSelected() {
 		t.Error("allSelected() = false, want true")
 	}
 }
 
 func TestAllSelected_SomeFalse(t *testing.T) {
-	m := Model{
-		services: []string{"web", "db", "redis"},
-		selected: map[int]bool{0: true, 1: false, 2: true},
-	}
+	m := Model{}
+	m.setSingleGroup([]string{"web", "db", "redis"})
+	m.selected = selectedIdx(m, 0, 2)
 	if m.allSelected() {
 		t.Error("allSelected() = true, want false")
 	}
@@ -5154,11 +5093,12 @@ func TestViewProgress_Running(t *testing.T) {
 		screen:    screenProgress,
 		pendingOp: runner.Deploy,
 		steps: []stepState{
-			{name: "Stop", status: runner.StatusDone},
-			{name: "Pull", status: runner.StatusRunning},
-			{name: "Create", status: ""},
+			progressStep("Stop", runner.StatusDone),
+			progressStep("Pull", runner.StatusRunning),
+			progressStep("Create", ""),
 		},
-		width: 80,
+		batchStepCount: 3,
+		width:          80,
 	}
 
 	view := m.viewProgress()
@@ -5172,11 +5112,12 @@ func TestViewProgress_AllDone(t *testing.T) {
 		screen:    screenProgress,
 		pendingOp: runner.Restart,
 		steps: []stepState{
-			{name: "Stop", status: runner.StatusDone},
-			{name: "Start", status: runner.StatusDone},
+			progressStep("Stop", runner.StatusDone),
+			progressStep("Start", runner.StatusDone),
 		},
-		done:  true,
-		width: 80,
+		batchStepCount: 2,
+		done:           true,
+		width:          80,
 	}
 
 	view := m.viewProgress()
@@ -5190,13 +5131,14 @@ func TestViewProgress_Failed(t *testing.T) {
 		screen:    screenProgress,
 		pendingOp: runner.Deploy,
 		steps: []stepState{
-			{name: "Stop", status: runner.StatusDone},
-			{name: "Pull", status: runner.StatusFailed},
+			progressStep("Stop", runner.StatusDone),
+			progressStep("Pull", runner.StatusFailed),
 		},
-		done:       true,
-		failed:     true,
-		logContent: "pull failed",
-		width:      80,
+		batchStepCount: 2,
+		done:           true,
+		failed:         true,
+		logContent:     "pull failed",
+		width:          80,
 	}
 
 	view := m.viewProgress()
@@ -5314,52 +5256,6 @@ func TestRefreshStatus_Error(t *testing.T) {
 	}
 }
 
-func TestLoadProjects_Success(t *testing.T) {
-	projects := []compose.Project{
-		{Name: "app1", ConfigDir: "/app1"},
-		{Name: "app2", ConfigDir: "/app2"},
-	}
-
-	m := NewModel(nil, io.Discard, nil, nil, nil)
-	m.ctx = context.Background()
-	m.projectLoader = func(ctx context.Context) ([]compose.Project, error) {
-		return projects, nil
-	}
-
-	cmd := m.loadProjects()
-	msg := cmd()
-
-	projMsg, ok := msg.(projectsMsg)
-	if !ok {
-		t.Fatalf("expected projectsMsg, got %T", msg)
-	}
-	if projMsg.err != nil {
-		t.Fatalf("unexpected error: %v", projMsg.err)
-	}
-	if len(projMsg.projects) != 2 {
-		t.Errorf("got %d projects, want 2", len(projMsg.projects))
-	}
-}
-
-func TestLoadProjects_Error(t *testing.T) {
-	m := NewModel(nil, io.Discard, nil, nil, nil)
-	m.ctx = context.Background()
-	m.projectLoader = func(ctx context.Context) ([]compose.Project, error) {
-		return nil, fmt.Errorf("docker not running")
-	}
-
-	cmd := m.loadProjects()
-	msg := cmd()
-
-	projMsg, ok := msg.(projectsMsg)
-	if !ok {
-		t.Fatalf("expected projectsMsg, got %T", msg)
-	}
-	if projMsg.err == nil {
-		t.Fatal("expected error, got nil")
-	}
-}
-
 func TestViewSelectContainers_ConfirmState(t *testing.T) {
 	mc := &mockComposer{
 		services: []string{"web", "db"},
@@ -5367,9 +5263,9 @@ func TestViewSelectContainers_ConfirmState(t *testing.T) {
 	}
 
 	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
-	m.services = []string{"web", "db"}
-	m.selected = map[int]bool{0: true, 1: true}
-	m.svcStatus = mc.status
+	m.setSingleGroup([]string{"web", "db"})
+	m.selected = selectedIdx(m, 0, 1)
+	m.svcStatus = qStatus(m, mc.status)
 	m.screen = screenSelectContainers
 	m.confirming = true
 	m.pendingOp = runner.Deploy
@@ -5395,8 +5291,8 @@ func TestConfigScreen_CKeyEntersConfig(t *testing.T) {
 		configFile: []byte("services:\n  web:\n    image: nginx\n"),
 	}
 	m := NewModel(mc, io.Discard, mockConfigFactory(mc), nil, nil)
-	m.services = mc.services
-	m.svcStatus = mc.status
+	m.setSingleGroup(mc.services)
+	m.svcStatus = qStatus(m, mc.status)
 	m.screen = screenSelectContainers
 	m.width = 80
 	m.height = 24
@@ -5421,8 +5317,8 @@ func TestConfigScreen_CKeyIgnoredWithoutConfigProvider(t *testing.T) {
 		status:   map[string]runner.ServiceStatus{"web": {Running: true}},
 	}
 	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
-	m.services = mc.services
-	m.svcStatus = mc.status
+	m.setSingleGroup(mc.services)
+	m.svcStatus = qStatus(m, mc.status)
 	m.screen = screenSelectContainers
 
 	result, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'c'}})
@@ -5442,8 +5338,8 @@ func TestConfigScreen_EscCleansUp(t *testing.T) {
 		configFile: []byte("test content"),
 	}
 	m := NewModel(mc, io.Discard, mockConfigFactory(mc), nil, nil)
-	m.services = mc.services
-	m.svcStatus = mc.status
+	m.setSingleGroup(mc.services)
+	m.svcStatus = qStatus(m, mc.status)
 	m.screen = screenConfig
 	m.configContent = []byte("test")
 	m.configResolved = []byte("resolved")
@@ -6004,8 +5900,8 @@ func TestViewSelectContainers_WithBadge(t *testing.T) {
 		status:   map[string]runner.ServiceStatus{"web": {Running: true}},
 	}
 	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
-	m.services = mc.services
-	m.svcStatus = mc.status
+	m.setSingleGroup(mc.services)
+	m.svcStatus = qStatus(m, mc.status)
 	m.screen = screenSelectContainers
 	m.width = 120
 	m.height = 24
@@ -6025,8 +5921,8 @@ func TestViewSelectContainers_WithoutServerColorUsesPlainBreadcrumb(t *testing.T
 		status:   map[string]runner.ServiceStatus{"web": {Running: true}},
 	}
 	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
-	m.services = mc.services
-	m.svcStatus = mc.status
+	m.setSingleGroup(mc.services)
+	m.svcStatus = qStatus(m, mc.status)
 	m.screen = screenSelectContainers
 	m.width = 120
 	m.height = 24
@@ -6046,8 +5942,8 @@ func TestViewSelectContainers_WithoutBadge(t *testing.T) {
 		status:   map[string]runner.ServiceStatus{"web": {Running: true}},
 	}
 	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
-	m.services = mc.services
-	m.svcStatus = mc.status
+	m.setSingleGroup(mc.services)
+	m.svcStatus = qStatus(m, mc.status)
 	m.screen = screenSelectContainers
 	m.width = 120
 	m.height = 24
@@ -6065,7 +5961,7 @@ func TestViewSelectContainers_WithoutBadge(t *testing.T) {
 func TestSvcVisibleCount_HeightZero(t *testing.T) {
 	mc := &mockComposer{}
 	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
-	m.services = []string{"a", "b", "c", "d", "e"}
+	m.setSingleGroup([]string{"a", "b", "c", "d", "e"})
 	m.height = 0
 
 	got := m.svcVisibleCount()
@@ -6078,7 +5974,7 @@ func TestSvcVisibleCount_NormalHeight(t *testing.T) {
 	mc := &mockComposer{}
 	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
 	m.statsRequested = false // exercise the "no columns" branch
-	m.services = []string{"a", "b", "c", "d", "e", "f", "g", "h", "i", "j"}
+	m.setSingleGroup([]string{"a", "b", "c", "d", "e", "f", "g", "h", "i", "j"})
 	m.width = 200 // wide enough for one-line help
 	m.height = 10
 
@@ -6094,7 +5990,7 @@ func TestSvcVisibleCount_NarrowWidth(t *testing.T) {
 	mc := &mockComposer{}
 	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
 	m.statsRequested = false
-	m.services = []string{"a", "b", "c", "d", "e", "f", "g", "h", "i", "j"}
+	m.setSingleGroup([]string{"a", "b", "c", "d", "e", "f", "g", "h", "i", "j"})
 	m.width = 40 // too narrow for one-line help
 	m.height = 10
 
@@ -6109,7 +6005,7 @@ func TestSvcVisibleCount_Confirming(t *testing.T) {
 	mc := &mockComposer{}
 	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
 	m.statsRequested = false
-	m.services = []string{"a", "b", "c", "d", "e", "f", "g", "h", "i", "j"}
+	m.setSingleGroup([]string{"a", "b", "c", "d", "e", "f", "g", "h", "i", "j"})
 	m.width = 120
 	m.height = 10
 	m.confirming = true
@@ -6125,7 +6021,7 @@ func TestSvcVisibleCount_Warning(t *testing.T) {
 	mc := &mockComposer{}
 	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
 	m.statsRequested = false
-	m.services = []string{"a", "b", "c", "d", "e", "f", "g", "h", "i", "j"}
+	m.setSingleGroup([]string{"a", "b", "c", "d", "e", "f", "g", "h", "i", "j"})
 	m.width = 200
 	m.height = 10
 	m.warning = "something wrong"
@@ -6140,7 +6036,7 @@ func TestSvcVisibleCount_Warning(t *testing.T) {
 func TestSvcVisibleCount_AllFit(t *testing.T) {
 	mc := &mockComposer{}
 	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
-	m.services = []string{"a", "b"}
+	m.setSingleGroup([]string{"a", "b"})
 	m.width = 120
 	m.height = 20
 
@@ -6154,7 +6050,7 @@ func TestSvcVisibleCount_AllFit(t *testing.T) {
 func TestSvcVisibleCount_MinOne(t *testing.T) {
 	mc := &mockComposer{}
 	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
-	m.services = []string{"a", "b", "c"}
+	m.setSingleGroup([]string{"a", "b", "c"})
 	m.width = 120
 	m.height = 5 // header=3, footer=3 → 5-6=-1 → clamped to 1
 
@@ -6167,12 +6063,12 @@ func TestSvcVisibleCount_MinOne(t *testing.T) {
 func TestSvcVisibleCount_WithStatusColumns(t *testing.T) {
 	mc := &mockComposer{}
 	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
-	m.services = []string{"a", "b", "c", "d", "e", "f", "g", "h", "i", "j"}
+	m.setSingleGroup([]string{"a", "b", "c", "d", "e", "f", "g", "h", "i", "j"})
 	m.width = 200
 	m.height = 10
-	m.svcStatus = map[string]runner.ServiceStatus{
+	m.svcStatus = qStatus(m, map[string]runner.ServiceStatus{
 		"a": {Running: true, Created: "2024-01-15 09:30", Uptime: "3h"},
-	}
+	})
 
 	// header=4 (3 + column captions), footer=3 (one-line help; reserved bar merges) → 10-4-3 = 3
 	got := m.svcVisibleCount()
@@ -6185,7 +6081,7 @@ func TestHasStatusColumns(t *testing.T) {
 	mc := &mockComposer{}
 	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
 	m.statsRequested = false // exercise the data-driven branch
-	m.services = []string{"a"}
+	m.setSingleGroup([]string{"a"})
 
 	// No status data
 	if m.hasStatusColumns() {
@@ -6193,43 +6089,43 @@ func TestHasStatusColumns(t *testing.T) {
 	}
 
 	// Status with only Running (no Created/Uptime)
-	m.svcStatus = map[string]runner.ServiceStatus{
+	m.svcStatus = qStatus(m, map[string]runner.ServiceStatus{
 		"a": {Running: true},
-	}
+	})
 	if m.hasStatusColumns() {
 		t.Error("hasStatusColumns() = true, want false with only Running set")
 	}
 
 	// Status with Created
-	m.svcStatus = map[string]runner.ServiceStatus{
+	m.svcStatus = qStatus(m, map[string]runner.ServiceStatus{
 		"a": {Created: "2024-01-15 09:30"},
-	}
+	})
 	if !m.hasStatusColumns() {
 		t.Error("hasStatusColumns() = false, want true with Created set")
 	}
 
 	// Status with Uptime
-	m.svcStatus = map[string]runner.ServiceStatus{
+	m.svcStatus = qStatus(m, map[string]runner.ServiceStatus{
 		"a": {Uptime: "3h"},
-	}
+	})
 	if !m.hasStatusColumns() {
 		t.Error("hasStatusColumns() = false, want true with Uptime set")
 	}
 
-	// Status for service NOT in m.services should be ignored
-	m.services = []string{"b"}
-	m.svcStatus = map[string]runner.ServiceStatus{
+	// Status for a service that has no row should be ignored
+	m.setSingleGroup([]string{"b"})
+	m.svcStatus = qStatus(m, map[string]runner.ServiceStatus{
 		"a": {Created: "2024-01-15 09:30", Uptime: "3h"},
-	}
+	})
 	if m.hasStatusColumns() {
 		t.Error("hasStatusColumns() = true, want false when status key not in services")
 	}
 
 	// Status with only Ports (no Created/Uptime)
-	m.services = []string{"a"}
-	m.svcStatus = map[string]runner.ServiceStatus{
+	m.setSingleGroup([]string{"a"})
+	m.svcStatus = qStatus(m, map[string]runner.ServiceStatus{
 		"a": {Running: true, Ports: []runner.Port{{Host: "0.0.0.0", HostPort: 80, ContainerPort: 80, Protocol: "tcp"}}},
-	}
+	})
 	if !m.hasStatusColumns() {
 		t.Error("hasStatusColumns() = false, want true with Ports set")
 	}
@@ -6238,11 +6134,11 @@ func TestHasStatusColumns(t *testing.T) {
 // TestHasStatusColumns_StatsRequested verifies that statsRequested short-circuits
 // hasStatusColumns to true even when no per-service data has arrived yet. This
 // keeps the CPU/Mem column captions visible from the first frame instead of
-// popping in when the ~1.5s host-wide docker stats call returns.
+// popping in when the host-wide docker stats call returns.
 func TestHasStatusColumns_StatsRequested(t *testing.T) {
 	mc := &mockComposer{}
 	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
-	m.services = []string{"a"}
+	m.setSingleGroup([]string{"a"})
 	m.statsRequested = true
 	m.svcStatus = nil
 	m.stats = nil
@@ -6272,7 +6168,7 @@ func TestFixSvcOffset_CursorBelowWindow(t *testing.T) {
 	mc := &mockComposer{}
 	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
 	m.statsRequested = false
-	m.services = []string{"a", "b", "c", "d", "e"}
+	m.setSingleGroup([]string{"a", "b", "c", "d", "e"})
 	m.width = 200
 	m.height = 9 // visible = 9-3-3 = 3
 	m.svcCursor = 4
@@ -6289,7 +6185,7 @@ func TestFixSvcOffset_CursorAboveWindow(t *testing.T) {
 	mc := &mockComposer{}
 	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
 	m.statsRequested = false
-	m.services = []string{"a", "b", "c", "d", "e"}
+	m.setSingleGroup([]string{"a", "b", "c", "d", "e"})
 	m.width = 120
 	m.height = 9 // visible = 9-3-3 = 3 (one-line help; reserved bar merges onto MarginTop)
 	m.svcCursor = 1
@@ -6305,7 +6201,7 @@ func TestFixSvcOffset_CursorAboveWindow(t *testing.T) {
 func TestFixSvcOffset_AllItemsFit(t *testing.T) {
 	mc := &mockComposer{}
 	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
-	m.services = []string{"a", "b"}
+	m.setSingleGroup([]string{"a", "b"})
 	m.width = 120
 	m.height = 20 // visible = all
 	m.svcCursor = 1
@@ -6320,7 +6216,7 @@ func TestFixSvcOffset_AllItemsFit(t *testing.T) {
 func TestFixSvcOffset_HeightZeroNoOp(t *testing.T) {
 	mc := &mockComposer{}
 	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
-	m.services = []string{"a", "b", "c"}
+	m.setSingleGroup([]string{"a", "b", "c"})
 	m.height = 0
 	m.svcCursor = 2
 	m.svcOffset = 0
@@ -6336,7 +6232,7 @@ func TestFixSvcOffset_ClampsMaxOffset(t *testing.T) {
 	mc := &mockComposer{}
 	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
 	m.statsRequested = false
-	m.services = []string{"a", "b", "c", "d", "e"}
+	m.setSingleGroup([]string{"a", "b", "c", "d", "e"})
 	m.width = 200
 	m.height = 9 // visible = 9-3-3 = 3
 	m.svcCursor = 4
@@ -6354,7 +6250,7 @@ func TestScrollDown_PastVisibleWindow(t *testing.T) {
 	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
 	m.statsRequested = false // isolate scroll math from the captions row
 	m.screen = screenSelectContainers
-	m.services = mc.services
+	m.setSingleGroup(mc.services)
 	m.width = 200
 	m.height = 9 // visible = 9-3-3 = 3
 
@@ -6382,7 +6278,7 @@ func TestScrollUp_PastTopOfWindow(t *testing.T) {
 	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
 	m.statsRequested = false
 	m.screen = screenSelectContainers
-	m.services = mc.services
+	m.setSingleGroup(mc.services)
 	m.width = 160
 	m.height = 9 // visible = 9-3-3 = 3
 	m.svcCursor = 4
@@ -6406,14 +6302,14 @@ func TestConfirming_CallsFixSvcOffset(t *testing.T) {
 	mc := &mockComposer{services: []string{"a", "b", "c", "d", "e", "f", "g", "h"}}
 	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
 	m.screen = screenSelectContainers
-	m.services = mc.services
+	m.setSingleGroup(mc.services)
 	m.width = 120
 	m.height = 8 // visible normal = confirming (constant with reserved search bar)
 
 	// Navigate to last item and select it
 	m.svcCursor = 7
 	m.svcOffset = 4 // near bottom
-	m.selected[7] = true
+	m.selected[m.svcKeyAt(7)] = true
 
 	// Press 'r' to enter confirming
 	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'r'}})
@@ -6433,7 +6329,7 @@ func TestSelectAll_DoesNotChangeOffset(t *testing.T) {
 	mc := &mockComposer{services: []string{"a", "b", "c", "d", "e"}}
 	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
 	m.screen = screenSelectContainers
-	m.services = mc.services
+	m.setSingleGroup(mc.services)
 	m.width = 160
 	m.height = 9 // visible = 3
 	m.svcCursor = 3
@@ -6451,7 +6347,7 @@ func TestWindowResize_FixesOffset(t *testing.T) {
 	mc := &mockComposer{services: []string{"a", "b", "c", "d", "e"}}
 	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
 	m.screen = screenSelectContainers
-	m.services = mc.services
+	m.setSingleGroup(mc.services)
 	m.width = 160
 	m.height = 20 // all fit
 	m.svcCursor = 4
@@ -6473,8 +6369,8 @@ func TestViewSelectContainers_UpIndicator(t *testing.T) {
 	mc := &mockComposer{services: []string{"a", "b", "c", "d", "e"}}
 	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
 	m.screen = screenSelectContainers
-	m.services = mc.services
-	m.svcStatus = map[string]runner.ServiceStatus{}
+	m.setSingleGroup(mc.services)
+	m.svcStatus = qStatus(m, map[string]runner.ServiceStatus{})
 	m.width = 160
 	m.height = 9 // visible = 3
 	m.svcCursor = 3
@@ -6491,8 +6387,8 @@ func TestViewSelectContainers_DownIndicator(t *testing.T) {
 	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
 	m.statsRequested = false
 	m.screen = screenSelectContainers
-	m.services = mc.services
-	m.svcStatus = map[string]runner.ServiceStatus{}
+	m.setSingleGroup(mc.services)
+	m.svcStatus = qStatus(m, map[string]runner.ServiceStatus{})
 	m.width = 200
 	m.height = 8 // visible = 8-3-3 = 2
 	m.svcCursor = 0
@@ -6508,8 +6404,8 @@ func TestViewSelectContainers_NoIndicatorsWhenAllFit(t *testing.T) {
 	mc := &mockComposer{services: []string{"a", "b"}}
 	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
 	m.screen = screenSelectContainers
-	m.services = mc.services
-	m.svcStatus = map[string]runner.ServiceStatus{}
+	m.setSingleGroup(mc.services)
+	m.svcStatus = qStatus(m, map[string]runner.ServiceStatus{})
 	m.width = 120
 	m.height = 20 // plenty of room
 	m.svcCursor = 0
@@ -6529,8 +6425,8 @@ func TestViewSelectContainers_BothIndicators(t *testing.T) {
 	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
 	m.statsRequested = false
 	m.screen = screenSelectContainers
-	m.services = mc.services
-	m.svcStatus = map[string]runner.ServiceStatus{}
+	m.setSingleGroup(mc.services)
+	m.svcStatus = qStatus(m, map[string]runner.ServiceStatus{})
 	m.width = 200
 	m.height = 8 // visible = 8-3-3 = 2
 	m.svcCursor = 2
@@ -6549,8 +6445,8 @@ func TestViewSelectContainers_HeightZeroRendersAll(t *testing.T) {
 	mc := &mockComposer{services: []string{"a", "b", "c", "d", "e"}}
 	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
 	m.screen = screenSelectContainers
-	m.services = mc.services
-	m.svcStatus = map[string]runner.ServiceStatus{}
+	m.setSingleGroup(mc.services)
+	m.svcStatus = qStatus(m, map[string]runner.ServiceStatus{})
 	m.width = 0
 	m.height = 0
 
@@ -6570,8 +6466,8 @@ func TestViewSelectContainers_WindowedOnlyShowsVisibleServices(t *testing.T) {
 	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
 	m.statsRequested = false
 	m.screen = screenSelectContainers
-	m.services = mc.services
-	m.svcStatus = map[string]runner.ServiceStatus{}
+	m.setSingleGroup(mc.services)
+	m.svcStatus = qStatus(m, map[string]runner.ServiceStatus{})
 	m.width = 200
 	m.height = 9 // visible = 9-3-3 = 3
 	m.svcCursor = 2
@@ -6599,12 +6495,12 @@ func TestViewSelectContainers_CreatedAndUptime(t *testing.T) {
 	mc := &mockComposer{services: []string{"web", "db", "cache"}}
 	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
 	m.screen = screenSelectContainers
-	m.services = mc.services
-	m.svcStatus = map[string]runner.ServiceStatus{
+	m.setSingleGroup(mc.services)
+	m.svcStatus = qStatus(m, map[string]runner.ServiceStatus{
 		"web":   {Running: true, Created: "2024-01-15 09:30", Uptime: "3h"},
 		"db":    {Running: true, Created: "2024-01-14 08:00", Uptime: "1d 3h"},
 		"cache": {Running: false, Created: "2024-01-15 10:00", Uptime: ""},
-	}
+	})
 	m.width = 120
 	m.height = 24
 
@@ -6634,11 +6530,11 @@ func TestViewSelectContainers_CreatedAndUptimeAlignment(t *testing.T) {
 	mc := &mockComposer{services: []string{"nginx", "postgres-db"}}
 	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
 	m.screen = screenSelectContainers
-	m.services = mc.services
-	m.svcStatus = map[string]runner.ServiceStatus{
+	m.setSingleGroup(mc.services)
+	m.svcStatus = qStatus(m, map[string]runner.ServiceStatus{
 		"nginx":       {Running: true, Created: "2024-01-15 09:30", Uptime: "3h"},
 		"postgres-db": {Running: true, Created: "2024-01-14 08:00", Uptime: "1d 3h"},
-	}
+	})
 	m.width = 120
 	m.height = 24
 
@@ -6670,14 +6566,14 @@ func TestViewSelectContainers_Ports(t *testing.T) {
 	mc := &mockComposer{services: []string{"web", "db"}}
 	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
 	m.screen = screenSelectContainers
-	m.services = mc.services
-	m.svcStatus = map[string]runner.ServiceStatus{
+	m.setSingleGroup(mc.services)
+	m.svcStatus = qStatus(m, map[string]runner.ServiceStatus{
 		"web": {Running: true, Ports: []runner.Port{
 			{Host: "0.0.0.0", HostPort: 8080, ContainerPort: 80, Protocol: "tcp"},
 			{Host: "0.0.0.0", HostPort: 8443, ContainerPort: 443, Protocol: "tcp"},
 		}},
 		"db": {Running: true},
-	}
+	})
 	m.width = 200
 	m.height = 24
 
@@ -6701,13 +6597,13 @@ func TestViewSelectContainers_PortsAlignment(t *testing.T) {
 	mc := &mockComposer{services: []string{"nginx", "api"}}
 	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
 	m.screen = screenSelectContainers
-	m.services = mc.services
-	m.svcStatus = map[string]runner.ServiceStatus{
+	m.setSingleGroup(mc.services)
+	m.svcStatus = qStatus(m, map[string]runner.ServiceStatus{
 		"nginx": {Running: true, Ports: []runner.Port{
 			{Host: "0.0.0.0", HostPort: 80, ContainerPort: 80, Protocol: "tcp"},
 		}},
 		"api": {Running: true},
-	}
+	})
 	m.width = 200
 	m.height = 24
 
@@ -6765,11 +6661,11 @@ func TestViewSelectContainers_NoPortsColumnWhenAllEmpty(t *testing.T) {
 	mc := &mockComposer{services: []string{"web", "db"}}
 	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
 	m.screen = screenSelectContainers
-	m.services = mc.services
-	m.svcStatus = map[string]runner.ServiceStatus{
+	m.setSingleGroup(mc.services)
+	m.svcStatus = qStatus(m, map[string]runner.ServiceStatus{
 		"web": {Running: true, Created: "2024-01-15 09:30", Uptime: "3h"},
 		"db":  {Running: false, Created: "2024-01-15 09:30"},
-	}
+	})
 	m.width = 200
 	m.height = 24
 
@@ -6783,11 +6679,11 @@ func TestViewSelectContainers_NoColumnsWhenNoStatus(t *testing.T) {
 	mc := &mockComposer{services: []string{"web", "db"}}
 	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
 	m.screen = screenSelectContainers
-	m.services = mc.services
-	m.svcStatus = map[string]runner.ServiceStatus{
+	m.setSingleGroup(mc.services)
+	m.svcStatus = qStatus(m, map[string]runner.ServiceStatus{
 		"web": {Running: true},
 		"db":  {Running: false},
-	}
+	})
 	m.width = 120
 	m.height = 24
 
@@ -7931,9 +7827,9 @@ func TestQuitConfirmation_RemoteConnection_ShowsPrompt(t *testing.T) {
 	mc := &mockComposer{services: []string{"nginx"}}
 	m := NewModel(nil, io.Discard, mockFactory(mc), testServers, mockConnectCb(mc))
 	m.screen = screenSelectContainers
-	m.showPicker = true
-	m.services = mc.services
-	m.selected = make(map[int]bool)
+	m.drilledFromHost = true
+	m.setSingleGroup(mc.services)
+	m.selected = make(map[string]bool)
 	m.disconnectFunc = func() error { return nil }
 	m.serverName = "prod"
 
@@ -7957,8 +7853,8 @@ func TestQuitConfirmation_LocalSession_QuitsImmediately(t *testing.T) {
 	mc := &mockComposer{services: []string{"nginx"}}
 	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
 	m.screen = screenSelectContainers
-	m.services = mc.services
-	m.selected = make(map[int]bool)
+	m.setSingleGroup(mc.services)
+	m.selected = make(map[string]bool)
 
 	updated, cmd := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'q'}})
 	um := updated.(Model)
@@ -7976,8 +7872,8 @@ func TestQuitConfirmation_NoCancels(t *testing.T) {
 	mc := &mockComposer{services: []string{"nginx"}}
 	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
 	m.screen = screenSelectContainers
-	m.services = mc.services
-	m.selected = make(map[int]bool)
+	m.setSingleGroup(mc.services)
+	m.selected = make(map[string]bool)
 	m.quitting = true
 	m.disconnectFunc = func() error { return nil }
 
@@ -8000,8 +7896,8 @@ func TestQuitConfirmation_EscCancels(t *testing.T) {
 	mc := &mockComposer{services: []string{"nginx"}}
 	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
 	m.screen = screenSelectContainers
-	m.services = mc.services
-	m.selected = make(map[int]bool)
+	m.setSingleGroup(mc.services)
+	m.selected = make(map[string]bool)
 	m.quitting = true
 	m.disconnectFunc = func() error { return nil }
 
@@ -8021,8 +7917,8 @@ func TestQuitConfirmation_OtherKeysSwallowed(t *testing.T) {
 	mc := &mockComposer{services: []string{"nginx"}}
 	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
 	m.screen = screenSelectContainers
-	m.services = mc.services
-	m.selected = make(map[int]bool)
+	m.setSingleGroup(mc.services)
+	m.selected = make(map[string]bool)
 	m.quitting = true
 	m.disconnectFunc = func() error { return nil }
 
@@ -8073,16 +7969,18 @@ func TestCtrlCConfirmation_AllRemoteScreens(t *testing.T) {
 		key    string
 		setup  func(m *Model)
 	}{
-		{"project select", screenSelectProject, "ctrl+c", func(m *Model) {
-			m.projects = []compose.Project{{Name: "app", ConfigDir: "/app"}}
+		{"containers grouped", screenSelectContainers, "ctrl+c", func(m *Model) {
+			m.grouped = true
+			m.svcGroups = []svcGroup{{proj: compose.Project{Name: "app", ConfigDir: "/app"}}}
+			m.svcEntries = rebuildSvcEntries(m.svcGroups)
 		}},
 		{"containers normal", screenSelectContainers, "ctrl+c", func(m *Model) {
-			m.services = []string{"nginx"}
-			m.selected = make(map[int]bool)
+			m.setSingleGroup([]string{"nginx"})
+			m.selected = make(map[string]bool)
 		}},
 		{"containers confirming", screenSelectContainers, "ctrl+c", func(m *Model) {
-			m.services = []string{"nginx"}
-			m.selected = map[int]bool{0: true}
+			m.setSingleGroup([]string{"nginx"})
+			m.selected = selectedIdx(*m, 0)
 			m.confirming = true
 			m.pendingOp = runner.Deploy
 		}},
@@ -8146,8 +8044,8 @@ func TestQuitConfirmation_ViewRendersDisconnectPrompt(t *testing.T) {
 	mc := &mockComposer{}
 	m := NewModel(nil, io.Discard, mockFactory(mc), testServers, mockConnectCb(mc))
 	m.screen = screenSelectContainers
-	m.services = []string{"nginx"}
-	m.selected = make(map[int]bool)
+	m.setSingleGroup([]string{"nginx"})
+	m.selected = make(map[string]bool)
 	m.disconnectFunc = func() error { return nil }
 	m.serverName = "prod-server"
 	m.quitting = true
@@ -8190,8 +8088,8 @@ func TestQuitConfirmation_YesReturnsQuitMsg(t *testing.T) {
 	mc := &mockComposer{services: []string{"nginx"}}
 	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
 	m.screen = screenSelectContainers
-	m.services = mc.services
-	m.selected = make(map[int]bool)
+	m.setSingleGroup(mc.services)
+	m.selected = make(map[string]bool)
 	m.quitting = true
 	m.disconnectFunc = func() error { return nil }
 
@@ -8212,8 +8110,8 @@ func TestQuitConfirmation_LocalQuitReturnsQuitMsg(t *testing.T) {
 	mc := &mockComposer{services: []string{"nginx"}}
 	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
 	m.screen = screenSelectContainers
-	m.services = mc.services
-	m.selected = make(map[int]bool)
+	m.setSingleGroup(mc.services)
+	m.selected = make(map[string]bool)
 
 	_, cmd := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'q'}})
 
@@ -8272,22 +8170,22 @@ func TestQBackNavigation_ContainerScreen(t *testing.T) {
 	mc := &mockComposer{}
 	m := NewModel(nil, io.Discard, mockFactory(mc), testServers, mockConnectCb(mc))
 	m.screen = screenSelectContainers
-	m.showPicker = true
-	m.services = []string{"nginx"}
-	m.selected = make(map[int]bool)
+	m.drilledFromHost = true
+	m.setSingleGroup([]string{"nginx"})
+	m.selected = make(map[string]bool)
 	m.composer = mc
 
 	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'q'}})
 	um := updated.(Model)
 
-	if um.screen != screenSelectProject {
-		t.Errorf("screen = %d, want screenSelectProject", um.screen)
+	if um.screen != screenSelectContainers || !um.grouped {
+		t.Errorf("screen = %d grouped = %v, want the grouped host view", um.screen, um.grouped)
 	}
 	if um.composer != nil {
 		t.Error("composer should be cleared after back nav")
 	}
-	if um.services != nil {
-		t.Error("services should be cleared after back nav")
+	if um.svcGroups != nil {
+		t.Error("the rows should be cleared after back nav")
 	}
 }
 
@@ -8295,9 +8193,9 @@ func TestQBackNavigation_ContainerScreenCancelsConfirming(t *testing.T) {
 	mc := &mockComposer{}
 	m := NewModel(nil, io.Discard, mockFactory(mc), testServers, mockConnectCb(mc))
 	m.screen = screenSelectContainers
-	m.showPicker = true
-	m.services = []string{"nginx"}
-	m.selected = map[int]bool{0: true}
+	m.drilledFromHost = true
+	m.setSingleGroup([]string{"nginx"})
+	m.selected = selectedIdx(m, 0)
 	m.confirming = true
 	m.pendingOp = runner.Deploy
 
@@ -8321,9 +8219,9 @@ func TestQBackNavigation_ContainerScreenCancelsPendingExec(t *testing.T) {
 	mc := &mockComposer{}
 	m := NewModel(nil, io.Discard, mockFactory(mc), testServers, mockConnectCb(mc))
 	m.screen = screenSelectContainers
-	m.showPicker = true
-	m.services = []string{"nginx"}
-	m.selected = map[int]bool{0: true}
+	m.drilledFromHost = true
+	m.setSingleGroup([]string{"nginx"})
+	m.selected = selectedIdx(m, 0)
 	m.confirming = true
 	m.pendingExec = true
 
@@ -8410,38 +8308,6 @@ func TestQBackNavigation_SettingsListCancelsDelete(t *testing.T) {
 	}
 }
 
-func TestQBackNavigation_ProjectScreen(t *testing.T) {
-	mc := &mockComposer{}
-	m := NewModel(nil, io.Discard, mockFactory(mc), testServers, mockConnectCb(mc))
-	m.screen = screenSelectProject
-	m.serverName = "prod"
-	disconnectCalls := 0
-	m.disconnectFunc = func() error {
-		disconnectCalls++
-		return nil
-	}
-
-	updated, cmd := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'q'}})
-	um := updated.(Model)
-
-	if um.screen != screenSelectServer {
-		t.Errorf("screen = %d, want screenSelectServer", um.screen)
-	}
-	if um.disconnectFunc != nil {
-		t.Error("disconnectFunc should be nil after back nav")
-	}
-	if cmd == nil {
-		t.Fatal("expected a tea.Cmd to run disconnect, got nil")
-	}
-	msg := cmd()
-	if _, ok := msg.(disconnectDoneMsg); !ok {
-		t.Errorf("expected disconnectDoneMsg, got %T", msg)
-	}
-	if disconnectCalls != 1 {
-		t.Errorf("disconnect called %d times, want 1", disconnectCalls)
-	}
-}
-
 func TestQBackNavigation_ProgressDoneReturnsToContainers(t *testing.T) {
 	tests := []struct {
 		name string
@@ -8458,8 +8324,8 @@ func TestQBackNavigation_ProgressDoneReturnsToContainers(t *testing.T) {
 			m.screen = screenProgress
 			m.done = tc.done
 			m.failed = tc.fail
-			m.services = []string{"nginx"}
-			m.selected = make(map[int]bool)
+			m.setSingleGroup([]string{"nginx"})
+			m.selected = make(map[string]bool)
 
 			updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'q'}})
 			um := updated.(Model)
@@ -8496,72 +8362,14 @@ func TestQOnProgressWhileRunningIsNoop(t *testing.T) {
 	}
 }
 
-func TestQQuitsAtRoot_ProjectScreenNoServers(t *testing.T) {
-	mc := &mockComposer{}
-	m := NewModel(nil, io.Discard, mockFactory(mc), nil, nil)
-	m.screen = screenSelectProject
-
-	_, cmd := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'q'}})
-
-	if cmd == nil {
-		t.Fatal("expected quit cmd, got nil")
-	}
-	msg := cmd()
-	if _, ok := msg.(tea.QuitMsg); !ok {
-		t.Errorf("expected tea.QuitMsg, got %T", msg)
-	}
-}
-
-func TestQBackNavigation_ProjectScreenWithEmptyConfig(t *testing.T) {
-	// When the config file exists but has no servers, NewModel starts on
-	// screenSelectServer (showing just the Local entry). Selecting Local
-	// transitions to screenSelectProject. Pressing q there must navigate
-	// back to server-select, not quit — because there IS a parent screen.
-	mc := &mockComposer{}
-	emptyCfg := &config.Config{}
-	m := NewModel(nil, io.Discard, mockFactory(mc), nil, nil, WithConfig(emptyCfg))
-	m.screen = screenSelectProject
-
-	updated, cmd := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'q'}})
-	um := updated.(Model)
-
-	if um.screen != screenSelectServer {
-		t.Errorf("screen = %d, want screenSelectServer", um.screen)
-	}
-	// No tea.Quit should be returned.
-	if cmd != nil {
-		if msg := cmd(); msg != nil {
-			if _, isQuit := msg.(tea.QuitMsg); isQuit {
-				t.Errorf("got tea.QuitMsg, expected back navigation")
-			}
-		}
-	}
-}
-
-func TestEscBackNavigation_ProjectScreenWithEmptyConfig(t *testing.T) {
-	// Same parent-exists condition for esc: when m.config != nil and
-	// len(servers) == 0, esc must still navigate back to server-select.
-	mc := &mockComposer{}
-	emptyCfg := &config.Config{}
-	m := NewModel(nil, io.Discard, mockFactory(mc), nil, nil, WithConfig(emptyCfg))
-	m.screen = screenSelectProject
-
-	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyEsc})
-	um := updated.(Model)
-
-	if um.screen != screenSelectServer {
-		t.Errorf("screen = %d, want screenSelectServer", um.screen)
-	}
-}
-
 func TestQQuitsAtRoot_ContainerScreenStandalone(t *testing.T) {
 	mc := &mockComposer{services: []string{"nginx"}}
 	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
 	m.screen = screenSelectContainers
-	m.showPicker = false
+	m.drilledFromHost = false
 	m.confirming = false
-	m.services = mc.services
-	m.selected = make(map[int]bool)
+	m.setSingleGroup(mc.services)
+	m.selected = make(map[string]bool)
 
 	_, cmd := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'q'}})
 
@@ -8618,9 +8426,9 @@ func TestCtrlCStillTriggersDisconnectPrompt(t *testing.T) {
 	mc := &mockComposer{}
 	m := NewModel(nil, io.Discard, mockFactory(mc), testServers, mockConnectCb(mc))
 	m.screen = screenSelectContainers
-	m.showPicker = true
-	m.services = []string{"nginx"}
-	m.selected = make(map[int]bool)
+	m.drilledFromHost = true
+	m.setSingleGroup([]string{"nginx"})
+	m.selected = make(map[string]bool)
 	m.disconnectFunc = func() error { return nil }
 	m.serverName = "prod"
 
@@ -8639,9 +8447,9 @@ func TestQDuringQuittingPromptStillSwallowed(t *testing.T) {
 	mc := &mockComposer{}
 	m := NewModel(nil, io.Discard, mockFactory(mc), testServers, mockConnectCb(mc))
 	m.screen = screenSelectContainers
-	m.showPicker = true
-	m.services = []string{"nginx"}
-	m.selected = make(map[int]bool)
+	m.drilledFromHost = true
+	m.setSingleGroup([]string{"nginx"})
+	m.selected = make(map[string]bool)
 	m.disconnectFunc = func() error { return nil }
 	m.serverName = "prod"
 	m.quitting = true
@@ -8661,12 +8469,12 @@ func TestColumnCaptions_ShownWithStatusData(t *testing.T) {
 	mc := &mockComposer{}
 	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
 	m.screen = screenSelectContainers
-	m.services = []string{"web", "api"}
-	m.selected = map[int]bool{}
-	m.svcStatus = map[string]runner.ServiceStatus{
+	m.setSingleGroup([]string{"web", "api"})
+	m.selected = map[string]bool{}
+	m.svcStatus = qStatus(m, map[string]runner.ServiceStatus{
 		"web": {Running: true, Created: "2024-01-15 09:30", Uptime: "3h"},
 		"api": {Running: true, Created: "2024-01-15 09:25", Uptime: "3h"},
-	}
+	})
 
 	view := m.viewSelectContainers()
 	if !strings.Contains(view, "Created") {
@@ -8681,12 +8489,12 @@ func TestColumnCaptions_HiddenWithoutStatusData(t *testing.T) {
 	mc := &mockComposer{}
 	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
 	m.screen = screenSelectContainers
-	m.services = []string{"web", "api"}
-	m.selected = map[int]bool{}
-	m.svcStatus = map[string]runner.ServiceStatus{
+	m.setSingleGroup([]string{"web", "api"})
+	m.selected = map[string]bool{}
+	m.svcStatus = qStatus(m, map[string]runner.ServiceStatus{
 		"web": {Running: true},
 		"api": {Running: false},
-	}
+	})
 
 	view := m.viewSelectContainers()
 	if strings.Contains(view, "Created") {
@@ -8701,12 +8509,12 @@ func TestColumnCaptions_Alignment(t *testing.T) {
 	mc := &mockComposer{}
 	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
 	m.screen = screenSelectContainers
-	m.services = []string{"web", "api-service"}
-	m.selected = map[int]bool{}
-	m.svcStatus = map[string]runner.ServiceStatus{
+	m.setSingleGroup([]string{"web", "api-service"})
+	m.selected = map[string]bool{}
+	m.svcStatus = qStatus(m, map[string]runner.ServiceStatus{
 		"web":         {Running: true, Created: "2024-01-15 09:30", Uptime: "3h"},
 		"api-service": {Running: true, Created: "2024-01-15 09:25", Uptime: "5d"},
-	}
+	})
 
 	view := m.viewSelectContainers()
 	// Strip ANSI escape sequences for reliable offset comparison
@@ -8755,8 +8563,8 @@ func TestExec_XKeyOnRunningServiceTriggersConfirm(t *testing.T) {
 		},
 	}
 	m := NewModel(mc, io.Discard, mockExecFactory(mc), nil, nil)
-	m.services = mc.services
-	m.svcStatus = mc.status
+	m.setSingleGroup(mc.services)
+	m.svcStatus = qStatus(m, mc.status)
 	m.screen = screenSelectContainers
 	m.svcCursor = 0 // "web" is running
 	m.width = 120
@@ -8784,8 +8592,8 @@ func TestExec_XKeyOnStoppedServiceShowsWarning(t *testing.T) {
 		},
 	}
 	m := NewModel(mc, io.Discard, mockExecFactory(mc), nil, nil)
-	m.services = mc.services
-	m.svcStatus = mc.status
+	m.setSingleGroup(mc.services)
+	m.svcStatus = qStatus(m, mc.status)
 	m.screen = screenSelectContainers
 	m.svcCursor = 1 // "db" is stopped
 	m.width = 120
@@ -8812,8 +8620,8 @@ func TestExec_XKeyWithoutExecProviderIsNoOp(t *testing.T) {
 		status:   map[string]runner.ServiceStatus{"web": {Running: true}},
 	}
 	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
-	m.services = mc.services
-	m.svcStatus = mc.status
+	m.setSingleGroup(mc.services)
+	m.svcStatus = qStatus(m, mc.status)
 	m.screen = screenSelectContainers
 	m.svcCursor = 0
 	m.width = 120
@@ -8841,8 +8649,8 @@ func TestExec_XKeyOnNoServicesIsNoOp(t *testing.T) {
 		},
 	}
 	m := NewModel(mc, io.Discard, mockExecFactory(mc), nil, nil)
-	m.services = mc.services
-	m.svcStatus = mc.status
+	m.setSingleGroup(mc.services)
+	m.svcStatus = qStatus(m, mc.status)
 	m.screen = screenSelectContainers
 	m.width = 120
 	m.height = 24
@@ -8863,8 +8671,8 @@ func TestExec_ConfirmEnterDispatchesExecProcess(t *testing.T) {
 		},
 	}
 	m := NewModel(mc, io.Discard, mockExecFactory(mc), nil, nil)
-	m.services = mc.services
-	m.svcStatus = mc.status
+	m.setSingleGroup(mc.services)
+	m.svcStatus = qStatus(m, mc.status)
 	m.screen = screenSelectContainers
 	m.svcCursor = 0
 	m.confirming = true
@@ -8887,8 +8695,8 @@ func TestExec_ConfirmEscClearsPendingExec(t *testing.T) {
 		},
 	}
 	m := NewModel(mc, io.Discard, mockExecFactory(mc), nil, nil)
-	m.services = mc.services
-	m.svcStatus = mc.status
+	m.setSingleGroup(mc.services)
+	m.svcStatus = qStatus(m, mc.status)
 	m.screen = screenSelectContainers
 	m.svcCursor = 0
 	m.confirming = true
@@ -8915,8 +8723,8 @@ func TestExec_ExecDoneMsgRefreshesStatus(t *testing.T) {
 		},
 	}
 	m := NewModel(mc, io.Discard, mockExecFactory(mc), nil, nil)
-	m.services = mc.services
-	m.svcStatus = mc.status
+	m.setSingleGroup(mc.services)
+	m.svcStatus = qStatus(m, mc.status)
 	m.screen = screenSelectContainers
 	m.pendingExec = true
 	m.confirming = true
@@ -8943,8 +8751,8 @@ func TestExec_ExecDoneMsgWithErrorStillResetsState(t *testing.T) {
 		},
 	}
 	m := NewModel(mc, io.Discard, mockExecFactory(mc), nil, nil)
-	m.services = mc.services
-	m.svcStatus = mc.status
+	m.setSingleGroup(mc.services)
+	m.svcStatus = qStatus(m, mc.status)
 	m.screen = screenSelectContainers
 	m.pendingExec = true
 	m.confirming = true
@@ -8977,8 +8785,8 @@ func TestExec_ExecDoneMsgStaleMessageGuard(t *testing.T) {
 		},
 	}
 	m := NewModel(mc, io.Discard, mockExecFactory(mc), nil, nil)
-	m.services = mc.services
-	m.svcStatus = mc.status
+	m.setSingleGroup(mc.services)
+	m.svcStatus = qStatus(m, mc.status)
 	m.screen = screenLogs // not on container screen
 	m.pendingExec = true
 	m.confirming = true
@@ -9009,8 +8817,8 @@ func TestExec_ViewShowsExecConfirmation(t *testing.T) {
 		},
 	}
 	m := NewModel(mc, io.Discard, mockExecFactory(mc), nil, nil)
-	m.services = mc.services
-	m.svcStatus = mc.status
+	m.setSingleGroup(mc.services)
+	m.svcStatus = qStatus(m, mc.status)
 	m.screen = screenSelectContainers
 	m.svcCursor = 0
 	m.confirming = true
@@ -9047,8 +8855,8 @@ func TestExec_XKeyOnServiceWithNoStatus(t *testing.T) {
 		},
 	}
 	m := NewModel(mc, io.Discard, mockExecFactory(mc), nil, nil)
-	m.services = mc.services
-	m.svcStatus = mc.status
+	m.setSingleGroup(mc.services)
+	m.svcStatus = qStatus(m, mc.status)
 	m.screen = screenSelectContainers
 	m.svcCursor = 0
 	m.width = 120
@@ -9083,10 +8891,10 @@ func TestStatsMsg_populates(t *testing.T) {
 	if len(model.stats) != 2 {
 		t.Fatalf("len(stats) = %d, want 2", len(model.stats))
 	}
-	if got := model.stats["web"].CPUPercent; got != 4.2 {
+	if got := model.stats[qk(model, "web")].CPUPercent; got != 4.2 {
 		t.Errorf("stats[web].CPUPercent = %v, want 4.2", got)
 	}
-	if got := model.stats["db"].MemoryUsed; got != 200000000 {
+	if got := model.stats[qk(model, "db")].MemoryUsed; got != 200000000 {
 		t.Errorf("stats[db].MemoryUsed = %v, want 200000000", got)
 	}
 }
@@ -9096,7 +8904,7 @@ func TestStatsMsg_storesError(t *testing.T) {
 	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
 	m.screen = screenSelectContainers
 	prior := map[string]runner.ServiceStats{"web": {CPUPercent: 4.2}}
-	m.stats = prior
+	m.stats = qStats(m, prior)
 
 	wantErr := errors.New("docker stats failed")
 	result, _ := m.Update(statsMsg{err: wantErr})
@@ -9132,7 +8940,7 @@ func TestStatsMsg_staleIgnored(t *testing.T) {
 func TestStatsMsg_staleErrorIgnored(t *testing.T) {
 	mc := &mockComposer{}
 	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
-	m.screen = screenSelectProject
+	m.screen = screenLogs
 
 	result, _ := m.Update(statsMsg{err: errors.New("boom")})
 	model := result.(Model)
@@ -9154,7 +8962,7 @@ func TestStatsMsg_clearsPriorError(t *testing.T) {
 	if model.statsErr != nil {
 		t.Errorf("statsErr not cleared on success: got %v", model.statsErr)
 	}
-	if got := model.stats["web"].CPUPercent; got != 1.5 {
+	if got := model.stats[qk(model, "web")].CPUPercent; got != 1.5 {
 		t.Errorf("stats[web].CPUPercent = %v, want 1.5", got)
 	}
 }
@@ -9163,18 +8971,17 @@ func TestEsc_clearsStats(t *testing.T) {
 	mc := &mockComposer{services: []string{"web"}}
 	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
 	m.screen = screenSelectContainers
-	m.showPicker = true
-	m.projects = []compose.Project{{Name: "proj"}}
-	m.services = []string{"web"}
-	m.svcStatus = map[string]runner.ServiceStatus{"web": {Running: true}}
-	m.stats = map[string]runner.ServiceStats{"web": {CPUPercent: 4.2}}
+	m.drilledFromHost = true
+	m.setSingleGroup([]string{"web"})
+	m.svcStatus = qStatus(m, map[string]runner.ServiceStatus{"web": {Running: true}})
+	m.stats = qStats(m, map[string]runner.ServiceStats{"web": {CPUPercent: 4.2}})
 	m.statsErr = errors.New("stale stats error")
 
 	result, _ := m.Update(tea.KeyMsg{Type: tea.KeyEsc})
 	model := result.(Model)
 
-	if model.screen != screenSelectProject {
-		t.Fatalf("screen = %d, want %d", model.screen, screenSelectProject)
+	if model.screen != screenSelectContainers || !model.grouped {
+		t.Fatalf("screen = %d grouped = %v, want the grouped host view", model.screen, model.grouped)
 	}
 	if model.stats != nil {
 		t.Errorf("stats not cleared on esc: got %+v", model.stats)
@@ -9219,7 +9026,7 @@ func TestStatsMsg_currentSessionAccepted(t *testing.T) {
 	})
 	model := result.(Model)
 
-	if got := model.stats["web"].CPUPercent; got != 1.0 {
+	if got := model.stats[qk(model, "web")].CPUPercent; got != 1.0 {
 		t.Errorf("stats[web].CPUPercent = %v, want 1.0", got)
 	}
 }
@@ -9238,28 +9045,11 @@ func TestRefreshStats_capturesCurrentSession(t *testing.T) {
 	}
 }
 
-func TestProjectEnter_bumpsStatsSession(t *testing.T) {
-	mc := &mockComposer{}
-	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
-	m.screen = screenSelectProject
-	m.projects = []compose.Project{{Name: "proj", ConfigDir: "/tmp"}}
-	m.projCursor = 0
-	m.statsSession = 1
-
-	result, _ := m.Update(tea.KeyMsg{Type: tea.KeyEnter})
-	model := result.(Model)
-
-	if model.statsSession <= 1 {
-		t.Errorf("statsSession = %d, want > 1 after project enter", model.statsSession)
-	}
-}
-
 func TestEsc_bumpsStatsSession(t *testing.T) {
 	mc := &mockComposer{services: []string{"web"}}
 	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
 	m.screen = screenSelectContainers
-	m.showPicker = true
-	m.projects = []compose.Project{{Name: "proj"}}
+	m.drilledFromHost = true
 	m.statsSession = 10
 
 	result, _ := m.Update(tea.KeyMsg{Type: tea.KeyEsc})
@@ -9593,7 +9383,7 @@ func TestStatusMsg_currentSessionAccepted(t *testing.T) {
 	})
 	model := result.(Model)
 
-	if !model.svcStatus["web"].Running {
+	if !model.svcStatus[qk(model, "web")].Running {
 		t.Errorf("svcStatus[web].Running = false, want true (current-session msg should be applied)")
 	}
 }
@@ -9606,7 +9396,7 @@ func TestStatusMsg_staleSessionIgnored(t *testing.T) {
 	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
 	m.screen = screenSelectContainers
 	m.statusSession = 9
-	m.svcStatus = map[string]runner.ServiceStatus{"new": {Running: true}}
+	m.svcStatus = qStatus(m, map[string]runner.ServiceStatus{"new": {Running: true}})
 
 	result, _ := m.Update(statusMsg{
 		status:  map[string]runner.ServiceStatus{"stale": {Running: true}},
@@ -9614,10 +9404,10 @@ func TestStatusMsg_staleSessionIgnored(t *testing.T) {
 	})
 	model := result.(Model)
 
-	if _, ok := model.svcStatus["stale"]; ok {
+	if _, ok := model.svcStatus[qk(model, "stale")]; ok {
 		t.Error("stale statusMsg from older context overwrote svcStatus")
 	}
-	if !model.svcStatus["new"].Running {
+	if !model.svcStatus[qk(model, "new")].Running {
 		t.Error("current svcStatus was clobbered by stale statusMsg")
 	}
 }
@@ -9637,7 +9427,7 @@ func TestStatusMsg_offScreenIgnored(t *testing.T) {
 	})
 	model := result.(Model)
 
-	if _, ok := model.svcStatus["x"]; ok {
+	if _, ok := model.svcStatus[qk(model, "x")]; ok {
 		t.Error("statusMsg applied while off-screen; should have been ignored")
 	}
 }
@@ -9690,10 +9480,10 @@ func TestServicesMsg_currentSessionAccepted(t *testing.T) {
 	})
 	model := result.(Model)
 
-	if len(model.services) != 1 || model.services[0] != "web" {
-		t.Errorf("services = %v, want [web]", model.services)
+	if got := modelServices(model); len(got) != 1 || got[0] != "web" {
+		t.Errorf("services = %v, want [web]", got)
 	}
-	if !model.svcStatus["web"].Running {
+	if !model.svcStatus[qk(model, "web")].Running {
 		t.Error("svcStatus not applied for current-session msg")
 	}
 }
@@ -9706,8 +9496,8 @@ func TestServicesMsg_staleSessionIgnored(t *testing.T) {
 	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
 	m.screen = screenSelectContainers
 	m.statusSession = 9 // current
-	m.services = []string{"new-svc"}
-	m.svcStatus = map[string]runner.ServiceStatus{"new-svc": {Running: true}}
+	m.setSingleGroup([]string{"new-svc"})
+	m.svcStatus = qStatus(m, map[string]runner.ServiceStatus{"new-svc": {Running: true}})
 
 	result, _ := m.Update(servicesMsg{
 		services: []string{"stale-svc"},
@@ -9716,10 +9506,10 @@ func TestServicesMsg_staleSessionIgnored(t *testing.T) {
 	})
 	model := result.(Model)
 
-	if len(model.services) != 1 || model.services[0] != "new-svc" {
-		t.Errorf("stale servicesMsg clobbered services: got %v, want [new-svc]", model.services)
+	if got := modelServices(model); len(got) != 1 || got[0] != "new-svc" {
+		t.Errorf("stale servicesMsg clobbered services: got %v, want [new-svc]", got)
 	}
-	if _, ok := model.svcStatus["stale-svc"]; ok {
+	if _, ok := model.svcStatus[qk(model, "stale-svc")]; ok {
 		t.Error("stale servicesMsg clobbered svcStatus")
 	}
 }
@@ -9730,7 +9520,7 @@ func TestServicesMsg_offScreenIgnored(t *testing.T) {
 	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
 	m.screen = screenProgress
 	m.statusSession = 1
-	m.services = []string{"existing"}
+	m.setSingleGroup([]string{"existing"})
 
 	result, _ := m.Update(servicesMsg{
 		services: []string{"unwanted"},
@@ -9739,109 +9529,8 @@ func TestServicesMsg_offScreenIgnored(t *testing.T) {
 	})
 	model := result.(Model)
 
-	if len(model.services) != 1 || model.services[0] != "existing" {
-		t.Errorf("servicesMsg applied while off-screen: got %v, want [existing]", model.services)
-	}
-}
-
-// --- projectsMsg session guard tests ---
-
-// TestLoadProjects_capturesCurrentSession verifies loadProjects captures
-// m.projectsSession at fire time.
-func TestLoadProjects_capturesCurrentSession(t *testing.T) {
-	mc := &mockComposer{}
-	loader := func(context.Context) ([]compose.Project, error) {
-		return []compose.Project{{Name: "p", ConfigDir: "/p"}}, nil
-	}
-	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil, WithLocalProjectLoader(loader))
-	m.projectsSession = 17
-
-	msg, ok := m.loadProjects()().(projectsMsg)
-	if !ok {
-		t.Fatalf("expected projectsMsg, got %T", m.loadProjects()())
-	}
-	if msg.session != 17 {
-		t.Errorf("captured session = %d, want 17", msg.session)
-	}
-}
-
-// TestProjectsMsg_currentSessionAccepted verifies the happy path.
-func TestProjectsMsg_currentSessionAccepted(t *testing.T) {
-	mc := &mockComposer{}
-	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
-	m.screen = screenSelectProject
-	m.projectsSession = 7
-
-	result, _ := m.Update(projectsMsg{
-		projects: []compose.Project{{Name: "p", ConfigDir: "/p"}},
-		session:  7,
-	})
-	model := result.(Model)
-
-	if len(model.projects) != 1 || model.projects[0].Name != "p" {
-		t.Errorf("projects = %v, want [{Name: p}]", model.projects)
-	}
-}
-
-// TestProjectsMsg_staleSessionIgnored is the regression test for the codex
-// round-3 finding: loadProjects from server A must NOT overwrite m.projects
-// after the user has navigated to server B (which would let server B's
-// composerFactory get fed a path discovered on server A — potentially mounting
-// the wrong directory on deploy).
-func TestProjectsMsg_staleSessionIgnored(t *testing.T) {
-	mc := &mockComposer{}
-	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
-	m.screen = screenSelectProject
-	m.projectsSession = 9 // current (server B)
-	m.projects = []compose.Project{{Name: "b-proj", ConfigDir: "/b"}}
-
-	result, _ := m.Update(projectsMsg{
-		projects: []compose.Project{{Name: "a-proj", ConfigDir: "/a"}}, // stale, from server A
-		session:  4,
-	})
-	model := result.(Model)
-
-	if len(model.projects) != 1 || model.projects[0].Name != "b-proj" {
-		t.Errorf("stale projectsMsg clobbered projects: got %v, want [{b-proj}]", model.projects)
-	}
-}
-
-// TestProjectsMsg_offScreenIgnored verifies the screen-gate still applies.
-func TestProjectsMsg_offScreenIgnored(t *testing.T) {
-	mc := &mockComposer{}
-	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
-	m.screen = screenSelectServer // not the project picker
-	m.projectsSession = 3
-	m.projects = []compose.Project{{Name: "existing"}}
-
-	result, _ := m.Update(projectsMsg{
-		projects: []compose.Project{{Name: "unwanted"}},
-		session:  3,
-	})
-	model := result.(Model)
-
-	if len(model.projects) != 1 || model.projects[0].Name != "existing" {
-		t.Errorf("projectsMsg applied while off-screen: got %v, want [existing]", model.projects)
-	}
-}
-
-// TestProjectsMsg_errorWithCurrentSessionApplied verifies error responses on
-// the current session ARE applied — without this, a network error from the
-// remote loader would never surface.
-func TestProjectsMsg_errorWithCurrentSessionApplied(t *testing.T) {
-	mc := &mockComposer{}
-	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
-	m.screen = screenSelectProject
-	m.projectsSession = 5
-
-	result, _ := m.Update(projectsMsg{
-		err:     errors.New("ssh: connection refused"),
-		session: 5,
-	})
-	model := result.(Model)
-
-	if model.projErr == nil || model.projErr.Error() != "ssh: connection refused" {
-		t.Errorf("projErr = %v, want 'ssh: connection refused'", model.projErr)
+	if got := modelServices(model); len(got) != 1 || got[0] != "existing" {
+		t.Errorf("servicesMsg applied while off-screen: got %v, want [existing]", got)
 	}
 }
 
@@ -9851,15 +9540,15 @@ func TestContainerScreen_rendersStatsColumns(t *testing.T) {
 	mc := &mockComposer{services: []string{"web", "db"}}
 	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
 	m.screen = screenSelectContainers
-	m.services = mc.services
-	m.svcStatus = map[string]runner.ServiceStatus{
+	m.setSingleGroup(mc.services)
+	m.svcStatus = qStatus(m, map[string]runner.ServiceStatus{
 		"web": {Running: true},
 		"db":  {Running: true},
-	}
-	m.stats = map[string]runner.ServiceStats{
+	})
+	m.stats = qStats(m, map[string]runner.ServiceStats{
 		"web": {CPUPercent: 4.2, MemoryUsed: 130023424, MemoryLimit: 536870912},
 		"db":  {CPUPercent: 1.1, MemoryUsed: 200 * 1024 * 1024, MemoryLimit: 1024 * 1024 * 1024},
-	}
+	})
 	m.width = 200
 	m.height = 24
 
@@ -9905,11 +9594,11 @@ func TestContainerScreen_serviceColumnHasCaption(t *testing.T) {
 	mc := &mockComposer{services: []string{"web", "db"}}
 	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
 	m.screen = screenSelectContainers
-	m.services = mc.services
-	m.svcStatus = map[string]runner.ServiceStatus{
+	m.setSingleGroup(mc.services)
+	m.svcStatus = qStatus(m, map[string]runner.ServiceStatus{
 		"web": {Running: true, Created: "2024-01-15 09:30"},
 		"db":  {Running: true, Created: "2024-01-15 09:30"},
-	}
+	})
 	m.width = 200
 	m.height = 24
 
@@ -9941,11 +9630,11 @@ func TestContainerScreen_serviceCaptionWidensShortNames(t *testing.T) {
 	mc := &mockComposer{services: []string{"a", "b"}} // both 1 char, shorter than "Service"
 	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
 	m.screen = screenSelectContainers
-	m.services = mc.services
-	m.svcStatus = map[string]runner.ServiceStatus{
+	m.setSingleGroup(mc.services)
+	m.svcStatus = qStatus(m, map[string]runner.ServiceStatus{
 		"a": {Running: true, Created: "2024-01-15 09:30"},
 		"b": {Running: true, Created: "2024-01-15 09:30"},
-	}
+	})
 	m.width = 200
 	m.height = 24
 
@@ -9992,15 +9681,15 @@ func TestContainerScreen_statsColumnWidthsAreStable(t *testing.T) {
 	mc := &mockComposer{services: []string{"small", "big"}}
 	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
 	m.screen = screenSelectContainers
-	m.services = mc.services
-	m.svcStatus = map[string]runner.ServiceStatus{
+	m.setSingleGroup(mc.services)
+	m.svcStatus = qStatus(m, map[string]runner.ServiceStatus{
 		"small": {Running: true},
 		"big":   {Running: true},
-	}
-	m.stats = map[string]runner.ServiceStats{
+	})
+	m.stats = qStats(m, map[string]runner.ServiceStats{
 		"small": {CPUPercent: 0.2, MemoryUsed: 10 * 1024 * 1024, MemoryLimit: 128 * 1024 * 1024},
 		"big":   {CPUPercent: 11.1, MemoryUsed: 1503238553, MemoryLimit: 4 * 1024 * 1024 * 1024}, // ~1.4 GiB
-	}
+	})
 	m.width = 200
 	m.height = 24
 
@@ -10043,15 +9732,15 @@ func TestContainerScreen_blankCellsForMissingStats(t *testing.T) {
 	mc := &mockComposer{services: []string{"web", "db"}}
 	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
 	m.screen = screenSelectContainers
-	m.services = mc.services
-	m.svcStatus = map[string]runner.ServiceStatus{
+	m.setSingleGroup(mc.services)
+	m.svcStatus = qStatus(m, map[string]runner.ServiceStatus{
 		"web": {Running: true},
 		"db":  {Running: true},
-	}
-	m.stats = map[string]runner.ServiceStats{
+	})
+	m.stats = qStats(m, map[string]runner.ServiceStats{
 		"web": {CPUPercent: 5.5, MemoryUsed: 100 * 1024 * 1024, MemoryLimit: 200 * 1024 * 1024},
 		// db absent from stats map
-	}
+	})
 	m.width = 200
 	m.height = 24
 
@@ -10088,15 +9777,15 @@ func TestContainerScreen_blankCellsForStoppedService(t *testing.T) {
 	mc := &mockComposer{services: []string{"web", "db"}}
 	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
 	m.screen = screenSelectContainers
-	m.services = mc.services
-	m.svcStatus = map[string]runner.ServiceStatus{
+	m.setSingleGroup(mc.services)
+	m.svcStatus = qStatus(m, map[string]runner.ServiceStatus{
 		"web": {Running: true},
 		"db":  {Running: false},
-	}
-	m.stats = map[string]runner.ServiceStats{
+	})
+	m.stats = qStats(m, map[string]runner.ServiceStats{
 		"web": {CPUPercent: 9.9, MemoryUsed: 100 * 1024 * 1024, MemoryLimit: 200 * 1024 * 1024},
 		"db":  {CPUPercent: 7.7, MemoryUsed: 50 * 1024 * 1024, MemoryLimit: 100 * 1024 * 1024},
-	}
+	})
 	m.width = 200
 	m.height = 24
 
@@ -10122,16 +9811,16 @@ func TestContainerScreen_blankCellsForStoppedService(t *testing.T) {
 
 func TestContainerScreen_StatsCaptionsReservedBeforeData(t *testing.T) {
 	// Once stats have been requested, CPU/Mem captions are reserved from the
-	// first frame so they don't pop in when the ~1.5s docker stats call returns.
+	// first frame so they don't pop in when the docker stats call returns.
 	// Cells stay blank for services without data yet.
 	mc := &mockComposer{services: []string{"web"}}
 	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
 	m.screen = screenSelectContainers
 	m.statsRequested = true
-	m.services = mc.services
-	m.svcStatus = map[string]runner.ServiceStatus{
+	m.setSingleGroup(mc.services)
+	m.svcStatus = qStatus(m, map[string]runner.ServiceStatus{
 		"web": {Running: true},
-	}
+	})
 	m.stats = nil
 	m.width = 120
 	m.height = 24
@@ -10153,10 +9842,10 @@ func TestContainerScreen_NoStatsCaptionsAbsentWithoutRequest(t *testing.T) {
 	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
 	m.screen = screenSelectContainers
 	m.statsRequested = false
-	m.services = mc.services
-	m.svcStatus = map[string]runner.ServiceStatus{
+	m.setSingleGroup(mc.services)
+	m.svcStatus = qStatus(m, map[string]runner.ServiceStatus{
 		"web": {Running: true},
-	}
+	})
 	m.stats = nil
 	m.width = 120
 	m.height = 24
@@ -10174,8 +9863,8 @@ func TestContainerScreen_statsErrFallback(t *testing.T) {
 	mc := &mockComposer{services: []string{"web"}}
 	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
 	m.screen = screenSelectContainers
-	m.services = mc.services
-	m.svcStatus = map[string]runner.ServiceStatus{"web": {Running: true}}
+	m.setSingleGroup(mc.services)
+	m.svcStatus = qStatus(m, map[string]runner.ServiceStatus{"web": {Running: true}})
 	m.statsErr = errors.New("docker stats failed: timeout")
 	m.width = 200
 	m.height = 24
@@ -10199,8 +9888,8 @@ func TestContainerScreen_svcErrPreferred(t *testing.T) {
 	mc := &mockComposer{services: []string{"web"}}
 	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
 	m.screen = screenSelectContainers
-	m.services = mc.services
-	m.svcStatus = map[string]runner.ServiceStatus{"web": {Running: true}}
+	m.setSingleGroup(mc.services)
+	m.svcStatus = qStatus(m, map[string]runner.ServiceStatus{"web": {Running: true}})
 	m.svcErr = errors.New("services load failed")
 	m.statsErr = errors.New("stats fetch failed too")
 	m.width = 200
@@ -10227,15 +9916,15 @@ func TestSvcVisibleCount_withStatsColumns(t *testing.T) {
 	// change the per-row line count beyond the existing Created/Uptime case.
 	mc := &mockComposer{}
 	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
-	m.services = []string{"a", "b", "c", "d", "e", "f", "g", "h", "i", "j"}
+	m.setSingleGroup([]string{"a", "b", "c", "d", "e", "f", "g", "h", "i", "j"})
 	m.width = 200
 	m.height = 10
-	m.svcStatus = map[string]runner.ServiceStatus{
+	m.svcStatus = qStatus(m, map[string]runner.ServiceStatus{
 		"a": {Running: true},
-	}
-	m.stats = map[string]runner.ServiceStats{
+	})
+	m.stats = qStats(m, map[string]runner.ServiceStats{
 		"a": {CPUPercent: 4.2, MemoryUsed: 100, MemoryLimit: 1000},
-	}
+	})
 
 	// header=4 (3 + captions row), footer=3 (one-line help; reserved bar merges) → 10-4-3 = 3
 	got := m.svcVisibleCount()
@@ -10248,11 +9937,11 @@ func TestHasStatusColumns_StatsDataAlone(t *testing.T) {
 	// Stats data alone (no Created/Uptime/Ports) should trigger captions row.
 	mc := &mockComposer{}
 	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
-	m.services = []string{"web"}
-	m.svcStatus = map[string]runner.ServiceStatus{"web": {Running: true}}
-	m.stats = map[string]runner.ServiceStats{
+	m.setSingleGroup([]string{"web"})
+	m.svcStatus = qStatus(m, map[string]runner.ServiceStatus{"web": {Running: true}})
+	m.stats = qStats(m, map[string]runner.ServiceStats{
 		"web": {CPUPercent: 4.2},
-	}
+	})
 	if !m.hasStatusColumns() {
 		t.Error("hasStatusColumns() = false, want true with stats data present")
 	}
@@ -10269,14 +9958,14 @@ func TestUpdatesMsg_currentSessionHydrates(t *testing.T) {
 	m.screen = screenSelectContainers
 	m.updatesSession = 3
 	m.updateInFlight = true
-	m.svcStatus = map[string]runner.ServiceStatus{
+	m.svcStatus = qStatus(m, map[string]runner.ServiceStatus{
 		"web":   {Running: true},
 		"db":    {Running: true},
 		"cache": {Running: true},
-	}
+	})
 
 	result, _ := m.Update(updatesMsg{
-		results: map[string]bool{"web": true, "db": false},
+		forKey: m.updatesCacheKey(), results: map[string]bool{"web": true, "db": false},
 		session: 3,
 	})
 	model := result.(Model)
@@ -10284,15 +9973,15 @@ func TestUpdatesMsg_currentSessionHydrates(t *testing.T) {
 	if model.updateInFlight {
 		t.Error("updateInFlight should be cleared after current-session msg")
 	}
-	if model.svcStatus["web"].UpdateAvailable == nil || !*model.svcStatus["web"].UpdateAvailable {
-		t.Errorf("web UpdateAvailable = %v, want &true", model.svcStatus["web"].UpdateAvailable)
+	if model.svcStatus[qk(model, "web")].UpdateAvailable == nil || !*model.svcStatus[qk(model, "web")].UpdateAvailable {
+		t.Errorf("web UpdateAvailable = %v, want &true", model.svcStatus[qk(model, "web")].UpdateAvailable)
 	}
-	if model.svcStatus["db"].UpdateAvailable == nil || *model.svcStatus["db"].UpdateAvailable {
-		t.Errorf("db UpdateAvailable = %v, want &false", model.svcStatus["db"].UpdateAvailable)
+	if model.svcStatus[qk(model, "db")].UpdateAvailable == nil || *model.svcStatus[qk(model, "db")].UpdateAvailable {
+		t.Errorf("db UpdateAvailable = %v, want &false", model.svcStatus[qk(model, "db")].UpdateAvailable)
 	}
 	// cache absent — UpdateAvailable should remain nil
-	if model.svcStatus["cache"].UpdateAvailable != nil {
-		t.Errorf("cache UpdateAvailable = %v, want nil (absent from results)", model.svcStatus["cache"].UpdateAvailable)
+	if model.svcStatus[qk(model, "cache")].UpdateAvailable != nil {
+		t.Errorf("cache UpdateAvailable = %v, want nil (absent from results)", model.svcStatus[qk(model, "cache")].UpdateAvailable)
 	}
 	// Cache should be populated
 	key := model.updatesCacheKey()
@@ -10310,15 +9999,15 @@ func TestUpdatesMsg_staleSessionIgnored(t *testing.T) {
 	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
 	m.screen = screenSelectContainers
 	m.updatesSession = 9
-	m.svcStatus = map[string]runner.ServiceStatus{"web": {Running: true}}
+	m.svcStatus = qStatus(m, map[string]runner.ServiceStatus{"web": {Running: true}})
 
 	result, _ := m.Update(updatesMsg{
-		results: map[string]bool{"web": true},
+		forKey: m.updatesCacheKey(), results: map[string]bool{"web": true},
 		session: 4, // older context
 	})
 	model := result.(Model)
 
-	if model.svcStatus["web"].UpdateAvailable != nil {
+	if model.svcStatus[qk(model, "web")].UpdateAvailable != nil {
 		t.Error("stale updatesMsg should NOT hydrate svcStatus")
 	}
 	// Cache should not be touched by stale msgs
@@ -10339,7 +10028,7 @@ func TestUpdatesMsg_clearsInFlightOffScreen(t *testing.T) {
 	m.updateInFlight = true
 
 	result, _ := m.Update(updatesMsg{
-		results: map[string]bool{"web": true},
+		forKey: m.updatesCacheKey(), results: map[string]bool{"web": true},
 		session: 5,
 	})
 	model := result.(Model)
@@ -10348,7 +10037,7 @@ func TestUpdatesMsg_clearsInFlightOffScreen(t *testing.T) {
 		t.Error("off-screen current-session updatesMsg should still clear updateInFlight")
 	}
 	// Data must NOT be applied to svcStatus (screen check still gates display).
-	if model.svcStatus["web"].UpdateAvailable != nil {
+	if model.svcStatus[qk(model, "web")].UpdateAvailable != nil {
 		t.Error("off-screen updatesMsg should not hydrate svcStatus")
 	}
 	// Cache IS populated regardless of screen so a re-entry can pick it up.
@@ -10367,7 +10056,7 @@ func TestUpdatesMsg_errorSetsErrAndClearsInFlight(t *testing.T) {
 	m.updateInFlight = true
 
 	result, _ := m.Update(updatesMsg{
-		err:     errors.New("registry timeout"),
+		forKey: m.updatesCacheKey(), err: errors.New("registry timeout"),
 		session: 1,
 	})
 	model := result.(Model)
@@ -10398,7 +10087,7 @@ func TestUpdatesMsg_staleClearsInFlight(t *testing.T) {
 	m.updateInFlight = true
 
 	result, _ := m.Update(updatesMsg{
-		results: map[string]bool{"web": true},
+		forKey: m.updatesCacheKey(), results: map[string]bool{"web": true},
 		session: 3, // stale
 	})
 	model := result.(Model)
@@ -10431,8 +10120,8 @@ func TestUpdatesCache_HydratesOnServicesMsg(t *testing.T) {
 	})
 	model := result.(Model)
 
-	if model.svcStatus["web"].UpdateAvailable == nil || !*model.svcStatus["web"].UpdateAvailable {
-		t.Errorf("UpdateAvailable should be hydrated from cache, got %v", model.svcStatus["web"].UpdateAvailable)
+	if model.svcStatus[qk(model, "web")].UpdateAvailable == nil || !*model.svcStatus[qk(model, "web")].UpdateAvailable {
+		t.Errorf("UpdateAvailable should be hydrated from cache, got %v", model.svcStatus[qk(model, "web")].UpdateAvailable)
 	}
 }
 
@@ -10457,7 +10146,7 @@ func TestUpdatesCache_HydratesOnStatusMsg(t *testing.T) {
 	})
 	model := result.(Model)
 
-	if model.svcStatus["web"].UpdateAvailable == nil || !*model.svcStatus["web"].UpdateAvailable {
+	if model.svcStatus[qk(model, "web")].UpdateAvailable == nil || !*model.svcStatus[qk(model, "web")].UpdateAvailable {
 		t.Error("UpdateAvailable should survive periodic statusMsg via cache re-apply")
 	}
 }
@@ -10482,7 +10171,7 @@ func TestUpdatesCache_ExpiredEntryNotHydrated(t *testing.T) {
 	})
 	model := result.(Model)
 
-	if model.svcStatus["web"].UpdateAvailable != nil {
+	if model.svcStatus[qk(model, "web")].UpdateAvailable != nil {
 		t.Error("expired cache entry should not hydrate UpdateAvailable")
 	}
 }
@@ -10539,7 +10228,7 @@ func TestUpdatesMsg_ErrorCachedWithShortTTL(t *testing.T) {
 	m.updateInFlight = true
 
 	result, _ := m.Update(updatesMsg{
-		results: map[string]bool{"web": true}, // partial — should NOT be cached on error
+		forKey: m.updatesCacheKey(), results: map[string]bool{"web": true}, // partial — should NOT be cached on error
 		err:     errors.New("registry boom"),
 		session: m.updatesSession,
 	})
@@ -10586,7 +10275,7 @@ func TestUpdatesMsg_ErrorClearsCachedSuccess(t *testing.T) {
 	}
 
 	result, _ := m.Update(updatesMsg{
-		err:     errors.New("registry boom"),
+		forKey: m.updatesCacheKey(), err: errors.New("registry boom"),
 		session: m.updatesSession,
 	})
 	model := result.(Model)
@@ -10618,14 +10307,14 @@ func TestUpdatesMsg_ErrorClearsGlyphs(t *testing.T) {
 	m.updateInFlight = true
 	// Seed svcStatus with prior verdicts from a previous successful fetch.
 	trueVal, falseVal := true, false
-	m.svcStatus = map[string]runner.ServiceStatus{
+	m.svcStatus = qStatus(m, map[string]runner.ServiceStatus{
 		"web":   {Running: true, UpdateAvailable: &trueVal},
 		"db":    {Running: true, UpdateAvailable: &falseVal},
 		"cache": {Running: true, UpdateAvailable: &trueVal},
-	}
+	})
 
 	result, _ := m.Update(updatesMsg{
-		err:     errors.New("registry timeout"),
+		forKey: m.updatesCacheKey(), err: errors.New("registry timeout"),
 		session: m.updatesSession,
 	})
 	model := result.(Model)
@@ -10716,23 +10405,23 @@ func TestUpdatesMsg_FreshResultClearsStaleVerdict(t *testing.T) {
 	m.updateInFlight = true
 	// Seed svcStatus with prior verdicts for two services.
 	trueVal, falseVal := true, false
-	m.svcStatus = map[string]runner.ServiceStatus{
+	m.svcStatus = qStatus(m, map[string]runner.ServiceStatus{
 		"web": {Running: true, UpdateAvailable: &trueVal},
 		"db":  {Running: true, UpdateAvailable: &falseVal},
-	}
+	})
 
 	// New refresh result omits "db" — it should drop back to nil.
 	result, _ := m.Update(updatesMsg{
-		results: map[string]bool{"web": true},
+		forKey: m.updatesCacheKey(), results: map[string]bool{"web": true},
 		session: m.updatesSession,
 	})
 	model := result.(Model)
 
-	if model.svcStatus["db"].UpdateAvailable != nil {
-		t.Errorf("fresh result that omits db should clear its UpdateAvailable, got %v", model.svcStatus["db"].UpdateAvailable)
+	if model.svcStatus[qk(model, "db")].UpdateAvailable != nil {
+		t.Errorf("fresh result that omits db should clear its UpdateAvailable, got %v", model.svcStatus[qk(model, "db")].UpdateAvailable)
 	}
-	if model.svcStatus["web"].UpdateAvailable == nil || !*model.svcStatus["web"].UpdateAvailable {
-		t.Errorf("web verdict from results should hydrate, got %v", model.svcStatus["web"].UpdateAvailable)
+	if model.svcStatus[qk(model, "web")].UpdateAvailable == nil || !*model.svcStatus[qk(model, "web")].UpdateAvailable {
+		t.Errorf("web verdict from results should hydrate, got %v", model.svcStatus[qk(model, "web")].UpdateAvailable)
 	}
 }
 
@@ -10894,28 +10583,26 @@ func TestUKeyPress_NoComposer(t *testing.T) {
 // documents and asserts that triggering it bumps both statsSession and
 // updatesSession (the two are paired across all 7 sites).
 func TestUpdatesSession_BumpsAtAllSites(t *testing.T) {
-	// 1. project pick (enter on screenSelectProject)
-	t.Run("project_pick", func(t *testing.T) {
+	// 1. drill in (enter on a group header)
+	t.Run("drill_in", func(t *testing.T) {
 		mc := &mockComposer{}
 		m := NewModel(nil, io.Discard, mockFactory(mc), nil, nil)
 		installFakeTick(&m)
-		m.screen = screenSelectProject
-		m.projects = []compose.Project{{Name: "p1", ConfigDir: "/p1"}}
-		m.projCursor = 0
+		parkOnGroupedScreen(&m, compose.Project{Name: "p1", ConfigDir: "/p1"}, compose.Project{Name: "p2", ConfigDir: "/p2"})
 		before := m.updatesSession
 		result, _ := m.Update(tea.KeyMsg{Type: tea.KeyEnter})
 		if result.(Model).updatesSession <= before {
-			t.Errorf("project_pick: updatesSession not bumped (before=%d, after=%d)", before, result.(Model).updatesSession)
+			t.Errorf("drill_in: updatesSession not bumped (before=%d, after=%d)", before, result.(Model).updatesSession)
 		}
 	})
 
-	// 2. esc container→proj
+	// 2. esc container→host view
 	t.Run("esc_container_to_proj", func(t *testing.T) {
 		mc := &mockComposer{}
 		m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
 		installFakeTick(&m)
 		m.screen = screenSelectContainers
-		m.showPicker = true
+		m.drilledFromHost = true
 		before := m.updatesSession
 		result, _ := m.Update(tea.KeyMsg{Type: tea.KeyEsc})
 		if result.(Model).updatesSession <= before {
@@ -10923,17 +10610,18 @@ func TestUpdatesSession_BumpsAtAllSites(t *testing.T) {
 		}
 	})
 
-	// 3. esc proj→server
-	t.Run("esc_proj_to_server", func(t *testing.T) {
+	// 3. esc host view→server
+	t.Run("esc_grouped_to_server", func(t *testing.T) {
 		mc := &mockComposer{}
 		srv := config.Server{Name: "s1", Host: "h1"}
 		m := NewModel(nil, io.Discard, mockFactory(mc), []config.Server{srv}, nil)
 		installFakeTick(&m)
-		m.screen = screenSelectProject
+		m.screen = screenSelectContainers
+		m.grouped = true
 		before := m.updatesSession
 		result, _ := m.Update(tea.KeyMsg{Type: tea.KeyEsc})
 		if result.(Model).updatesSession <= before {
-			t.Errorf("esc_proj_to_server: updatesSession not bumped (before=%d, after=%d)", before, result.(Model).updatesSession)
+			t.Errorf("esc_grouped_to_server: updatesSession not bumped (before=%d, after=%d)", before, result.(Model).updatesSession)
 		}
 	})
 
@@ -10994,9 +10682,9 @@ func TestUpdatesSession_BumpsAtAllSites(t *testing.T) {
 }
 
 // TestUpdatesSession_NotBumpedAtConnectResultError verifies the
-// connectResultMsg error path does NOT bump updatesSession (it's a
-// projectsSession site, not a stats/status/updates site — confirms the plan
-// constraint).
+// connectResultMsg error path does NOT bump updatesSession: it navigates BACK
+// to the server screen without fetching anything, so it invalidates the
+// rollback fetch only.
 func TestUpdatesSession_NotBumpedAtConnectResultError(t *testing.T) {
 	mc := &mockComposer{}
 	srv := config.Server{Name: "s1", Host: "h1"}
@@ -11010,7 +10698,7 @@ func TestUpdatesSession_NotBumpedAtConnectResultError(t *testing.T) {
 }
 
 // TestUpdatesSession_BumpSitesFireRefresh drives one representative site
-// from each fan-out branch (project pick, execDone, esc-from-progress,
+// from each fan-out branch (drill-in, execDone, esc-from-progress,
 // esc-from-logs, entryLocal fast-track) and confirms the returned batch
 // actually invokes CheckUpdates. The bump-only assertions above don't
 // catch a regression where the session bumps but refreshUpdates is dropped
@@ -11022,11 +10710,9 @@ func TestUpdatesSession_BumpSitesFireRefresh(t *testing.T) {
 		key   tea.Msg
 	}{
 		{
-			name: "project_pick",
+			name: "drill_in",
 			setup: func(m *Model) {
-				m.screen = screenSelectProject
-				m.projects = []compose.Project{{Name: "p1", ConfigDir: "/p1"}}
-				m.projCursor = 0
+				parkOnGroupedScreen(m, compose.Project{Name: "p1", ConfigDir: "/p1"}, compose.Project{Name: "p2", ConfigDir: "/p2"})
 			},
 			key: tea.KeyMsg{Type: tea.KeyEnter},
 		},
@@ -11187,7 +10873,7 @@ func TestRefreshUpdates_VerdictsDoNotWaitOnDetails(t *testing.T) {
 	m := NewModel(mc, io.Discard, mockFactory(&mc.mockComposer), nil, nil)
 	m.composer = mc
 	m.screen = screenSelectContainers
-	m.svcStatus = map[string]runner.ServiceStatus{"web": {Running: true}}
+	m.svcStatus = qStatus(m, map[string]runner.ServiceStatus{"web": {Running: true}})
 	m.updateInFlight = true
 
 	msg := m.refreshUpdates()().(updatesMsg)
@@ -11200,7 +10886,7 @@ func TestRefreshUpdates_VerdictsDoNotWaitOnDetails(t *testing.T) {
 	if mo.updateInFlight {
 		t.Error("the in-flight guard must clear with the verdicts — U stays dead until it does")
 	}
-	if st := mo.svcStatus["web"]; st.UpdateAvailable == nil || !*st.UpdateAvailable {
+	if st := mo.svcStatus[qk(mo, "web")]; st.UpdateAvailable == nil || !*st.UpdateAvailable {
 		t.Error("the glyph must hydrate from the verdict message alone")
 	}
 	if cmd == nil {
@@ -11335,7 +11021,7 @@ func TestRefreshUpdates_DetailErrorKeepsVerdictsAndSuccessTTL(t *testing.T) {
 	m := NewModel(mc, io.Discard, mockFactory(&mc.mockComposer), nil, nil)
 	m.composer = mc
 	m.screen = screenSelectContainers
-	m.svcStatus = map[string]runner.ServiceStatus{"web": {Running: true}}
+	m.svcStatus = qStatus(m, map[string]runner.ServiceStatus{"web": {Running: true}})
 
 	msg := m.refreshUpdates()().(updatesMsg)
 	if msg.err != nil {
@@ -11346,7 +11032,7 @@ func TestRefreshUpdates_DetailErrorKeepsVerdictsAndSuccessTTL(t *testing.T) {
 	if model.updatesErr != "" {
 		t.Errorf("updatesErr = %q, want empty — the verdicts are sound", model.updatesErr)
 	}
-	if st := model.svcStatus["web"]; st.UpdateAvailable == nil || !*st.UpdateAvailable {
+	if st := model.svcStatus[qk(model, "web")]; st.UpdateAvailable == nil || !*st.UpdateAvailable {
 		t.Error("the ⇧ verdict must survive a detail-fetch failure")
 	}
 	entry, ok := model.updateCache[model.updatesCacheKey()]
@@ -11394,7 +11080,7 @@ func TestUpdateDetailsMsg_MergesOntoTheCacheEntry(t *testing.T) {
 	mc := &mockComposer{}
 	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
 	m.screen = screenSelectContainers
-	m.svcStatus = map[string]runner.ServiceStatus{"web": {Running: true}}
+	m.svcStatus = qStatus(m, map[string]runner.ServiceStatus{"web": {Running: true}})
 
 	fetched := time.Now()
 	m.updateCache = map[string]updateEntry{m.updatesCacheKey(): {
@@ -11485,7 +11171,7 @@ func TestUpdateDetails_ColdCacheFillsEveryRow(t *testing.T) {
 	mc.updates = map[string]bool{"web": true}
 	m := inspectScreenModel(t)
 	m.composer = mc
-	m.svcStatus = map[string]runner.ServiceStatus{"web": {Running: true}}
+	m.svcStatus = qStatus(m, map[string]runner.ServiceStatus{"web": {Running: true}})
 	if _, ok := m.updateCache[m.updatesCacheKey()]; ok {
 		t.Fatal("precondition: the cache must be cold")
 	}
@@ -11600,7 +11286,7 @@ func TestUpdateDetailsMsg_ErroredEntryIsNotMerged(t *testing.T) {
 // TestUpdateDetailsMsg_LandsAfterNavigatingAway pins the second half of the
 // identity rule. A detail scan is the long half — three registry round-trips
 // per updated image, tens of seconds over SSH — so an ordinary esc to the
-// project picker mid-scan is routine. Because the batch carries the key it was
+// grouped host view mid-scan is routine. Because the batch carries the key it was
 // fetched under, the merge still lands on that project's entry, and returning
 // inside the 10-minute TTL shows the rows. Looking the key up at MERGE time
 // instead dropped the message, and nothing refetched: the entry is a fresh
@@ -11614,10 +11300,10 @@ func TestUpdateDetailsMsg_LandsAfterNavigatingAway(t *testing.T) {
 	fetched := time.Now()
 	m.updateCache = map[string]updateEntry{projectKey: {fetchedAt: fetched, results: map[string]bool{"web": true}}}
 
-	// esc to the project picker: projDir is cleared, so the current key is no
-	// longer the one the batch was fetched under.
+	// esc out to the grouped host view: projDir is cleared, so the current key
+	// is no longer the one the batch was fetched under.
 	m.projDir = ""
-	m.screen = screenSelectProject
+	m.grouped = true
 	if m.updatesCacheKey() == projectKey {
 		t.Fatal("precondition: leaving the project must change the cache key")
 	}
@@ -11653,9 +11339,9 @@ func TestUpdateDetails_OneBatchAtATime(t *testing.T) {
 	m := NewModel(mc, io.Discard, mockFactory(&mc.mockComposer), nil, nil)
 	m.composer = mc
 	m.screen = screenSelectContainers
-	m.svcStatus = map[string]runner.ServiceStatus{"web": {Running: true}}
+	m.svcStatus = qStatus(m, map[string]runner.ServiceStatus{"web": {Running: true}})
 
-	first, cmd := m.Update(updatesMsg{results: map[string]bool{"web": true}, session: m.updatesSession})
+	first, cmd := m.Update(updatesMsg{forKey: m.updatesCacheKey(), results: map[string]bool{"web": true}, session: m.updatesSession})
 	mo := first.(Model)
 	if cmd == nil {
 		t.Fatal("the first verdicts must enqueue a detail fetch")
@@ -11667,7 +11353,7 @@ func TestUpdateDetails_OneBatchAtATime(t *testing.T) {
 	// The user presses U while the details are still resolving: the verdicts
 	// refresh (that half is guarded by updateInFlight alone), but the handler
 	// must NOT enqueue a second detail batch.
-	second, cmd2 := mo.Update(updatesMsg{results: map[string]bool{"web": true}, session: mo.updatesSession})
+	second, cmd2 := mo.Update(updatesMsg{forKey: mo.updatesCacheKey(), results: map[string]bool{"web": true}, session: mo.updatesSession})
 	so := second.(Model)
 	if cmd2 != nil {
 		t.Errorf("a second detail batch was enqueued while one was in flight: %T", cmd2())
@@ -11724,15 +11410,15 @@ func TestUpdateDetails_RefillTargetsTheNewestEntry(t *testing.T) {
 	m := NewModel(mc, io.Discard, mockFactory(&mc.mockComposer), nil, nil)
 	m.composer = mc
 	m.screen = screenSelectContainers
-	m.svcStatus = map[string]runner.ServiceStatus{"web": {Running: true}}
+	m.svcStatus = qStatus(m, map[string]runner.ServiceStatus{"web": {Running: true}})
 
-	model, cmd := m.Update(updatesMsg{results: map[string]bool{"web": true}, session: m.updatesSession})
+	model, cmd := m.Update(updatesMsg{forKey: m.updatesCacheKey(), results: map[string]bool{"web": true}, session: m.updatesSession})
 	if cmd == nil {
 		t.Fatal("the first verdicts must enqueue a detail fetch")
 	}
 	mo := model.(Model)
 	for range 3 {
-		next, c := mo.Update(updatesMsg{results: map[string]bool{"web": true}, session: mo.updatesSession})
+		next, c := mo.Update(updatesMsg{forKey: mo.updatesCacheKey(), results: map[string]bool{"web": true}, session: mo.updatesSession})
 		if c != nil {
 			t.Fatalf("a second detail batch was enqueued while one was in flight: %T", c())
 		}
@@ -11897,8 +11583,8 @@ func TestUpdateDetails_UStaysLiveDuringTheDetailScan(t *testing.T) {
 	m := NewModel(mc, io.Discard, mockFactory(&mc.mockComposer), nil, nil)
 	m.composer = mc
 	m.screen = screenSelectContainers
-	m.services = []string{"web"}
-	m.svcStatus = map[string]runner.ServiceStatus{"web": {Running: true}}
+	m.setSingleGroup([]string{"web"})
+	m.svcStatus = qStatus(m, map[string]runner.ServiceStatus{"web": {Running: true}})
 	m.detailsInFlight = true
 	m.updateInFlight = false
 
@@ -11965,21 +11651,19 @@ func TestUpdateDetails_GuardIsNotClearedByNavigation(t *testing.T) {
 			msg:   tea.KeyMsg{Type: tea.KeyEsc},
 		},
 		{
-			name:  "esc container→project",
-			setup: func(m *Model) { m.screen = screenSelectContainers; m.showPicker = true },
+			name:  "esc container→host view",
+			setup: func(m *Model) { m.screen = screenSelectContainers; m.drilledFromHost = true },
 			msg:   tea.KeyMsg{Type: tea.KeyEsc},
 		},
 		{
-			name:  "esc project→server",
-			setup: func(m *Model) { m.screen = screenSelectProject; m.servers = servers },
+			name:  "esc host view→server",
+			setup: func(m *Model) { m.screen = screenSelectContainers; m.grouped = true; m.servers = servers },
 			msg:   tea.KeyMsg{Type: tea.KeyEsc},
 		},
 		{
-			name: "project pick",
+			name: "drill in",
 			setup: func(m *Model) {
-				m.screen = screenSelectProject
-				m.projects = []compose.Project{{Name: "p1", ConfigDir: "/p1"}}
-				m.projCursor = 0
+				parkOnGroupedScreen(m, compose.Project{Name: "p1", ConfigDir: "/p1"}, compose.Project{Name: "p2", ConfigDir: "/p2"})
 			},
 			msg: tea.KeyMsg{Type: tea.KeyEnter},
 		},
@@ -12028,36 +11712,34 @@ func TestUpdateDetails_SelfHealsAtEveryScreenEntry(t *testing.T) {
 		msg   tea.Msg
 	}{
 		{
-			name: "project pick",
-			key:  "/p1|",
+			name: "drill in",
+			key:  "/p1\x00p1|",
 			setup: func(m *Model) {
-				m.screen = screenSelectProject
-				m.projects = []compose.Project{{Name: "p1", ConfigDir: "/p1"}}
-				m.projCursor = 0
+				parkOnGroupedScreen(m, compose.Project{Name: "p1", ConfigDir: "/p1"}, compose.Project{Name: "p2", ConfigDir: "/p2"})
 			},
 			msg: tea.KeyMsg{Type: tea.KeyEnter},
 		},
 		{
 			name:  "entryLocal fast-track",
-			key:   "|",
+			key:   "\x00|",
 			setup: func(m *Model) { m.screen = screenSelectServer; m.serverCursor = 0 },
 			msg:   tea.KeyMsg{Type: tea.KeyEnter},
 		},
 		{
 			name:  "execDone",
-			key:   "|",
+			key:   "\x00|",
 			setup: func(m *Model) { m.screen = screenSelectContainers },
 			msg:   execDoneMsg{},
 		},
 		{
 			name:  "esc from logs",
-			key:   "|",
+			key:   "\x00|",
 			setup: func(m *Model) { m.screen = screenLogs },
 			msg:   tea.KeyMsg{Type: tea.KeyEsc},
 		},
 		{
 			name: "esc from progress",
-			key:  "|",
+			key:  "\x00|",
 			setup: func(m *Model) {
 				m.screen = screenProgress
 				m.done = true
@@ -12108,16 +11790,16 @@ func TestUpdateDetails_LostBatchHealsAfterNavigating(t *testing.T) {
 	installFakeTick(&m)
 	m.composer = mc
 	m.screen = screenSelectContainers
-	m.svcStatus = map[string]runner.ServiceStatus{"web": {Running: true}}
+	m.svcStatus = qStatus(m, map[string]runner.ServiceStatus{"web": {Running: true}})
 
 	// Batch B1 goes out for entry E1.
-	first, b1 := m.Update(updatesMsg{results: map[string]bool{"web": true}, session: m.updatesSession})
+	first, b1 := m.Update(updatesMsg{forKey: m.updatesCacheKey(), results: map[string]bool{"web": true}, session: m.updatesSession})
 	mo := first.(Model)
 	if b1 == nil {
 		t.Fatal("the first verdicts must enqueue a detail fetch")
 	}
 	// U mid-scan: E2 replaces E1 and its own batch is refused.
-	second, refused := mo.Update(updatesMsg{results: map[string]bool{"web": true}, session: mo.updatesSession})
+	second, refused := mo.Update(updatesMsg{forKey: mo.updatesCacheKey(), results: map[string]bool{"web": true}, session: mo.updatesSession})
 	if refused != nil {
 		t.Fatalf("precondition: the second batch must be refused, got %T", refused())
 	}
@@ -12189,7 +11871,7 @@ func TestUpdateDetails_FetchCarriesADeadline(t *testing.T) {
 	m.composer = mc
 	m.screen = screenSelectContainers
 
-	_, cmd := m.Update(updatesMsg{results: map[string]bool{"web": true}, session: m.updatesSession})
+	_, cmd := m.Update(updatesMsg{forKey: m.updatesCacheKey(), results: map[string]bool{"web": true}, session: m.updatesSession})
 	if cmd == nil {
 		t.Fatal("the verdicts enqueued no detail fetch")
 	}
@@ -12220,7 +11902,7 @@ func TestUpdatesMsg_StaleSessionDoesNotWriteTheEntry(t *testing.T) {
 	m.updatesSession = 7
 
 	model, cmd := m.Update(updatesMsg{
-		results: map[string]bool{"web": true},
+		forKey: m.updatesCacheKey(), results: map[string]bool{"web": true},
 		session: 6, // a fetch issued before the context changed
 	})
 
@@ -12244,14 +11926,14 @@ func TestUpdatesMsg_StaleSessionDoesNotWriteTheEntry(t *testing.T) {
 // fails here rather than passing on "the sentinel is gone".
 func TestUpdatesMsg_RefreshesInspectSummary(t *testing.T) {
 	m := inspectScreenModel(t)
-	m.svcStatus = map[string]runner.ServiceStatus{"web": {Running: true}}
+	m.svcStatus = qStatus(m, map[string]runner.ServiceStatus{"web": {Running: true}})
 	// A sentinel the rebuild has to overwrite: rebuildInspectSummary re-parses
 	// m.inspectRaw, so any value here that survives proves it never ran.
 	m.inspectSummary = "STALE SUMMARY"
 	m.setInspectContent()
 
 	mid, cmd := m.Update(updatesMsg{
-		results: map[string]bool{"web": true},
+		forKey: m.updatesCacheKey(), results: map[string]bool{"web": true},
 		session: m.updatesSession,
 	})
 	model := mid.(Model)
@@ -12293,7 +11975,7 @@ func TestUpdatesMsg_RefreshesInspectSummary(t *testing.T) {
 // glyph column blanks while the inspect screen keeps contradicting it.
 func TestUpdatesMsg_FailurePathClearsInspectRows(t *testing.T) {
 	m := inspectScreenModel(t)
-	m.svcStatus = map[string]runner.ServiceStatus{"web": {Running: true}}
+	m.svcStatus = qStatus(m, map[string]runner.ServiceStatus{"web": {Running: true}})
 	m.updateCache = map[string]updateEntry{m.updatesCacheKey(): {
 		fetchedAt: time.Now().Add(-3 * time.Minute),
 		results:   map[string]bool{"web": true},
@@ -12307,7 +11989,7 @@ func TestUpdatesMsg_FailurePathClearsInspectRows(t *testing.T) {
 	}
 
 	model := modelOf(m.Update(updatesMsg{
-		err:     errors.New("registry unreachable"),
+		forKey: m.updatesCacheKey(), err: errors.New("registry unreachable"),
 		session: m.updatesSession,
 	}))
 
@@ -12326,7 +12008,7 @@ func TestUpdatesMsg_RawModeKeepsHorizontalScroll(t *testing.T) {
 	raw := inspectScrolledRawModel(t)
 
 	model := modelOf(raw.Update(updatesMsg{
-		results: map[string]bool{"web": true},
+		forKey: raw.updatesCacheKey(), results: map[string]bool{"web": true},
 		session: raw.updatesSession,
 	}))
 
@@ -12350,7 +12032,7 @@ func TestUpdatesMsg_InspectRebuildIsScreenScoped(t *testing.T) {
 	m.inspectSummary = "STALE SUMMARY"
 
 	model := modelOf(m.Update(updatesMsg{
-		results: map[string]bool{"web": true},
+		forKey: m.updatesCacheKey(), results: map[string]bool{"web": true},
 		session: m.updatesSession,
 	}))
 
@@ -12538,6 +12220,7 @@ func TestUpdateDetails_FireOnTheGlyphTriggers(t *testing.T) {
 		m.screen = screenProgress
 		m.done = true
 		m.pendingOp = runner.Deploy
+		m.batches = []opBatch{{proj: m.currentProject()}}
 		key := m.updatesCacheKey()
 		m.updateCache = primed(m)
 
@@ -12749,7 +12432,7 @@ func TestUpdateInFlight_ResetOnLeaveScreen_ContainerToProj(t *testing.T) {
 	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
 	installFakeTick(&m)
 	m.screen = screenSelectContainers
-	m.showPicker = true
+	m.drilledFromHost = true
 	m.updateInFlight = true
 
 	result, _ := m.Update(tea.KeyMsg{Type: tea.KeyEsc})
@@ -12758,19 +12441,20 @@ func TestUpdateInFlight_ResetOnLeaveScreen_ContainerToProj(t *testing.T) {
 	}
 }
 
-// TestUpdateInFlight_ResetOnLeaveScreen_ProjToServer verifies the same reset
+// TestUpdateInFlight_ResetOnLeaveScreen_GroupedToServer verifies the same reset
 // at the second leave-screen site.
-func TestUpdateInFlight_ResetOnLeaveScreen_ProjToServer(t *testing.T) {
+func TestUpdateInFlight_ResetOnLeaveScreen_GroupedToServer(t *testing.T) {
 	mc := &mockComposer{}
 	srv := config.Server{Name: "s1", Host: "h1"}
 	m := NewModel(nil, io.Discard, mockFactory(mc), []config.Server{srv}, nil)
 	installFakeTick(&m)
-	m.screen = screenSelectProject
+	m.screen = screenSelectContainers
+	m.grouped = true
 	m.updateInFlight = true
 
 	result, _ := m.Update(tea.KeyMsg{Type: tea.KeyEsc})
 	if result.(Model).updateInFlight {
-		t.Error("esc proj→server should reset updateInFlight to false")
+		t.Error("esc host view→server should reset updateInFlight to false")
 	}
 }
 
@@ -12790,30 +12474,59 @@ func TestRefreshUpdates_capturesCurrentSession(t *testing.T) {
 	}
 }
 
-// TestUpdatesCacheKey_Composition verifies the cache key format documented
-// in the comment: projDir + "|" + serverName, empty serverName = local.
+// TestUpdatesCacheKey_Composition verifies the cache key format documented in
+// the comment: projDir + NUL + projName + "|" + serverName, empty serverName =
+// local. The last two cases are the finding the key format exists for: two
+// projects deployed with `docker compose -p` out of ONE directory are two
+// container sets, and on ConfigDir alone they shared a cache entry.
 func TestUpdatesCacheKey_Composition(t *testing.T) {
 	tests := []struct {
 		name       string
 		projDir    string
+		projName   string
 		serverName string
 		want       string
 	}{
-		{"local_no_project", "", "", "|"},
-		{"local_with_project", "/srv/app", "", "/srv/app|"},
-		{"remote_with_project", "/srv/app", "prod", "/srv/app|prod"},
-		{"remote_no_project", "", "prod", "|prod"},
+		{"local_no_project", "", "", "", "\x00|"},
+		{"local_with_project", "/srv/app", "app", "", "/srv/app\x00app|"},
+		{"remote_with_project", "/srv/app", "app", "prod", "/srv/app\x00app|prod"},
+		{"remote_no_project", "", "", "prod", "\x00|prod"},
+		{"named_project_in_shared_dir", "/srv/app", "blue", "", "/srv/app\x00blue|"},
+		{"sibling_named_project", "/srv/app", "green", "", "/srv/app\x00green|"},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			mc := &mockComposer{}
 			m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
 			m.projDir = tc.projDir
+			m.projName = tc.projName
 			m.serverName = tc.serverName
 			if got := m.updatesCacheKey(); got != tc.want {
 				t.Errorf("updatesCacheKey() = %q, want %q", got, tc.want)
 			}
 		})
+	}
+}
+
+// TestUpdatesCacheKey_NamedProjectsInOneDirStayDistinct is the finding pin: two
+// compose projects launched with `-p` out of the same directory are separate
+// container sets and must not share one update-cache entry — a shared entry
+// paints one project's ⇧ verdicts onto the other's rows and suppresses its own
+// scan for the whole TTL.
+func TestUpdatesCacheKey_NamedProjectsInOneDirStayDistinct(t *testing.T) {
+	mc := &mockComposer{}
+	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
+	blue := m.projUpdatesCacheKey(compose.Project{Name: "blue", ConfigDir: "/srv/app"})
+	green := m.projUpdatesCacheKey(compose.Project{Name: "green", ConfigDir: "/srv/app"})
+	if blue == green {
+		t.Errorf("two -p projects in one directory share the cache key %q", blue)
+	}
+	// The separator must not be spellable by either half, or one (dir, name)
+	// pair could forge another's key. "/srv" + "app|x" is the shape that
+	// collides on a printable separator.
+	if m.projUpdatesCacheKey(compose.Project{Name: "app", ConfigDir: "/srv"}) ==
+		m.projUpdatesCacheKey(compose.Project{Name: "", ConfigDir: "/srvapp"}) {
+		t.Error("the separator is forgeable: two different projects spell one key")
 	}
 }
 
@@ -12832,12 +12545,12 @@ func TestViewSelectContainers_UpdateGlyphRendered(t *testing.T) {
 	mc := &mockComposer{}
 	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
 	m.screen = screenSelectContainers
-	m.services = []string{"web", "db", "cache"}
-	m.svcStatus = map[string]runner.ServiceStatus{
+	m.setSingleGroup([]string{"web", "db", "cache"})
+	m.svcStatus = qStatus(m, map[string]runner.ServiceStatus{
 		"web":   {Running: true, UpdateAvailable: trueP()},
 		"db":    {Running: true, UpdateAvailable: falseP()},
 		"cache": {Running: true}, // nil = unknown, no glyph
-	}
+	})
 
 	v := m.View()
 	if !strings.Contains(v, compose.UpdateGlyph) {
@@ -12865,10 +12578,10 @@ func TestViewSelectContainers_UpdateGlyphOnStoppedService(t *testing.T) {
 	mc := &mockComposer{}
 	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
 	m.screen = screenSelectContainers
-	m.services = []string{"web"}
-	m.svcStatus = map[string]runner.ServiceStatus{
+	m.setSingleGroup([]string{"web"})
+	m.svcStatus = qStatus(m, map[string]runner.ServiceStatus{
 		"web": {Running: false, UpdateAvailable: trueP()},
-	}
+	})
 
 	v := m.View()
 	if !strings.Contains(v, compose.UpdateGlyph) {
@@ -12884,14 +12597,14 @@ func TestViewSelectContainers_UpdateAlignment_PreservesColumns(t *testing.T) {
 	mc := &mockComposer{}
 	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
 	m.screen = screenSelectContainers
-	m.services = []string{"web", "db", "cache"}
-	m.svcStatus = map[string]runner.ServiceStatus{
+	m.setSingleGroup([]string{"web", "db", "cache"})
+	m.svcStatus = qStatus(m, map[string]runner.ServiceStatus{
 		// Created/Uptime are present so the Created column renders, giving us
 		// a stable column to align against.
 		"web":   {Running: true, Created: "2024-01-15 09:30", Uptime: "3h", UpdateAvailable: trueP()},
 		"db":    {Running: true, Created: "2024-01-15 09:30", Uptime: "3h"},
 		"cache": {Running: true, Created: "2024-01-15 09:30", Uptime: "3h"},
-	}
+	})
 
 	v := m.View()
 	lines := strings.Split(v, "\n")
@@ -12905,7 +12618,7 @@ func TestViewSelectContainers_UpdateAlignment_PreservesColumns(t *testing.T) {
 	ansi := regexp.MustCompile(`\x1b\[[0-9;]*m`)
 	for _, line := range lines {
 		clean := ansi.ReplaceAllString(line, "")
-		for _, svc := range m.services {
+		for _, svc := range modelServices(m) {
 			if !strings.Contains(clean, svc) || !strings.Contains(clean, "2024-01-15") {
 				continue
 			}
@@ -12942,8 +12655,8 @@ func TestViewSelectContainers_SoftWarningPriority_StatsBeatsUpdates(t *testing.T
 	mc := &mockComposer{}
 	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
 	m.screen = screenSelectContainers
-	m.services = []string{"web"}
-	m.svcStatus = map[string]runner.ServiceStatus{"web": {Running: true}}
+	m.setSingleGroup([]string{"web"})
+	m.svcStatus = qStatus(m, map[string]runner.ServiceStatus{"web": {Running: true}})
 	m.width = 200
 	m.height = 24
 	m.statsErr = errors.New("stats boom")
@@ -12964,8 +12677,8 @@ func TestViewSelectContainers_SoftWarningPriority_UpdatesAloneShown(t *testing.T
 	mc := &mockComposer{}
 	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
 	m.screen = screenSelectContainers
-	m.services = []string{"web"}
-	m.svcStatus = map[string]runner.ServiceStatus{"web": {Running: true}}
+	m.setSingleGroup([]string{"web"})
+	m.svcStatus = qStatus(m, map[string]runner.ServiceStatus{"web": {Running: true}})
 	m.width = 200
 	m.height = 24
 	m.statsErr = nil
@@ -12986,14 +12699,14 @@ func TestViewSelectContainers_NoGlyph_ReservationAlwaysApplied(t *testing.T) {
 	mc := &mockComposer{}
 	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
 	m.screen = screenSelectContainers
-	m.services = []string{"web", "db"}
-	m.svcStatus = map[string]runner.ServiceStatus{
+	m.setSingleGroup([]string{"web", "db"})
+	m.svcStatus = qStatus(m, map[string]runner.ServiceStatus{
 		// All UpdateAvailable=nil → no glyph rendered, but the reservation
 		// must still apply so downstream columns don't shift when a verdict
 		// later arrives.
 		"web": {Running: true, Created: "2024-01-15 09:30"},
 		"db":  {Running: true, Created: "2024-01-15 09:30"},
-	}
+	})
 
 	v := m.View()
 	if strings.Contains(v, compose.UpdateGlyph) {
@@ -13005,7 +12718,7 @@ func TestViewSelectContainers_NoGlyph_ReservationAlwaysApplied(t *testing.T) {
 	cols := map[string]int{}
 	for _, line := range strings.Split(v, "\n") {
 		clean := ansi.ReplaceAllString(line, "")
-		for _, svc := range m.services {
+		for _, svc := range modelServices(m) {
 			if !strings.Contains(clean, svc) || !strings.Contains(clean, "2024-01-15") {
 				continue
 			}
@@ -13021,15 +12734,15 @@ func TestViewSelectContainers_NoGlyph_ReservationAlwaysApplied(t *testing.T) {
 	// one service flagged as updated. The Created column offset must be
 	// IDENTICAL to the no-glyph case — that's the column-stability property.
 	trueVal := true
-	m.svcStatus = map[string]runner.ServiceStatus{
+	m.svcStatus = qStatus(m, map[string]runner.ServiceStatus{
 		"web": {Running: true, Created: "2024-01-15 09:30", UpdateAvailable: &trueVal},
 		"db":  {Running: true, Created: "2024-01-15 09:30"},
-	}
+	})
 	v2 := m.View()
 	cols2 := map[string]int{}
 	for _, line := range strings.Split(v2, "\n") {
 		clean := ansi.ReplaceAllString(line, "")
-		for _, svc := range m.services {
+		for _, svc := range modelServices(m) {
 			if !strings.Contains(clean, svc) || !strings.Contains(clean, "2024-01-15") {
 				continue
 			}
@@ -13047,15 +12760,14 @@ func TestViewSelectContainers_NoGlyph_ReservationAlwaysApplied(t *testing.T) {
 // in m.svcStatus (e.g. transient race between `compose config` listing and
 // `compose config --services` at fetch time, or a verdict referring to a
 // stale service after project switch), hydrateUpdates MUST NOT synthesise a
-// phantom svcStatus entry. The renderer iterates m.services not the status
+// phantom svcStatus entry. The renderer iterates the rows, not the status
 // map so today it'd be invisible, but a phantom would leak across project
 // switches and surface in any future map-key iterator.
 func TestHydrateUpdates_SkipsUnknownServices(t *testing.T) {
-	m := &Model{
-		svcStatus: map[string]runner.ServiceStatus{
-			"web": {Running: true},
-		},
-	}
+	m := &Model{}
+	m.svcStatus = qStatus(*m, map[string]runner.ServiceStatus{
+		"web": {Running: true},
+	})
 	yes := true
 	m.hydrateUpdates(map[string]bool{
 		"web":     true,  // known: hydrate
@@ -13064,7 +12776,7 @@ func TestHydrateUpdates_SkipsUnknownServices(t *testing.T) {
 	if got := len(m.svcStatus); got != 1 {
 		t.Errorf("svcStatus len = %d, want 1 (phantom must not be created); got %#v", got, m.svcStatus)
 	}
-	web, ok := m.svcStatus["web"]
+	web, ok := m.svcStatus[qk(*m, "web")]
 	if !ok {
 		t.Fatal("web entry missing after hydrate")
 	}
@@ -13074,8 +12786,8 @@ func TestHydrateUpdates_SkipsUnknownServices(t *testing.T) {
 	if !web.Running {
 		t.Error("web.Running flipped to false during hydrate — phantom-style overwrite")
 	}
-	if _, leaked := m.svcStatus["phantom"]; leaked {
-		t.Errorf("phantom entry leaked into svcStatus: %#v", m.svcStatus["phantom"])
+	if _, leaked := m.svcStatus[qk(*m, "phantom")]; leaked {
+		t.Errorf("phantom entry leaked into svcStatus: %#v", m.svcStatus[qk(*m, "phantom")])
 	}
 }
 
@@ -13105,13 +12817,13 @@ func TestUpdatesMsg_OffScreenErrorClearsState(t *testing.T) {
 	m.updatesSession = 4
 	m.updateInFlight = true
 	trueVal := true
-	m.svcStatus = map[string]runner.ServiceStatus{
+	m.svcStatus = qStatus(m, map[string]runner.ServiceStatus{
 		"web": {Running: true, UpdateAvailable: &trueVal},
 		"db":  {Running: true, UpdateAvailable: &trueVal},
-	}
+	})
 
 	result, _ := m.Update(updatesMsg{
-		err:     errors.New("registry timeout"),
+		forKey: m.updatesCacheKey(), err: errors.New("registry timeout"),
 		session: 4,
 	})
 	model := result.(Model)
@@ -13231,8 +12943,8 @@ func TestServicesMsg_CachedErrorRestoresWarning(t *testing.T) {
 	if model.updatesErr != "stale-bad" {
 		t.Errorf("servicesMsg cache-replay should restore cached error warning, got %q", model.updatesErr)
 	}
-	if model.svcStatus["web"].UpdateAvailable != nil {
-		t.Errorf("cached error must NOT hydrate glyphs, got %v", model.svcStatus["web"].UpdateAvailable)
+	if model.svcStatus[qk(model, "web")].UpdateAvailable != nil {
+		t.Errorf("cached error must NOT hydrate glyphs, got %v", model.svcStatus[qk(model, "web")].UpdateAvailable)
 	}
 }
 
@@ -13246,7 +12958,7 @@ func TestUpdatesMsg_ErrorCacheStoresErrMsg(t *testing.T) {
 	m.updateInFlight = true
 
 	result, _ := m.Update(updatesMsg{
-		err:     errors.New("docker hub timeout"),
+		forKey: m.updatesCacheKey(), err: errors.New("docker hub timeout"),
 		session: m.updatesSession,
 	})
 	model := result.(Model)
@@ -13282,19 +12994,19 @@ func TestUpdatesMsg_OffScreenErrorFixesOffset(t *testing.T) {
 	// the last visible row pre-error; post-error it falls outside the new window.
 	m.width = 200
 	m.height = 9
-	m.services = []string{"a", "b", "c", "d", "e"}
-	m.svcStatus = map[string]runner.ServiceStatus{
+	m.setSingleGroup([]string{"a", "b", "c", "d", "e"})
+	m.svcStatus = qStatus(m, map[string]runner.ServiceStatus{
 		"a": {Running: true},
 		"b": {Running: true},
 		"c": {Running: true},
 		"d": {Running: true},
 		"e": {Running: true},
-	}
+	})
 	m.svcCursor = 2
 	m.svcOffset = 0
 
 	result, _ := m.Update(updatesMsg{
-		err:     errors.New("registry timeout"),
+		forKey: m.updatesCacheKey(), err: errors.New("registry timeout"),
 		session: 7,
 	})
 	model := result.(Model)
@@ -13313,11 +13025,9 @@ func TestUpdatesMsg_OffScreenErrorFixesOffset(t *testing.T) {
 // Uses a literal (not NewModel) so the "/" handler is responsible for building
 // the textinput, matching the plan's "fresh input on every open" contract.
 func containerSearchModel(services []string) Model {
-	return Model{
-		screen:   screenSelectContainers,
-		services: services,
-		selected: make(map[int]bool),
-	}
+	m := singleGroupModel(services)
+	m.screen = screenSelectContainers
+	return m
 }
 
 func TestSearchOpen(t *testing.T) {
@@ -13557,7 +13267,7 @@ func TestQTypedIntoSearchInput(t *testing.T) {
 func committedSearchModel(services []string, query string) Model {
 	m := containerSearchModel(services)
 	m.searchQuery = query
-	m.searchMatches = computeMatches(services, query)
+	m.searchMatches = computeMatches(m.svcEntries, query)
 	if len(m.searchMatches) > 0 {
 		m.svcCursor = m.searchMatches[0]
 	}
@@ -13734,10 +13444,10 @@ func TestSearchCycleOffMatchBelowAll(t *testing.T) {
 }
 
 // TestSearchTwoStageEsc: first esc clears the committed search and stays on the
-// container screen; second esc navigates back to the project picker.
+// container screen; second esc navigates back to the grouped host view.
 func TestSearchTwoStageEsc(t *testing.T) {
 	m := committedSearchModel([]string{"api", "web", "worker"}, "w")
-	m.showPicker = true // so the second esc has a project picker to return to
+	m.drilledFromHost = true // so the second esc has a host view to return to
 	if m.searchQuery == "" {
 		t.Fatal("precondition: committed search expected")
 	}
@@ -13755,11 +13465,11 @@ func TestSearchTwoStageEsc(t *testing.T) {
 		t.Errorf("after 1st esc: searchMatches = %v, want nil", m.searchMatches)
 	}
 
-	// Second esc: no active search → back-nav to project picker.
+	// Second esc: no active search → drill out to the grouped host view.
 	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyEsc})
 	m = updated.(Model)
-	if m.screen != screenSelectProject {
-		t.Errorf("after 2nd esc: screen = %d, want screenSelectProject (back-nav)", m.screen)
+	if m.screen != screenSelectContainers || !m.grouped {
+		t.Errorf("after 2nd esc: screen = %d grouped = %v, want the grouped host view", m.screen, m.grouped)
 	}
 }
 
@@ -13841,7 +13551,7 @@ func TestSearchCycleScrollsOffScreenMatchIntoView(t *testing.T) {
 // counter and the "↳ <name>" bar summary in the reserved footer line.
 func TestSearchViewCommittedShowsCounter(t *testing.T) {
 	m := committedSearchModel([]string{"api", "web", "web-worker"}, "w")
-	m.svcStatus = map[string]runner.ServiceStatus{}
+	m.svcStatus = qStatus(m, map[string]runner.ServiceStatus{})
 	if m.svcCursor != 1 {
 		t.Fatalf("precondition: svcCursor = %d, want 1 (first match)", m.svcCursor)
 	}
@@ -13879,7 +13589,7 @@ func TestSearchViewMatchedNameStyled(t *testing.T) {
 	defer lipgloss.SetColorProfile(prev)
 
 	m := committedSearchModel([]string{"api", "web"}, "web")
-	m.svcStatus = map[string]runner.ServiceStatus{}
+	m.svcStatus = qStatus(m, map[string]runner.ServiceStatus{})
 	// Cursor is on the sole match "web".
 
 	v := m.viewSelectContainers()
@@ -13926,7 +13636,7 @@ func TestSearchViewMatchedNameStyled(t *testing.T) {
 // footer shows the '/' search token.
 func TestSearchViewIdleReservedLine(t *testing.T) {
 	m := containerSearchModel([]string{"api", "web"})
-	m.svcStatus = map[string]runner.ServiceStatus{}
+	m.svcStatus = qStatus(m, map[string]runner.ServiceStatus{})
 	m.width = 200 // one-line help
 
 	v := m.viewSelectContainers()
@@ -13952,7 +13662,7 @@ func TestSearchViewIdleReservedLine(t *testing.T) {
 // "/ " prefix + counter and the footer shows the "enter jump · esc cancel" hint.
 func TestSearchViewSearchingShowsInputAndCounter(t *testing.T) {
 	m := containerSearchModel([]string{"api", "web", "web-worker"})
-	m.svcStatus = map[string]runner.ServiceStatus{}
+	m.svcStatus = qStatus(m, map[string]runner.ServiceStatus{})
 	m.width = 200
 
 	// Open + type "w".
@@ -13980,7 +13690,7 @@ func TestSearchViewSearchingShowsInputAndCounter(t *testing.T) {
 // "(no match)" in the bar.
 func TestSearchViewNoMatchCounter(t *testing.T) {
 	m := containerSearchModel([]string{"api", "web"})
-	m.svcStatus = map[string]runner.ServiceStatus{}
+	m.svcStatus = qStatus(m, map[string]runner.ServiceStatus{})
 	m.width = 200
 
 	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'/'}})
@@ -14007,10 +13717,10 @@ func TestSearchViewEqualWidthNameCells(t *testing.T) {
 
 	// Same-length names so the padding is identical; "web" matches, "api" not.
 	m := committedSearchModel([]string{"api", "web"}, "web")
-	m.svcStatus = map[string]runner.ServiceStatus{
+	m.svcStatus = qStatus(m, map[string]runner.ServiceStatus{
 		"api": {Running: true, Created: "2024-01-15 09:30"},
 		"web": {Running: true, Created: "2024-01-15 09:30"},
-	}
+	})
 
 	v := m.viewSelectContainers()
 	ansi := regexp.MustCompile(`\x1b\[[0-9;]*m`)
@@ -14045,11 +13755,11 @@ func TestSvcVisibleCount_ConstantAcrossConfirming(t *testing.T) {
 		mc := &mockComposer{}
 		m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
 		m.statsRequested = false
-		m.services = []string{"api", "web", "web-worker", "db", "cache", "queue"}
+		m.setSingleGroup([]string{"api", "web", "web-worker", "db", "cache", "queue"})
 		m.width = 200 // one-line help in both branches
 		m.height = 12
 		m.searchQuery = "w"
-		m.searchMatches = computeMatches(m.services, "w")
+		m.searchMatches = computeMatches(m.svcEntries, "w")
 		m.svcCursor = m.searchMatches[0]
 		return m
 	}
@@ -14058,7 +13768,7 @@ func TestSvcVisibleCount_ConstantAcrossConfirming(t *testing.T) {
 	m1.confirming = false
 	m2 := base()
 	m2.confirming = true
-	m2.selected = map[int]bool{1: true}
+	m2.selected = selectedIdx(m2, 1)
 
 	c1 := m1.svcVisibleCount()
 	c2 := m2.svcVisibleCount()
@@ -14092,9 +13802,9 @@ func TestSearchClearedOnServicesReload(t *testing.T) {
 	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
 	installFakeTick(&m)
 	m.screen = screenSelectContainers
-	m.services = mc.services
+	m.setSingleGroup(mc.services)
 	m.searchQuery = "w"
-	m.searchMatches = computeMatches(m.services, "w") // [1 2]
+	m.searchMatches = computeMatches(m.svcEntries, "w") // [1 2]
 	m.svcCursor = 1
 	if len(m.searchMatches) != 2 {
 		t.Fatalf("precondition: expected 2 matches, got %v", m.searchMatches)
@@ -14112,26 +13822,26 @@ func TestSearchClearedOnServicesReload(t *testing.T) {
 }
 
 // TestSearchClearedOnEscToProject: a context switch off the container screen
-// (esc → project picker) clears the committed search.
+// (esc → grouped host view) clears the committed search.
 func TestSearchClearedOnEscToProject(t *testing.T) {
 	m := committedSearchModel([]string{"api", "web", "worker"}, "w")
-	m.showPicker = true
+	m.drilledFromHost = true
 	if m.searchQuery == "" {
 		t.Fatal("precondition: committed search expected")
 	}
 
 	// First esc clears the search (two-stage guard); the SECOND esc back-navigates.
-	// After the second esc we're on the project picker AND search stays clear.
+	// After the second esc we're on the grouped host view AND search stays clear.
 	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyEsc})
 	m = updated.(Model)
 	assertSearchCleared(t, m, "after 1st esc (search clear)")
 
 	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyEsc})
 	m = updated.(Model)
-	if m.screen != screenSelectProject {
-		t.Errorf("after 2nd esc: screen = %d, want screenSelectProject", m.screen)
+	if m.screen != screenSelectContainers || !m.grouped {
+		t.Errorf("after 2nd esc: screen = %d grouped = %v, want the grouped host view", m.screen, m.grouped)
 	}
-	assertSearchCleared(t, m, "after esc→project back-nav")
+	assertSearchCleared(t, m, "after esc→grouped drill-out")
 }
 
 // TestSearchClearedOnEscToProjectSingleEsc: even when a committed search is active
@@ -14141,14 +13851,14 @@ func TestSearchClearedOnEscToProject(t *testing.T) {
 // asserts the unconditional (idempotent) clearSearch at the back-nav site.
 func TestSearchClearedOnEscToProjectNoActiveSearch(t *testing.T) {
 	m := containerSearchModel([]string{"api", "web", "worker"})
-	m.showPicker = true
+	m.drilledFromHost = true
 	// No active search — first (and only) esc back-navigates directly.
 	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyEsc})
 	m = updated.(Model)
-	if m.screen != screenSelectProject {
-		t.Errorf("screen = %d, want screenSelectProject (direct back-nav)", m.screen)
+	if m.screen != screenSelectContainers || !m.grouped {
+		t.Errorf("screen = %d grouped = %v, want the grouped host view (direct back-nav)", m.screen, m.grouped)
 	}
-	assertSearchCleared(t, m, "after direct esc→project (no active search)")
+	assertSearchCleared(t, m, "after direct esc→grouped (no active search)")
 }
 
 // TestSearchClearedOnEnterLogs: a read-only departure to the logs screen (l key)
@@ -14158,12 +13868,12 @@ func TestSearchClearedOnEnterLogs(t *testing.T) {
 	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
 	installFakeTick(&m)
 	m.screen = screenSelectContainers
-	m.services = mc.services
+	m.setSingleGroup(mc.services)
 	m.composer = mc
 	m.width = 80
 	m.height = 24
 	m.searchQuery = "w"
-	m.searchMatches = computeMatches(m.services, "w")
+	m.searchMatches = computeMatches(m.svcEntries, "w")
 	m.svcCursor = m.searchMatches[0]
 
 	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'l'}})
@@ -14182,16 +13892,16 @@ func TestSearchClearedOnEnterProgress(t *testing.T) {
 	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
 	installFakeTick(&m)
 	m.screen = screenSelectContainers
-	m.services = mc.services
+	m.setSingleGroup(mc.services)
 	m.composer = mc
 	m.width = 80
 	m.height = 24
 	m.pendingOp = runner.Restart
 	m.searchQuery = "w"
-	m.searchMatches = computeMatches(m.services, "w")
+	m.searchMatches = computeMatches(m.svcEntries, "w")
 	m.svcCursor = m.searchMatches[0]
 
-	updated, _ := m.enterProgress([]string{"web"})
+	updated, _ := m.enterProgress([]opBatch{{proj: m.currentProject(), services: []string{"web"}}})
 	m = updated.(Model)
 
 	if m.screen != screenProgress {
@@ -14208,12 +13918,12 @@ func TestSearchClearedEnterLogsThenEscBack(t *testing.T) {
 	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
 	installFakeTick(&m)
 	m.screen = screenSelectContainers
-	m.services = mc.services
+	m.setSingleGroup(mc.services)
 	m.composer = mc
 	m.width = 80
 	m.height = 24
 	m.searchQuery = "w"
-	m.searchMatches = computeMatches(m.services, "w")
+	m.searchMatches = computeMatches(m.svcEntries, "w")
 	m.svcCursor = m.searchMatches[0]
 
 	// Enter logs (departure clears search).
@@ -14241,7 +13951,7 @@ func TestSelectedContainersUnaffectedBySearch(t *testing.T) {
 
 	// Baseline: no search, select "api" (0) and "web-worker" (2).
 	base := containerSearchModel(services)
-	base.selected = map[int]bool{0: true, 2: true}
+	base.selected = selectedIdx(base, 0, 2)
 	want := base.selectedContainers()
 	if len(want) != 2 || want[0] != "api" || want[1] != "web-worker" {
 		t.Fatalf("precondition: selectedContainers() = %v, want [api web-worker]", want)
@@ -14250,9 +13960,9 @@ func TestSelectedContainersUnaffectedBySearch(t *testing.T) {
 	// Same selection, but with an active committed search on "w" (matches web,
 	// web-worker) and the cursor jumped onto a match.
 	withSearch := containerSearchModel(services)
-	withSearch.selected = map[int]bool{0: true, 2: true}
+	withSearch.selected = selectedIdx(withSearch, 0, 2)
 	withSearch.searchQuery = "w"
-	withSearch.searchMatches = computeMatches(services, "w")
+	withSearch.searchMatches = computeMatches(withSearch.svcEntries, "w")
 	withSearch.svcCursor = withSearch.searchMatches[0]
 
 	got := withSearch.selectedContainers()
@@ -14326,7 +14036,7 @@ func TestSearchViewNonCurrentMatchStyled(t *testing.T) {
 
 	// "web" matches web (0) and web-worker (1); "api" (2) does not. Cursor on 0.
 	m := committedSearchModel([]string{"web", "web-worker", "api"}, "web")
-	m.svcStatus = map[string]runner.ServiceStatus{}
+	m.svcStatus = qStatus(m, map[string]runner.ServiceStatus{})
 	if m.svcCursor != 0 {
 		t.Fatalf("precondition: svcCursor = %d, want 0 (first match)", m.svcCursor)
 	}
@@ -14363,7 +14073,7 @@ func TestSearchViewNonCurrentMatchStyled(t *testing.T) {
 // "n next" token so this isn't satisfied by the footer hint instead.
 func TestSearchViewCommittedBarHint(t *testing.T) {
 	m := committedSearchModel([]string{"api", "web", "web-worker"}, "w")
-	m.svcStatus = map[string]runner.ServiceStatus{}
+	m.svcStatus = qStatus(m, map[string]runner.ServiceStatus{})
 
 	v := m.viewSelectContainers()
 	if !strings.Contains(v, "n next") {
@@ -14432,7 +14142,7 @@ func TestUpperNTypedIntoSearchInput(t *testing.T) {
 // TestSearchClearedOnEntryLocal: selecting the "Local" entry on the server screen
 // swaps m.composer AND reloads the service list, so a committed search from a
 // previous session must be cleared (stale indices would point into a replaced
-// m.services). This exercises the entryLocal clearSearch() site.
+// the row list). This exercises the entryLocal clearSearch() site.
 func TestSearchClearedOnEntryLocal(t *testing.T) {
 	mc := &mockComposer{services: []string{"api", "web", "web-worker"}}
 	m := NewModel(nil, io.Discard, mockFactory(mc), testServers, mockConnectCb(mc))
@@ -14455,31 +14165,36 @@ func TestSearchClearedOnEntryLocal(t *testing.T) {
 	assertSearchCleared(t, m, "after entryLocal")
 }
 
-// TestSearchClearedOnEscProjectToServer: esc from the project picker back to the
-// server screen clears any active search (defensive — search is container-scoped).
-func TestSearchClearedOnEscProjectToServer(t *testing.T) {
+// TestSearchClearedOnEscGroupedToServer: esc from the grouped host view back to
+// the server screen clears any active search.
+func TestSearchClearedOnEscGroupedToServer(t *testing.T) {
 	mc := &mockComposer{}
 	m := NewModel(nil, io.Discard, mockFactory(mc), testServers, mockConnectCb(mc))
 	installFakeTick(&m)
-	m.screen = screenSelectProject
-	m.showPicker = true
+	m.screen = screenSelectContainers
+	m.grouped = true
 	m.disconnectFunc = func() error { return nil }
-	// Seed a stale committed search.
+	// Seed a stale committed search. The first esc is the two-stage clear, the
+	// second back-navigates — and must leave the search cleared either way.
 	m.searchQuery = "w"
 	m.searchMatches = []int{1, 2}
 
 	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyEsc})
 	m = updated.(Model)
+	assertSearchCleared(t, m, "after the two-stage esc")
+
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyEsc})
+	m = updated.(Model)
 
 	if m.screen != screenSelectServer {
-		t.Fatalf("screen = %d, want screenSelectServer (esc project→server)", m.screen)
+		t.Fatalf("screen = %d, want screenSelectServer (esc host view→server)", m.screen)
 	}
-	assertSearchCleared(t, m, "after esc project→server")
+	assertSearchCleared(t, m, "after esc host view→server")
 }
 
 // TestSearchClearedOnConnectError: a failed remote connect swaps the projectLoader
 // and resets transient state; it must also clear a committed search (the error
-// path lands the user on the project picker with no valid service list).
+// path lands the user back on the server screen with no valid service list).
 func TestSearchClearedOnConnectError(t *testing.T) {
 	mc := &mockComposer{}
 	m := NewModel(nil, io.Discard, mockFactory(mc), testServers, mockConnectCb(mc))
@@ -14505,12 +14220,12 @@ func TestSearchClearedOnEnterConfig(t *testing.T) {
 	m := NewModel(mc, io.Discard, mockConfigFactory(mc), nil, nil)
 	installFakeTick(&m)
 	m.screen = screenSelectContainers
-	m.services = mc.services
+	m.setSingleGroup(mc.services)
 	m.composer = mc
 	m.width = 80
 	m.height = 24
 	m.searchQuery = "w"
-	m.searchMatches = computeMatches(m.services, "w")
+	m.searchMatches = computeMatches(m.svcEntries, "w")
 	m.svcCursor = m.searchMatches[0]
 
 	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'c'}})
@@ -14531,13 +14246,13 @@ func TestSearchClearedOnEnterExec(t *testing.T) {
 	m := NewModel(mc, io.Discard, mockExecFactory(mc), nil, nil)
 	installFakeTick(&m)
 	m.screen = screenSelectContainers
-	m.services = mc.services
+	m.setSingleGroup(mc.services)
 	m.composer = mc
 	m.width = 80
 	m.height = 24
 	m.svcCursor = 1 // "web"
 	m.searchQuery = "w"
-	m.searchMatches = computeMatches(m.services, "w")
+	m.searchMatches = computeMatches(m.svcEntries, "w")
 
 	updated, _ := m.enterExec()
 	m = updated.(Model)
@@ -14689,14 +14404,14 @@ func TestEnterProgress_DeploySnapshotsBeforeStop(t *testing.T) {
 	}
 	m := NewModel(mc, io.Discard, mockFactory(&mc.mockComposer), nil, nil)
 	m.screen = screenSelectContainers
-	m.services = mc.services
+	m.setSingleGroup(mc.services)
 	m.composer = mc
-	m.selected[0] = true
+	m.selected[m.svcKeyAt(0)] = true
 	m.pendingOp = runner.Deploy
 	m.width = 80
 	m.height = 24
 
-	updated, _ := m.enterProgress([]string{"web"})
+	updated, _ := m.enterProgress([]opBatch{{proj: m.currentProject(), services: []string{"web"}}})
 	m = updated.(Model)
 
 	// Drain the pipeline events to completion (channel close = goroutine done).
@@ -14721,14 +14436,14 @@ func TestEnterProgress_NonSnapshotterMockRunsAsToday(t *testing.T) {
 	mc := &mockComposer{services: []string{"web"}}
 	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
 	m.screen = screenSelectContainers
-	m.services = mc.services
+	m.setSingleGroup(mc.services)
 	m.composer = mc
-	m.selected[0] = true
+	m.selected[m.svcKeyAt(0)] = true
 	m.pendingOp = runner.Deploy
 	m.width = 80
 	m.height = 24
 
-	updated, _ := m.enterProgress([]string{"web"})
+	updated, _ := m.enterProgress([]opBatch{{proj: m.currentProject(), services: []string{"web"}}})
 	m = updated.(Model)
 
 	if m.screen != screenProgress {
@@ -14744,11 +14459,11 @@ func TestPipelineDone_StartsWaitAfterDone(t *testing.T) {
 	m := Model{
 		screen:       screenProgress,
 		pendingOp:    runner.Deploy,
-		services:     []string{"web"},
 		opContainers: []string{"web"},
 		composer:     mc,
 		ctx:          context.Background(),
 	}
+	m.setSingleGroup([]string{"web"})
 
 	updated, cmd := m.Update(pipelineDoneMsg{})
 	m = updated.(Model)
@@ -14771,7 +14486,8 @@ func TestPipelineDone_StartsWaitAfterDone(t *testing.T) {
 }
 
 func TestPipelineDone_NoWaitOnFailed(t *testing.T) {
-	m := Model{screen: screenProgress, pendingOp: runner.Deploy, failed: true, services: []string{"web"}, opContainers: []string{"web"}}
+	m := Model{screen: screenProgress, pendingOp: runner.Deploy, failed: true, opContainers: []string{"web"}}
+	m.setSingleGroup([]string{"web"})
 
 	updated, cmd := m.Update(pipelineDoneMsg{})
 	m = updated.(Model)
@@ -14788,7 +14504,8 @@ func TestPipelineDone_NoWaitOnFailed(t *testing.T) {
 }
 
 func TestPipelineDone_StopOnlyNeverWaits(t *testing.T) {
-	m := Model{screen: screenProgress, pendingOp: runner.StopOnly, services: []string{"web"}, opContainers: []string{"web"}}
+	m := Model{screen: screenProgress, pendingOp: runner.StopOnly, opContainers: []string{"web"}}
+	m.setSingleGroup([]string{"web"})
 
 	updated, cmd := m.Update(pipelineDoneMsg{})
 	m = updated.(Model)
@@ -14809,10 +14526,10 @@ func TestPipelineDone_EmptyTargetsFallsBackToServices(t *testing.T) {
 	m := Model{
 		screen:    screenProgress,
 		pendingOp: runner.Restart,
-		services:  []string{"web", "db"},
 		composer:  mc,
 		ctx:       context.Background(),
 	} // opContainers deliberately nil
+	m.setSingleGroup([]string{"web", "db"})
 
 	updated, _ := m.Update(pipelineDoneMsg{})
 	m = updated.(Model)
@@ -14820,7 +14537,7 @@ func TestPipelineDone_EmptyTargetsFallsBackToServices(t *testing.T) {
 	if !m.waiting {
 		t.Fatal("waiting should start with a services fallback target set")
 	}
-	// The fallback target set must be exactly m.services, in order.
+	// The fallback target set must be exactly the drilled group, in order.
 	want := []string{"web", "db"}
 	if len(m.waitState.Services) != len(want) {
 		t.Fatalf("waitState.Services = %v, want %v", m.waitState.Services, want)
@@ -15224,10 +14941,10 @@ func TestRollbackKey_NonPreparerIgnored(t *testing.T) {
 	mc := &mockComposer{services: []string{"web"}}
 	m := Model{
 		screen:   screenSelectContainers,
-		services: []string{"web"},
 		composer: mc,
-		selected: map[int]bool{0: true},
 	}
+	m.setSingleGroup([]string{"web"})
+	m.selected = selectedIdx(m, 0)
 	updated, cmd := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'R'}})
 	m = updated.(Model)
 	if m.confirming {
@@ -15240,7 +14957,8 @@ func TestRollbackKey_NonPreparerIgnored(t *testing.T) {
 
 func TestRollbackKey_EmptyListIgnored(t *testing.T) {
 	mc := &mockRollbackComposer{}
-	m := Model{screen: screenSelectContainers, services: nil, composer: mc, selected: map[int]bool{}}
+	m := Model{screen: screenSelectContainers, composer: mc, selected: map[string]bool{}}
+	m.setSingleGroup(nil)
 	updated, cmd := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'R'}})
 	m = updated.(Model)
 	if cmd != nil || m.warning != "" {
@@ -15250,7 +14968,8 @@ func TestRollbackKey_EmptyListIgnored(t *testing.T) {
 
 func TestRollbackKey_NoSelectionWarns(t *testing.T) {
 	mc := &mockRollbackComposer{mockComposer: mockComposer{services: []string{"web"}}}
-	m := Model{screen: screenSelectContainers, services: []string{"web"}, composer: mc, selected: map[int]bool{}}
+	m := Model{screen: screenSelectContainers, composer: mc, selected: map[string]bool{}}
+	m.setSingleGroup([]string{"web"})
 	updated, cmd := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'R'}})
 	m = updated.(Model)
 	if m.warning != warnNoSelection {
@@ -15266,12 +14985,12 @@ func TestRollbackKey_FiresFetch(t *testing.T) {
 	mc := &mockRollbackComposer{mockComposer: mockComposer{services: []string{"web"}}, snap: snap}
 	m := Model{
 		screen:               screenSelectContainers,
-		services:             []string{"web"},
 		composer:             mc,
-		selected:             map[int]bool{0: true},
 		ctx:                  context.Background(),
 		rollbackFetchSession: 0,
 	}
+	m.setSingleGroup([]string{"web"})
+	m.selected = selectedIdx(m, 0)
 	updated, cmd := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'R'}})
 	m = updated.(Model)
 	if m.rollbackFetchSession != 1 {
@@ -15299,10 +15018,10 @@ func TestRollbackKey_FiresFetch(t *testing.T) {
 func TestRollbackSnapshotMsg_NoSnapshotWarns(t *testing.T) {
 	m := Model{
 		screen:               screenSelectContainers,
-		services:             []string{"web"},
-		selected:             map[int]bool{0: true},
 		rollbackFetchSession: 3,
 	}
+	m.setSingleGroup([]string{"web"})
+	m.selected = selectedIdx(m, 0)
 	updated, _ := m.Update(rollbackSnapshotMsg{snap: nil, session: 3})
 	m = updated.(Model)
 	if m.confirming {
@@ -15316,10 +15035,10 @@ func TestRollbackSnapshotMsg_NoSnapshotWarns(t *testing.T) {
 func TestRollbackSnapshotMsg_ReadErrorWarns(t *testing.T) {
 	m := Model{
 		screen:               screenSelectContainers,
-		services:             []string{"web"},
-		selected:             map[int]bool{0: true},
 		rollbackFetchSession: 1,
 	}
+	m.setSingleGroup([]string{"web"})
+	m.selected = selectedIdx(m, 0)
 	updated, _ := m.Update(rollbackSnapshotMsg{err: errors.New("schema 2 unsupported"), session: 1})
 	m = updated.(Model)
 	if m.confirming {
@@ -15334,11 +15053,11 @@ func TestRollbackSnapshotMsg_TargetedMissingWarns(t *testing.T) {
 	snap := &compose.Snapshot{Schema: 1, Services: map[string]compose.SnapshotEntry{"web": {}}}
 	m := Model{
 		screen:               screenSelectContainers,
-		services:             []string{"web", "db"},
-		selected:             map[int]bool{0: true, 1: true},
 		rollbackTargets:      []string{"web", "db"}, // captured at R-press
 		rollbackFetchSession: 2,
 	}
+	m.setSingleGroup([]string{"web", "db"})
+	m.selected = selectedIdx(m, 0, 1)
 	updated, _ := m.Update(rollbackSnapshotMsg{snap: snap, session: 2})
 	m = updated.(Model)
 	if m.confirming {
@@ -15359,11 +15078,11 @@ func TestRollbackSnapshotMsg_ComposeRemovedWarns(t *testing.T) {
 	snap := rollbackTestSnapshot()
 	m := Model{
 		screen:               screenSelectContainers,
-		services:             []string{"web", "db"},
-		selected:             map[int]bool{0: true, 1: true}, // both selected
-		rollbackTargets:      []string{"web", "db"},          // captured at R-press
+		rollbackTargets:      []string{"web", "db"}, // captured at R-press
 		rollbackFetchSession: 2,
 	}
+	m.setSingleGroup([]string{"web", "db"})
+	m.selected = selectedIdx(m, 0, 1) // both selected
 	updated, _ := m.Update(rollbackSnapshotMsg{snap: snap, live: []string{"web"}, session: 2})
 	m = updated.(Model)
 	if m.confirming {
@@ -15433,11 +15152,11 @@ func TestRollbackSnapshotMsg_PresentEntersConfirm(t *testing.T) {
 	snap := rollbackTestSnapshot()
 	m := Model{
 		screen:               screenSelectContainers,
-		services:             []string{"web"},
-		selected:             map[int]bool{0: true},
 		rollbackTargets:      []string{"web"}, // captured at R-press
 		rollbackFetchSession: 1,
 	}
+	m.setSingleGroup([]string{"web"})
+	m.selected = selectedIdx(m, 0)
 	// live includes the selected target, so the live-compose intersection passes.
 	updated, _ := m.Update(rollbackSnapshotMsg{snap: snap, live: []string{"web", "db"}, session: 1})
 	m = updated.(Model)
@@ -15459,10 +15178,10 @@ func TestRollbackSnapshotMsg_StaleSessionRejected(t *testing.T) {
 	snap := rollbackTestSnapshot()
 	m := Model{
 		screen:               screenSelectContainers,
-		services:             []string{"web"},
-		selected:             map[int]bool{0: true},
 		rollbackFetchSession: 5,
 	}
+	m.setSingleGroup([]string{"web"})
+	m.selected = selectedIdx(m, 0)
 	updated, _ := m.Update(rollbackSnapshotMsg{snap: snap, session: 4}) // stale
 	m = updated.(Model)
 	if m.confirming {
@@ -15488,9 +15207,9 @@ func TestRollbackConfirm_MultiSelectTargetSet(t *testing.T) {
 	mc := &mockRollbackComposer{mockComposer: mockComposer{services: []string{"db", "web"}}, snap: snap}
 	m := NewModel(mc, io.Discard, mockRollbackFactory(mc), nil, nil)
 	m.screen = screenSelectContainers
-	m.services = []string{"db", "web"}
+	m.setSingleGroup([]string{"db", "web"})
 	m.composer = mc
-	m.selected = map[int]bool{0: true, 1: true}
+	m.selected = selectedIdx(m, 0, 1)
 	m.rollbackSnapshot = snap
 	m.rollbackTargets = []string{"db", "web"} // captured at R-press; drives the pipeline target
 	m.pendingOp = runner.Rollback
@@ -15519,11 +15238,11 @@ func TestRollbackTargets_CapturedAtPressNotAfterFetch(t *testing.T) {
 	mc := &mockRollbackComposer{mockComposer: mockComposer{services: []string{"web", "db"}}, snap: snap}
 	m := Model{
 		screen:   screenSelectContainers,
-		services: []string{"web", "db"},
 		composer: mc,
-		selected: map[int]bool{0: true}, // web only
 		ctx:      context.Background(),
 	}
+	m.setSingleGroup([]string{"web", "db"})
+	m.selected = selectedIdx(m, 0) // web only
 	// Press R: captures {web}, bumps the fetch session, fires the async fetch.
 	updated, cmd := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'R'}})
 	m = updated.(Model)
@@ -15536,7 +15255,7 @@ func TestRollbackTargets_CapturedAtPressNotAfterFetch(t *testing.T) {
 	session := m.rollbackFetchSession
 
 	// Simulate the user CLEARING the selection while the fetch is in flight.
-	m.selected = map[int]bool{}
+	m.selected = map[string]bool{}
 
 	// The snapshot lands for the captured session.
 	updated, _ = m.Update(rollbackSnapshotMsg{snap: snap, live: []string{"web", "db"}, session: session})
@@ -15568,11 +15287,11 @@ func TestRollbackSnapshotMsg_EmptyCapturedRefuses(t *testing.T) {
 	snap := rollbackTestSnapshot()
 	m := Model{
 		screen:               screenSelectContainers,
-		services:             []string{"web", "db"},
-		selected:             map[int]bool{0: true, 1: true},
 		rollbackTargets:      nil, // captured set empty
 		rollbackFetchSession: 2,
 	}
+	m.setSingleGroup([]string{"web", "db"})
+	m.selected = selectedIdx(m, 0, 1)
 	updated, _ := m.Update(rollbackSnapshotMsg{snap: snap, live: []string{"web", "db"}, session: 2})
 	m = updated.(Model)
 	if m.confirming {
@@ -15899,14 +15618,15 @@ func TestEscFromProgress_RollbackInvalidatesUpdateCache(t *testing.T) {
 		pendingOp:   runner.Rollback,
 		composer:    &mockComposer{},
 		ctx:         context.Background(),
-		updateCache: map[string]updateEntry{"|": {results: map[string]bool{"web": true}}},
+		batches:     []opBatch{{}},
+		updateCache: map[string]updateEntry{"\x00|": {results: map[string]bool{"web": true}}},
 	}
 	if _, ok := m.updateCache[m.updatesCacheKey()]; !ok {
 		t.Fatalf("precondition: cache should hold key %q", m.updatesCacheKey())
 	}
 	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyEsc})
 	m = updated.(Model)
-	if _, ok := m.updateCache["|"]; ok {
+	if _, ok := m.updateCache["\x00|"]; ok {
 		t.Error("a successful Rollback should invalidate the update-availability cache")
 	}
 }
@@ -15927,9 +15647,9 @@ func TestViewProgress_RollbackConfirmShowsAge(t *testing.T) {
 	mc := &mockRollbackComposer{mockComposer: mockComposer{services: []string{"web"}}, snap: snap}
 	m := NewModel(mc, io.Discard, mockRollbackFactory(mc), nil, nil)
 	m.screen = screenSelectContainers
-	m.services = []string{"web"}
+	m.setSingleGroup([]string{"web"})
 	m.composer = mc
-	m.selected = map[int]bool{0: true}
+	m.selected = selectedIdx(m, 0)
 	m.rollbackSnapshot = snap
 	m.rollbackTargets = []string{"web"} // captured at R-press; drives the confirm prompt
 	m.pendingOp = runner.Rollback
@@ -16048,7 +15768,7 @@ func newReadOnlyModel(t *testing.T, mc *readOnlyMockComposer) Model {
 	// that later subtests share.
 	m.svcStatus = make(map[string]runner.ServiceStatus, len(mc.status))
 	for k, v := range mc.status {
-		m.svcStatus[k] = v
+		m.svcStatus[qk(m, k)] = v
 	}
 	return m
 }
@@ -16175,8 +15895,8 @@ func TestReadOnly_GatesWriteKeys_WithCapableComposer(t *testing.T) {
 			mc := &capableReadOnlyComposer{readOnlyMockComposer: *readOnlyTestComposer()}
 			m := NewModel(mc, io.Discard, func(compose.Project) runner.Composer { return mc }, nil, nil)
 			m.screen = screenSelectContainers
-			m.services = append([]string(nil), mc.services...)
-			m.svcStatus = mc.status
+			m.setSingleGroup(append([]string(nil), mc.services...))
+			m.svcStatus = qStatus(m, mc.status)
 			m.width, m.height = 120, 24
 			m.updateInFlight = false
 			m.refreshInFlight = false
@@ -16185,7 +15905,7 @@ func TestReadOnly_GatesWriteKeys_WithCapableComposer(t *testing.T) {
 			// it is unreachable through space on this composer, so set it
 			// directly to prove the gate — not the missing selection — is
 			// what stops the key.
-			m.selected[0] = true
+			m.selected[m.svcKeyAt(0)] = true
 
 			// Precondition: the capability assertions the gates sit above
 			// would BOTH succeed on this composer.
@@ -16235,7 +15955,7 @@ func TestReadOnly_GatedKeyReclampsOffset(t *testing.T) {
 			m.height = 24
 			// The x-on-stopped warning is the state this reproduces from.
 			m.warning = "Container is not running"
-			m.svcCursor = len(m.services) - 1
+			m.svcCursor = len(m.svcEntries) - 1
 			m.fixSvcOffset()
 			if m.svcOffset == 0 {
 				t.Fatal("precondition: the list must scroll at this height")
@@ -16247,7 +15967,7 @@ func TestReadOnly_GatedKeyReclampsOffset(t *testing.T) {
 			if got.warning != "" {
 				t.Fatalf("precondition: the dispatch must clear the warning, got %q", got.warning)
 			}
-			want := len(got.services) - got.svcVisibleCount()
+			want := len(got.svcEntries) - got.svcVisibleCount()
 			if got.svcOffset != want {
 				t.Errorf("svcOffset = %d, want %d; the gated key left a blank row at the bottom", got.svcOffset, want)
 			}
@@ -16374,19 +16094,21 @@ func TestUpdatesCacheKey_FollowsComposerAcrossNavigation(t *testing.T) {
 		return local
 	}, []config.Server{{Name: "prod", Host: "prod.example.com"}}, nil)
 	installFakeTick(&m)
-	m.screen = screenSelectProject
-	m.showPicker = true
-	m.projects = []compose.Project{{Name: compose.UnmanagedProjectName, Desc: "2 containers", Unmanaged: true}}
+	parkOnGroupedScreen(&m,
+		compose.Project{Name: "shop", ConfigDir: "/srv/shop"},
+		compose.Project{Name: compose.UnmanagedProjectName, Unmanaged: true},
+	)
+	m.svcCursor = headerIndexFor(t, m.svcEntries, 1)
 
 	updated, _ := m.Update(keyMsgFor("enter"))
 	m = updated.(Model)
-	if got := m.updatesCacheKey(); got != "unmanaged||" {
-		t.Fatalf("after picking the unmanaged row, key = %q, want %q", got, "unmanaged||")
+	if got := m.updatesCacheKey(); got != "unmanaged|\x00(unmanaged)|" {
+		t.Fatalf("after drilling into the unmanaged group, key = %q, want %q", got, "unmanaged|\x00(unmanaged)|")
 	}
 
-	updated, _ = m.Update(keyMsgFor("esc")) // containers -> project
+	updated, _ = m.Update(keyMsgFor("esc")) // drilled -> grouped host view
 	m = updated.(Model)
-	updated, _ = m.Update(keyMsgFor("esc")) // project -> server
+	updated, _ = m.Update(keyMsgFor("esc")) // host view -> server
 	m = updated.(Model)
 	if m.screen != screenSelectServer {
 		t.Fatalf("screen = %d, want screenSelectServer", m.screen)
@@ -16396,8 +16118,8 @@ func TestUpdatesCacheKey_FollowsComposerAcrossNavigation(t *testing.T) {
 	m.serverCursor = 0
 	updated, _ = m.Update(keyMsgFor("enter"))
 	m = updated.(Model)
-	if got := m.updatesCacheKey(); got != "|" {
-		t.Errorf("after the local fast-track, key = %q, want %q", got, "|")
+	if got := m.updatesCacheKey(); got != "\x00|" {
+		t.Errorf("after the local fast-track, key = %q, want %q", got, "\x00|")
 	}
 }
 
@@ -16408,11 +16130,11 @@ func TestUpdatesCacheKey_FollowsComposerAcrossNavigation(t *testing.T) {
 func TestUpdatesCache_UnmanagedDoesNotReplayFastTrackVerdicts(t *testing.T) {
 	mc := readOnlyTestComposer()
 	m := newReadOnlyModel(t, mc)
-	m.services = []string{"web"}
-	m.svcStatus = map[string]runner.ServiceStatus{"web": {Running: true}}
+	m.setSingleGroup([]string{"web"})
+	m.svcStatus = qStatus(m, map[string]runner.ServiceStatus{"web": {Running: true}})
 	m.updateCache = map[string]updateEntry{
 		// The local-fast-track slot, populated by a previous compose context.
-		"|": {fetchedAt: time.Now(), results: map[string]bool{"web": true}},
+		"\x00|": {fetchedAt: time.Now(), results: map[string]bool{"web": true}},
 	}
 
 	updated, cmd := m.Update(statusMsg{
@@ -16421,7 +16143,7 @@ func TestUpdatesCache_UnmanagedDoesNotReplayFastTrackVerdicts(t *testing.T) {
 	})
 	got := updated.(Model)
 
-	if ua := got.svcStatus["web"].UpdateAvailable; ua != nil {
+	if ua := got.svcStatus[qk(got, "web")].UpdateAvailable; ua != nil {
 		t.Errorf("UpdateAvailable = %v, want nil; the fast-track verdict leaked into the unmanaged view", *ua)
 	}
 
@@ -16440,7 +16162,7 @@ func TestUpdatesCache_UnmanagedDoesNotReplayFastTrackVerdicts(t *testing.T) {
 		status:  map[string]runner.ServiceStatus{"web": {Running: true}},
 		session: m.statusSession,
 	})
-	ua := updated.(Model).svcStatus["web"].UpdateAvailable
+	ua := updated.(Model).svcStatus[qk(updated.(Model), "web")].UpdateAvailable
 	if ua == nil || !*ua {
 		t.Error("the fast-track context must still replay its own cached verdict")
 	}
@@ -16464,8 +16186,8 @@ func TestReadOnly_NoSelectionAffordances(t *testing.T) {
 	wc := &mockComposer{services: mc.services, status: mc.status}
 	w := NewModel(wc, io.Discard, mockFactory(wc), nil, nil)
 	w.screen = screenSelectContainers
-	w.services = wc.services
-	w.svcStatus = wc.status
+	w.setSingleGroup(wc.services)
+	w.svcStatus = qStatus(w, wc.status)
 	w.width, w.height = 120, 24
 	control := ansi.Strip(w.viewSelectContainers())
 	if !strings.Contains(control, "selected") || !strings.Contains(control, "[ ]") {
@@ -16499,8 +16221,8 @@ func TestReadOnly_CaptionAlignment(t *testing.T) {
 				wc := &mockComposer{services: []string{"watchtower", "portainer"}, status: status}
 				m = NewModel(wc, io.Discard, mockFactory(wc), nil, nil)
 				m.screen = screenSelectContainers
-				m.services = wc.services
-				m.svcStatus = status
+				m.setSingleGroup(wc.services)
+				m.svcStatus = qStatus(m, status)
 				m.width, m.height = 120, 24
 			}
 
@@ -16516,7 +16238,7 @@ func TestReadOnly_CaptionAlignment(t *testing.T) {
 				if !strings.Contains(plain, "●") {
 					continue
 				}
-				for _, svc := range m.services {
+				for _, svc := range modelServices(m) {
 					if strings.Contains(plain, svc) {
 						rows[svc] = plain
 					}
@@ -16525,8 +16247,8 @@ func TestReadOnly_CaptionAlignment(t *testing.T) {
 			if caption == "" {
 				t.Fatalf("no captions row rendered:\n%s", view)
 			}
-			if len(rows) != len(m.services) {
-				t.Fatalf("found %d data rows, want %d:\n%s", len(rows), len(m.services), view)
+			if len(rows) != len(modelServices(m)) {
+				t.Fatalf("found %d data rows, want %d:\n%s", len(rows), len(modelServices(m)), view)
 			}
 
 			want := ansi.StringWidth(caption[:strings.Index(caption, "Service")])
@@ -16557,15 +16279,15 @@ func TestReadOnly_UpdateGlyphHydrates(t *testing.T) {
 	m := newReadOnlyModel(t, mc)
 
 	result, _ := m.Update(updatesMsg{
-		results: map[string]bool{"watchtower": true, "portainer": false},
+		forKey: m.updatesCacheKey(), results: map[string]bool{"watchtower": true, "portainer": false},
 		session: m.updatesSession,
 	})
 	model := result.(Model)
 
-	if av := model.svcStatus["watchtower"].UpdateAvailable; av == nil || !*av {
+	if av := model.svcStatus[qk(model, "watchtower")].UpdateAvailable; av == nil || !*av {
 		t.Fatalf("watchtower UpdateAvailable = %v, want &true", av)
 	}
-	if av := model.svcStatus["portainer"].UpdateAvailable; av == nil || *av {
+	if av := model.svcStatus[qk(model, "portainer")].UpdateAvailable; av == nil || *av {
 		t.Fatalf("portainer UpdateAvailable = %v, want &false", av)
 	}
 
@@ -16603,9 +16325,9 @@ func TestReadOnly_RendersAllStatusColumns(t *testing.T) {
 	}
 	m := newReadOnlyModel(t, mc)
 	m.statsRequested = true
-	m.stats = map[string]runner.ServiceStats{
+	m.stats = qStats(m, map[string]runner.ServiceStats{
 		"watchtower": {CPUPercent: 12.5, MemoryUsed: 130023424, MemoryLimit: 2147483648},
-	}
+	})
 
 	view := ansi.Strip(m.viewSelectContainers())
 
@@ -17125,10 +16847,10 @@ func inspectTestModel(t *testing.T, c runner.Composer, services []string) Model 
 	t.Helper()
 	m := NewModel(c, io.Discard, func(compose.Project) runner.Composer { return c }, nil, nil)
 	m.screen = screenSelectContainers
-	m.services = append([]string(nil), services...)
+	m.setSingleGroup(append([]string(nil), services...))
 	m.svcStatus = map[string]runner.ServiceStatus{}
 	for _, s := range services {
-		m.svcStatus[s] = runner.ServiceStatus{Running: true}
+		m.svcStatus[qk(m, s)] = runner.ServiceStatus{Running: true}
 	}
 	m.width, m.height = 120, 24
 	m.updateInFlight = false
@@ -17318,7 +17040,7 @@ func TestInspectKey_SwallowedWhileConfirming(t *testing.T) {
 	mc := &mockInspectComposer{inspectRaw: []byte(inspectFixtureJSON)}
 	mc.services = []string{"web"}
 	m := inspectTestModel(t, mc, mc.services)
-	m.selected = map[int]bool{0: true}
+	m.selected = selectedIdx(m, 0)
 
 	result, _ := m.Update(keyMsgFor("d"))
 	armed := result.(Model)
@@ -18203,5 +17925,101 @@ func TestInspectKey_MissingContainerSurfacesNamedError(t *testing.T) {
 	}
 	if strings.Contains(view, "Loading") {
 		t.Error("a failed fetch must not leave the screen reading as loading")
+	}
+}
+
+// TestRollbackPreppedMsg_CarriesBatchIdentity is the superseded-prep pin. The
+// screen alone is not identity: a cancelled prep keeps running until
+// PrepareRollback notices its context, and the user can be back on
+// screenProgress with a DIFFERENT operation by the time it answers. Ungated,
+// its error failed that operation, its success overwrote the cleanup the new
+// one owns, and the waitForEvent it starts put a second consumer on the live
+// event channel.
+func TestRollbackPreppedMsg_CarriesBatchIdentity(t *testing.T) {
+	newModel := func() Model {
+		events := make(chan runner.StepEvent)
+		close(events)
+		return Model{screen: screenProgress, eventCh: events, batchIdx: 1, batchSession: 7}
+	}
+
+	cases := []struct {
+		name string
+		msg  rollbackPreppedMsg
+	}{
+		{"stale session", rollbackPreppedMsg{batchIdx: 1, session: 6}},
+		{"stale batch index", rollbackPreppedMsg{batchIdx: 0, session: 7}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name+" error is dropped", func(t *testing.T) {
+			m := newModel()
+			msg := tc.msg
+			msg.err = errors.New("pull failed")
+			updated, cmd := m.Update(msg)
+			got := updated.(Model)
+			if got.failed {
+				t.Error("a superseded prep error marked the current operation failed")
+			}
+			if got.rollbackErr != "" {
+				t.Errorf("rollbackErr = %q, want empty", got.rollbackErr)
+			}
+			if cmd != nil {
+				t.Error("a superseded prep must not schedule anything")
+			}
+		})
+		t.Run(tc.name+" success is dropped and cleaned up", func(t *testing.T) {
+			m := newModel()
+			calls := 0
+			msg := tc.msg
+			msg.cleanup = func() { calls++ }
+			updated, cmd := m.Update(msg)
+			got := updated.(Model)
+			if calls != 1 {
+				t.Errorf("cleanup ran %d times, want 1 - the override file leaks otherwise", calls)
+			}
+			if got.rollbackCleanup != nil {
+				t.Error("a superseded prep overwrote the current batch's cleanup")
+			}
+			if cmd != nil {
+				t.Error("a superseded prep started a second consumer on the event channel")
+			}
+		})
+	}
+
+	t.Run("the current batch is accepted", func(t *testing.T) {
+		m := newModel()
+		updated, cmd := m.Update(rollbackPreppedMsg{cleanup: func() {}, batchIdx: 1, session: 7})
+		if updated.(Model).rollbackCleanup == nil {
+			t.Error("the matching prep must store its cleanup")
+		}
+		if cmd == nil {
+			t.Error("the matching prep must start consuming events")
+		}
+	})
+}
+
+// prepareRollbackCmd stamps the identity at DISPATCH, the same moment
+// waitForEvent does, so a prep and the pipeline it starts are one batch.
+func TestPrepareRollbackCmd_StampsCurrentBatchIdentity(t *testing.T) {
+	mc := &mockRollbackComposer{prepErr: errors.New("nope")}
+	m := Model{composer: mc, rollbackSnapshot: rollbackTestSnapshot(), ctx: context.Background(), batchIdx: 2, batchSession: 9}
+	events := make(chan runner.StepEvent, 1)
+
+	msg, ok := m.prepareRollbackCmd(context.Background(), []string{"web"}, io.Discard, events)().(rollbackPreppedMsg)
+	if !ok {
+		t.Fatal("cmd should produce a rollbackPreppedMsg")
+	}
+	if msg.batchIdx != 2 || msg.session != 9 {
+		t.Errorf("identity = (idx %d, session %d), want (2, 9)", msg.batchIdx, msg.session)
+	}
+
+	// The capability-refusal branch carries it too - it is the one that can
+	// answer instantly while a later operation is already on screen.
+	plain := Model{composer: &mockComposer{}, ctx: context.Background(), batchIdx: 3, batchSession: 11}
+	msg, ok = plain.prepareRollbackCmd(context.Background(), nil, io.Discard, events)().(rollbackPreppedMsg)
+	if !ok {
+		t.Fatal("cmd should produce a rollbackPreppedMsg")
+	}
+	if msg.batchIdx != 3 || msg.session != 11 {
+		t.Errorf("refusal identity = (idx %d, session %d), want (3, 11)", msg.batchIdx, msg.session)
 	}
 }

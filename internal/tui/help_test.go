@@ -18,7 +18,6 @@ import (
 // skipping every screen-table test in this file.
 var allScreens = []screen{
 	screenSelectServer,
-	screenSelectProject,
 	screenSelectContainers,
 	screenProgress,
 	screenLogs,
@@ -109,9 +108,16 @@ var helpKeyAliases = map[string]string{
 // covers all three progress tables instead of whichever one it happened to
 // sample.
 func helpKeyTokens(s screen, canGoBack, readOnly bool) map[string]bool {
+	return helpKeyTokensCtx(s, helpContext{canGoBack: canGoBack, readOnly: readOnly})
+}
+
+// helpKeyTokensCtx is helpKeyTokens with the whole context spelled out, for the
+// variants a bare (canGoBack, readOnly) pair cannot name.
+func helpKeyTokensCtx(s screen, hc helpContext) map[string]bool {
 	out := map[string]bool{}
 	for _, phase := range allProgressPhases {
-		for _, g := range helpGroupsFor(s, helpContext{canGoBack: canGoBack, readOnly: readOnly, phase: phase}) {
+		hc.phase = phase
+		for _, g := range helpGroupsFor(s, hc) {
 			for _, e := range g.entries {
 				for _, tok := range strings.Fields(e.keys) {
 					if alias, ok := helpKeyAliases[tok]; ok {
@@ -130,13 +136,17 @@ func helpKeyTokens(s screen, canGoBack, readOnly bool) map[string]bool {
 // must be added to both places.
 func TestHelpGroups_NamesEveryBoundKey(t *testing.T) {
 	bound := map[screen][]string{
-		screenSelectServer:  {"q", "ctrl+c", "up", "k", "down", "j", "enter", "s"},
-		screenSelectProject: {"q", "ctrl+c", "esc", "up", "k", "down", "j", "enter"},
+		screenSelectServer: {"q", "ctrl+c", "up", "k", "down", "j", "enter", "s"},
+		// The named variant is the DRILLED one (see the helpKeyTokens call
+		// below), so the grouped-only fold keys — z, ← and → — are not in
+		// this set; TestHelpGroups_GroupedNamesTheSameKeys pins those.
 		screenSelectContainers: {
 			"q", "ctrl+c", "esc", "enter", "up", "k", "down", "j", " ", "a",
 			"r", "d", "s", "R", "n", "N", "/", "l", "c", "x", "U", "i",
 		},
-		screenProgress: {"q", "ctrl+c", "esc"},
+		// enter is bound only in the waiting sub-state, where it releases the
+		// health gate. progressGroups names it in both midSequence variants.
+		screenProgress: {"q", "ctrl+c", "esc", "enter"},
 		screenLogs: {
 			"q", "ctrl+c", "esc", "enter", "ctrl+r", "w", "p", "G", "f", "/",
 			"n", "N", "up", "down", "left", "right", "pgup", "pgdown",
@@ -236,20 +246,22 @@ func TestHelpGroups_ReadOnlyNamesEveryBoundKey(t *testing.T) {
 func TestHelpGroups_ReadOnlyDropsGatedKeys(t *testing.T) {
 	gated := []string{"d", "r", "s", "R", "c", " ", "a"}
 	for _, canGoBack := range []bool{true, false} {
-		named := helpKeyTokens(screenSelectContainers, canGoBack, true)
-		for _, k := range gated {
-			if named[k] {
-				t.Errorf("canGoBack=%v: read-only table names gated key %q", canGoBack, k)
+		for _, grouped := range []bool{false, true} {
+			named := helpKeyTokensCtx(screenSelectContainers, helpContext{canGoBack: canGoBack, readOnly: true, grouped: grouped})
+			for _, k := range gated {
+				if named[k] {
+					t.Errorf("canGoBack=%v grouped=%v: read-only table names gated key %q", canGoBack, grouped, k)
+				}
 			}
-		}
-		for _, g := range readOnlyContainerGroups(canGoBack) {
-			if g.title == "SELECT" || g.title == "OPERATE" {
-				t.Errorf("canGoBack=%v: read-only table still carries the %q group", canGoBack, g.title)
-			}
-			for _, e := range g.entries {
-				for _, dead := range []string{"toggle", "all", "deploy", "restart", "stop", "rollback", "config"} {
-					if strings.Contains(e.desc, dead) {
-						t.Errorf("canGoBack=%v: read-only entry %+v describes the gated action %q", canGoBack, e, dead)
+			for _, g := range readOnlyContainerGroups(canGoBack, grouped) {
+				if g.title == "SELECT" || g.title == "OPERATE" {
+					t.Errorf("canGoBack=%v grouped=%v: read-only table still carries the %q group", canGoBack, grouped, g.title)
+				}
+				for _, e := range g.entries {
+					for _, dead := range []string{"toggle", "all", "deploy", "restart", "stop", "rollback", "config"} {
+						if strings.Contains(e.desc, dead) {
+							t.Errorf("canGoBack=%v grouped=%v: read-only entry %+v describes the gated action %q", canGoBack, grouped, e, dead)
+						}
 					}
 				}
 			}
@@ -257,10 +269,11 @@ func TestHelpGroups_ReadOnlyDropsGatedKeys(t *testing.T) {
 	}
 }
 
-// TestHelpGroups_LeaveGroupMatchesFooter pins the two screens whose LEAVE
-// binding is conditional. On a standalone run q QUITS and esc does nothing, so
-// an overlay that says "back" would tell the user to press the key that exits
-// the program — and would contradict the footer rendered a moment earlier.
+// TestHelpGroups_LeaveGroupMatchesFooter pins the container screen, whose
+// LEAVE binding is conditional in both of its modes. On a standalone run q
+// QUITS and esc does nothing, so an overlay that says "back" would tell the
+// user to press the key that exits the program — and would contradict the
+// footer rendered a moment earlier.
 func TestHelpGroups_LeaveGroupMatchesFooter(t *testing.T) {
 	tests := []struct {
 		name      string
@@ -271,18 +284,20 @@ func TestHelpGroups_LeaveGroupMatchesFooter(t *testing.T) {
 		checkFoot bool
 	}{
 		{
-			name:     "project with servers",
-			m:        Model{screen: screenSelectProject, servers: testServers},
+			name:     "grouped with servers",
+			m:        Model{screen: screenSelectContainers, grouped: true, servers: testServers},
 			wantKeys: "q esc", wantDesc: "back",
+			wantFoot: "q back", checkFoot: true,
 		},
 		{
-			name:     "project standalone",
-			m:        Model{screen: screenSelectProject},
+			name:     "grouped standalone",
+			m:        Model{screen: screenSelectContainers, grouped: true},
 			wantKeys: "q", wantDesc: "quit",
+			wantFoot: "q quit", checkFoot: true,
 		},
 		{
-			name:     "containers from the picker",
-			m:        Model{screen: screenSelectContainers, showPicker: true},
+			name:     "containers drilled in from the host view",
+			m:        Model{screen: screenSelectContainers, drilledFromHost: true},
 			wantKeys: "q esc", wantDesc: "back",
 			wantFoot: "q back", checkFoot: true,
 		},
@@ -296,8 +311,8 @@ func TestHelpGroups_LeaveGroupMatchesFooter(t *testing.T) {
 		// label is the first token on it. The overlay reads the same predicate
 		// and must not disagree.
 		{
-			name:     "read-only containers from the picker",
-			m:        Model{screen: screenSelectContainers, showPicker: true, composer: &readOnlyMockComposer{}},
+			name:     "read-only containers drilled in from the host view",
+			m:        Model{screen: screenSelectContainers, drilledFromHost: true, composer: &readOnlyMockComposer{}},
 			wantKeys: "q esc", wantDesc: "back",
 			wantFoot: "q back", checkFoot: true,
 		},
@@ -340,11 +355,11 @@ func TestHelpGroups_LeaveGroupMatchesFooter(t *testing.T) {
 func TestViewHelp_ReplacesScreen(t *testing.T) {
 	m := Model{
 		screen:   screenSelectContainers,
-		services: []string{"web-frontend"},
 		width:    120,
 		height:   24,
 		helpOpen: true,
 	}
+	m.setSingleGroup([]string{"web-frontend"})
 	view := m.View()
 	if !strings.Contains(view, "OPERATE") {
 		t.Errorf("overlay should list the OPERATE group, got: %q", view)
@@ -364,16 +379,17 @@ func TestViewHelp_ReplacesScreen(t *testing.T) {
 // open. The composer is readOnlyMockComposer, not the real HostContainers, so
 // no test here shells out to docker.
 func readOnlyOverlayModel(width, height int) Model {
-	return Model{
-		screen:     screenSelectContainers,
-		services:   []string{"watchtower", "portainer"},
-		selected:   make(map[int]bool),
-		showPicker: true,
-		composer:   &readOnlyMockComposer{},
-		width:      width,
-		height:     height,
-		helpOpen:   true,
+	m := Model{
+		screen:          screenSelectContainers,
+		selected:        make(map[string]bool),
+		drilledFromHost: true,
+		composer:        &readOnlyMockComposer{},
+		width:           width,
+		height:          height,
+		helpOpen:        true,
 	}
+	m.setSingleGroup([]string{"watchtower", "portainer"})
+	return m
 }
 
 // TestViewHelp_ReadOnlyOverlay renders the read-only table end to end: INSPECT
@@ -407,7 +423,7 @@ func TestReadOnly_NoGatedKeyAdvertised(t *testing.T) {
 
 	for _, picker := range []bool{true, false} {
 		m := readOnlyOverlayModel(120, 24)
-		m.showPicker = picker
+		m.drilledFromHost = picker
 
 		named := map[string]bool{}
 		for _, g := range m.helpGroups() {
@@ -422,13 +438,13 @@ func TestReadOnly_NoGatedKeyAdvertised(t *testing.T) {
 		}
 		for _, k := range gatedTokens {
 			if named[k] {
-				t.Errorf("showPicker=%v: read-only overlay names gated key %q", picker, k)
+				t.Errorf("drilledFromHost=%v: read-only overlay names gated key %q", picker, k)
 			}
 		}
 		overlay := ansi.Strip(m.View())
 		for _, tok := range gatedOverlay {
 			if strings.Contains(overlay, tok) {
-				t.Errorf("showPicker=%v: read-only overlay advertises %q, got:\n%s", picker, tok, overlay)
+				t.Errorf("drilledFromHost=%v: read-only overlay advertises %q, got:\n%s", picker, tok, overlay)
 			}
 		}
 
@@ -436,7 +452,7 @@ func TestReadOnly_NoGatedKeyAdvertised(t *testing.T) {
 		footer := ansi.Strip(m.containerFooter())
 		for _, tok := range gatedFooter {
 			if strings.Contains(footer, tok) {
-				t.Errorf("showPicker=%v: read-only footer advertises %q, got: %q", picker, tok, footer)
+				t.Errorf("drilledFromHost=%v: read-only footer advertises %q, got: %q", picker, tok, footer)
 			}
 		}
 	}
@@ -686,9 +702,12 @@ func TestViewHelp_NarrowTerminalKeepsActionKeys(t *testing.T) {
 		"deploy", "restart", "stop", "logs",
 	}
 	// Below 65 columns the overlay stacks to one column, which is where the
-	// budget bites; 24 is the classic short terminal.
+	// budget bites; 24 is the classic short terminal. Drilled variant only —
+	// the grouped table carries two more action rows, so every threshold there
+	// sits two notches higher (TestViewHelp_InspectSurvivesTheFirstTruncation
+	// pins both).
 	for _, w := range []int{30, 40, 50, 59} {
-		m := Model{screen: screenSelectContainers, width: w, height: 24, showPicker: true, helpOpen: true}
+		m := Model{screen: screenSelectContainers, width: w, height: 24, drilledFromHost: true, helpOpen: true}
 		view := ansi.Strip(m.View())
 		for _, s := range want {
 			if !strings.Contains(view, s) {
@@ -700,36 +719,66 @@ func TestViewHelp_NarrowTerminalKeepsActionKeys(t *testing.T) {
 
 // TestViewHelp_InspectSurvivesTheFirstTruncation pins i's POSITION inside
 // inspectGroup, which TestViewHelp_NarrowTerminalKeepsActionKeys cannot: that
-// test samples height 24, where all 19 action rows still fit, so appending i
-// last would pass it. INSPECT is the last action group singleColumnOrder emits,
-// so its trailing entries are the first keys the budget sacrifices — and i
-// lives nowhere but the overlay. The re-measured single-column table (widths
-// 30-64, identical across them): height >= 24 keeps everything, 23 loses
-// `U check updates`, 22 loses `x exec` too, 21 loses `c config` too, 20 loses
-// `i inspect` too, 19 loses `l logs` too.
+// test samples height 24, where the drilled variant's 19 action rows still fit,
+// so appending i last would pass it. INSPECT is the last action group
+// singleColumnOrder emits, so its trailing entries are the first keys the budget
+// sacrifices — and i lives nowhere but the overlay.
+//
+// The thresholds are VARIANT-DEPENDENT and both are pinned. The grouped SELECT
+// group carries two rows the drilled one does not (`← →`, `z`), and
+// singleColumnOrder emits SELECT before INSPECT, so every grouped threshold
+// sits two notches higher. Re-measured single-column tables (widths 30-59,
+// identical across them; the layout goes two-column at 65 drilled / 77 grouped):
+//
+//	drilled: >= 24 keeps everything, 23 loses `U check updates`, 22 loses
+//	         `x exec` too, 21 loses `c config` too, 20 loses `i inspect` too,
+//	         19 loses `l logs` too.
+//	grouped: >= 26 keeps everything, 25 loses `U`, 24 loses `x`, 23 loses `c`,
+//	         22 loses `i`, 21 loses `l`.
 func TestViewHelp_InspectSurvivesTheFirstTruncation(t *testing.T) {
-	for _, w := range []int{30, 40, 50, 59} {
-		// 23 is one below the height that fits every action row, so it is
-		// exactly the first notch where something must go.
-		m := Model{screen: screenSelectContainers, width: w, height: 23, showPicker: true, helpOpen: true}
-		view := ansi.Strip(m.View())
-		if !strings.Contains(view, "inspect") {
-			t.Errorf("width %d: i was the first key sacrificed; move it up inside inspectGroup:\n%s", w, view)
-		}
-	}
-	// The full-fit height, so a future row added to any action group shows up
-	// here as the threshold moving rather than as a silent loss — and i's
-	// POSITION, as an ordering against the key the budget sacrifices first.
-	// Asserting `check updates` is ABSENT at height 23 instead would pin the
-	// whole overlay's first sacrifice, so any future row in any action group
-	// would fail this test with a message about inspect.
-	m := Model{screen: screenSelectContainers, width: 50, height: 24, showPicker: true, helpOpen: true}
-	view := ansi.Strip(m.View())
-	if !strings.Contains(view, "check updates") {
-		t.Fatalf("height 24 no longer fits every action row:\n%s", view)
-	}
-	if at, uAt := strings.Index(view, "inspect"), strings.Index(view, "check updates"); at > uAt {
-		t.Errorf("inspect renders below check updates, so it goes first under the budget:\n%s", view)
+	for _, tc := range []struct {
+		name              string
+		grouped           bool
+		fullFit, firstCut int
+	}{
+		{name: "drilled", fullFit: 24, firstCut: 23},
+		{name: "grouped", grouped: true, fullFit: 26, firstCut: 25},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			for _, w := range []int{30, 40, 50, 59} {
+				// firstCut is one below the height that fits every action row,
+				// so it is exactly the first notch where something must go.
+				m := Model{screen: screenSelectContainers, width: w, height: tc.firstCut,
+					grouped: tc.grouped, drilledFromHost: true, helpOpen: true}
+				view := ansi.Strip(m.View())
+				if !strings.Contains(view, "inspect") {
+					t.Errorf("width %d: i was the first key sacrificed; move it up inside inspectGroup:\n%s", w, view)
+				}
+			}
+			// The full-fit height, so a future row added to any action group
+			// shows up here as the threshold moving rather than as a silent
+			// loss — and i's POSITION, as an ordering against the key the
+			// budget sacrifices first. Asserting `check updates` is ABSENT at
+			// firstCut instead would pin the whole overlay's first sacrifice,
+			// so any future row in any action group would fail this test with
+			// a message about inspect.
+			m := Model{screen: screenSelectContainers, width: 50, height: tc.fullFit,
+				grouped: tc.grouped, drilledFromHost: true, helpOpen: true}
+			view := ansi.Strip(m.View())
+			if !strings.Contains(view, "check updates") {
+				t.Fatalf("height %d no longer fits every action row:\n%s", tc.fullFit, view)
+			}
+			// One below it must lose exactly that key, or the threshold moved
+			// up as well as down and the table above is stale.
+			cut := Model{screen: screenSelectContainers, width: 50, height: tc.firstCut,
+				grouped: tc.grouped, drilledFromHost: true, helpOpen: true}
+			if strings.Contains(ansi.Strip(cut.View()), "check updates") {
+				t.Errorf("height %d still fits every action row; the truncation threshold moved", tc.firstCut)
+			}
+			if at, uAt := strings.Index(view, "inspect"), strings.Index(view, "check updates"); at > uAt {
+				t.Errorf("inspect renders below check updates, so it goes first under the budget:\n%s", view)
+			}
+		})
 	}
 }
 
@@ -775,13 +824,14 @@ func TestSplitHelpGroups_SingleGroup(t *testing.T) {
 // feature, so its tests sit beside the renderer's.
 
 func helpContainerModel() Model {
-	return Model{
+	m := Model{
 		screen:   screenSelectContainers,
-		services: []string{"web", "db"},
-		selected: make(map[int]bool),
+		selected: make(map[string]bool),
 		width:    120,
 		height:   24,
 	}
+	m.setSingleGroup([]string{"web", "db"})
+	return m
 }
 
 func pressKey(m Model, r rune) Model {
@@ -832,7 +882,7 @@ func TestHelpOverlay_CloseKeys(t *testing.T) {
 // does not close on, or a stray d would arm a deploy behind it.
 func TestHelpOverlay_SwallowsActionKeys(t *testing.T) {
 	m := helpContainerModel()
-	m.selected[0] = true
+	m.selected[m.svcKeyAt(0)] = true
 	m.helpOpen = true
 
 	um := pressKey(m, 'd')
@@ -1032,7 +1082,6 @@ func TestTypingInInput(t *testing.T) {
 		{"settings form field 3", Model{screen: screenSettingsForm, settingsField: 3}, true},
 		{"settings form color picker", Model{screen: screenSettingsForm, settingsField: 4}, false},
 		{"server select", Model{screen: screenSelectServer}, false},
-		{"project select", Model{screen: screenSelectProject}, false},
 		{"progress", Model{screen: screenProgress}, false},
 		{"config", Model{screen: screenConfig}, false},
 		{"settings list", Model{screen: screenSettingsList}, false},
@@ -1049,7 +1098,7 @@ func TestTypingInInput(t *testing.T) {
 // --- Task 4: `?` key-reference overlay acceptance pins ------------------
 
 // TestHelpOverlay_OpensFromEveryScreen proves the "? opens the overlay from
-// all 8 screens, and the content matches the screen it was opened from"
+// every screen, and the content matches the screen it was opened from"
 // criterion. TestViewHelp_ReplacesScreen renders viewHelp with the flag
 // pre-set; this one drives the real `?` keypress through Update, so it also
 // covers the intercept reaching every screen.
@@ -1061,7 +1110,6 @@ func TestHelpOverlay_OpensFromEveryScreen(t *testing.T) {
 		notWant string
 	}{
 		{s: screenSelectServer, want: "settings", notWant: "rollback"},
-		{s: screenSelectProject, want: "select", notWant: "settings"},
 		{s: screenSelectContainers, want: "rollback", notWant: "regex mode"},
 		// A bare Model is the RUNNING phase, where esc cancels the operation.
 		// The other two phases are pinned by TestHelpGroups_ProgressPhases.
@@ -1081,7 +1129,7 @@ func TestHelpOverlay_OpensFromEveryScreen(t *testing.T) {
 	}
 
 	for _, tt := range tests {
-		m := Model{screen: tt.s, width: 120, height: 24, selected: map[int]bool{}}
+		m := Model{screen: tt.s, width: 120, height: 24, selected: map[string]bool{}}
 		if tt.setup != nil {
 			tt.setup(&m)
 		}
@@ -1159,7 +1207,7 @@ func TestHelpOverlay_SwallowedAtEveryConfirmPrompt(t *testing.T) {
 
 	for _, tt := range ops {
 		m := helpContainerModel()
-		m.selected[0] = true
+		m.selected[m.svcKeyAt(0)] = true
 		m.confirming = true
 		m.pendingOp = tt.op
 		m.pendingExec = tt.exec
@@ -1223,8 +1271,8 @@ func TestHelpOverlay_OpensOnProgress(t *testing.T) {
 	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
 	installFakeTick(&m)
 	m.screen = screenSelectContainers
-	m.services = mc.services
-	m.selected[0] = true
+	m.setSingleGroup(mc.services)
+	m.selected[m.svcKeyAt(0)] = true
 	m.width, m.height = 120, 24
 
 	m = pressKey(m, 'd')
@@ -1264,8 +1312,8 @@ func TestHelpGroups_ProgressPhases(t *testing.T) {
 	base := func() Model {
 		m := Model{screen: screenProgress, width: 120, height: 24}
 		m.composer = mc
-		m.selected = map[int]bool{}
-		m.services = mc.services
+		m.selected = map[string]bool{}
+		m.setSingleGroup(mc.services)
 		return m
 	}
 
@@ -1333,17 +1381,19 @@ func TestHelpGroups_ProgressPhases(t *testing.T) {
 	// The drift pin unions the tokens over the phases, so a phase that dropped
 	// a key would still look covered. Every phase must name all three.
 	for _, phase := range allProgressPhases {
-		got := map[string]bool{}
-		for _, g := range progressGroups(phase) {
-			for _, e := range g.entries {
-				for _, tok := range strings.Fields(e.keys) {
-					got[tok] = true
+		for _, midSeq := range []bool{false, true} {
+			got := map[string]bool{}
+			for _, g := range progressGroups(phase, midSeq) {
+				for _, e := range g.entries {
+					for _, tok := range strings.Fields(e.keys) {
+						got[tok] = true
+					}
 				}
 			}
-		}
-		for _, want := range []string{"q", "esc", "ctrl+c"} {
-			if !got[want] {
-				t.Errorf("phase %d does not name %q", phase, want)
+			for _, want := range []string{"q", "esc", "ctrl+c"} {
+				if !got[want] {
+					t.Errorf("phase %d (midSequence=%v) does not name %q", phase, midSeq, want)
+				}
 			}
 		}
 	}
@@ -1426,7 +1476,7 @@ func TestProgressPhases_BehaviourMatchesLabels(t *testing.T) {
 		} {
 			m := Model{screen: screenProgress, width: 120, height: 24, done: true}
 			m.composer = mc
-			m.selected = map[int]bool{}
+			m.selected = map[string]bool{}
 			updated, _ := m.handleKey(key)
 			if got := updated.(Model).screen; got != screenSelectContainers {
 				t.Errorf("%v left screen %d, want the container screen", key, got)
@@ -1451,14 +1501,14 @@ func TestHelpOverlay_ClosedByAsyncRollbackConfirm(t *testing.T) {
 	snap := rollbackTestSnapshot()
 	m := Model{
 		screen:               screenSelectContainers,
-		services:             []string{"web", "db"},
-		selected:             map[int]bool{0: true},
 		rollbackTargets:      []string{"web"},
 		rollbackFetchSession: 1,
 		width:                120,
 		height:               24,
 		helpOpen:             true, // ? pressed while the async fetch is running
 	}
+	m.setSingleGroup([]string{"web", "db"})
+	m.selected = selectedIdx(m, 0)
 
 	updated, _ := m.Update(rollbackSnapshotMsg{snap: snap, live: []string{"web", "db"}, session: 1})
 	um := updated.(Model)
@@ -1500,29 +1550,56 @@ func TestHelpOverlay_YieldsToQuitPrompt(t *testing.T) {
 // `d` case. The keys that matter most are the ones that would change m.screen
 // from under the overlay (l/c/x/i), start work (U), open an input (/), or
 // mutate the selection (space/enter/a).
+//
+// The grouped variant carries the fold keys on top. Their dispatch is gated on
+// !m.grouped, so only a grouped model can pin them, and they are exactly the
+// "state changed behind the overlay" this test is about: a fold hides rows AND
+// re-aims the cursor.
 func TestHelpOverlay_SwallowsEveryActionKey(t *testing.T) {
-	containerKeys := []string{"l", "c", "x", "i", "/", "U", "r", "s", "R", "a", " ", "j", "k", "n", "N", "enter"}
-	for _, key := range containerKeys {
-		m := helpContainerModel()
-		m.selected[0] = true
-		m.svcCursor = 1
-		m.helpOpen = true
+	shared := []string{"l", "c", "x", "i", "/", "U", "r", "s", "R", "a", " ", "j", "k", "n", "N", "enter"}
+	for _, tc := range []struct {
+		name  string
+		build func() Model
+		keys  []string
+	}{
+		{name: "drilled", build: helpContainerModel, keys: shared},
+		{
+			name: "grouped",
+			build: func() Model {
+				return groupedScreenModel(svcGroupOf("web", "api", "nginx"), svcGroupOf("db", "postgres"))
+			},
+			keys: append(append([]string{}, shared...), "z", "left", "right"),
+		},
+	} {
+		for _, key := range tc.keys {
+			m := tc.build()
+			// Row 1 is a service under the first group in both fixtures, so
+			// one cursor position and one selection serve both.
+			m.selected[m.svcKeyAt(1)] = true
+			m.svcCursor = 1
+			m.helpOpen = true
+			rows := len(m.svcEntries)
 
-		updated, cmd := m.Update(keyMsgFor(key))
-		um := updated.(Model)
+			updated, cmd := m.Update(keyMsgFor(key))
+			um := updated.(Model)
 
-		if !um.helpOpen {
-			t.Errorf("%q: helpOpen = false, want true (the key must be swallowed, not acted on)", key)
-		}
-		if um.screen != screenSelectContainers {
-			t.Errorf("%q: screen changed to %d behind the overlay", key, um.screen)
-		}
-		if um.confirming || um.searching || um.svcCursor != 1 || len(um.selected) != 1 {
-			t.Errorf("%q: state changed behind the overlay (confirming=%v searching=%v cursor=%d selected=%v)",
-				key, um.confirming, um.searching, um.svcCursor, um.selected)
-		}
-		if cmd != nil {
-			t.Errorf("%q: swallowed key returned a command", key)
+			if !um.helpOpen {
+				t.Errorf("%s %q: helpOpen = false, want true (the key must be swallowed, not acted on)", tc.name, key)
+			}
+			if um.screen != screenSelectContainers {
+				t.Errorf("%s %q: screen changed to %d behind the overlay", tc.name, key, um.screen)
+			}
+			if um.confirming || um.searching || um.svcCursor != 1 || len(um.selected) != 1 {
+				t.Errorf("%s %q: state changed behind the overlay (confirming=%v searching=%v cursor=%d selected=%v)",
+					tc.name, key, um.confirming, um.searching, um.svcCursor, um.selected)
+			}
+			if foldedCount(um) != 0 || len(um.svcEntries) != rows {
+				t.Errorf("%s %q: fold state changed behind the overlay (%d folded, %d rows, want 0/%d)",
+					tc.name, key, foldedCount(um), len(um.svcEntries), rows)
+			}
+			if cmd != nil {
+				t.Errorf("%s %q: swallowed key returned a command", tc.name, key)
+			}
 		}
 	}
 
@@ -1546,13 +1623,24 @@ func TestHelpOverlay_SwallowsEveryActionKey(t *testing.T) {
 	}
 }
 
-// keyMsgFor builds the tea.KeyMsg for a handleKey key string.
+// keyMsgFor builds the tea.KeyMsg for a handleKey key string. It is the
+// package's ONE key-construction table: a named key missing a case here still
+// stringifies back to its own name as a run of runes, so the dispatch matches
+// and the test passes against a fake the terminal can never produce.
 func keyMsgFor(key string) tea.KeyMsg {
 	switch key {
 	case "enter":
 		return tea.KeyMsg{Type: tea.KeyEnter}
 	case " ":
 		return tea.KeyMsg{Type: tea.KeySpace}
+	case "up":
+		return tea.KeyMsg{Type: tea.KeyUp}
+	case "down":
+		return tea.KeyMsg{Type: tea.KeyDown}
+	case "left":
+		return tea.KeyMsg{Type: tea.KeyLeft}
+	case "right":
+		return tea.KeyMsg{Type: tea.KeyRight}
 	}
 	return tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune(key)}
 }
@@ -1568,7 +1656,7 @@ func TestHelpGroups_EscClearsQueryBeforeBack(t *testing.T) {
 	t.Run("containers", func(t *testing.T) {
 		for _, key := range []string{"q", "esc"} {
 			m := helpContainerModel()
-			m.showPicker = true
+			m.drilledFromHost = true
 			m = pressKey(m, '/')
 			for _, r := range "web" {
 				m = pressKey(m, r)
@@ -1597,8 +1685,9 @@ func TestHelpGroups_EscClearsQueryBeforeBack(t *testing.T) {
 				t.Errorf("%q: screen = %d, want the container screen (the first press only clears)", key, um.screen)
 			}
 			updated, _ = um.Update(keyMsgFor(key))
-			if got := updated.(Model).screen; got != screenSelectProject {
-				t.Errorf("%q: second press left screen %d, want the project screen", key, got)
+			if got := updated.(Model); got.screen != screenSelectContainers || !got.grouped {
+				t.Errorf("%q: second press left screen %d grouped %v, want the grouped host view",
+					key, got.screen, got.grouped)
 			}
 		}
 	})
@@ -1640,4 +1729,247 @@ func TestHelpGroups_EscClearsQueryBeforeBack(t *testing.T) {
 			}
 		}
 	})
+}
+
+// TestHelpGroups_GroupedSelectNamesFold pins the one description that varies by
+// mode. space carries two meanings on the grouped host view — fold a group
+// header, select a service row — and a key bound in a sub-state must name that
+// state. The drilled screen has no header row, so its description must NOT
+// mention folding.
+func TestHelpGroups_GroupedSelectNamesFold(t *testing.T) {
+	selectDesc := func(grouped bool) string {
+		t.Helper()
+		for _, g := range helpGroupsFor(screenSelectContainers, helpContext{canGoBack: true, grouped: grouped}) {
+			if g.title != "SELECT" {
+				continue
+			}
+			for _, e := range g.entries {
+				if e.keys == "space" {
+					return e.desc
+				}
+			}
+		}
+		t.Fatalf("grouped=%v: no space entry in the SELECT group", grouped)
+		return ""
+	}
+
+	got := selectDesc(true)
+	for _, want := range []string{"service", "fold"} {
+		if !strings.Contains(got, want) {
+			t.Errorf("grouped space desc = %q, want it to name %q", got, want)
+		}
+	}
+	if drilled := selectDesc(false); strings.Contains(drilled, "fold") {
+		t.Errorf("drilled space desc = %q, want no mention of folding (no header rows exist there)", drilled)
+	}
+}
+
+// The grouped variant must name every key the writable table names — that half
+// rides the drift pin already checked against handleKey — plus exactly the fold
+// keys the grouped host view binds and the drilled screen does not. Those three
+// are the one hand-maintained list here; both directions run against it, so a
+// grouped-only key added to the table without a binding (or bound without a
+// row) still fails.
+func TestHelpGroups_GroupedNamesTheSameKeys(t *testing.T) {
+	groupedOnly := map[string]bool{"z": true, "left": true, "right": true}
+	for _, canGoBack := range []bool{true, false} {
+		drilled := helpKeyTokensCtx(screenSelectContainers, helpContext{canGoBack: canGoBack})
+		grouped := helpKeyTokensCtx(screenSelectContainers, helpContext{canGoBack: canGoBack, grouped: true})
+		for k := range drilled {
+			if !grouped[k] {
+				t.Errorf("canGoBack=%v: grouped table drops bound key %q", canGoBack, k)
+			}
+		}
+		for k := range grouped {
+			if !drilled[k] && !groupedOnly[k] {
+				t.Errorf("canGoBack=%v: grouped table names %q, which the screen does not bind", canGoBack, k)
+			}
+		}
+		for k := range groupedOnly {
+			if !grouped[k] {
+				t.Errorf("canGoBack=%v: grouped table drops grouped-only key %q", canGoBack, k)
+			}
+			if drilled[k] {
+				t.Errorf("canGoBack=%v: drilled table names grouped-only key %q", canGoBack, k)
+			}
+		}
+	}
+}
+
+// Group ORDER is load-bearing: splitHelpGroups cuts sequentially, so LEAVE must
+// stay 4th of 6 in BOTH container variants.
+func TestHelpGroups_GroupedKeepsGroupOrder(t *testing.T) {
+	want := []string{"MOVE", "FIND", "SELECT", "LEAVE", "OPERATE", "INSPECT"}
+	for _, grouped := range []bool{false, true} {
+		groups := helpGroupsFor(screenSelectContainers, helpContext{canGoBack: true, grouped: grouped})
+		if len(groups) != len(want) {
+			t.Fatalf("grouped=%v: %d groups, want %d", grouped, len(groups), len(want))
+		}
+		for i, g := range groups {
+			if g.title != want[i] {
+				t.Errorf("grouped=%v: group %d is %q, want %q", grouped, i, g.title, want[i])
+			}
+		}
+	}
+}
+
+// enter carries two meanings on the container screen — confirm a prompt, and
+// drill into a project — and one key must not occupy two rows of one table. So
+// the GROUPED table folds both onto one SELECT row and OPERATE drops its own,
+// the way inspectGroup's read-only enter already folds them. The drilled table
+// has no drill-in at all, so there OPERATE keeps the only enter row.
+func TestHelpGroups_GroupedNamesDrillIn(t *testing.T) {
+	enterDesc := func(grouped bool, title string) (string, bool) {
+		for _, g := range helpGroupsFor(screenSelectContainers, helpContext{canGoBack: true, grouped: grouped}) {
+			if g.title != title {
+				continue
+			}
+			for _, e := range g.entries {
+				if e.keys == "enter" {
+					return e.desc, true
+				}
+			}
+		}
+		return "", false
+	}
+
+	desc, ok := enterDesc(true, "SELECT")
+	if !ok {
+		t.Fatal("grouped SELECT must name enter as the drill-in key")
+	}
+	// enter answers on EVERY grouped row — a header and a service row name the
+	// same project — so the description must not restrict itself to a row kind.
+	// It must also still name the confirmation, which is the meaning OPERATE
+	// gave up.
+	for _, want := range []string{"drill", "project", "confirm"} {
+		if !strings.Contains(desc, want) {
+			t.Errorf("grouped enter desc = %q, want it to name %q", desc, want)
+		}
+	}
+	if strings.Contains(desc, "header") {
+		t.Errorf("grouped enter desc = %q, want no header-only restriction (a service row drills too)", desc)
+	}
+	if _, ok := enterDesc(false, "SELECT"); ok {
+		t.Error("the drilled table must not name a drill-in: it has no group headers")
+	}
+
+	if _, ok := enterDesc(true, "OPERATE"); ok {
+		t.Error("grouped OPERATE must not name enter: SELECT already carries both meanings")
+	}
+	if desc, ok := enterDesc(false, "OPERATE"); !ok {
+		t.Error("the drilled table's OPERATE must name enter as the confirmation key")
+	} else if !strings.Contains(desc, "confirm") {
+		t.Errorf("drilled OPERATE enter desc = %q, want it to name the confirmation", desc)
+	}
+}
+
+// TestHelpGroups_ContainerNoKeyIsNamedTwice is the general form of the rule
+// above: a reader scanning one rendered container table for a key must find
+// exactly one row for it, or the two descriptions read as a contradiction. It
+// runs all four variants (writable / read-only × grouped / drilled), so a
+// future key folded into a second group fails here rather than only in the
+// overlay a user happens to open.
+//
+// Scoped to the container screen on purpose, and esc is the one exemption:
+// the two-stage esc ladder is a real pair of meanings the reader needs both
+// halves of — `esc  clear an active search` in FIND takes the first press and
+// `q esc  back` in LEAVE the next. screenLogs carries the same pair.
+func TestHelpGroups_ContainerNoKeyIsNamedTwice(t *testing.T) {
+	const ladderKey = "esc" // the documented two-stage esc; see findGroup
+	for _, canGoBack := range []bool{true, false} {
+		for _, readOnly := range []bool{true, false} {
+			for _, grouped := range []bool{true, false} {
+				hc := helpContext{canGoBack: canGoBack, readOnly: readOnly, grouped: grouped}
+				seen := map[string]string{}
+				for _, g := range helpGroupsFor(screenSelectContainers, hc) {
+					for _, e := range g.entries {
+						for _, tok := range strings.Fields(e.keys) {
+							if tok == ladderKey {
+								continue
+							}
+							if prev, dup := seen[tok]; dup {
+								t.Errorf("%+v: key %q named in both %q and %q", hc, tok, prev, g.title)
+								continue
+							}
+							seen[tok] = g.title
+						}
+					}
+				}
+			}
+		}
+	}
+}
+
+// TestHelpGroups_ReadOnlyGroupedNamesTheDrill pins the one key the read-only
+// table used to mis-describe. enter is NOT gated on readOnly, so on a grouped
+// host whose only group is the unmanaged bucket it really does drill into that
+// group — while the table, which drops SELECT whole, named it as the exec
+// prompt's confirmation and nothing else.
+func TestHelpGroups_ReadOnlyGroupedNamesTheDrill(t *testing.T) {
+	find := func(groups []helpGroup, key string) (string, bool) {
+		for _, g := range groups {
+			for _, e := range g.entries {
+				for _, tok := range strings.Fields(e.keys) {
+					if tok == key {
+						return e.desc, true
+					}
+				}
+			}
+		}
+		return "", false
+	}
+
+	grouped, ok := find(readOnlyContainerGroups(true, true), "enter")
+	if !ok {
+		t.Fatal("the read-only grouped table does not name enter at all")
+	}
+	if !strings.Contains(grouped, "drill") {
+		t.Errorf("read-only grouped enter reads %q; it must name the drill it performs", grouped)
+	}
+	if !strings.Contains(grouped, "exec prompt") {
+		t.Errorf("read-only grouped enter reads %q; the x prompt still binds it too", grouped)
+	}
+
+	// The DRILLED read-only screen has no group to drill into, so it keeps the
+	// single meaning.
+	drilled, ok := find(readOnlyContainerGroups(true, false), "enter")
+	if !ok {
+		t.Fatal("the read-only drilled table does not name enter at all")
+	}
+	if strings.Contains(drilled, "drill") {
+		t.Errorf("read-only drilled enter reads %q; there is no group to drill into there", drilled)
+	}
+}
+
+// TestHelpGroups_ProgressWaitingMidSequence pins the overlay half of the
+// esc/enter split at the health gate. With a batch still to come the two keys
+// have OPPOSITE consequences — enter starts the next project's pipeline, esc
+// stops the sequence — so one row reading "skip health wait" under-described a
+// destructive action.
+func TestHelpGroups_ProgressWaitingMidSequence(t *testing.T) {
+	descs := func(midSequence bool) string {
+		var b strings.Builder
+		for _, g := range progressGroups(progressWaiting, midSequence) {
+			for _, e := range g.entries {
+				b.WriteString(e.keys + " => " + e.desc + "\n")
+			}
+		}
+		return b.String()
+	}
+
+	mid := descs(true)
+	if !strings.Contains(mid, "enter => skip health wait, start the next project") {
+		t.Errorf("the mid-sequence table must name what enter starts, got:\n%s", mid)
+	}
+	if !strings.Contains(mid, "q esc => stop, skip the projects left") {
+		t.Errorf("the mid-sequence table must name esc as a stop, got:\n%s", mid)
+	}
+
+	last := descs(false)
+	if !strings.Contains(last, "enter q esc => skip health wait") {
+		t.Errorf("with nothing left to release the three keys share one row, got:\n%s", last)
+	}
+	if strings.Contains(last, "stop") {
+		t.Errorf("the last batch's gate must not promise a choice, got:\n%s", last)
+	}
 }

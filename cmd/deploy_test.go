@@ -1488,3 +1488,36 @@ func TestRunOperation_LocalDetectFailure(t *testing.T) {
 		t.Errorf("error = %q, want it to contain 'neither'", err.Error())
 	}
 }
+
+// --project-name must reach the composer on every branch. Without it the CLI
+// kept addressing the directory's default project while the TUI addressed the
+// row's real name, so a TUI deploy and a CLI rollback of the "same" project
+// touched different containers and different snapshot files.
+func TestRunOperation_ProjectNameReachesTheComposer(t *testing.T) {
+	oldServer, oldSSH, oldProj, oldName := serverName, sshTarget, projectDir, projectName
+	oldNewLocal, oldLogDir := opNewLocal, logDir
+	t.Cleanup(func() {
+		serverName, sshTarget, projectDir, projectName = oldServer, oldSSH, oldProj, oldName
+		opNewLocal, logDir = oldNewLocal, oldLogDir
+	})
+
+	serverName, sshTarget = "", ""
+	projectDir, projectName = t.TempDir(), "blue"
+	logDir = t.TempDir()
+
+	// The named project must be one docker reports: --project-name selects an
+	// existing project, and an unknown one is refused rather than run against
+	// an auto-discovered compose file.
+	var built *compose.Compose
+	opNewLocal = hookedLocalFactory(lsPayloadFor("blue", projectDir), &built)
+
+	if err := runOperation(context.Background(), runner.StopOnly, true, nil); err != nil {
+		t.Fatalf("runOperation: %v", err)
+	}
+	if built == nil {
+		t.Fatal("the local composer was never built")
+	}
+	if built.ProjectName != "blue" {
+		t.Errorf("ProjectName = %q, want blue", built.ProjectName)
+	}
+}

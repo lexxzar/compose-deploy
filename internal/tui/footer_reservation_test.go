@@ -8,6 +8,8 @@ import (
 	"github.com/charmbracelet/bubbles/textinput"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/x/ansi"
+	"github.com/lexxzar/compose-deploy/internal/compose"
+	"github.com/lexxzar/compose-deploy/internal/config"
 )
 
 // TestContainerFooterReservation is a regression pin for the container-list
@@ -38,19 +40,32 @@ func TestContainerFooterReservation(t *testing.T) {
 	newModel := func(width int) Model {
 		m := Model{}
 		m.screen = screenSelectContainers
-		m.services = svcs
-		m.selected = map[int]bool{}
+		m.setSingleGroup(svcs)
+		m.selected = map[string]bool{}
 		m.height = 24
 		m.width = width
-		m.showPicker = true
+		m.drilledFromHost = true
 		return m
 	}
 
+	// Count rendered rows by LINE SHAPE — never by "is this name anywhere in
+	// the output". A committed search puts the cursor's match into
+	// searchBarLine as "↳ <name>", so a name-presence count would count a row
+	// that is scrolled out of the window, which is exactly the off-by-one this
+	// whole sweep exists to catch. A data row carries the status dot and a
+	// service name; a group header carries the dot but a project name, and the
+	// fold marker rules it out.
 	countServiceRows := func(out string) int {
 		n := 0
-		for _, s := range svcs {
-			if strings.Contains(out, s) {
-				n++
+		for _, l := range strings.Split(ansi.Strip(out), "\n") {
+			if !strings.Contains(l, "●") || strings.Contains(l, "▼") || strings.Contains(l, "▶") {
+				continue
+			}
+			for _, s := range svcs {
+				if strings.Contains(l, s) {
+					n++
+					break
+				}
 			}
 		}
 		return n
@@ -66,7 +81,7 @@ func TestContainerFooterReservation(t *testing.T) {
 	commitSearch := func(m *Model) {
 		m.searchInput = textinput.New()
 		m.searchQuery = "svc1"
-		m.searchMatches = computeMatches(m.services, "svc1")
+		m.searchMatches = computeMatches(m.svcEntries, "svc1")
 		m.svcCursor = m.searchMatches[0]
 	}
 	typeSearch := func(m *Model) {
@@ -81,12 +96,12 @@ func TestContainerFooterReservation(t *testing.T) {
 		{"committed", commitSearch},
 		{"confirming", func(m *Model) {
 			m.confirming = true
-			m.selected = map[int]bool{0: true}
+			m.selected = selectedIdx(*m, 0)
 		}},
 		{"confirming+committed", func(m *Model) {
 			commitSearch(m)
 			m.confirming = true
-			m.selected = map[int]bool{0: true}
+			m.selected = selectedIdx(*m, 0)
 		}},
 	}
 	// A read-only composer reaches the confirm prompt only through the x exec
@@ -209,12 +224,12 @@ func TestContainerView_ExcessLineWidthIsPaddingOnly(t *testing.T) {
 			m.searchInput.Focus()
 			m.searching = true
 			m.searchQuery = "svc1"
-			m.searchMatches = computeMatches(m.services, "svc1")
+			m.searchMatches = computeMatches(m.svcEntries, "svc1")
 			m.svcCursor = m.searchMatches[0]
 		}},
 		{"committed", func(m *Model) {
 			m.searchQuery = "svc1"
-			m.searchMatches = computeMatches(m.services, "svc1")
+			m.searchMatches = computeMatches(m.svcEntries, "svc1")
 			m.svcCursor = m.searchMatches[0]
 		}},
 	}
@@ -228,11 +243,11 @@ func TestContainerView_ExcessLineWidthIsPaddingOnly(t *testing.T) {
 			for _, st := range states {
 				m := Model{}
 				m.screen = screenSelectContainers
-				m.services = svcs
-				m.selected = map[int]bool{}
+				m.setSingleGroup(svcs)
+				m.selected = map[string]bool{}
 				m.height = 24
 				m.width = width
-				m.showPicker = true
+				m.drilledFromHost = true
 				m.searchInput = textinput.New()
 				if readOnly {
 					m.composer = &readOnlyMockComposer{}
@@ -282,11 +297,11 @@ func TestSearchBarLineNeverWraps(t *testing.T) {
 	build := func(width int) Model {
 		m := Model{}
 		m.screen = screenSelectContainers
-		m.services = longNames
-		m.selected = map[int]bool{}
+		m.setSingleGroup(longNames)
+		m.selected = map[string]bool{}
 		m.height = 24
 		m.width = width
-		m.showPicker = true
+		m.drilledFromHost = true
 		m.searchInput = textinput.New()
 		return m
 	}
@@ -302,16 +317,16 @@ func TestSearchBarLineNeverWraps(t *testing.T) {
 			m.searchInput.Focus()
 			m.searching = true
 			m.searchQuery = longQuery
-			m.searchMatches = computeMatches(m.services, longQuery)
+			m.searchMatches = computeMatches(m.svcEntries, longQuery)
 		}},
 		{"committed-on-long-match", func(m *Model) {
 			m.searchQuery = "extremely-long-service"
-			m.searchMatches = computeMatches(m.services, "extremely-long-service")
+			m.searchMatches = computeMatches(m.svcEntries, "extremely-long-service")
 			m.svcCursor = m.searchMatches[0]
 		}},
 		{"committed-off-match", func(m *Model) {
 			m.searchQuery = "extremely-long-service"
-			m.searchMatches = computeMatches(m.services, "extremely-long-service")
+			m.searchMatches = computeMatches(m.svcEntries, "extremely-long-service")
 			m.svcCursor = 2 // "api" is not a match → off-match committed form
 		}},
 		{"typing-no-match", func(m *Model) {
@@ -323,7 +338,7 @@ func TestSearchBarLineNeverWraps(t *testing.T) {
 			m.searchInput.Focus()
 			m.searching = true
 			m.searchQuery = "zzz-no-such-service"
-			m.searchMatches = computeMatches(m.services, "zzz-no-such-service")
+			m.searchMatches = computeMatches(m.svcEntries, "zzz-no-such-service")
 		}},
 	}
 
@@ -366,8 +381,8 @@ func TestSearchInputWidthPersists(t *testing.T) {
 	base := func() Model {
 		m := Model{}
 		m.screen = screenSelectContainers
-		m.services = []string{"web-frontend", "api", "postgres"}
-		m.selected = map[int]bool{}
+		m.setSingleGroup([]string{"web-frontend", "api", "postgres"})
+		m.selected = map[string]bool{}
 		m.height = 24
 		m.width = 80
 		return m
@@ -423,8 +438,8 @@ func TestSearchInputWidthStableAcrossCounterChange(t *testing.T) {
 	base := func() Model {
 		m := Model{}
 		m.screen = screenSelectContainers
-		m.services = []string{"web", "api", "worker"} // 3 services → stable max counter
-		m.selected = map[int]bool{}
+		m.setSingleGroup([]string{"web", "api", "worker"}) // 3 services → stable max counter
+		m.selected = map[string]bool{}
 		m.height = 24
 		m.width = 22 // narrow: budget arithmetic is load-bearing
 		return m
@@ -485,8 +500,8 @@ func TestSearchInputWidthStableAcrossCounterChange(t *testing.T) {
 func TestSearchInputWidthTracksResize(t *testing.T) {
 	m := Model{}
 	m.screen = screenSelectContainers
-	m.services = []string{"web-frontend", "api", "postgres"}
-	m.selected = map[int]bool{}
+	m.setSingleGroup([]string{"web-frontend", "api", "postgres"})
+	m.selected = map[string]bool{}
 	m.height = 24
 	m.width = 100
 
@@ -529,12 +544,12 @@ var containerFooterSearchStates = []struct {
 		m.searchInput.Focus()
 		m.searching = true
 		m.searchQuery = "web"
-		m.searchMatches = computeMatches(m.services, "web")
+		m.searchMatches = computeMatches(m.svcEntries, "web")
 	}},
 	{"committed", func(m *Model) {
 		m.searchInput = textinput.New()
 		m.searchQuery = "web"
-		m.searchMatches = computeMatches(m.services, "web")
+		m.searchMatches = computeMatches(m.svcEntries, "web")
 	}},
 }
 
@@ -543,9 +558,9 @@ var containerFooterSearchStates = []struct {
 func containerFooterModel(picker bool) Model {
 	m := Model{}
 	m.screen = screenSelectContainers
-	m.services = []string{"web", "db"}
-	m.selected = map[int]bool{}
-	m.showPicker = picker
+	m.setSingleGroup([]string{"web", "db"})
+	m.selected = map[string]bool{}
+	m.drilledFromHost = picker
 	m.width, m.height = 80, 24
 	return m
 }
@@ -606,7 +621,7 @@ func TestContainerFooter_AdvertisesOnlyWorkingKeys(t *testing.T) {
 				}
 				for _, tok := range toks {
 					if !strings.Contains(out, tok) {
-						t.Errorf("readOnly=%v showPicker=%v state=%s: footer missing %q; got:\n%s",
+						t.Errorf("readOnly=%v drilledFromHost=%v state=%s: footer missing %q; got:\n%s",
 							readOnly, picker, st.name, tok, out)
 					}
 				}
@@ -616,7 +631,7 @@ func TestContainerFooter_AdvertisesOnlyWorkingKeys(t *testing.T) {
 				}
 				for _, tok := range bad {
 					if strings.Contains(out, tok) {
-						t.Errorf("readOnly=%v showPicker=%v state=%s: footer advertises %q, which does nothing here; got:\n%s",
+						t.Errorf("readOnly=%v drilledFromHost=%v state=%s: footer advertises %q, which does nothing here; got:\n%s",
 							readOnly, picker, st.name, tok, out)
 					}
 				}
@@ -665,16 +680,16 @@ func TestContainerFooter_RendersOneLineAtEighty(t *testing.T) {
 					}
 					found = true
 					if !strings.Contains(line, end.probe) {
-						t.Errorf("readOnly=%v showPicker=%v state=%s: footer split into two lines at width 80 (%q missing from the %q line): %q",
+						t.Errorf("readOnly=%v drilledFromHost=%v state=%s: footer split into two lines at width 80 (%q missing from the %q line): %q",
 							readOnly, picker, st.name, end.probe, end.anchor, line)
 					}
 					if w := ansi.StringWidth(line); w > 80 {
-						t.Errorf("readOnly=%v showPicker=%v state=%s: footer line is %d cells, exceeds width 80: %q",
+						t.Errorf("readOnly=%v drilledFromHost=%v state=%s: footer line is %d cells, exceeds width 80: %q",
 							readOnly, picker, st.name, w, line)
 					}
 				}
 				if !found {
-					t.Errorf("readOnly=%v showPicker=%v state=%s: no footer line contains %q",
+					t.Errorf("readOnly=%v drilledFromHost=%v state=%s: no footer line contains %q",
 						readOnly, picker, st.name, end.anchor)
 				}
 			}
@@ -692,7 +707,7 @@ const oldContainerHelpLine2 = "  r restart  •  d deploy  •  s stop  •  R r
 // is 3 bytes but one display cell, so len() over-counted 2 per separator).
 func oldContainerFooterLines(m Model) int {
 	back := "q quit"
-	if m.showPicker {
+	if m.drilledFromHost {
 		back = "q back"
 	}
 	line1 := fmt.Sprintf("  space toggle  •  a all  •  / search  •  %s", back)
@@ -731,11 +746,11 @@ func TestSvcVisibleCount_GainsRowVersusOldFooter(t *testing.T) {
 	build := func(width int, picker bool) Model {
 		m := Model{}
 		m.screen = screenSelectContainers
-		m.services = svcs
-		m.selected = map[int]bool{}
+		m.setSingleGroup(svcs)
+		m.selected = map[string]bool{}
 		m.height = 24
 		m.width = width
-		m.showPicker = picker
+		m.drilledFromHost = picker
 		return m
 	}
 
@@ -760,7 +775,7 @@ func TestSvcVisibleCount_GainsRowVersusOldFooter(t *testing.T) {
 			old := m.height - headerLines - oldContainerFooterLines(m)
 			got := m.svcVisibleCount()
 			if got != old+tc.gain {
-				t.Errorf("width=%d showPicker=%v: svcVisibleCount()=%d, old build=%d, want a gain of %d",
+				t.Errorf("width=%d drilledFromHost=%v: svcVisibleCount()=%d, old build=%d, want a gain of %d",
 					tc.width, picker, got, old, tc.gain)
 			}
 		}
@@ -808,7 +823,7 @@ func TestContainerFooter_NeverExceedsWidth(t *testing.T) {
 				m := Model{}
 				m.screen = screenSelectContainers
 				m.width = width
-				m.showPicker = true
+				m.drilledFromHost = true
 				if readOnly {
 					m.composer = &readOnlyMockComposer{}
 				}
@@ -821,6 +836,132 @@ func TestContainerFooter_NeverExceedsWidth(t *testing.T) {
 							readOnly, width, st.name, i, w, visible)
 					}
 				}
+			}
+		}
+	}
+}
+
+// TestContainerFooterReservation_Grouped sweeps the same two invariants over
+// the third footer variant, the grouped host view. It needs its own sweep for
+// the reason the read-only sweep does: containerHelpLines returns a different
+// pair, so the one-line/two-line threshold sits at a different width — and the
+// grouped screen adds rows the drilled one has not (group headers), which the
+// reservation counts like any other row.
+func TestContainerFooterReservation_Grouped(t *testing.T) {
+	const perGroup = 12
+	groupNames := []string{"web", "db", "(unmanaged)"}
+	var svcs []string
+	groups := make([]svcGroup, 0, len(groupNames))
+	for gi, gname := range groupNames {
+		names := make([]string, perGroup)
+		for i := range names {
+			names[i] = fmt.Sprintf("%s-svc%02d", gname, i)
+		}
+		svcs = append(svcs, names...)
+		groups = append(groups, svcGroup{
+			proj:     compose.Project{Name: gname, Unmanaged: gi == len(groupNames)-1},
+			services: names,
+		})
+	}
+
+	newModel := func(width int) Model {
+		m := Model{}
+		m.screen = screenSelectContainers
+		m.grouped = true
+		m.selected = map[string]bool{}
+		m.svcGroups = append([]svcGroup(nil), groups...)
+		m.svcEntries = rebuildSvcEntries(m.svcGroups)
+		m.height = 24
+		m.width = width
+		m.servers = []config.Server{{Name: "prod", Host: "prod.example"}}
+		return m
+	}
+
+	// Count rendered rows by LINE SHAPE — never by "is this name anywhere in
+	// the output". A committed search puts the cursor's match into
+	// searchBarLine as "↳ <name>", so a name-presence count would count a row
+	// that is scrolled out of the window, which is exactly the off-by-one this
+	// whole sweep exists to catch. A data row carries the status dot and a
+	// service name; a group header carries the dot but a project name, and the
+	// fold marker rules it out.
+	countServiceRows := func(out string) int {
+		n := 0
+		for _, l := range strings.Split(ansi.Strip(out), "\n") {
+			if !strings.Contains(l, "●") || strings.Contains(l, "▼") || strings.Contains(l, "▶") {
+				continue
+			}
+			for _, s := range svcs {
+				if strings.Contains(l, s) {
+					n++
+					break
+				}
+			}
+		}
+		return n
+	}
+	countHeaderRows := func(out string) int {
+		n := 0
+		for _, l := range strings.Split(ansi.Strip(out), "\n") {
+			if strings.HasPrefix(l, "  ▼ ") || strings.HasPrefix(l, "> ▼ ") ||
+				strings.HasPrefix(l, "  ▶ ") || strings.HasPrefix(l, "> ▶ ") {
+				n++
+			}
+		}
+		return n
+	}
+	physLines := func(out string) int {
+		return strings.Count(strings.TrimRight(out, "\n"), "\n") + 1
+	}
+
+	commitSearch := func(m *Model) {
+		m.searchInput = textinput.New()
+		m.searchQuery = "svc1"
+		m.searchMatches = computeMatches(m.svcEntries, m.searchQuery)
+		m.svcCursor = m.searchMatches[0]
+	}
+	states := []struct {
+		name  string
+		setup func(m *Model)
+	}{
+		{"idle", func(m *Model) {}},
+		{"folded", func(m *Model) {
+			m.svcGroups[1].folded = true
+			m.svcEntries = rebuildSvcEntries(m.svcGroups)
+		}},
+		{"searching", func(m *Model) {
+			commitSearch(m)
+			m.searchInput.SetValue("svc1")
+			m.searchInput.Focus()
+			m.searching = true
+		}},
+		{"committed", commitSearch},
+		{"confirming", func(m *Model) {
+			m.confirming = true
+			m.selected = map[string]bool{svcKey("web", "web-svc00"): true}
+		}},
+	}
+
+	for width := 40; width <= 180; width++ {
+		var firstPhys int
+		for i, st := range states {
+			m := newModel(width)
+			st.setup(&m)
+			want := m.svcVisibleCount()
+			out := m.viewSelectContainers()
+			rows := countServiceRows(out) + countHeaderRows(out)
+			phys := physLines(out)
+
+			if rows != want {
+				t.Errorf("width=%d state=%s: rendered %d rows, svcVisibleCount()=%d (headers are rows too)",
+					width, st.name, rows, want)
+			}
+			if i == 0 {
+				firstPhys = phys
+				continue
+			}
+			if phys != firstPhys {
+				t.Errorf("width=%d state=%s: physical line count %d differs from idle %d",
+					width, st.name, phys, firstPhys)
 			}
 		}
 	}

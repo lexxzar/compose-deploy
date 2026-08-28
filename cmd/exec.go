@@ -72,14 +72,14 @@ func runExec(ctx context.Context, service string, command []string) error {
 	var c execCommander
 	switch {
 	case sshTarget != "":
-		rc, cleanup, err := resolveSSHRemote(ctx, sshTarget, projectDir, identityFile, execNewRemote)
+		rc, cleanup, err := resolveSSHRemote(ctx, sshTarget, projectDir, projectName, identityFile, execNewRemote)
 		if err != nil {
 			return err
 		}
 		defer cleanup()
 		c = rc
 	case serverName != "":
-		rc, cleanup, err := resolveServerRemote(ctx, serverName, projectDir, execNewRemote)
+		rc, cleanup, err := resolveServerRemote(ctx, serverName, projectDir, projectName, execNewRemote)
 		if err != nil {
 			return err
 		}
@@ -98,7 +98,7 @@ func runExec(ctx context.Context, service string, command []string) error {
 			return fmt.Errorf("no compose file found in %s (use -s to specify a remote server)", dir)
 		}
 		lc := execNewLocal(dir)
-		if err := lc.Detect(ctx); err != nil {
+		if err := prepareLocalComposer(ctx, lc, projectName); err != nil {
 			return err
 		}
 		c = lc

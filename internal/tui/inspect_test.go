@@ -1450,7 +1450,7 @@ func TestInspectUpdateInfo_FromCache(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			m := Model{
 				inspectService: tt.service,
-				updateCache:    map[string]updateEntry{"|": tt.entry},
+				updateCache:    map[string]updateEntry{"\x00|": tt.entry},
 			}
 			got := m.currentUpdateInfo()
 
