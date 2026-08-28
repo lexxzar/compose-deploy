@@ -2548,6 +2548,18 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 				m.svcCursor++
 			}
 			m.fixSvcOffset()
+		case "pgup", "pgdown":
+			// The step is the WHOLE visible window, so a pgdown from the top
+			// of it lands one row past the bottom edge and fixSvcOffset
+			// scrolls the window by one.
+			page := m.svcVisibleCount()
+			if key == "pgup" {
+				m.svcCursor -= page
+			} else {
+				m.svcCursor += page
+			}
+			m.clampSvcCursor()
+			m.fixSvcOffset()
 		case " ":
 			// Multi-select exists only to feed d/r/s/R. On a read-only composer
 			// those are gated, so toggling would arm nothing — and the row

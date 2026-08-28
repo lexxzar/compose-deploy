@@ -1388,6 +1388,105 @@ func pressGroupKey(m Model, key string) Model {
 	return updated.(Model)
 }
 
+// TestGroupedPageKeys_PageOverHeaderRows pins pgup/pgdown in the host view: a
+// page is svcVisibleCount() ROWS, so a group header counts exactly like a
+// service, and the keys are gated on neither grouped nor readOnly.
+func TestGroupedPageKeys_PageOverHeaderRows(t *testing.T) {
+	m := groupedScreenModel(svcGroupOf("web", "api", "cache", "nginx"), svcGroupOf("db", "postgres", "redis"))
+	m.height = 9 // 3 header lines + 3 footer lines, so one page is 3 rows
+	if got, rows := m.svcVisibleCount(), len(m.svcEntries); got != 3 || rows != 7 {
+		t.Fatalf("fixture: svcVisibleCount() = %d, rows = %d, want 3 and 7", got, rows)
+	}
+
+	for _, want := range []int{3, 6, 6} {
+		m = pressGroupKey(m, "pgdown")
+		if m.svcCursor != want {
+			t.Fatalf("pgdown: svcCursor = %d, want %d", m.svcCursor, want)
+		}
+		assertCursorVisible(t, m)
+	}
+	for _, want := range []int{3, 0, 0} {
+		m = pressGroupKey(m, "pgup")
+		if m.svcCursor != want {
+			t.Fatalf("pgup: svcCursor = %d, want %d", m.svcCursor, want)
+		}
+		assertCursorVisible(t, m)
+	}
+}
+
+// TestGroupedPageKeys_FollowTheFoldedRowCount pins that paging reads the ROWS
+// on screen: a folded group contributes one header and no services, so the
+// clamp lands on the smaller list rather than on a row the fold removed.
+func TestGroupedPageKeys_FollowTheFoldedRowCount(t *testing.T) {
+	m := groupedScreenModel(svcGroupOf("web", "api", "cache", "nginx"), svcGroupOf("db", "postgres", "redis"))
+	m.height = 9
+
+	m = pressGroupKey(m, "left") // fold web from its own header
+	if !m.svcGroups[0].folded || len(m.svcEntries) != 4 {
+		t.Fatalf("fold left %d rows (folded=%v), want 4", len(m.svcEntries), m.svcGroups[0].folded)
+	}
+
+	m = pressGroupKey(m, "pgdown")
+	if m.svcCursor != 3 {
+		t.Errorf("pgdown after the fold: svcCursor = %d, want 3 (the last remaining row)", m.svcCursor)
+	}
+	assertCursorVisible(t, m)
+
+	m = pressGroupKey(m, "pgdown")
+	if m.svcCursor != 3 {
+		t.Errorf("pgdown at the bottom: svcCursor = %d, want 3", m.svcCursor)
+	}
+}
+
+// TestGroupedPageKeys_ReadOnlyHostPagesByItsOwnFooter is the one place the two
+// dimensions the page keys sit on are NOT independent. The dispatch gates them
+// on neither grouped nor readOnly, so the key itself needs no combined test —
+// but the STEP is svcVisibleCount(), which reserves rows from
+// containerFooterLines(), which picks its line count from the read-only pair
+// (`q back • ? keys` / `l logs • x exec`, one line from width 43) or the
+// grouped writable one (six longer tokens, one line only from width 89). At
+// width 50 those disagree, so an unmanaged-only host pages one row further than
+// a single-project host of exactly the same shape.
+//
+// Both fixtures are reachable: a host running exactly one compose project, and
+// a host running nothing but unlabelled containers. They carry the same rows so
+// the footer variant is the only variable, and grouped readOnly() reads the
+// GROUP LIST rather than the composer — hence the Unmanaged flip.
+func TestGroupedPageKeys_ReadOnlyHostPagesByItsOwnFooter(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		unmanaged  bool
+		footerRows int
+		want       int
+	}{
+		{name: "single writable project wraps the footer", footerRows: 2, want: 3},
+		{name: "unmanaged-only host keeps it on one line", unmanaged: true, footerRows: 1, want: 4},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			g := svcGroupOf("web", "api", "cache", "nginx", "redis", "queue")
+			g.proj.Unmanaged = tc.unmanaged
+			m := groupedScreenModel(g)
+			m.width, m.height = 50, 10
+
+			if m.readOnly() != tc.unmanaged {
+				t.Fatalf("fixture: readOnly() = %v, want %v", m.readOnly(), tc.unmanaged)
+			}
+			if got := m.containerFooterLines(); got != tc.footerRows {
+				t.Fatalf("fixture: containerFooterLines() = %d, want %d", got, tc.footerRows)
+			}
+			if got := m.svcVisibleCount(); got != tc.want {
+				t.Fatalf("fixture: svcVisibleCount() = %d, want %d", got, tc.want)
+			}
+
+			m = pressGroupKey(m, "pgdown")
+			if m.svcCursor != tc.want {
+				t.Errorf("pgdown moved %d rows, want %d — the page must follow the footer variant", m.svcCursor, tc.want)
+			}
+			assertCursorVisible(t, m)
+		})
+	}
+}
+
 // TestGroupedSpace_OnHeaderFoldsAndUnfolds pins space's first meaning: on a
 // group header it folds, which hides ROWS and nothing else — the selection the
 // group carried survives, because svcRefs ignores fold state.

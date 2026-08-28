@@ -3,6 +3,7 @@ package tui
 import (
 	"errors"
 	"io"
+	"slices"
 	"strings"
 	"testing"
 
@@ -141,7 +142,8 @@ func TestHelpGroups_NamesEveryBoundKey(t *testing.T) {
 		// below), so the grouped-only fold keys — z, ← and → — are not in
 		// this set; TestHelpGroups_GroupedNamesTheSameKeys pins those.
 		screenSelectContainers: {
-			"q", "ctrl+c", "esc", "enter", "up", "k", "down", "j", " ", "a",
+			"q", "ctrl+c", "esc", "enter", "up", "k", "down", "j",
+			"pgup", "pgdown", " ", "a",
 			"r", "d", "s", "R", "n", "N", "/", "l", "c", "x", "U", "i",
 		},
 		// enter is bound only in the waiting sub-state, where it releases the
@@ -210,7 +212,7 @@ func TestHelpGroups_NamesEveryBoundKey(t *testing.T) {
 // named by BOTH variants and appears in both bound sets.
 func TestHelpGroups_ReadOnlyNamesEveryBoundKey(t *testing.T) {
 	bound := []string{
-		"q", "ctrl+c", "esc", "enter", "up", "k", "down", "j",
+		"q", "ctrl+c", "esc", "enter", "up", "k", "down", "j", "pgup", "pgdown",
 		"n", "N", "/", "l", "x", "U", "i",
 	}
 	boundSet := map[string]bool{}
@@ -485,7 +487,10 @@ func TestViewHelp_ReadOnlyNeverExceedsBudget(t *testing.T) {
 	// writable table needs singleColumnOrder for.
 	for _, w := range []int{30, 40, 50, 59} {
 		view := ansi.Strip(readOnlyOverlayModel(w, 24).View())
-		for _, want := range []string{"search", "next / prev match", "logs", "exec", "check updates"} {
+		// Half description for the same reason as
+		// TestViewHelp_NarrowTerminalKeepsActionKeys: `pgup pgdown` widens the
+		// key column, so width 30 clamps the value.
+		for _, want := range []string{"search", "next / prev", "logs", "exec", "check updates"} {
 			if !strings.Contains(view, want) {
 				t.Errorf("width %d: truncated read-only overlay dropped %q:\n%s", w, want, view)
 			}
@@ -696,12 +701,18 @@ func TestViewHelp_NarrowTerminalKeepsActionKeys(t *testing.T) {
 	// drops either. `all` and `search` were the round-4 gap: the footer trim
 	// removed `a all` and `/ search` from line1 while SELECT and the search keys
 	// were still unflagged, so both fell off the bottom of a 50-column pane.
+	//
+	// `next / prev` is deliberately the half description: `pgup pgdown` is the
+	// widest key in the table, and helpRows aligns every description on the
+	// widest key across ALL groups, so at width 30 the value column is 13
+	// cells and clampToWidth cuts `next / prev match` short. The row is what
+	// this pin is about, and the row is still there.
 	want := []string{
-		"all", "search", "next / prev match",
+		"all", "search", "next / prev",
 		"rollback", "config", "exec", "check updates", "inspect",
 		"deploy", "restart", "stop", "logs",
 	}
-	// Below 65 columns the overlay stacks to one column, which is where the
+	// Below 70 columns the overlay stacks to one column, which is where the
 	// budget bites; 24 is the classic short terminal. Drilled variant only —
 	// the grouped table carries two more action rows, so every threshold there
 	// sits two notches higher (TestViewHelp_InspectSurvivesTheFirstTruncation
@@ -728,7 +739,9 @@ func TestViewHelp_NarrowTerminalKeepsActionKeys(t *testing.T) {
 // group carries two rows the drilled one does not (`← →`, `z`), and
 // singleColumnOrder emits SELECT before INSPECT, so every grouped threshold
 // sits two notches higher. Re-measured single-column tables (widths 30-59,
-// identical across them; the layout goes two-column at 65 drilled / 77 grouped):
+// identical across them; the layout goes two-column at 70 drilled / 87 grouped
+// — `pgup pgdown` widened the left column by 5 cells, see
+// TestViewHelp_KeyColumnClampsOnlyTheNarrowestPane):
 //
 //	drilled: >= 24 keeps everything, 23 loses `U check updates`, 22 loses
 //	         `x exec` too, 21 loses `c config` too, 20 loses `i inspect` too,
@@ -782,6 +795,236 @@ func TestViewHelp_InspectSurvivesTheFirstTruncation(t *testing.T) {
 	}
 }
 
+// TestViewHelp_KeyColumnClampsOnlyTheNarrowestPane pins the width consequence
+// `pgup pgdown` brought in, and is the other half of a trade two older pins
+// made. helpRows aligns every description on the widest key across ALL the
+// groups it renders, so an 11-cell key label pushed the value column 5 cells
+// right; at width 30 the single-column row spends 4 on the indent, 11 on the
+// key and 2 on the gap, leaving 13 for the description, and `next / prev match`
+// (17 cells) is cut. TestViewHelp_NarrowTerminalKeepsActionKeys and
+// TestViewHelp_ReadOnlyNeverExceedsBudget therefore assert the half string —
+// at EVERY width they sample, 30 included, which is the strength this test
+// gives back: after that edit, shortening the description itself to `next /
+// prev` passes both of them and nothing else in the suite notices. The 40-59
+// loop below is the only assertion that does.
+//
+// The widest-key assertion is the early-warning half. `check updates` is
+// exactly 13 cells, so one more cell of key column cuts it and
+// TestViewHelp_ReadOnlyNeverExceedsBudget fails with a misleading "dropped
+// check updates" — a truncation report for what is really a column-width
+// change. Failing here first names the real cause.
+func TestViewHelp_KeyColumnClampsOnlyTheNarrowestPane(t *testing.T) {
+	const widestKey = "pgup pgdown"
+	for _, hc := range []helpContext{
+		{canGoBack: true},
+		{canGoBack: true, grouped: true},
+		{canGoBack: true, readOnly: true},
+		{canGoBack: true, readOnly: true, grouped: true},
+	} {
+		widest, keyw := "", 0
+		for _, g := range helpGroupsFor(screenSelectContainers, hc) {
+			for _, e := range g.entries {
+				if w := ansi.StringWidth(e.keys); w > keyw {
+					widest, keyw = e.keys, w
+				}
+			}
+		}
+		if widest != widestKey {
+			t.Errorf("readOnly=%v grouped=%v: the widest key is %q (%d cells), want %q (%d) — the description budget moved, so re-measure the want lists in TestViewHelp_NarrowTerminalKeepsActionKeys and TestViewHelp_ReadOnlyNeverExceedsBudget",
+				hc.readOnly, hc.grouped, widest, keyw, widestKey, ansi.StringWidth(widestKey))
+		}
+	}
+
+	for _, tc := range []struct {
+		name string
+		view func(width int) string
+	}{
+		{"writable", func(width int) string {
+			m := Model{screen: screenSelectContainers, width: width, height: 24,
+				drilledFromHost: true, helpOpen: true}
+			return ansi.Strip(m.View())
+		}},
+		{"read-only", func(width int) string { return ansi.Strip(readOnlyOverlayModel(width, 24).View()) }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			narrow := tc.view(30)
+			// Clamped, not dropped: the ROW is what the two pins above are
+			// about, and it must still be on screen.
+			if !strings.Contains(narrow, "next / prev") {
+				t.Errorf("width 30 lost the FIND row entirely:\n%s", narrow)
+			}
+			if strings.Contains(narrow, "next / prev match") {
+				t.Errorf("width 30 no longer clamps the description — the key column narrowed, so TestViewHelp_NarrowTerminalKeepsActionKeys and TestViewHelp_ReadOnlyNeverExceedsBudget can go back to the full string:\n%s", narrow)
+			}
+			for _, w := range []int{40, 50, 59} {
+				if view := tc.view(w); !strings.Contains(view, "next / prev match") {
+					t.Errorf("width %d lost the FULL description; it was shortened, or the key column grew past %d cells:\n%s",
+						w, ansi.StringWidth(widestKey), view)
+				}
+			}
+		})
+	}
+}
+
+// helpGroupTitles lists the titles of a group slice, so a test names the
+// screen's declared groups rather than a hand-maintained copy of them.
+func helpGroupTitles(groups []helpGroup) []string {
+	titles := make([]string, 0, len(groups))
+	for _, g := range groups {
+		titles = append(titles, g.title)
+	}
+	return titles
+}
+
+func hasHelpGroup(groups []helpGroup, title string) bool {
+	return slices.Contains(helpGroupTitles(groups), title)
+}
+
+// helpRendersTwoColumns answers whether a rendered overlay is two-up. Two group
+// titles on ONE physical line is what that looks like: lipgloss.JoinHorizontal
+// pairs left row i with right row i, and row 0 of each column is its first
+// group's title, so the pairing survives the height budget.
+//
+// The titles come from the groups the SCREEN declares, never a list kept here:
+// a renamed or added group would leave a hand-maintained copy silently blind,
+// and this helper decides the two-column thresholds the overlay is pinned on.
+func helpRendersTwoColumns(view string, groups []helpGroup) bool {
+	titles := helpGroupTitles(groups)
+	for _, line := range strings.Split(view, "\n") {
+		n := 0
+		for _, title := range titles {
+			if strings.Contains(line, title) {
+				n++
+			}
+		}
+		if n >= 2 {
+			return true
+		}
+	}
+	return false
+}
+
+// TestViewHelp_TwoColumnThresholdPerVariant pins the width at which each
+// container table stops stacking, for ALL FOUR variants — the blindness that
+// let `pgup pgdown` move the grouped threshold from 77 to 87 unnoticed.
+// TestSplitHelpGroups_Balances and TestViewHelp_NarrowTerminalKeepsActionKeys
+// both sample the drilled table only, and the drilled threshold moved by the
+// same 5 cells without costing anything: at 80 columns it is still two-column.
+//
+// **The grouped gap at 77-86 columns is ACCEPTED, not a bug.** `pgup pgdown`
+// is the widest key label in the table, so every description shifted 5 cells
+// right and the two-column block outgrew 80 columns. Below 87 the grouped
+// table stacks to 28 rows, a 24-line pane keeps 19, and singleColumnOrder
+// emits the 21 action rows first — so the last two, `x exec` and `U check
+// updates`, fall off, and the overlay is their only home (the grouped footer
+// is already at its six tokens). They come back at width >= 87, or at height
+// >= 26 on a narrow pane. The alternative was shortening a description or a
+// key label to buy the cells back; that was weighed and refused, so this test
+// records the choice instead of leaving it to be rediscovered.
+func TestViewHelp_TwoColumnThresholdPerVariant(t *testing.T) {
+	for _, tc := range []struct {
+		name              string
+		model             func(w, h int) Model
+		readOnly, grouped bool
+		threshold         int
+		// Whether `x exec` and `U check updates` fall off an 80x24 pane.
+		dropsAtEighty bool
+	}{
+		{
+			name: "drilled",
+			model: func(w, h int) Model {
+				return Model{screen: screenSelectContainers, width: w, height: h,
+					drilledFromHost: true, helpOpen: true}
+			},
+			threshold: 70,
+		},
+		{
+			name: "grouped",
+			model: func(w, h int) Model {
+				return Model{screen: screenSelectContainers, width: w, height: h,
+					grouped: true, drilledFromHost: true, helpOpen: true}
+			},
+			grouped:       true,
+			threshold:     87,
+			dropsAtEighty: true,
+		},
+		{
+			name:      "read-only drilled",
+			model:     readOnlyOverlayModel,
+			readOnly:  true,
+			threshold: 75,
+		},
+		{
+			// setSingleGroup stamps proj.Unmanaged from readOnly(), which the
+			// read-only composer already answers true, so flipping grouped
+			// leaves allGroupsUnmanaged() true — an unmanaged-only host.
+			name: "read-only grouped",
+			model: func(w, h int) Model {
+				m := readOnlyOverlayModel(w, h)
+				m.grouped = true
+				return m
+			},
+			readOnly:  true,
+			grouped:   true,
+			threshold: 100,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			m := tc.model(80, 24)
+			if m.readOnly() != tc.readOnly || m.grouped != tc.grouped {
+				t.Fatalf("fixture: readOnly() = %v, grouped = %v, want %v/%v",
+					m.readOnly(), m.grouped, tc.readOnly, tc.grouped)
+			}
+
+			// The FIRST width that renders two columns is the threshold, so
+			// this fails whichever way it moves.
+			got := 0
+			for w := 20; w <= 200; w++ {
+				probe := tc.model(w, 24)
+				if helpRendersTwoColumns(ansi.Strip(probe.View()), probe.helpGroups()) {
+					got = w
+					break
+				}
+			}
+			if got != tc.threshold {
+				t.Errorf("two-column threshold is %d, want %d — a key label or a description changed width:\n%s",
+					got, tc.threshold, ansi.Strip(tc.model(tc.threshold, 24).View()))
+			}
+			// Wider must stay two-column: the fallback is a floor, not a band.
+			for _, w := range []int{tc.threshold + 10, 200} {
+				wide := tc.model(w, 24)
+				if !helpRendersTwoColumns(ansi.Strip(wide.View()), wide.helpGroups()) {
+					t.Errorf("width %d stacked to one column", w)
+				}
+			}
+
+			view := ansi.Strip(tc.model(80, 24).View())
+			for _, key := range []string{"exec", "check updates"} {
+				switch shown := strings.Contains(view, key); {
+				case tc.dropsAtEighty && shown:
+					t.Errorf("80x24 renders %q again — the accepted gap closed, so re-measure it here and in helpRows:\n%s", key, view)
+				case !tc.dropsAtEighty && !shown:
+					t.Errorf("80x24 lost %q; the overlay is its only home:\n%s", key, view)
+				}
+			}
+			if !tc.dropsAtEighty {
+				return
+			}
+			// Both ways back out of the gap.
+			for _, tv := range []struct {
+				w, h int
+			}{{tc.threshold, 24}, {80, 26}} {
+				back := ansi.Strip(tc.model(tv.w, tv.h).View())
+				for _, key := range []string{"exec", "check updates"} {
+					if !strings.Contains(back, key) {
+						t.Errorf("%dx%d should bring %q back:\n%s", tv.w, tv.h, key, back)
+					}
+				}
+			}
+		})
+	}
+}
+
 func TestLayoutHelpColumns_Empty(t *testing.T) {
 	if got := layoutHelpColumns(nil, 80); got != nil {
 		t.Errorf("layoutHelpColumns(nil) = %v, want nil", got)
@@ -793,20 +1036,57 @@ func TestLayoutHelpColumns_Empty(t *testing.T) {
 // trailing separator that helpColumnRows only emits between groups, so the two
 // disagree by one per column and only the rendered count decides the overlay's
 // height.
+//
+// BOTH container variants run: the grouped table carries three SELECT rows the
+// drilled one does not, and covering the drilled context alone hid a 19/12
+// split there — a 7-row imbalance this test's own limit would have failed.
+//
+// leaveLeft pins WHICH column LEAVE lands in, which the totals and the balance
+// limit above cannot see. helpGroupsFor's group-order comment used to promise
+// the left one unconditionally; the third grouped SELECT row moved the cut, so
+// the promise now holds for the drilled table only and the split reads
+// MOVE FIND SELECT | LEAVE OPERATE INSPECT there. That is recorded rather than
+// corrected, so a future row that moves the cut again fails here instead of
+// silently re-laying-out the overlay.
 func TestSplitHelpGroups_Balances(t *testing.T) {
-	left, right := splitHelpGroups(helpGroupsFor(screenSelectContainers, helpContext{canGoBack: true}))
-	if len(left) == 0 || len(right) == 0 {
-		t.Fatalf("container groups should split into two columns, got %d/%d", len(left), len(right))
-	}
-	lh, rh := len(helpColumnRows(left)), len(helpColumnRows(right))
-	if lh < rh {
-		t.Errorf("left column (%d lines) should not be shorter than right (%d)", lh, rh)
-	}
-	// The container table renders as 28 rows over 6 groups once split (the two
-	// columns each drop their own trailing separator); the split may not leave
-	// one column more than a group's worth (5 rows) taller than the other.
-	if lh-rh > 5 {
-		t.Errorf("columns are unbalanced: left %d rendered rows, right %d", lh, rh)
+	for _, tc := range []struct {
+		name string
+		hc   helpContext
+		// Rendered rows once split: the two columns each drop their own
+		// trailing separator, so the total sits one under helpRows(_, true).
+		total int
+		// Whether the LEAVE group renders in the LEFT column.
+		leaveLeft bool
+	}{
+		{name: "drilled", hc: helpContext{canGoBack: true}, total: 30, leaveLeft: true},
+		{name: "grouped", hc: helpContext{canGoBack: true, grouped: true}, total: 32},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			left, right := splitHelpGroups(helpGroupsFor(screenSelectContainers, tc.hc))
+			if len(left) == 0 || len(right) == 0 {
+				t.Fatalf("container groups should split into two columns, got %d/%d", len(left), len(right))
+			}
+			if got := hasHelpGroup(left, "LEAVE"); got != tc.leaveLeft {
+				t.Errorf("LEAVE in the left column = %v, want %v — the cut moved, so re-measure the split in helpGroupsFor's group-order comment: left %v, right %v",
+					got, tc.leaveLeft, helpGroupTitles(left), helpGroupTitles(right))
+			}
+			if hasHelpGroup(right, "LEAVE") == tc.leaveLeft {
+				t.Errorf("LEAVE renders in both columns or in neither: left %v, right %v",
+					helpGroupTitles(left), helpGroupTitles(right))
+			}
+			lh, rh := len(helpColumnRows(left)), len(helpColumnRows(right))
+			if lh+rh != tc.total {
+				t.Errorf("split renders %d rows (%d/%d), want %d", lh+rh, lh, rh, tc.total)
+			}
+			if lh < rh {
+				t.Errorf("left column (%d lines) should not be shorter than right (%d)", lh, rh)
+			}
+			// The split may not leave one column more than a group's worth
+			// (5 rows) taller than the other.
+			if lh-rh > 5 {
+				t.Errorf("columns are unbalanced: left %d rendered rows, right %d", lh, rh)
+			}
+		})
 	}
 }
 
@@ -1556,7 +1836,8 @@ func TestHelpOverlay_YieldsToQuitPrompt(t *testing.T) {
 // "state changed behind the overlay" this test is about: a fold hides rows AND
 // re-aims the cursor.
 func TestHelpOverlay_SwallowsEveryActionKey(t *testing.T) {
-	shared := []string{"l", "c", "x", "i", "/", "U", "r", "s", "R", "a", " ", "j", "k", "n", "N", "enter"}
+	shared := []string{"l", "c", "x", "i", "/", "U", "r", "s", "R", "a", " ", "j", "k",
+		"pgup", "pgdown", "n", "N", "enter"}
 	for _, tc := range []struct {
 		name  string
 		build func() Model
@@ -1641,6 +1922,10 @@ func keyMsgFor(key string) tea.KeyMsg {
 		return tea.KeyMsg{Type: tea.KeyLeft}
 	case "right":
 		return tea.KeyMsg{Type: tea.KeyRight}
+	case "pgup":
+		return tea.KeyMsg{Type: tea.KeyPgUp}
+	case "pgdown":
+		return tea.KeyMsg{Type: tea.KeyPgDown}
 	}
 	return tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune(key)}
 }
