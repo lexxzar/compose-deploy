@@ -222,6 +222,14 @@ const warnRollbackCrossProject = "Rollback covers one project at a time"
 // the disagreement, so the refusal names retrying rather than a dead end.
 const warnNoComposeDir = "No compose directory for this project yet — try again after the next refresh"
 
+// warnAllSelectableFolded answers `a` when every selectable service sits inside
+// a folded group. The grouped view lands folded, so scoping select-all to the
+// unfolded groups makes the key inert there; going silent would only move the
+// original invisible-selection surprise one keystroke along, so the refusal
+// names the way out. It stays quiet when nothing is selectable at all — a
+// loading or empty host has no fold to blame.
+const warnAllSelectableFolded = "No service is visible — unfold a group to select one"
+
 // serverEntryKind distinguishes selectable items from visual group headers.
 type serverEntryKind int
 
@@ -2628,11 +2636,22 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 				m.fixSvcOffset()
 				return m, nil
 			}
+			// Fold-aware: `a` ticks what the user can SEE. A folded group's
+			// services keep whatever the user set before it closed — folding
+			// hides rows, never state — so a selection made earlier still
+			// reaches selectedContainers() and the batch it names.
 			allSel := m.allSelected()
-			m.eachSelectableRef(func(r svcRef) bool {
+			touched := false
+			m.eachUnfoldedSelectableRef(func(r svcRef) bool {
+				touched = true
 				m.selected[r.key] = !allSel
 				return true
 			})
+			if !touched && m.selectableCount() > 0 {
+				m.warning = warnAllSelectableFolded
+				m.fixSvcOffset()
+				return m, nil
+			}
 		case "r":
 			if m.readOnly() {
 				m.fixSvcOffset()
@@ -5738,9 +5757,13 @@ func (m Model) loadServices() tea.Cmd {
 	}
 }
 
+// allSelected is the toggle DIRECTION for `a`, so it reads the same fold-aware
+// walk that key writes. Measured host-wide it inverts wrongly: a service still
+// selected inside a folded group would report "all selected" and turn the next
+// `a` into a clear of the visible rows the user was aiming to tick.
 func (m Model) allSelected() bool {
 	any, all := false, true
-	m.eachSelectableRef(func(r svcRef) bool {
+	m.eachUnfoldedSelectableRef(func(r svcRef) bool {
 		any = true
 		if !m.selected[r.key] {
 			all = false

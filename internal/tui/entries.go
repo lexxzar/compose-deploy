@@ -242,6 +242,25 @@ func (m Model) eachSelectableRef(fn func(svcRef) bool) {
 	})
 }
 
+// eachUnfoldedSelectableRef is eachSelectableRef minus the services a FOLD
+// hides. The grouped host view LANDS folded, so a host-wide `a` ticked every
+// service on the box while the only thing that moved on screen was one digit of
+// the title counter — a folded header renders byte-identically either way.
+//
+// Exactly two callers: the `a` handler and allSelected(), which is the toggle
+// direction for that same key. selectedContainers() and the counters stay
+// host-wide on purpose — scoping them would drop a service the user genuinely
+// selected before folding its group, so the operation would touch fewer
+// services than the confirmation prompt just named.
+func (m Model) eachUnfoldedSelectableRef(fn func(svcRef) bool) {
+	m.eachSelectableRef(func(r svcRef) bool {
+		if m.svcGroups[r.groupIdx].folded {
+			return true
+		}
+		return fn(r)
+	})
+}
+
 // svcRefs is eachSvcRef WITH the slice, for the render pass.
 func (m Model) svcRefs() []svcRef {
 	var refs []svcRef

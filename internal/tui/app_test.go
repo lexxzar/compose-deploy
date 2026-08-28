@@ -407,6 +407,43 @@ func TestSelectContainers_SelectAll(t *testing.T) {
 	}
 }
 
+// `a` is fold-aware on the grouped host view, and the drilled screen must be
+// byte-identical anyway: the fold keys are gated on m.grouped, so nothing here
+// can hide a row from select-all.
+func TestSelectContainers_SelectAllDrilledIgnoresTheFoldRule(t *testing.T) {
+	m := singleGroupModel([]string{"nginx", "postgres", "redis"})
+	m.screen = screenSelectContainers
+	m.width, m.height = 100, 30
+
+	for _, key := range []string{"left", "z"} {
+		m = pressGroupKey(m, key)
+		if m.svcGroups[0].folded {
+			t.Fatalf("%q folded the drilled group", key)
+		}
+	}
+
+	m = pressGroupKey(m, "a")
+
+	if got := m.selectedCount(); got != 3 {
+		t.Errorf("selectedCount = %d, want 3: %v", got, m.selected)
+	}
+	if !m.allSelected() {
+		t.Error("allSelected = false after `a` on the drilled screen")
+	}
+	if m.warning != "" {
+		t.Errorf("warning = %q, want none on the drilled screen", m.warning)
+	}
+
+	m = pressGroupKey(m, "a")
+
+	if got := m.selectedCount(); got != 0 {
+		t.Errorf("a second `a` left %d selected: %v", got, m.selected)
+	}
+	if m.warning != "" {
+		t.Errorf("warning = %q, want none after the second `a`", m.warning)
+	}
+}
+
 func TestSelectContainers_EnterIgnoredWhenNotConfirming(t *testing.T) {
 	mc := &mockComposer{services: []string{"nginx"}}
 	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
