@@ -479,10 +479,13 @@ func helpStackedRows(groups []helpGroup) []string {
 // in. separate adds a blank line BETWEEN groups — the two-column layout keeps
 // it, the single-column fallback drops it because that is where the height
 // budget bites. Those five blanks are the drilled container table's
-// 30-versus-25 rows, and 25 is what makes its 19 action rows fit the 19 a
-// 24-line pane keeps. The grouped variant runs 32/27 with 21 action rows, so
-// the two rows past that budget (x, U) fall off a narrow 24-line pane. Every
-// other row-count claim in this file refers back to those numbers.
+// 31-versus-26 rows, and 26 is what makes its 19 action rows fit the 19 a
+// 24-line pane keeps. The grouped variant runs 33/28 with 21 action rows, so
+// the two rows past that budget (x, U) fall off a 24-line pane at any width
+// below its two-column threshold — 87 columns since `pgup pgdown` joined MOVE,
+// so 80x24 is now one of them. That is accepted and pinned by
+// TestViewHelp_TwoColumnThresholdPerVariant. Every other row-count claim in
+// this file refers back to those numbers.
 func helpRows(groups []helpGroup, separate bool) []string {
 	keyw := 0
 	for _, g := range groups {

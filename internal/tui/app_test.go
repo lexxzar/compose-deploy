@@ -6352,8 +6352,8 @@ func TestPageKeys_MoveAFullPageAndClamp(t *testing.T) {
 }
 
 // TestPageKeys_EmptyListStaysInRange pins the degenerate case svcVisibleCount
-// answers 0 for: with no rows the page size floors at 1, and the cursor must
-// still land inside svcEntries rather than at -1.
+// answers 0 for: the step moves nothing, and clampSvcCursor holds the cursor at
+// 0 rather than letting it sit at -1 on a list with no rows.
 func TestPageKeys_EmptyListStaysInRange(t *testing.T) {
 	m := pageKeyModel(t, nil)
 	if len(m.svcEntries) != 0 {
@@ -6394,23 +6394,57 @@ func TestPageKeys_WorkOnTheReadOnlyScreen(t *testing.T) {
 // typing search bar (every key is the query's), an armed confirmation (enter
 // re-resolves its batch from the cursor) and the error screen that hides the
 // rows.
+//
+// The cursor starts on row 4 of ten, so one page (3 rows) in either direction
+// stays inside the list: a step that ran would land on 1 or 7 and be seen.
 func TestPageKeys_InertWhereTheOtherMovementKeysAre(t *testing.T) {
+	const start = 4
 	for _, tc := range []struct {
-		name string
-		arm  func(*Model)
+		name  string
+		arm   func(*Model)
+		check func(*testing.T, Model)
 	}{
-		{name: "searching", arm: func(m *Model) { m.searching = true; m.searchInput = textinput.New() }},
+		{
+			// The search intercept re-aims the cursor at the FIRST match on
+			// every keystroke, so the query names row 4 and the fixture starts
+			// there — an empty query would make the cursor unmovable for a
+			// second reason and pass this whether the keys were routed or not.
+			name: "searching",
+			arm: func(m *Model) {
+				m.searching = true
+				m.searchInput = textinput.New()
+				m.searchInput.SetValue("e")
+				m.searchQuery = "e"
+				m.searchMatches = computeMatches(m.svcEntries, "e")
+			},
+			check: func(t *testing.T, m Model) {
+				if m.searchQuery != "e" || m.searchInput.Value() != "e" {
+					t.Errorf("the key reached the query: %q / %q, want %q both",
+						m.searchQuery, m.searchInput.Value(), "e")
+				}
+				if len(m.searchMatches) != 1 || m.searchMatches[0] != start {
+					t.Errorf("searchMatches = %v, want [%d]", m.searchMatches, start)
+				}
+			},
+		},
 		{name: "confirming", arm: func(m *Model) { m.confirming = true; m.pendingOp = runner.Deploy }},
 		{name: "svcErr", arm: func(m *Model) { m.svcErr = errors.New("docker is unreachable") }},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			for _, key := range []string{"pgdown", "pgup"} {
-				m := pageKeyModel(t, []string{"a", "b", "c", "d", "e", "f"})
-				m.svcCursor = 1
+				m := pageKeyModel(t, []string{"a", "b", "c", "d", "e", "f", "g", "h", "i", "j"})
+				m.svcCursor = start
 				tc.arm(&m)
+				if got := m.svcVisibleCount(); got != 3 {
+					t.Fatalf("fixture: svcVisibleCount() = %d, want 3", got)
+				}
 
-				if got := pressGroupKey(m, key); got.svcCursor != 1 {
+				got := pressGroupKey(m, key)
+				if got.svcCursor != start {
 					t.Errorf("%s moved the cursor to %d", key, got.svcCursor)
+				}
+				if tc.check != nil {
+					tc.check(t, got)
 				}
 			}
 		})

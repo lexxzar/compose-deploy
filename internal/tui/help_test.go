@@ -868,6 +868,146 @@ func TestViewHelp_KeyColumnClampsOnlyTheNarrowestPane(t *testing.T) {
 	}
 }
 
+// helpOverlayTitles are every group title the container tables use. Two of
+// them on ONE physical line is what a two-column render looks like:
+// lipgloss.JoinHorizontal pairs left row i with right row i, and row 0 of each
+// column is its first group's title, so the pairing survives the height budget.
+var helpOverlayTitles = []string{"MOVE", "FIND", "SELECT", "OPERATE", "INSPECT", "LEAVE"}
+
+func helpRendersTwoColumns(view string) bool {
+	for _, line := range strings.Split(view, "\n") {
+		n := 0
+		for _, title := range helpOverlayTitles {
+			if strings.Contains(line, title) {
+				n++
+			}
+		}
+		if n >= 2 {
+			return true
+		}
+	}
+	return false
+}
+
+// TestViewHelp_TwoColumnThresholdPerVariant pins the width at which each
+// container table stops stacking, for ALL FOUR variants — the blindness that
+// let `pgup pgdown` move the grouped threshold from 77 to 87 unnoticed.
+// TestSplitHelpGroups_Balances and TestViewHelp_NarrowTerminalKeepsActionKeys
+// both sample the drilled table only, and the drilled threshold moved by the
+// same 5 cells without costing anything: at 80 columns it is still two-column.
+//
+// **The grouped gap at 77-86 columns is ACCEPTED, not a bug.** `pgup pgdown`
+// is the widest key label in the table, so every description shifted 5 cells
+// right and the two-column block outgrew 80 columns. Below 87 the grouped
+// table stacks to 28 rows, a 24-line pane keeps 19, and singleColumnOrder
+// emits the 21 action rows first — so the last two, `x exec` and `U check
+// updates`, fall off, and the overlay is their only home (the grouped footer
+// is already at its six tokens). They come back at width >= 87, or at height
+// >= 26 on a narrow pane. The alternative was shortening a description or a
+// key label to buy the cells back; that was weighed and refused, so this test
+// records the choice instead of leaving it to be rediscovered.
+func TestViewHelp_TwoColumnThresholdPerVariant(t *testing.T) {
+	for _, tc := range []struct {
+		name              string
+		model             func(w, h int) Model
+		readOnly, grouped bool
+		threshold         int
+		// Whether `x exec` and `U check updates` fall off an 80x24 pane.
+		dropsAtEighty bool
+	}{
+		{
+			name: "drilled",
+			model: func(w, h int) Model {
+				return Model{screen: screenSelectContainers, width: w, height: h,
+					drilledFromHost: true, helpOpen: true}
+			},
+			threshold: 70,
+		},
+		{
+			name: "grouped",
+			model: func(w, h int) Model {
+				return Model{screen: screenSelectContainers, width: w, height: h,
+					grouped: true, drilledFromHost: true, helpOpen: true}
+			},
+			grouped:       true,
+			threshold:     87,
+			dropsAtEighty: true,
+		},
+		{
+			name:      "read-only drilled",
+			model:     readOnlyOverlayModel,
+			readOnly:  true,
+			threshold: 75,
+		},
+		{
+			// setSingleGroup stamps proj.Unmanaged from readOnly(), which the
+			// read-only composer already answers true, so flipping grouped
+			// leaves allGroupsUnmanaged() true — an unmanaged-only host.
+			name: "read-only grouped",
+			model: func(w, h int) Model {
+				m := readOnlyOverlayModel(w, h)
+				m.grouped = true
+				return m
+			},
+			readOnly:  true,
+			grouped:   true,
+			threshold: 100,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			m := tc.model(80, 24)
+			if m.readOnly() != tc.readOnly || m.grouped != tc.grouped {
+				t.Fatalf("fixture: readOnly() = %v, grouped = %v, want %v/%v",
+					m.readOnly(), m.grouped, tc.readOnly, tc.grouped)
+			}
+
+			// The FIRST width that renders two columns is the threshold, so
+			// this fails whichever way it moves.
+			got := 0
+			for w := 20; w <= 200; w++ {
+				if helpRendersTwoColumns(ansi.Strip(tc.model(w, 24).View())) {
+					got = w
+					break
+				}
+			}
+			if got != tc.threshold {
+				t.Errorf("two-column threshold is %d, want %d — a key label or a description changed width:\n%s",
+					got, tc.threshold, ansi.Strip(tc.model(tc.threshold, 24).View()))
+			}
+			// Wider must stay two-column: the fallback is a floor, not a band.
+			for _, w := range []int{tc.threshold + 10, 200} {
+				if !helpRendersTwoColumns(ansi.Strip(tc.model(w, 24).View())) {
+					t.Errorf("width %d stacked to one column", w)
+				}
+			}
+
+			view := ansi.Strip(tc.model(80, 24).View())
+			for _, key := range []string{"exec", "check updates"} {
+				switch shown := strings.Contains(view, key); {
+				case tc.dropsAtEighty && shown:
+					t.Errorf("80x24 renders %q again — the accepted gap closed, so re-measure it here and in helpRows:\n%s", key, view)
+				case !tc.dropsAtEighty && !shown:
+					t.Errorf("80x24 lost %q; the overlay is its only home:\n%s", key, view)
+				}
+			}
+			if !tc.dropsAtEighty {
+				return
+			}
+			// Both ways back out of the gap.
+			for _, tv := range []struct {
+				w, h int
+			}{{tc.threshold, 24}, {80, 26}} {
+				back := ansi.Strip(tc.model(tv.w, tv.h).View())
+				for _, key := range []string{"exec", "check updates"} {
+					if !strings.Contains(back, key) {
+						t.Errorf("%dx%d should bring %q back:\n%s", tv.w, tv.h, key, back)
+					}
+				}
+			}
+		})
+	}
+}
+
 func TestLayoutHelpColumns_Empty(t *testing.T) {
 	if got := layoutHelpColumns(nil, 80); got != nil {
 		t.Errorf("layoutHelpColumns(nil) = %v, want nil", got)
@@ -879,20 +1019,39 @@ func TestLayoutHelpColumns_Empty(t *testing.T) {
 // trailing separator that helpColumnRows only emits between groups, so the two
 // disagree by one per column and only the rendered count decides the overlay's
 // height.
+//
+// BOTH container variants run: the grouped table carries three SELECT rows the
+// drilled one does not, and covering the drilled context alone hid a 19/12
+// split there — a 7-row imbalance this test's own limit would have failed.
 func TestSplitHelpGroups_Balances(t *testing.T) {
-	left, right := splitHelpGroups(helpGroupsFor(screenSelectContainers, helpContext{canGoBack: true}))
-	if len(left) == 0 || len(right) == 0 {
-		t.Fatalf("container groups should split into two columns, got %d/%d", len(left), len(right))
-	}
-	lh, rh := len(helpColumnRows(left)), len(helpColumnRows(right))
-	if lh < rh {
-		t.Errorf("left column (%d lines) should not be shorter than right (%d)", lh, rh)
-	}
-	// The container table renders as 28 rows over 6 groups once split (the two
-	// columns each drop their own trailing separator); the split may not leave
-	// one column more than a group's worth (5 rows) taller than the other.
-	if lh-rh > 5 {
-		t.Errorf("columns are unbalanced: left %d rendered rows, right %d", lh, rh)
+	for _, tc := range []struct {
+		name string
+		hc   helpContext
+		// Rendered rows once split: the two columns each drop their own
+		// trailing separator, so the total sits one under helpRows(_, true).
+		total int
+	}{
+		{name: "drilled", hc: helpContext{canGoBack: true}, total: 30},
+		{name: "grouped", hc: helpContext{canGoBack: true, grouped: true}, total: 32},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			left, right := splitHelpGroups(helpGroupsFor(screenSelectContainers, tc.hc))
+			if len(left) == 0 || len(right) == 0 {
+				t.Fatalf("container groups should split into two columns, got %d/%d", len(left), len(right))
+			}
+			lh, rh := len(helpColumnRows(left)), len(helpColumnRows(right))
+			if lh+rh != tc.total {
+				t.Errorf("split renders %d rows (%d/%d), want %d", lh+rh, lh, rh, tc.total)
+			}
+			if lh < rh {
+				t.Errorf("left column (%d lines) should not be shorter than right (%d)", lh, rh)
+			}
+			// The split may not leave one column more than a group's worth
+			// (5 rows) taller than the other.
+			if lh-rh > 5 {
+				t.Errorf("columns are unbalanced: left %d rendered rows, right %d", lh, rh)
+			}
+		})
 	}
 }
 

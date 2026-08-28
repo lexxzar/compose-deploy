@@ -2549,14 +2549,10 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			}
 			m.fixSvcOffset()
 		case "pgup", "pgdown":
-			// A page is the visible window, so the cursor lands on the
-			// opposite edge of the same rows. svcVisibleCount() clamps to
-			// len(svcEntries) and is therefore 0 on an empty list, so the step
-			// needs its own floor before it moves anything.
+			// The step is the WHOLE visible window, so a pgdown from the top
+			// of it lands one row past the bottom edge and fixSvcOffset
+			// scrolls the window by one.
 			page := m.svcVisibleCount()
-			if page < 1 {
-				page = 1
-			}
 			if key == "pgup" {
 				m.svcCursor -= page
 			} else {
