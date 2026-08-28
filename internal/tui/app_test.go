@@ -427,8 +427,8 @@ func TestSelectContainers_SelectAllDrilledIgnoresTheFoldRule(t *testing.T) {
 	if got := m.selectedCount(); got != 3 {
 		t.Errorf("selectedCount = %d, want 3: %v", got, m.selected)
 	}
-	if !m.allSelected() {
-		t.Error("allSelected = false after `a` on the drilled screen")
+	if !m.allVisibleSelected() {
+		t.Error("allVisibleSelected = false after `a` on the drilled screen")
 	}
 	if m.warning != "" {
 		t.Errorf("warning = %q, want none on the drilled screen", m.warning)
@@ -567,13 +567,13 @@ func TestAllSelected(t *testing.T) {
 	m := Model{}
 	m.setSingleGroup([]string{"a", "b"})
 	m.selected = selectedIdx(m, 0, 1)
-	if !m.allSelected() {
-		t.Error("allSelected() = false, want true")
+	if !m.allVisibleSelected() {
+		t.Error("allVisibleSelected() = false, want true")
 	}
 
 	m.selected[m.svcKeyAt(1)] = false
-	if m.allSelected() {
-		t.Error("allSelected() = true, want false")
+	if m.allVisibleSelected() {
+		t.Error("allVisibleSelected() = true, want false")
 	}
 }
 
@@ -5113,8 +5113,8 @@ func TestSortServices_TieBreaker(t *testing.T) {
 func TestAllSelected_Empty(t *testing.T) {
 	m := singleGroupModel(nil)
 	m.selected = nil
-	if m.allSelected() {
-		t.Error("allSelected() = true for empty services, want false")
+	if m.allVisibleSelected() {
+		t.Error("allVisibleSelected() = true for empty services, want false")
 	}
 }
 
@@ -5122,8 +5122,8 @@ func TestAllSelected_AllTrue(t *testing.T) {
 	m := Model{}
 	m.setSingleGroup([]string{"web", "db"})
 	m.selected = selectedIdx(m, 0, 1)
-	if !m.allSelected() {
-		t.Error("allSelected() = false, want true")
+	if !m.allVisibleSelected() {
+		t.Error("allVisibleSelected() = false, want true")
 	}
 }
 
@@ -5131,8 +5131,8 @@ func TestAllSelected_SomeFalse(t *testing.T) {
 	m := Model{}
 	m.setSingleGroup([]string{"web", "db", "redis"})
 	m.selected = selectedIdx(m, 0, 2)
-	if m.allSelected() {
-		t.Error("allSelected() = true, want false")
+	if m.allVisibleSelected() {
+		t.Error("allVisibleSelected() = true, want false")
 	}
 }
 

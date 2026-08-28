@@ -232,12 +232,6 @@ func (m Model) eachSvcRef(fn func(svcRef) bool) {
 // the compose pipelines, and an unmanaged container has no compose project to
 // run one against, so no selection question may be answered over a row whose
 // checkbox is not even drawn.
-//
-// It is the DIRECT walk for selectedContainers() and for the counters behind
-// the title — the host-wide half. `a` and allSelected() reach it through
-// eachUnfoldedSelectableRef, which drops a FOLD's rows on top, so the key
-// writes what the user can see while the batch and the counters stay
-// host-wide.
 func (m Model) eachSelectableRef(fn func(svcRef) bool) {
 	m.eachSvcRef(func(r svcRef) bool {
 		if m.groupUnmanaged(r.groupIdx) {
@@ -252,11 +246,11 @@ func (m Model) eachSelectableRef(fn func(svcRef) bool) {
 // service on the box while the only thing that moved on screen was one digit of
 // the title counter — a folded header renders byte-identically either way.
 //
-// Exactly two callers: the `a` handler and allSelected(), which is the toggle
-// direction for that same key. selectedContainers() and the counters stay
-// host-wide on purpose — scoping them would drop a service the user genuinely
-// selected before folding its group, so the operation would touch fewer
-// services than the confirmation prompt just named.
+// Exactly two callers: the `a` handler and allVisibleSelected(), which is the
+// toggle direction for that same key. selectedContainers() and the counters
+// stay host-wide on purpose — scoping them would drop a service the user
+// genuinely selected before folding its group, so the operation would touch
+// fewer services than the confirmation prompt just named.
 func (m Model) eachUnfoldedSelectableRef(fn func(svcRef) bool) {
 	m.eachSelectableRef(func(r svcRef) bool {
 		if m.svcGroups[r.groupIdx].folded {
@@ -369,10 +363,6 @@ func groupCounts(g svcGroup, status map[string]runner.ServiceStatus) (up, unheal
 // this reads the UI selection the user built — and only this one needs the
 // unmanaged gate below.
 //
-// The header is the ONLY place a folded group's selection is visible: folding
-// hides the rows, not the selection, so a group ticked before it was folded
-// still reaches the runner with nothing on screen saying so.
-//
 // The unmanaged bucket answers (0, 0), by the same rule eachSelectableRef skips
 // it: those rows draw no checkbox and can hold no selection, so a count there
 // would advertise state that cannot exist.
@@ -380,8 +370,8 @@ func groupSelected(g svcGroup, selected map[string]bool) (n, total int) {
 	if g.proj.Unmanaged {
 		return 0, 0
 	}
+	total = len(g.services)
 	for _, name := range g.services {
-		total++
 		if selected[svcKey(g.proj.Name, name)] {
 			n++
 		}

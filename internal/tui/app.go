@@ -2639,18 +2639,8 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 				m.fixSvcOffset()
 				return m, nil
 			}
-			// Fold-aware: `a` ticks what the user can SEE. A folded group's
-			// services keep whatever the user set before it closed — folding
-			// hides rows, never state — so a selection made earlier still
-			// reaches selectedContainers() and the batch it names.
-			allSel := m.allSelected()
-			touched := false
-			m.eachUnfoldedSelectableRef(func(r svcRef) bool {
-				touched = true
-				m.selected[r.key] = !allSel
-				return true
-			})
-			if !touched && m.selectableCount() > 0 {
+			// Fold-aware: see eachUnfoldedSelectableRef.
+			if !m.toggleSelectAll() && m.selectableCount() > 0 {
 				m.warning = warnAllSelectableFolded
 				m.fixSvcOffset()
 				return m, nil
@@ -5760,16 +5750,13 @@ func (m Model) loadServices() tea.Cmd {
 	}
 }
 
-// allSelected is the toggle DIRECTION for `a`, so it reads the same fold-aware
-// walk that key writes. Measured host-wide the key goes DEAD: one unselected
-// service inside a folded group holds the answer at false while every visible
-// row is already ticked, so `a` re-ticks them instead of clearing, and nothing
-// short of unfolding that group can undo the selection. A host-wide true
-// implies a fold-aware true only while some unfolded selectable row exists:
-// fold every group and the walk sets no `any`, so this returns false. That
-// costs nothing — the same empty walk leaves the `a` handler untouched, and it
-// refuses with warnAllSelectableFolded instead of writing.
-func (m Model) allSelected() bool {
+// allVisibleSelected reports whether every UNFOLDED selectable row is ticked. It
+// is the toggle DIRECTION for `a`, so it walks exactly what that key writes.
+//
+// Fold every group and the walk yields nothing, so this returns false. That
+// costs nothing: the `a` handler runs the same empty walk and refuses with
+// warnAllSelectableFolded instead of writing.
+func (m Model) allVisibleSelected() bool {
 	any, all := false, true
 	m.eachUnfoldedSelectableRef(func(r svcRef) bool {
 		any = true
@@ -6584,6 +6571,21 @@ func (m *Model) foldAllGroups(folded bool) {
 	}
 	m.setAllFolded(folded)
 	m.settleFold(aim)
+}
+
+// toggleSelectAll ticks every unfolded selectable row, or clears them when they
+// are already ticked, and reports whether it wrote anything. A false means the
+// walk was empty — every selectable row is folded away — which is the caller's
+// cue to refuse rather than report a selection it did not make.
+func (m *Model) toggleSelectAll() bool {
+	selecting := !m.allVisibleSelected()
+	wrote := false
+	m.eachUnfoldedSelectableRef(func(r svcRef) bool {
+		wrote = true
+		m.selected[r.key] = selecting
+		return true
+	})
+	return wrote
 }
 
 // anyGroupUnfolded reports whether any group is currently open.

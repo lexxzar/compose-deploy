@@ -205,8 +205,7 @@ func selectGroup(grouped bool) helpGroup {
 			// only, and refuses outright when every selectable row is folded
 			// away. The drilled table keeps the bare "all" — that screen has
 			// no fold, so the qualifier would name a distinction it cannot
-			// make. This row is the key's only advertisement in grouped mode:
-			// the footer pair is full at six tokens.
+			// make.
 			{"a", "all visible"},
 			// Not "fold · unfold": everywhere else in this table `·` joins
 			// two MEANINGS of one key, and here the two keys have one each.
