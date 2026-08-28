@@ -7005,8 +7005,10 @@ func (m Model) containerFooter() string {
 // the caller's). The fold marker points down on an open group and right on a
 // folded one, mirroring the convention every tree view uses.
 //
-// The aggregates are what make a FOLDED group still worth looking at: `● n up`
-// and, only when something is actually wrong, `✗ n`. A group that owns no
+// The aggregates are what make a FOLDED group still worth looking at: `● n up`,
+// only when something is actually wrong `✗ n`, and `[x] n/m` only when the group
+// holds a selection — folding hides the rows, not the selection, so the header is
+// the one place a hidden selection can still be seen. A group that owns no
 // services renders a bare header — "0 up" for a project with nothing to run
 // reads as a fault it is not.
 //
@@ -7036,6 +7038,12 @@ func (m Model) groupHeaderLine(groupIdx int) string {
 	}
 	if updates > 0 {
 		line += fmt.Sprintf("  %s %d", updateGlyphStyle.Render(compose.UpdateGlyph), updates)
+	}
+	// The selection cell is LAST and appears only when the group holds one, so
+	// a group with nothing ticked renders exactly as it did before this cell
+	// existed and pressing `space` never shifts the aggregates left of it.
+	if sel, total := groupSelected(g, m.selected); sel > 0 {
+		line += fmt.Sprintf("  %s %d/%d", checkboxOn.Render("[x]"), sel, total)
 	}
 	return line
 }

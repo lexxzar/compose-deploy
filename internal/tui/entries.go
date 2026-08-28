@@ -357,6 +357,33 @@ func groupCounts(g svcGroup, status map[string]runner.ServiceStatus) (up, unheal
 	return up, unhealthy, updates
 }
 
+// groupSelected totals one group's selection for its header row: how many of
+// its services are ticked, out of how many could be. It is a sibling of
+// groupCounts rather than a fifth return value on it, because the two read
+// different things — groupCounts summarises live docker state off svcStatus,
+// this reads the UI selection the user built — and only this one needs the
+// unmanaged gate below.
+//
+// The header is the ONLY place a folded group's selection is visible: folding
+// hides the rows, not the selection, so a group ticked before it was folded
+// still reaches the runner with nothing on screen saying so.
+//
+// The unmanaged bucket answers (0, 0), by the same rule eachSelectableRef skips
+// it: those rows draw no checkbox and can hold no selection, so a count there
+// would advertise state that cannot exist.
+func groupSelected(g svcGroup, selected map[string]bool) (n, total int) {
+	if g.proj.Unmanaged {
+		return 0, 0
+	}
+	for _, name := range g.services {
+		total++
+		if selected[svcKey(g.proj.Name, name)] {
+			n++
+		}
+	}
+	return n, total
+}
+
 // buildSvcGroups folds the grouped payload — the project list from the
 // ProjectLoader and the host-wide status map from GroupHostStatus — into the row
 // model.

@@ -2613,6 +2613,13 @@ func TestGroupHeaderLine_FoldedKeepsAggregates(t *testing.T) {
 	if !strings.Contains(got, "● 1 up") {
 		t.Errorf("folded header = %q, want the running count", got)
 	}
+
+	// A selection made before the fold is invisible everywhere else on screen:
+	// the header is what carries it.
+	m.selected = map[string]bool{svcKey("web", "api"): true}
+	if got := ansi.Strip(m.groupHeaderLine(0)); !strings.Contains(got, "[x] 1/1") {
+		t.Errorf("folded header = %q, want the hidden selection counted", got)
+	}
 }
 
 // A group that owns no services renders a bare header: "0 up" for a project
@@ -2629,6 +2636,143 @@ func TestGroupHeaderLine_OutOfRange(t *testing.T) {
 	m := groupedScreenModel(svcGroupOf("web", "api"))
 	if got := m.groupHeaderLine(7); got != "" {
 		t.Errorf("groupHeaderLine(7) = %q, want the empty string", got)
+	}
+}
+
+// The selection cell is the reason the header carries aggregates at all for a
+// FOLDED group: folding hides the rows, not the selection, so without it a
+// selection made before the fold reaches the runner with nothing on screen
+// saying so. It reads `[x] n/m` over the group's SELECTABLE total.
+func TestGroupHeaderLine_SelectionCount(t *testing.T) {
+	tests := []struct {
+		name   string
+		rows   []int
+		folded bool
+		want   string
+	}{
+		{name: "partial, unfolded", rows: []int{1}, want: "[x] 1/3"},
+		{name: "partial, folded", rows: []int{1, 2}, folded: true, want: "[x] 2/3"},
+		{name: "all selected", rows: []int{1, 2, 3}, want: "[x] 3/3"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			m := groupedScreenModel(svcGroupOf("web", "api", "nginx", "cache"), svcGroupOf("db", "postgres"))
+			m.svcStatus = map[string]runner.ServiceStatus{svcKey("web", "api"): {Running: true}}
+			// The selection is built from ROW indices, so it must be taken
+			// before the fold removes those rows.
+			m.selected = selectedIdx(m, tt.rows...)
+			m.svcGroups[0].folded = tt.folded
+			m.svcEntries = rebuildSvcEntries(m.svcGroups)
+
+			got := ansi.Strip(m.groupHeaderLine(0))
+			if !strings.Contains(got, tt.want) {
+				t.Errorf("header = %q, want the selection cell %q", got, tt.want)
+			}
+			// The live aggregates keep their place: the cell is appended last.
+			if !strings.Contains(got, "● 1 up") {
+				t.Errorf("header = %q, want the running count untouched", got)
+			}
+			if i, j := strings.Index(got, "● 1 up"), strings.Index(got, "[x]"); i > j {
+				t.Errorf("header = %q, want the selection cell AFTER the aggregates", got)
+			}
+			// The other group holds nothing, so it draws no cell.
+			if other := ansi.Strip(m.groupHeaderLine(1)); strings.Contains(other, "[x]") {
+				t.Errorf("db header = %q, want no selection cell for an unselected group", other)
+			}
+		})
+	}
+}
+
+// A group with nothing selected renders BYTE-IDENTICALLY to what it drew before
+// the cell existed — styling included, so this compares the raw string rather
+// than the stripped one.
+func TestGroupHeaderLine_NoSelectionRendersUnchanged(t *testing.T) {
+	m := groupedScreenModel(svcGroupOf("web", "api", "nginx"), svcGroupOf("db", "postgres"))
+	up := true
+	m.svcStatus = map[string]runner.ServiceStatus{
+		svcKey("web", "api"):     {Running: true, Health: "unhealthy", UpdateAvailable: &up},
+		svcKey("web", "nginx"):   {Running: true},
+		svcKey("db", "postgres"): {Running: true},
+	}
+
+	baseline := m.groupHeaderLine(0)
+	if strings.Contains(ansi.Strip(baseline), "[x]") {
+		t.Fatalf("precondition: an unselected header already draws a selection cell: %q", baseline)
+	}
+
+	// A selection in ANOTHER group must not leak into this one.
+	m.selected = selectedIdx(m, 4)
+	if got := m.groupHeaderLine(0); got != baseline {
+		t.Errorf("web header changed for a db-only selection:\n got %q\nwant %q", got, baseline)
+	}
+	if got := ansi.Strip(m.groupHeaderLine(1)); !strings.Contains(got, "[x] 1/1") {
+		t.Errorf("db header = %q, want its own selection cell", got)
+	}
+}
+
+// The unmanaged bucket draws no checkbox and cannot hold a selection, so its
+// header must never claim one — even when something contrived puts a key for it
+// in the map, which is exactly what a stale entry from a renamed project is.
+func TestGroupHeaderLine_UnmanagedNeverShowsSelection(t *testing.T) {
+	m := groupedScreenModel(svcGroupOf("web", "api"), unmanagedGroupOf("stray", "orphan"))
+	bare := m.groupHeaderLine(1)
+
+	m.selected = map[string]bool{
+		svcKey(compose.UnmanagedProjectName, "stray"):  true,
+		svcKey(compose.UnmanagedProjectName, "orphan"): true,
+	}
+	got := m.groupHeaderLine(1)
+	if strings.Contains(ansi.Strip(got), "[x]") {
+		t.Errorf("unmanaged header = %q, want no selection cell", ansi.Strip(got))
+	}
+	if got != bare {
+		t.Errorf("unmanaged header changed:\n got %q\nwant %q", got, bare)
+	}
+	if n, total := groupSelected(m.svcGroups[1], m.selected); n != 0 || total != 0 {
+		t.Errorf("groupSelected(unmanaged) = (%d, %d), want (0, 0)", n, total)
+	}
+}
+
+// The empty-group early return stays ABOVE the selection cell: a project with
+// nothing to run draws its name and nothing else.
+func TestGroupHeaderLine_EmptyGroupStaysBareWithASelection(t *testing.T) {
+	m := groupedScreenModel(svcGroupOf("web", "api"), svcGroupOf("empty"))
+	m.selected = map[string]bool{
+		svcKey("web", "api"):  true,
+		svcKey("empty", "no"): true,
+	}
+	if got := ansi.Strip(m.groupHeaderLine(1)); got != "▼ empty" && got != "▶ empty" {
+		t.Errorf("empty group header = %q, want the marker and the name only", got)
+	}
+}
+
+// The selection cell must not cost the list a row: the header stays ONE clamped
+// physical line at a narrow width, and svcVisibleCount — which counts a header
+// as exactly one row — is unmoved by it.
+func TestGroupHeaderLine_SelectionCellKeepsTheRowBudget(t *testing.T) {
+	long := strings.Repeat("verylongproject", 6)
+	m := groupedScreenModel(svcGroupOf(long, "api", "nginx"), svcGroupOf("blog", "web"))
+	m.width = 40
+	m.svcStatus = map[string]runner.ServiceStatus{svcKey(long, "api"): {Running: true}}
+
+	before := m.svcVisibleCount()
+	m.selected = selectedIdx(m, 1, 2)
+	if after := m.svcVisibleCount(); after != before {
+		t.Errorf("svcVisibleCount() = %d with a selection, %d without — a header is still one row", after, before)
+	}
+
+	headers := 0
+	for _, l := range strings.Split(ansi.Strip(m.viewSelectContainers()), "\n") {
+		if !strings.Contains(l, "▼") && !strings.Contains(l, "▶") {
+			continue
+		}
+		headers++
+		if w := ansi.StringWidth(l); w > m.width {
+			t.Errorf("header overruns width %d (%d cells): %q", m.width, w, l)
+		}
+	}
+	if headers != 2 {
+		t.Fatalf("rendered %d header lines, want 2 — a wrapped header costs the list a row", headers)
 	}
 }
 
