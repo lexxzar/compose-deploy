@@ -228,7 +228,10 @@ const warnNoComposeDir = "No compose directory for this project yet — try agai
 // original invisible-selection surprise one keystroke along, so the refusal
 // names the way out. It stays quiet when nothing is selectable at all — a
 // loading or empty host has no fold to blame.
-const warnAllSelectableFolded = "No service is visible — unfold a group to select one"
+//
+// SELECTABLE, not visible: an unfolded `(unmanaged)` bucket can be drawing rows
+// while every compose group is closed, and those rows carry no checkbox.
+const warnAllSelectableFolded = "No selectable service is visible — unfold a group to select one"
 
 // serverEntryKind distinguishes selectable items from visual group headers.
 type serverEntryKind int
@@ -5761,9 +5764,11 @@ func (m Model) loadServices() tea.Cmd {
 // walk that key writes. Measured host-wide the key goes DEAD: one unselected
 // service inside a folded group holds the answer at false while every visible
 // row is already ticked, so `a` re-ticks them instead of clearing, and nothing
-// short of unfolding that group can undo the selection. The mirror failure
-// cannot happen — a host-wide true implies a fold-aware true, since the second
-// walk is a subset of the first.
+// short of unfolding that group can undo the selection. A host-wide true
+// implies a fold-aware true only while some unfolded selectable row exists:
+// fold every group and the walk sets no `any`, so this returns false. That
+// costs nothing — the same empty walk leaves the `a` handler untouched, and it
+// refuses with warnAllSelectableFolded instead of writing.
 func (m Model) allSelected() bool {
 	any, all := false, true
 	m.eachUnfoldedSelectableRef(func(r svcRef) bool {

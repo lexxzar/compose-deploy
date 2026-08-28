@@ -201,7 +201,13 @@ func selectGroup(grouped bool) helpGroup {
 	if grouped {
 		return helpGroup{title: "SELECT", actions: true, entries: []helpEntry{
 			{"space", "toggle a service · fold a group"},
-			{"a", "all"},
+			// "all visible", not "all": grouped `a` ticks the UNFOLDED groups
+			// only, and refuses outright when every selectable row is folded
+			// away. The drilled table keeps the bare "all" — that screen has
+			// no fold, so the qualifier would name a distinction it cannot
+			// make. This row is the key's only advertisement in grouped mode:
+			// the footer pair is full at six tokens.
+			{"a", "all visible"},
 			// Not "fold · unfold": everywhere else in this table `·` joins
 			// two MEANINGS of one key, and here the two keys have one each.
 			{"← →", "fold, unfold"},

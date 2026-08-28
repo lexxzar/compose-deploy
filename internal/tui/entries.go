@@ -230,9 +230,14 @@ func (m Model) eachSvcRef(fn func(svcRef) bool) {
 
 // eachSelectableRef is eachSvcRef minus the unmanaged bucket. Selection feeds
 // the compose pipelines, and an unmanaged container has no compose project to
-// run one against, so `a`, allSelected and the title's denominator all go
-// through it — otherwise `a` would appear to select rows whose checkbox is not
-// even drawn.
+// run one against, so no selection question may be answered over a row whose
+// checkbox is not even drawn.
+//
+// It is the DIRECT walk for selectedContainers() and for the counters behind
+// the title — the host-wide half. `a` and allSelected() reach it through
+// eachUnfoldedSelectableRef, which drops a FOLD's rows on top, so the key
+// writes what the user can see while the batch and the counters stay
+// host-wide.
 func (m Model) eachSelectableRef(fn func(svcRef) bool) {
 	m.eachSvcRef(func(r svcRef) bool {
 		if m.groupUnmanaged(r.groupIdx) {

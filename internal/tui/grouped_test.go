@@ -2838,23 +2838,39 @@ func TestGroupHeaderLine_EmptyGroupStaysBareWithASelection(t *testing.T) {
 	}
 }
 
-// The selection cell must not cost the list a row: the header stays ONE clamped
-// physical line at a narrow width, and svcVisibleCount — which counts a header
-// as exactly one row — is unmoved by it.
+// The selection cell must not cost the list a row: the screen emits the same
+// number of physical lines with the cell as without, and a header long enough
+// to overrun a narrow pane still clamps to ONE line rather than wrapping into
+// the row svcVisibleCount already spent on it.
 func TestGroupHeaderLine_SelectionCellKeepsTheRowBudget(t *testing.T) {
 	long := strings.Repeat("verylongproject", 6)
 	m := groupedScreenModel(svcGroupOf(long, "api", "nginx"), svcGroupOf("blog", "web"))
 	m.width = 40
 	m.svcStatus = map[string]runner.ServiceStatus{svcKey(long, "api"): {Running: true}}
 
-	before := m.svcVisibleCount()
-	m.selected = selectedIdx(m, 1, 2)
-	if after := m.svcVisibleCount(); after != before {
-		t.Errorf("svcVisibleCount() = %d with a selection, %d without — a header is still one row", after, before)
+	// Measured on the RENDER, not on svcVisibleCount(): that helper reads
+	// m.height, the captions, the footer and the warning slots and nothing of
+	// m.selected, so comparing it across a selection is an equality that holds
+	// by construction. What can actually cost the list a row is the header
+	// block emitting a second physical line — an aggregate pushed onto its own
+	// line, or a newline inside the cell that clampToWidth carries through.
+	before := strings.Split(ansi.Strip(m.viewSelectContainers()), "\n")
+	m.selected = selectedIdx(m, 1, 2, 4)
+	lines := strings.Split(ansi.Strip(m.viewSelectContainers()), "\n")
+	if len(lines) != len(before) {
+		t.Errorf("viewSelectContainers() emits %d lines with a selection, %d without:\n%s",
+			len(lines), len(before), strings.Join(lines, "\n"))
+	}
+	// Without this the comparison above is vacuous: the long project name
+	// clamps its own cell off at width 40, so a cell that stopped rendering at
+	// all would keep the line counts equal. blog's header is short enough to
+	// carry it.
+	if !strings.Contains(strings.Join(lines, "\n"), "[x] 1/1") {
+		t.Fatalf("no selection cell in the render, so the row budget is untested:\n%s", strings.Join(lines, "\n"))
 	}
 
 	headers := 0
-	for _, l := range strings.Split(ansi.Strip(m.viewSelectContainers()), "\n") {
+	for _, l := range lines {
 		if !strings.Contains(l, "▼") && !strings.Contains(l, "▶") {
 			continue
 		}
