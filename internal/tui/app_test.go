@@ -6417,6 +6417,112 @@ func TestPageKeys_InertWhereTheOtherMovementKeysAre(t *testing.T) {
 	}
 }
 
+// TestPageKeys_PageIsTheWholeListWhenItFits pins the branch
+// TestPageKeys_MoveAFullPageAndClamp cannot reach: svcVisibleCount() never
+// answers more rows than svcEntries holds, so when the list fits the window a
+// page IS the whole list and the two keys degenerate to end/home. Both shapes
+// that produce it are covered — a list shorter than the pane, and the unsized
+// terminal before the first WindowSizeMsg, which is the separate m.height == 0
+// early return. In both, svcOffset must stay 0: there is no window to scroll.
+func TestPageKeys_PageIsTheWholeListWhenItFits(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		build func() Model
+		last  int
+	}{
+		{
+			// height 9 budgets 3 rows, the list holds 2, so the clamp at the
+			// bottom of svcVisibleCount decides the page.
+			name:  "list shorter than the pane",
+			build: func() Model { return pageKeyModel(t, []string{"a", "b"}) },
+			last:  1,
+		},
+		{
+			// No WindowSizeMsg yet: svcVisibleCount returns len(svcEntries)
+			// outright, so the first frame pages the whole list.
+			name: "no WindowSizeMsg yet",
+			build: func() Model {
+				m := singleGroupModel([]string{"a", "b", "c", "d", "e"})
+				m.screen = screenSelectContainers
+				return m
+			},
+			last: 4,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			m := tc.build()
+			if got, rows := m.svcVisibleCount(), len(m.svcEntries); got != rows {
+				t.Fatalf("fixture: svcVisibleCount() = %d, rows = %d — the list must fit the window", got, rows)
+			}
+
+			m = pressGroupKey(m, "pgdown")
+			if m.svcCursor != tc.last {
+				t.Errorf("pgdown: svcCursor = %d, want %d (the last row)", m.svcCursor, tc.last)
+			}
+			if m.svcOffset != 0 {
+				t.Errorf("pgdown scrolled a list that fits: svcOffset = %d, want 0", m.svcOffset)
+			}
+			assertCursorVisible(t, m)
+
+			m = pressGroupKey(m, "pgdown")
+			if m.svcCursor != tc.last {
+				t.Errorf("second pgdown ran past the end: svcCursor = %d, want %d", m.svcCursor, tc.last)
+			}
+
+			m = pressGroupKey(m, "pgup")
+			if m.svcCursor != 0 || m.svcOffset != 0 {
+				t.Errorf("pgup: cursor = %d, offset = %d, want 0/0", m.svcCursor, m.svcOffset)
+			}
+		})
+	}
+}
+
+// TestPageKeys_PageSizeFollowsTheVisibleCount pins WHERE the step comes from.
+// svcVisibleCount() is not a constant: the soft-warning slot spends a footer
+// row and the Created/Uptime captions spend a header row, both without a
+// keystroke (a stats fetch fails, a status refresh lands). The page must be
+// read from it at press time, so the cursor always travels exactly the rows the
+// pane is showing — a hard-coded or cached step would scroll past a row here.
+func TestPageKeys_PageSizeFollowsTheVisibleCount(t *testing.T) {
+	services := []string{"a", "b", "c", "d", "e", "f", "g", "h", "i", "j"}
+	for _, tc := range []struct {
+		name string
+		arm  func(*Model)
+		want int
+	}{
+		{name: "idle", arm: func(*Model) {}, want: 3},
+		{
+			name: "soft warning takes a footer row",
+			arm:  func(m *Model) { m.statsErr = errors.New("docker stats unavailable") },
+			want: 2,
+		},
+		{
+			name: "column captions take a header row",
+			arm: func(m *Model) {
+				m.svcStatus = qStatus(*m, map[string]runner.ServiceStatus{
+					"a": {Running: true, Uptime: "3h"},
+				})
+			},
+			want: 2,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			m := pageKeyModel(t, services)
+			tc.arm(&m)
+			if got := m.svcVisibleCount(); got != tc.want {
+				t.Fatalf("fixture: svcVisibleCount() = %d, want %d", got, tc.want)
+			}
+
+			m = pressGroupKey(m, "pgdown")
+			if m.svcCursor != tc.want {
+				t.Errorf("pgdown moved %d rows, want %d — the step must come from svcVisibleCount() at press time",
+					m.svcCursor, tc.want)
+			}
+			assertCursorVisible(t, m)
+		})
+	}
+}
+
 func TestConfirming_CallsFixSvcOffset(t *testing.T) {
 	mc := &mockComposer{services: []string{"a", "b", "c", "d", "e", "f", "g", "h"}}
 	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)

@@ -1438,6 +1438,55 @@ func TestGroupedPageKeys_FollowTheFoldedRowCount(t *testing.T) {
 	}
 }
 
+// TestGroupedPageKeys_ReadOnlyHostPagesByItsOwnFooter is the one place the two
+// dimensions the page keys sit on are NOT independent. The dispatch gates them
+// on neither grouped nor readOnly, so the key itself needs no combined test —
+// but the STEP is svcVisibleCount(), which reserves rows from
+// containerFooterLines(), which picks its line count from the read-only pair
+// (`q back • ? keys` / `l logs • x exec`, one line from width 43) or the
+// grouped writable one (six longer tokens, one line only from width 89). At
+// width 50 those disagree, so an unmanaged-only host pages one row further than
+// a single-project host of exactly the same shape.
+//
+// Both fixtures are reachable: a host running exactly one compose project, and
+// a host running nothing but unlabelled containers. They carry the same rows so
+// the footer variant is the only variable, and grouped readOnly() reads the
+// GROUP LIST rather than the composer — hence the Unmanaged flip.
+func TestGroupedPageKeys_ReadOnlyHostPagesByItsOwnFooter(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		unmanaged  bool
+		footerRows int
+		want       int
+	}{
+		{name: "single writable project wraps the footer", footerRows: 2, want: 3},
+		{name: "unmanaged-only host keeps it on one line", unmanaged: true, footerRows: 1, want: 4},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			g := svcGroupOf("web", "api", "cache", "nginx", "redis", "queue")
+			g.proj.Unmanaged = tc.unmanaged
+			m := groupedScreenModel(g)
+			m.width, m.height = 50, 10
+
+			if m.readOnly() != tc.unmanaged {
+				t.Fatalf("fixture: readOnly() = %v, want %v", m.readOnly(), tc.unmanaged)
+			}
+			if got := m.containerFooterLines(); got != tc.footerRows {
+				t.Fatalf("fixture: containerFooterLines() = %d, want %d", got, tc.footerRows)
+			}
+			if got := m.svcVisibleCount(); got != tc.want {
+				t.Fatalf("fixture: svcVisibleCount() = %d, want %d", got, tc.want)
+			}
+
+			m = pressGroupKey(m, "pgdown")
+			if m.svcCursor != tc.want {
+				t.Errorf("pgdown moved %d rows, want %d — the page must follow the footer variant", m.svcCursor, tc.want)
+			}
+			assertCursorVisible(t, m)
+		})
+	}
+}
+
 // TestGroupedSpace_OnHeaderFoldsAndUnfolds pins space's first meaning: on a
 // group header it folds, which hides ROWS and nothing else — the selection the
 // group carried survives, because svcRefs ignores fold state.

@@ -711,7 +711,7 @@ func TestViewHelp_NarrowTerminalKeepsActionKeys(t *testing.T) {
 		"rollback", "config", "exec", "check updates", "inspect",
 		"deploy", "restart", "stop", "logs",
 	}
-	// Below 65 columns the overlay stacks to one column, which is where the
+	// Below 70 columns the overlay stacks to one column, which is where the
 	// budget bites; 24 is the classic short terminal. Drilled variant only —
 	// the grouped table carries two more action rows, so every threshold there
 	// sits two notches higher (TestViewHelp_InspectSurvivesTheFirstTruncation
@@ -738,7 +738,9 @@ func TestViewHelp_NarrowTerminalKeepsActionKeys(t *testing.T) {
 // group carries two rows the drilled one does not (`← →`, `z`), and
 // singleColumnOrder emits SELECT before INSPECT, so every grouped threshold
 // sits two notches higher. Re-measured single-column tables (widths 30-59,
-// identical across them; the layout goes two-column at 65 drilled / 77 grouped):
+// identical across them; the layout goes two-column at 70 drilled / 87 grouped
+// — `pgup pgdown` widened the left column by 5 cells, see
+// TestViewHelp_KeyColumnClampsOnlyTheNarrowestPane):
 //
 //	drilled: >= 24 keeps everything, 23 loses `U check updates`, 22 loses
 //	         `x exec` too, 21 loses `c config` too, 20 loses `i inspect` too,
@@ -787,6 +789,80 @@ func TestViewHelp_InspectSurvivesTheFirstTruncation(t *testing.T) {
 			}
 			if at, uAt := strings.Index(view, "inspect"), strings.Index(view, "check updates"); at > uAt {
 				t.Errorf("inspect renders below check updates, so it goes first under the budget:\n%s", view)
+			}
+		})
+	}
+}
+
+// TestViewHelp_KeyColumnClampsOnlyTheNarrowestPane pins the width consequence
+// `pgup pgdown` brought in, and is the other half of a trade two older pins
+// made. helpRows aligns every description on the widest key across ALL the
+// groups it renders, so an 11-cell key label pushed the value column 5 cells
+// right; at width 30 the single-column row spends 4 on the indent, 11 on the
+// key and 2 on the gap, leaving 13 for the description, and `next / prev match`
+// (17 cells) is cut. TestViewHelp_NarrowTerminalKeepsActionKeys and
+// TestViewHelp_ReadOnlyNeverExceedsBudget therefore assert the half string —
+// at EVERY width they sample, 30 included, which is the strength this test
+// gives back: after that edit, shortening the description itself to `next /
+// prev` passes both of them and nothing else in the suite notices. The 40-59
+// loop below is the only assertion that does.
+//
+// The widest-key assertion is the early-warning half. `check updates` is
+// exactly 13 cells, so one more cell of key column cuts it and
+// TestViewHelp_ReadOnlyNeverExceedsBudget fails with a misleading "dropped
+// check updates" — a truncation report for what is really a column-width
+// change. Failing here first names the real cause.
+func TestViewHelp_KeyColumnClampsOnlyTheNarrowestPane(t *testing.T) {
+	const widestKey = "pgup pgdown"
+	for _, hc := range []helpContext{
+		{canGoBack: true},
+		{canGoBack: true, grouped: true},
+		{canGoBack: true, readOnly: true},
+		{canGoBack: true, readOnly: true, grouped: true},
+	} {
+		widest, keyw := "", 0
+		for _, g := range helpGroupsFor(screenSelectContainers, hc) {
+			for _, e := range g.entries {
+				if w := ansi.StringWidth(e.keys); w > keyw {
+					widest, keyw = e.keys, w
+				}
+			}
+		}
+		if widest != widestKey {
+			t.Errorf("readOnly=%v grouped=%v: the widest key is %q (%d cells), want %q (%d) — the description budget moved, so re-measure the want lists in TestViewHelp_NarrowTerminalKeepsActionKeys and TestViewHelp_ReadOnlyNeverExceedsBudget",
+				hc.readOnly, hc.grouped, widest, keyw, widestKey, ansi.StringWidth(widestKey))
+		}
+	}
+	if budget := 30 - 4 - ansi.StringWidth(widestKey) - 2; budget != 13 {
+		t.Fatalf("width-30 description budget is %d cells, want 13", budget)
+	}
+
+	for _, tc := range []struct {
+		name string
+		view func(width int) string
+	}{
+		{"writable", func(width int) string {
+			m := Model{screen: screenSelectContainers, width: width, height: 24,
+				drilledFromHost: true, helpOpen: true}
+			return ansi.Strip(m.View())
+		}},
+		{"read-only", func(width int) string { return ansi.Strip(readOnlyOverlayModel(width, 24).View()) }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			narrow := tc.view(30)
+			// Clamped, not dropped: the ROW is what the two pins above are
+			// about, and it must still be on screen.
+			if !strings.Contains(narrow, "next / prev") {
+				t.Errorf("width 30 lost the FIND row entirely:\n%s", narrow)
+			}
+			if strings.Contains(narrow, "next / prev match") {
+				t.Errorf("width 30 no longer clamps the description — the key column narrowed, so TestViewHelp_NarrowTerminalKeepsActionKeys and TestViewHelp_ReadOnlyNeverExceedsBudget can go back to the full string:\n%s", narrow)
+			}
+			for _, w := range []int{40, 50, 59} {
+				if view := tc.view(w); !strings.Contains(view, "next / prev match") {
+					t.Errorf("width %d lost the FULL description; it was shortened, or the key column grew past %d cells:\n%s",
+						w, ansi.StringWidth(widestKey), view)
+				}
 			}
 		})
 	}
