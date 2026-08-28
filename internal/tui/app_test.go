@@ -6298,6 +6298,125 @@ func TestScrollUp_PastTopOfWindow(t *testing.T) {
 	}
 }
 
+// assertCursorVisible pins the invariant every cursor move owes fixSvcOffset:
+// the window holds the cursor.
+func assertCursorVisible(t *testing.T, m Model) {
+	t.Helper()
+	visible := m.svcVisibleCount()
+	if m.svcCursor < m.svcOffset || m.svcCursor >= m.svcOffset+visible {
+		t.Errorf("cursor %d outside the visible window [%d, %d)", m.svcCursor, m.svcOffset, m.svcOffset+visible)
+	}
+}
+
+// pageKeyModel is a drilled container screen sized so one page is 3 rows:
+// height 9 minus 3 header lines minus 3 footer lines.
+func pageKeyModel(t *testing.T, services []string) Model {
+	t.Helper()
+	m := singleGroupModel(services)
+	m.screen = screenSelectContainers
+	m.width, m.height = 200, 9
+	return m
+}
+
+// TestPageKeys_MoveAFullPageAndClamp pins pgup/pgdown on the drilled container
+// screen: one press moves svcVisibleCount() rows, neither key leaves
+// svcEntries, and svcOffset follows so the cursor stays on screen.
+func TestPageKeys_MoveAFullPageAndClamp(t *testing.T) {
+	m := pageKeyModel(t, []string{"a", "b", "c", "d", "e", "f", "g", "h", "i", "j"})
+	if got := m.svcVisibleCount(); got != 3 {
+		t.Fatalf("svcVisibleCount() = %d, want 3", got)
+	}
+
+	// The last press has nowhere left to go: 9 is the last row.
+	for _, want := range []int{3, 6, 9, 9} {
+		m = pressGroupKey(m, "pgdown")
+		if m.svcCursor != want {
+			t.Fatalf("pgdown: svcCursor = %d, want %d", m.svcCursor, want)
+		}
+		assertCursorVisible(t, m)
+	}
+	if m.svcOffset != 7 {
+		t.Errorf("svcOffset at the bottom = %d, want 7", m.svcOffset)
+	}
+
+	for _, want := range []int{6, 3, 0, 0} {
+		m = pressGroupKey(m, "pgup")
+		if m.svcCursor != want {
+			t.Fatalf("pgup: svcCursor = %d, want %d", m.svcCursor, want)
+		}
+		assertCursorVisible(t, m)
+	}
+	if m.svcOffset != 0 {
+		t.Errorf("svcOffset at the top = %d, want 0", m.svcOffset)
+	}
+}
+
+// TestPageKeys_EmptyListStaysInRange pins the degenerate case svcVisibleCount
+// answers 0 for: with no rows the page size floors at 1, and the cursor must
+// still land inside svcEntries rather than at -1.
+func TestPageKeys_EmptyListStaysInRange(t *testing.T) {
+	m := pageKeyModel(t, nil)
+	if len(m.svcEntries) != 0 {
+		t.Fatalf("fixture has %d rows, want 0", len(m.svcEntries))
+	}
+	for _, key := range []string{"pgdown", "pgup"} {
+		m = pressGroupKey(m, key)
+		if m.svcCursor != 0 || m.svcOffset != 0 {
+			t.Fatalf("%s on an empty list: cursor = %d, offset = %d, want 0/0", key, m.svcCursor, m.svcOffset)
+		}
+	}
+}
+
+// TestPageKeys_WorkOnTheReadOnlyScreen pins that paging is not gated on
+// readOnly(): moving the cursor writes nothing to docker, exactly like up/down.
+func TestPageKeys_WorkOnTheReadOnlyScreen(t *testing.T) {
+	m := pageKeyModel(t, []string{"a", "b", "c", "d", "e", "f"})
+	m.composer = &readOnlyMockComposer{}
+	if !m.readOnly() {
+		t.Fatal("fixture is not read-only")
+	}
+	page := m.svcVisibleCount()
+
+	m = pressGroupKey(m, "pgdown")
+	if m.svcCursor != page {
+		t.Errorf("pgdown on the read-only screen: svcCursor = %d, want %d", m.svcCursor, page)
+	}
+	assertCursorVisible(t, m)
+
+	m = pressGroupKey(m, "pgup")
+	if m.svcCursor != 0 {
+		t.Errorf("pgup on the read-only screen: svcCursor = %d, want 0", m.svcCursor)
+	}
+}
+
+// TestPageKeys_InertWhereTheOtherMovementKeysAre pins pgup/pgdown against the
+// three states the container dispatch already refuses to move the cursor in: a
+// typing search bar (every key is the query's), an armed confirmation (enter
+// re-resolves its batch from the cursor) and the error screen that hides the
+// rows.
+func TestPageKeys_InertWhereTheOtherMovementKeysAre(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		arm  func(*Model)
+	}{
+		{name: "searching", arm: func(m *Model) { m.searching = true; m.searchInput = textinput.New() }},
+		{name: "confirming", arm: func(m *Model) { m.confirming = true; m.pendingOp = runner.Deploy }},
+		{name: "svcErr", arm: func(m *Model) { m.svcErr = errors.New("docker is unreachable") }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			for _, key := range []string{"pgdown", "pgup"} {
+				m := pageKeyModel(t, []string{"a", "b", "c", "d", "e", "f"})
+				m.svcCursor = 1
+				tc.arm(&m)
+
+				if got := pressGroupKey(m, key); got.svcCursor != 1 {
+					t.Errorf("%s moved the cursor to %d", key, got.svcCursor)
+				}
+			}
+		})
+	}
+}
+
 func TestConfirming_CallsFixSvcOffset(t *testing.T) {
 	mc := &mockComposer{services: []string{"a", "b", "c", "d", "e", "f", "g", "h"}}
 	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)

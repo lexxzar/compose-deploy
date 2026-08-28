@@ -141,7 +141,8 @@ func TestHelpGroups_NamesEveryBoundKey(t *testing.T) {
 		// below), so the grouped-only fold keys — z, ← and → — are not in
 		// this set; TestHelpGroups_GroupedNamesTheSameKeys pins those.
 		screenSelectContainers: {
-			"q", "ctrl+c", "esc", "enter", "up", "k", "down", "j", " ", "a",
+			"q", "ctrl+c", "esc", "enter", "up", "k", "down", "j",
+			"pgup", "pgdown", " ", "a",
 			"r", "d", "s", "R", "n", "N", "/", "l", "c", "x", "U", "i",
 		},
 		// enter is bound only in the waiting sub-state, where it releases the
@@ -210,7 +211,7 @@ func TestHelpGroups_NamesEveryBoundKey(t *testing.T) {
 // named by BOTH variants and appears in both bound sets.
 func TestHelpGroups_ReadOnlyNamesEveryBoundKey(t *testing.T) {
 	bound := []string{
-		"q", "ctrl+c", "esc", "enter", "up", "k", "down", "j",
+		"q", "ctrl+c", "esc", "enter", "up", "k", "down", "j", "pgup", "pgdown",
 		"n", "N", "/", "l", "x", "U", "i",
 	}
 	boundSet := map[string]bool{}
@@ -485,7 +486,10 @@ func TestViewHelp_ReadOnlyNeverExceedsBudget(t *testing.T) {
 	// writable table needs singleColumnOrder for.
 	for _, w := range []int{30, 40, 50, 59} {
 		view := ansi.Strip(readOnlyOverlayModel(w, 24).View())
-		for _, want := range []string{"search", "next / prev match", "logs", "exec", "check updates"} {
+		// Half description for the same reason as
+		// TestViewHelp_NarrowTerminalKeepsActionKeys: `pgup pgdown` widens the
+		// key column, so width 30 clamps the value.
+		for _, want := range []string{"search", "next / prev", "logs", "exec", "check updates"} {
 			if !strings.Contains(view, want) {
 				t.Errorf("width %d: truncated read-only overlay dropped %q:\n%s", w, want, view)
 			}
@@ -696,8 +700,14 @@ func TestViewHelp_NarrowTerminalKeepsActionKeys(t *testing.T) {
 	// drops either. `all` and `search` were the round-4 gap: the footer trim
 	// removed `a all` and `/ search` from line1 while SELECT and the search keys
 	// were still unflagged, so both fell off the bottom of a 50-column pane.
+	//
+	// `next / prev` is deliberately the half description: `pgup pgdown` is the
+	// widest key in the table, and helpRows aligns every description on the
+	// widest key across ALL groups, so at width 30 the value column is 13
+	// cells and clampToWidth cuts `next / prev match` short. The row is what
+	// this pin is about, and the row is still there.
 	want := []string{
-		"all", "search", "next / prev match",
+		"all", "search", "next / prev",
 		"rollback", "config", "exec", "check updates", "inspect",
 		"deploy", "restart", "stop", "logs",
 	}
@@ -1556,7 +1566,8 @@ func TestHelpOverlay_YieldsToQuitPrompt(t *testing.T) {
 // "state changed behind the overlay" this test is about: a fold hides rows AND
 // re-aims the cursor.
 func TestHelpOverlay_SwallowsEveryActionKey(t *testing.T) {
-	shared := []string{"l", "c", "x", "i", "/", "U", "r", "s", "R", "a", " ", "j", "k", "n", "N", "enter"}
+	shared := []string{"l", "c", "x", "i", "/", "U", "r", "s", "R", "a", " ", "j", "k",
+		"pgup", "pgdown", "n", "N", "enter"}
 	for _, tc := range []struct {
 		name  string
 		build func() Model
@@ -1641,6 +1652,10 @@ func keyMsgFor(key string) tea.KeyMsg {
 		return tea.KeyMsg{Type: tea.KeyLeft}
 	case "right":
 		return tea.KeyMsg{Type: tea.KeyRight}
+	case "pgup":
+		return tea.KeyMsg{Type: tea.KeyPgUp}
+	case "pgdown":
+		return tea.KeyMsg{Type: tea.KeyPgDown}
 	}
 	return tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune(key)}
 }

@@ -1388,6 +1388,56 @@ func pressGroupKey(m Model, key string) Model {
 	return updated.(Model)
 }
 
+// TestGroupedPageKeys_PageOverHeaderRows pins pgup/pgdown in the host view: a
+// page is svcVisibleCount() ROWS, so a group header counts exactly like a
+// service, and the keys are gated on neither grouped nor readOnly.
+func TestGroupedPageKeys_PageOverHeaderRows(t *testing.T) {
+	m := groupedScreenModel(svcGroupOf("web", "api", "cache", "nginx"), svcGroupOf("db", "postgres", "redis"))
+	m.height = 9 // 3 header lines + 3 footer lines, so one page is 3 rows
+	if got, rows := m.svcVisibleCount(), len(m.svcEntries); got != 3 || rows != 7 {
+		t.Fatalf("fixture: svcVisibleCount() = %d, rows = %d, want 3 and 7", got, rows)
+	}
+
+	for _, want := range []int{3, 6, 6} {
+		m = pressGroupKey(m, "pgdown")
+		if m.svcCursor != want {
+			t.Fatalf("pgdown: svcCursor = %d, want %d", m.svcCursor, want)
+		}
+		assertCursorVisible(t, m)
+	}
+	for _, want := range []int{3, 0, 0} {
+		m = pressGroupKey(m, "pgup")
+		if m.svcCursor != want {
+			t.Fatalf("pgup: svcCursor = %d, want %d", m.svcCursor, want)
+		}
+		assertCursorVisible(t, m)
+	}
+}
+
+// TestGroupedPageKeys_FollowTheFoldedRowCount pins that paging reads the ROWS
+// on screen: a folded group contributes one header and no services, so the
+// clamp lands on the smaller list rather than on a row the fold removed.
+func TestGroupedPageKeys_FollowTheFoldedRowCount(t *testing.T) {
+	m := groupedScreenModel(svcGroupOf("web", "api", "cache", "nginx"), svcGroupOf("db", "postgres", "redis"))
+	m.height = 9
+
+	m = pressGroupKey(m, "left") // fold web from its own header
+	if !m.svcGroups[0].folded || len(m.svcEntries) != 4 {
+		t.Fatalf("fold left %d rows (folded=%v), want 4", len(m.svcEntries), m.svcGroups[0].folded)
+	}
+
+	m = pressGroupKey(m, "pgdown")
+	if m.svcCursor != 3 {
+		t.Errorf("pgdown after the fold: svcCursor = %d, want 3 (the last remaining row)", m.svcCursor)
+	}
+	assertCursorVisible(t, m)
+
+	m = pressGroupKey(m, "pgdown")
+	if m.svcCursor != 3 {
+		t.Errorf("pgdown at the bottom: svcCursor = %d, want 3", m.svcCursor)
+	}
+}
+
 // TestGroupedSpace_OnHeaderFoldsAndUnfolds pins space's first meaning: on a
 // group header it folds, which hides ROWS and nothing else — the selection the
 // group carried survives, because svcRefs ignores fold state.

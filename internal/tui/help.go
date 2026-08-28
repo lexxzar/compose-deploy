@@ -247,6 +247,7 @@ func readOnlyContainerGroups(canGoBack, grouped bool) []helpGroup {
 		{title: "MOVE", entries: []helpEntry{
 			{"↑ k", "up"},
 			{"↓ j", "down"},
+			{"pgup pgdown", "page"},
 		}},
 		findGroup(),
 		leaveGroup(canGoBack),
@@ -307,6 +308,7 @@ func helpGroupsFor(s screen, hc helpContext) []helpGroup {
 			{title: "MOVE", entries: []helpEntry{
 				{"↑ k", "up"},
 				{"↓ j", "down"},
+				{"pgup pgdown", "page"},
 			}},
 			findGroup(),
 			selectGroup(hc.grouped),
