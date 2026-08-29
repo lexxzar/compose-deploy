@@ -4150,39 +4150,401 @@ func TestGroupedFoldRestore_KeysOnTheSanitizedName(t *testing.T) {
 	}
 }
 
-// The two row-derived one-shots and the fold snapshot are departure-site state:
-// the invariant is LOCAL to each navigation site rather than emergent from
-// whatever svcGroups happens to hold. All three ride clearContainerScreen, so
-// the sites that carry one PAST it are the interesting rows: the landing body
-// re-arms the fold, and the drill-out esc restores the snapshot and arms the
-// cursor target right after it. drillIntoGroup is the one site with no
-// clearContainerScreen behind it, so it disarms both one-shots by hand — either
-// one surviving a drill-in would fire on some later grouped payload the user
-// reached another way — and it is also the ONE site that WRITES the snapshot.
+// --- The drill-out selection snapshot ---------------------------------------
+
+// tickRows drives the real space key over the given ROW indices. The snapshot
+// under test carries what the user's own key produced, and space is its one
+// producer. It only ever SELECTS — a row already ticked toggles back off — so
+// the count check is also the guard against a row index that names a header or
+// an unmanaged service, neither of which space fills in.
+func tickRows(t *testing.T, m Model, rows ...int) Model {
+	t.Helper()
+	for _, row := range rows {
+		before := len(m.selected)
+		m.svcCursor = row
+		m = pressGroupKey(m, " ")
+		if len(m.selected) != before+1 {
+			t.Fatalf("space on row %d selected nothing; selection = %v", row, m.selected)
+		}
+	}
+	return m
+}
+
+// Looking inside a project is not a destructive act on a plan the user built row
+// by row across the host: the ticks come back on the landing payload, under the
+// same qualified keys, and that payload spends the snapshot.
+func TestGroupedSelectionRestore_SurvivesADrillRoundTrip(t *testing.T) {
+	m, _ := drillTestModel(t)
+	m = tickRows(t, m, 1, 4) // blog/web and shop/db — two different projects
+	want := selectedIdx(m, 1, 4)
+
+	m, cmd := drillOut(t, m, headerIndexFor(t, m.svcEntries, 1))
+	if !reflect.DeepEqual(m.groupSelectionRestore, want) {
+		t.Fatalf("drill-in captured %v, want %v", m.groupSelectionRestore, want)
+	}
+	updated, _ := m.Update(cmd())
+	m = updated.(Model)
+
+	if len(m.svcGroups) != 3 {
+		t.Fatalf("landed with %d groups, want 3", len(m.svcGroups))
+	}
+	if !reflect.DeepEqual(m.selected, want) {
+		t.Errorf("selection = %v, want %v (the one the drill-in left)", m.selected, want)
+	}
+	if m.groupSelectionRestore != nil {
+		t.Error("the landing payload did not spend the selection snapshot")
+	}
+}
+
+// The snapshot carries OUTWARDS only. The drilled screen addresses ONE project
+// and its d/r/s act on whatever is ticked, so inheriting a host-wide plan would
+// arm an operation over rows that screen never drew.
+func TestGroupedSelectionRestore_DrilledScreenInheritsNothing(t *testing.T) {
+	m, _ := drillTestModel(t)
+	m = tickRows(t, m, 1, 4)
+	want := selectedIdx(m, 1, 4)
+
+	m.svcCursor = headerIndexFor(t, m.svcEntries, 1)
+	updated, _ := m.Update(keyMsgFor("enter"))
+	m = updated.(Model)
+	if m.grouped {
+		t.Fatal("precondition: enter did not drill in")
+	}
+
+	if len(m.selected) != 0 {
+		t.Errorf("the drilled screen inherited %v", m.selected)
+	}
+	if !reflect.DeepEqual(m.groupSelectionRestore, want) {
+		t.Errorf("snapshot = %v, want %v: the capture must run before the clear that drops it",
+			m.groupSelectionRestore, want)
+	}
+}
+
+// An empty selection captures as nil rather than as an empty map, so the spend
+// guard reads "no snapshot" and the landing keeps what the reload found. An
+// empty map would be indistinguishable from a plan and would hand pruneSelection
+// a map to reconcile for nothing.
+func TestGroupedSelectionRestore_NothingTickedRestoresNothing(t *testing.T) {
+	m, _ := drillTestModel(t)
+	if len(m.selected) != 0 {
+		t.Fatalf("precondition: the fixture starts with %v ticked", m.selected)
+	}
+
+	m, cmd := drillOut(t, m, headerIndexFor(t, m.svcEntries, 1))
+	if m.groupSelectionRestore != nil {
+		t.Fatalf("an empty selection captured as %#v, want nil", m.groupSelectionRestore)
+	}
+	updated, _ := m.Update(cmd())
+	m = updated.(Model)
+
+	if len(m.svcGroups) != 3 {
+		t.Fatalf("landed with %d groups, want 3", len(m.svcGroups))
+	}
+	if len(m.selected) != 0 {
+		t.Errorf("selection = %v, want nothing ticked", m.selected)
+	}
+	if m.groupSelectionRestore != nil {
+		t.Errorf("the landing armed a snapshot of its own: %v", m.groupSelectionRestore)
+	}
+}
+
+// The keys are qualified by PROJECT, and two hosts routinely run projects of the
+// same name, so every site that leaves the server context drops the snapshot. A
+// leak would tick host B's rows from host A's plan, and d/r/s read the ticks.
+func TestGroupedSelectionRestore_DoesNotSurviveAServerSwitch(t *testing.T) {
+	_, projects := groupedFixture()
+	m, f := drillTestModel(t)
+	m = tickRows(t, m, 1, 4)
+	m, _ = drillOut(t, m, headerIndexFor(t, m.svcEntries, 1))
+	if len(m.groupSelectionRestore) != 2 {
+		t.Fatalf("precondition: the drill-in captured %v, want two rows", m.groupSelectionRestore)
+	}
+
+	m.backToServerScreen()
+	if m.groupSelectionRestore != nil {
+		t.Fatalf("the server screen kept %v; it names another host's services", m.groupSelectionRestore)
+	}
+
+	// The next server's connect installs its own loader and factory.
+	m.projectLoader = func(context.Context) ([]compose.Project, error) { return projects, nil }
+	m.composerFactory = f.factory()
+	updated, cmd := m.Update(connectResultMsg{err: nil})
+	m = updated.(Model)
+	if cmd == nil {
+		t.Fatal("connect success dispatched no host-view load")
+	}
+	updated, _ = m.Update(cmd())
+	m = updated.(Model)
+
+	if len(m.selected) != 0 {
+		t.Errorf("%v arrived ticked on the new host, want an empty selection", m.selected)
+	}
+}
+
+// The zero-group rule covers the selection snapshot as well as the fold one, and
+// for the same reason: a payload with no rows is not the landing — a remote host
+// whose containers come up a few seconds after the connect sends one — so it
+// stays armed. Spending it there would hand the ticks to pruneSelection with no
+// live rows to reconcile against, and the plan would be gone by the time the
+// rows arrived.
+func TestGroupedSelectionRestore_EmptyPayloadKeepsTheSnapshot(t *testing.T) {
+	projects, status := twoProjectHost()
+	m, h := mutableHostModel(t, projects, status)
+	m = tickRows(t, m, 1) // blog/web
+	want := selectedIdx(m, 1)
+
+	m, cmd := drillOut(t, m, headerIndexFor(t, m.svcEntries, 1))
+	h.set(nil, map[string]map[string]runner.ServiceStatus{})
+	updated, _ := m.Update(cmd())
+	m = updated.(Model)
+
+	if len(m.svcGroups) != 0 {
+		t.Fatalf("precondition: landed with %d groups, want an empty host", len(m.svcGroups))
+	}
+	if !reflect.DeepEqual(m.groupSelectionRestore, want) {
+		t.Fatalf("a payload with no rows in it spent the snapshot: %v", m.groupSelectionRestore)
+	}
+
+	// The containers come up. THIS is the frame the user first sees rows in.
+	h.set(projects, status)
+	updated, _ = m.Update(m.loadGroups()())
+	m = updated.(Model)
+
+	if !reflect.DeepEqual(m.selected, want) {
+		t.Errorf("selection = %v, want %v (the one the drill-in left)", m.selected, want)
+	}
+	if m.groupSelectionRestore != nil {
+		t.Error("the payload that restored did not spend the snapshot")
+	}
+}
+
+// A service that went away while the user was inside another project must not
+// come back ticked. The snapshot is spent ABOVE pruneSelection, so the restored
+// keys go through the same walk that reconciles a live selection; restoring
+// below it would re-arm a dead key and the next d/r/s would name a service the
+// host no longer has.
+func TestGroupedSelectionRestore_PruneDropsAVanishedService(t *testing.T) {
+	projects := []compose.Project{
+		{Name: "blog", ConfigDir: "/srv/blog"},
+		{Name: "shop", ConfigDir: "/srv/shop"},
+	}
+	m, h := mutableHostModel(t, projects, map[string]map[string]runner.ServiceStatus{
+		"blog": {"cache": {Running: true}, "web": {Running: true}},
+		"shop": {"api": {Running: true}},
+	})
+	// 0 blog · 1 cache · 2 web · 3 shop · 4 api
+	m = tickRows(t, m, 1, 2)
+
+	m, cmd := drillOut(t, m, headerIndexFor(t, m.svcEntries, 1))
+	// blog/cache stops while the user is inside shop.
+	h.set(projects, map[string]map[string]runner.ServiceStatus{
+		"blog": {"web": {Running: true}},
+		"shop": {"api": {Running: true}},
+	})
+	updated, _ := m.Update(cmd())
+	m = updated.(Model)
+
+	if got := len(m.svcEntries); got != 4 {
+		t.Fatalf("precondition: %d rows, want 4 (blog lost cache)", got)
+	}
+	want := map[string]bool{svcKey("blog", "web"): true}
+	if !reflect.DeepEqual(m.selected, want) {
+		t.Errorf("selection = %v, want %v (the vanished blog/cache pruned out of the restore)",
+			m.selected, want)
+	}
+}
+
+// The operation the drill-in was FOR runs on the drilled screen and returns
+// through screenProgress — a second departure from the container screen, and one
+// that must not drop the snapshot. esc from progress lands back on the drilled
+// screen; the esc after it is the ordinary drill-out.
+func TestGroupedSelectionRestore_SurvivesAnOperationRoundTrip(t *testing.T) {
+	m, _ := drillTestModel(t)
+	m = tickRows(t, m, 1, 4)
+	want := selectedIdx(m, 1, 4)
+
+	m.svcCursor = headerIndexFor(t, m.svcEntries, 1)
+	updated, _ := m.Update(keyMsgFor("enter"))
+	m = updated.(Model)
+	if m.grouped || m.projName != "shop" {
+		t.Fatalf("precondition: drill-in left grouped=%v proj=%q", m.grouped, m.projName)
+	}
+
+	// The drilled screen restarts one of ITS OWN rows.
+	m.selected[qk(m, "api")] = true
+	updated, _ = m.Update(keyMsgFor("r"))
+	m = updated.(Model)
+	if !m.confirming {
+		t.Fatalf("precondition: r armed no confirmation; warning = %q", m.warning)
+	}
+	updated, _ = m.Update(keyMsgFor("enter"))
+	m = updated.(Model)
+	if m.screen != screenProgress {
+		t.Fatalf("precondition: screen = %d, want screenProgress", m.screen)
+	}
+
+	// The pipeline resolves; the first esc leaves the progress screen.
+	m.done = true
+	updated, _ = m.Update(keyMsgFor("esc"))
+	m = updated.(Model)
+	if m.screen != screenSelectContainers || m.grouped {
+		t.Fatalf("precondition: esc from progress left screen=%d grouped=%v", m.screen, m.grouped)
+	}
+	if !reflect.DeepEqual(m.groupSelectionRestore, want) {
+		t.Fatalf("the progress round trip dropped the snapshot: %v", m.groupSelectionRestore)
+	}
+
+	updated, cmd := m.Update(keyMsgFor("esc"))
+	m = updated.(Model)
+	if cmd == nil {
+		t.Fatal("drill-out must dispatch the host-view reload")
+	}
+	updated, _ = m.Update(cmd())
+	m = updated.(Model)
+
+	if !reflect.DeepEqual(m.selected, want) {
+		t.Errorf("selection = %v, want %v (the host plan the operation was built from)", m.selected, want)
+	}
+}
+
+// The branch that spends the snapshot is ALSO the 5-second reload, so a standing
+// one would re-tick a row the user cleared after the drill-out, every tick — and
+// the next d/r/s would run over rows the user believed they had dropped.
+func TestGroupedSelectionRestore_DoesNotFireOnTheNextReload(t *testing.T) {
+	m, _ := drillTestModel(t)
+	m = tickRows(t, m, 1, 4)
+
+	m, cmd := drillOut(t, m, headerIndexFor(t, m.svcEntries, 1))
+	updated, _ := m.Update(cmd())
+	m = updated.(Model)
+	if len(m.selected) != 2 {
+		t.Fatalf("precondition: the landing restored %v, want two rows", m.selected)
+	}
+
+	// The user drops one of the rows the restore brought back. space toggles the
+	// key to false rather than deleting it, so the whole-map comparison the
+	// tests above use does not apply here: read the two rows instead.
+	m.svcCursor = 4
+	m = pressGroupKey(m, " ")
+	if m.selected[svcKey("shop", "db")] || m.selectedCount() != 1 {
+		t.Fatalf("precondition: space left %v, want shop/db unticked", m.selected)
+	}
+
+	updated, _ = m.Update(m.loadGroups()())
+	m = updated.(Model)
+
+	if m.selected[svcKey("shop", "db")] {
+		t.Errorf("the reload replayed the snapshot and re-ticked shop/db; selection = %v", m.selected)
+	}
+	if !m.selected[svcKey("blog", "web")] {
+		t.Errorf("the reload dropped the row the user kept; selection = %v", m.selected)
+	}
+}
+
+// The m.confirming early return sits ABOVE the spend, and it has to: the payload
+// it drops is the one whose rows the restore would be reconciled against, so
+// spending the snapshot there would leave the ticks unpruned against a row list
+// this Model never installed. The prompt is armed by hand — a drill-out lands on
+// an empty grouped screen, which has no row to arm one from — so this pins the
+// guard ORDER, not a sequence the user can key in.
+func TestGroupedSelectionRestore_ConfirmingPayloadDoesNotSpendIt(t *testing.T) {
+	m, _ := drillTestModel(t)
+	m = tickRows(t, m, 1, 4)
+	want := selectedIdx(m, 1, 4)
+
+	m, cmd := drillOut(t, m, headerIndexFor(t, m.svcEntries, 1))
+	m.confirming = true
+	m.pendingOp = runner.Restart
+
+	updated, _ := m.Update(cmd())
+	m = updated.(Model)
+	if len(m.svcGroups) != 0 {
+		t.Fatalf("precondition: an armed prompt must drop the payload, got %d groups", len(m.svcGroups))
+	}
+	if !reflect.DeepEqual(m.groupSelectionRestore, want) {
+		t.Fatalf("the dropped payload spent the snapshot: %v", m.groupSelectionRestore)
+	}
+
+	// The prompt closes and the next reload lands the plan.
+	m.confirming = false
+	updated, _ = m.Update(m.loadGroups()())
+	m = updated.(Model)
+
+	if !reflect.DeepEqual(m.selected, want) {
+		t.Errorf("selection = %v, want %v", m.selected, want)
+	}
+}
+
+// Two projects on one host both owning a "db" is the collision svcKey exists
+// for. The snapshot carries the QUALIFIED keys drillIntoGroup cloned, so the
+// restore ticks the project the user chose; a bare service name would tick both,
+// and the next d/r/s would restart a database in a project nobody touched.
+func TestGroupedSelectionRestore_KeysStayQualifiedPerProject(t *testing.T) {
+	m, _ := mutableHostModel(t,
+		[]compose.Project{
+			{Name: "alpha", ConfigDir: "/srv/alpha"},
+			{Name: "beta", ConfigDir: "/srv/beta"},
+		},
+		map[string]map[string]runner.ServiceStatus{
+			"alpha": {"db": {Running: true}},
+			"beta":  {"db": {Running: true}},
+		})
+	// 0 alpha · 1 alpha/db · 2 beta · 3 beta/db
+	m = tickRows(t, m, 1)
+
+	m, cmd := drillOut(t, m, headerIndexFor(t, m.svcEntries, 1))
+	updated, _ := m.Update(cmd())
+	m = updated.(Model)
+
+	if !m.selected[svcKey("alpha", "db")] {
+		t.Errorf("alpha/db came back unticked; selection = %v", m.selected)
+	}
+	if m.selected[svcKey("beta", "db")] {
+		t.Errorf("beta/db came back ticked off the other project's plan; selection = %v", m.selected)
+	}
+}
+
+// The two row-derived one-shots and the two drill-in snapshots are
+// departure-site state: the invariant is LOCAL to each navigation site rather
+// than emergent from whatever svcGroups happens to hold. All four ride
+// clearContainerScreen, so the sites that carry one PAST it are the interesting
+// rows: the landing body re-arms the fold, and the drill-out esc restores both
+// snapshots and arms the cursor target right after it. drillIntoGroup is the
+// one site with no clearContainerScreen behind it, so it disarms both one-shots
+// by hand — either one surviving a drill-in would fire on some later grouped
+// payload the user reached another way — and it is also the ONE site that
+// WRITES either snapshot.
 //
-// ONE row per site covers ALL THREE fields: a seventh navigation site that
-// settles only some of them fails here, rather than in whichever of three
+// ONE row per site covers ALL FOUR fields: a seventh navigation site that
+// settles only some of them fails here, rather than in whichever of four
 // parallel tables nobody remembered to edit.
 func TestGroupedOneShots_SettledAtEveryNavigationSite(t *testing.T) {
 	stale := svcRowID{proj: "blog", header: true}
 	staleFolds := map[string]bool{"ghost": true}
+	stalePicks := map[string]bool{svcKey("ghost", "svc"): true}
 	hostFolds := map[string]bool{"blog": false, "shop": false, compose.UnmanagedProjectName: false}
+	hostPicks := map[string]bool{svcKey("blog", "web"): true}
 	for _, tc := range []struct {
-		name        string
-		run         func(t *testing.T) Model
-		wantFold    bool
-		wantCursor  svcRowID
-		wantRestore map[string]bool
+		name          string
+		run           func(t *testing.T) Model
+		wantFold      bool
+		wantCursor    svcRowID
+		wantRestore   map[string]bool
+		wantSelection map[string]bool
 	}{
 		{
-			name:        "drill in",
-			wantRestore: hostFolds,
+			name:          "drill in",
+			wantRestore:   hostFolds,
+			wantSelection: hostPicks,
 			run: func(t *testing.T) Model {
 				m, _ := drillTestModel(t)
 				// A landing payload still in flight.
 				m.groupFoldPending = true
 				m.groupCursorPending = stale
 				m.groupFoldRestore = staleFolds
+				m.groupSelectionRestore = stalePicks
+				// The host plan this site has to capture as it clears.
+				m = tickRows(t, m, 1)
 				m.svcCursor = headerIndexFor(t, m.svcEntries, 1)
 				updated, _ := m.Update(keyMsgFor("enter"))
 				m = updated.(Model)
@@ -4200,6 +4562,7 @@ func TestGroupedOneShots_SettledAtEveryNavigationSite(t *testing.T) {
 				m.groupFoldPending = true
 				m.groupCursorPending = stale
 				m.groupFoldRestore = staleFolds
+				m.groupSelectionRestore = stalePicks
 				m.backToServerScreen()
 				return m
 			},
@@ -4212,6 +4575,7 @@ func TestGroupedOneShots_SettledAtEveryNavigationSite(t *testing.T) {
 				m.groupFoldPending = true
 				m.groupCursorPending = stale
 				m.groupFoldRestore = staleFolds
+				m.groupSelectionRestore = stalePicks
 				updated, _ := m.Update(connectResultMsg{err: errors.New("ssh: connect refused")})
 				return updated.(Model)
 			},
@@ -4223,6 +4587,7 @@ func TestGroupedOneShots_SettledAtEveryNavigationSite(t *testing.T) {
 				m.groupFoldPending = true
 				m.groupCursorPending = stale
 				m.groupFoldRestore = staleFolds
+				m.groupSelectionRestore = stalePicks
 				updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyEnter})
 				m = updated.(Model)
 				if m.grouped {
@@ -4240,6 +4605,7 @@ func TestGroupedOneShots_SettledAtEveryNavigationSite(t *testing.T) {
 			run: func(t *testing.T) Model {
 				m := localFastTrackModel(t)
 				m.groupFoldRestore = staleFolds
+				m.groupSelectionRestore = stalePicks
 				updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyEnter})
 				m = updated.(Model)
 				if !m.drilledFromHost || m.projName != "" {
@@ -4252,12 +4618,14 @@ func TestGroupedOneShots_SettledAtEveryNavigationSite(t *testing.T) {
 		{
 			// The drill-out CARRIES the snapshot the drill-in wrote: the
 			// landing payload is what spends it, not this site.
-			name:        "drill out",
-			wantFold:    true,
-			wantCursor:  svcRowID{proj: "shop", header: true},
-			wantRestore: hostFolds,
+			name:          "drill out",
+			wantFold:      true,
+			wantCursor:    svcRowID{proj: "shop", header: true},
+			wantRestore:   hostFolds,
+			wantSelection: hostPicks,
 			run: func(t *testing.T) Model {
 				m, _ := drillTestModel(t)
+				m = tickRows(t, m, 1)
 				m, _ = drillOut(t, m, headerIndexFor(t, m.svcEntries, 1))
 				return m
 			},
@@ -4273,6 +4641,9 @@ func TestGroupedOneShots_SettledAtEveryNavigationSite(t *testing.T) {
 			}
 			if got := m.groupFoldRestore; !reflect.DeepEqual(got, tc.wantRestore) {
 				t.Errorf("groupFoldRestore = %v, want %v", got, tc.wantRestore)
+			}
+			if got := m.groupSelectionRestore; !reflect.DeepEqual(got, tc.wantSelection) {
+				t.Errorf("groupSelectionRestore = %v, want %v", got, tc.wantSelection)
 			}
 		})
 	}
