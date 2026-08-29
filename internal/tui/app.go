@@ -414,6 +414,19 @@ type Model struct {
 	// call that helper — clears it by hand.
 	groupFoldPending bool
 
+	// groupCursorPending names the row the next grouped payload must aim the
+	// cursor at. It is armed at ONE site — the esc that drills OUT of a
+	// project, carrying that project's header — so the host view comes back on
+	// the project the user just visited instead of on row 0.
+	//
+	// It is a one-shot for the same reason groupFoldPending is: the branch that
+	// spends it is also the 5-second reload, so a persistent target would
+	// re-aim the cursor every tick and fight every arrow key the user presses.
+	// Disarming rides with the rows it names — clearContainerScreen drops it,
+	// drillIntoGroup clears it by hand — so the drill-out site arms AFTER
+	// enterGroupedContainers returns.
+	groupCursorPending svcRowID
+
 	// svcStatus and stats are keyed by the QUALIFIED key svcKey produces, not
 	// by the bare service name a Composer returns: two projects on one host
 	// routinely both own a "db", and a bare key would let one overwrite the
@@ -1200,6 +1213,13 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			// Before anything below re-derives from the rows: a fold
 			// renumbers every one of them.
 			m.applyPendingGroupFold()
+			// A drill-out overrides the captured cursor: the row it names is
+			// the project the user just left, which the drilled screen's own
+			// cursor cannot name. AFTER the fold, which decides the rows the
+			// id can land on.
+			if id, ok := m.takePendingGroupCursor(); ok {
+				cursorID = id
+			}
 			m.svcStatus = flattenQualified(msg.hostStatus)
 			// The fresh status map carries no verdicts, and this branch is the
 			// 5-second refresh as well as the initial load — without the replay
@@ -2526,7 +2546,13 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 				// the backward-navigation cleanup this site owes.
 				//
 				// Hoisted: pointer receiver, same m as the return.
+				proj := m.projName
 				cmd := m.enterGroupedContainers()
+				// AFTER the call, which clears the target along with the rows
+				// it names. The project's HEADER, not the service row the
+				// cursor sat on: the host view lands folded, so that row is not
+				// there to receive the cursor.
+				m.groupCursorPending = svcRowID{proj: proj, header: true}
 				return m, cmd
 			}
 		case "enter":
@@ -6300,8 +6326,10 @@ func (m *Model) drillIntoGroup(gi int) tea.Cmd {
 		return nil
 	}
 	m.grouped = false
-	// This site does not call clearContainerScreen, so it disarms by hand.
+	// This site does not call clearContainerScreen, so it disarms both
+	// row-derived one-shots by hand.
 	m.groupFoldPending = false
+	m.groupCursorPending = svcRowID{}
 	// The grouped view is the parent screen from here on: canGoBack and the
 	// footer's back label both read drilledFromHost on the drilled screen.
 	m.drilledFromHost = true
@@ -6423,14 +6451,16 @@ func (m *Model) bumpFetchSessions() {
 // three of them. Site-specific state (project identity, sessions, callbacks,
 // search, wait) stays at the site.
 //
-// The two one-shots it carries, svcReloadPending and groupFoldPending, are
-// row-derived like the rest: both name a payload for rows this call just
-// dropped. enterGroupedContainers re-arms groupFoldPending AFTER calling this,
-// which is what makes the landing fold survive its own cleanup.
+// The three one-shots it carries — svcReloadPending, groupFoldPending and
+// groupCursorPending — are row-derived like the rest: each names a payload for
+// rows this call just dropped. enterGroupedContainers re-arms groupFoldPending
+// AFTER calling this, which is what makes the landing fold survive its own
+// cleanup, and the drill-out site arms groupCursorPending the same way.
 func (m *Model) clearContainerScreen() {
 	m.clearSvcGroups()
 	m.svcReloadPending = false
 	m.groupFoldPending = false
+	m.groupCursorPending = svcRowID{}
 	m.svcStatus = nil
 	m.stats = nil
 	m.statsErr = nil
@@ -6524,6 +6554,21 @@ func (m *Model) applyPendingGroupFold() {
 	}
 	m.setAllFolded(true)
 	m.svcEntries = rebuildSvcEntries(m.svcGroups)
+}
+
+// takePendingGroupCursor spends the one-shot drill-out cursor target and
+// reports the row the grouped payload must aim at.
+//
+// It follows applyPendingGroupFold's zero-group rule: a payload with no groups
+// is not the landing — a remote host whose containers appear a few seconds
+// after the connect sends one — so the target survives until rows arrive.
+func (m *Model) takePendingGroupCursor() (svcRowID, bool) {
+	if !m.groupCursorPending.ok() || len(m.svcGroups) == 0 {
+		return svcRowID{}, false
+	}
+	id := m.groupCursorPending
+	m.groupCursorPending = svcRowID{}
+	return id, true
 }
 
 // setAllFolded writes one fold state across every group. It rebuilds nothing:
