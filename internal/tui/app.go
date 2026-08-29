@@ -2550,10 +2550,15 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 				proj := m.projName
 				cmd := m.enterGroupedContainers()
 				// AFTER the call, which clears the target along with the rows
-				// it names. The project's HEADER, not the service row the
-				// cursor sat on: the host view lands folded, so that row is not
-				// there to receive the cursor.
-				m.groupCursorPending = svcRowID{proj: proj, header: true}
+				// it names. The project's HEADER: a multi-group host lands
+				// folded, so the service row the cursor sat on is gone, and a
+				// lone group draws no header at all, so there the target misses
+				// and restoreCursorRow clamps. The entryLocal fast track drills
+				// out carrying no name — it never looks one up — so it arms
+				// nothing rather than an id ok() would refuse to spend.
+				if proj != "" {
+					m.groupCursorPending = svcRowID{proj: proj, header: true}
+				}
 				return m, cmd
 			}
 		case "enter":

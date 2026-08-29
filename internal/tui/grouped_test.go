@@ -2319,6 +2319,29 @@ func TestGroupCursorPending_SettledAtEveryNavigationSite(t *testing.T) {
 			},
 		},
 		{
+			// The fast track clears projName, so its drill-out has no project
+			// to name and must arm nothing at all.
+			name: "fast-track drill out",
+			run: func(t *testing.T) Model {
+				mc := &mockComposer{services: []string{"api", "web"}}
+				m := NewModel(mc, io.Discard, mockFactory(mc), testServers, mockConnectCb(mc))
+				installFakeTick(&m)
+				m.screen = screenSelectServer
+				for i, e := range m.serverEntries {
+					if e.kind == entryLocal {
+						m.serverCursor = i
+					}
+				}
+				updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+				m = updated.(Model)
+				if !m.drilledFromHost || m.projName != "" {
+					t.Fatalf("precondition: fast track must drill from host with no name, got drilledFromHost=%v projName=%q", m.drilledFromHost, m.projName)
+				}
+				updated, _ = m.Update(keyMsgFor("esc"))
+				return updated.(Model)
+			},
+		},
+		{
 			name: "drill out",
 			want: svcRowID{proj: "shop", header: true},
 			run: func(t *testing.T) Model {
