@@ -4605,8 +4605,9 @@ func (m Model) fetchInspect() tea.Cmd {
 //
 // The verdict must be true and the entry must be non-errored, so the screen
 // never spends registry round-trips the "⇧" column would not have spent. The
-// empty-service guard is load-bearing rather than defensive: filterServices
-// reads an empty services slice as ALL services.
+// empty-service guard saves the discovery call UpdateDetails makes before it
+// filters — one SSH round-trip on the remote path, for a name that matches
+// nothing.
 //
 // The key is inspectUpdateKey()'s, the same resolution currentUpdateInfo makes
 // — grouped mode's entry belongs to the CURSOR row's group, not to the

@@ -4395,9 +4395,9 @@ func TestGroupedU_InFlightGuardBindsNothing(t *testing.T) {
 }
 
 // detailingComposer is capableComposer plus UpdateDetailer. It is a double of
-// its own rather than a method on capableComposer, which backs drillTestModel
-// and every other grouped test: making THAT type an UpdateDetailer would arm the
-// detail path in ~30 tests whose subject is something else entirely.
+// its own so that capableComposer, which backs drillTestModel and every other
+// grouped test, stays inert as coverage grows: no grouped test presses `i`
+// against a warm entry today, so arming it would be silent until one does.
 type detailingComposer struct {
 	capableComposer
 	details      map[string]compose.UpdateDetail
