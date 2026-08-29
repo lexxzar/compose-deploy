@@ -416,8 +416,9 @@ type Model struct {
 	// The FIRST grouped payload that installs ROWS consumes it and clears it
 	// again. The one-shot is the whole point: that same branch is the 5-second
 	// reload, which must preserve the folds the user opened, so a flat "fold
-	// on a grouped payload" would re-fold the screen every tick. Drill-out
-	// lands through enterGroupedContainers and re-folds on purpose.
+	// on a grouped payload" would re-fold the screen every tick. A drill-out
+	// arms it here too, but carries groupFoldRestore, which
+	// applyPendingGroupFold applies INSTEAD of the blanket fold.
 	//
 	// Disarming rides with the rows the flag names: clearContainerScreen
 	// clears it, and drillIntoGroup — the one departure site that does not
@@ -436,6 +437,25 @@ type Model struct {
 	// drillIntoGroup clears it by hand — so the drill-out site arms AFTER
 	// enterGroupedContainers returns.
 	groupCursorPending svcRowID
+
+	// groupFoldRestore carries the host view's fold layout across a drill-in /
+	// drill-out round trip, so a project the user left open comes back open.
+	// drillIntoGroup is its ONE writer, because setSingleGroup replaces the
+	// host groups that hold the flags: by the time the drill-out esc runs there
+	// is nothing left to read them from.
+	//
+	// It is keyed by the sanitized project NAME, like buildSvcGroups' own
+	// carry-forward, and a project the map does not name lands FOLDED — it
+	// appeared while the user was inside a project, and the host view is
+	// compact by default.
+	//
+	// applyPendingGroupFold spends it together with groupFoldPending, and it
+	// rides clearContainerScreen like the other one-shots — it names ONE
+	// host's projects, and applying host A's folds to host B's projects of the
+	// same name is the hazard of the whole mechanism. The drill-out esc is the
+	// one site that needs it ACROSS the landing, so it carries it over
+	// enterGroupedContainers by hand, the same shape groupCursorPending uses.
+	groupFoldRestore map[string]bool
 
 	// svcStatus and stats are keyed by the QUALIFIED key svcKey produces, not
 	// by the bare service name a Composer returns: two projects on one host
@@ -2600,14 +2620,21 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 				//
 				// Hoisted: pointer receiver, same m as the return.
 				proj := m.projName
+				folds := m.groupFoldRestore
 				cmd := m.enterGroupedContainers()
-				// AFTER the call, which clears the target along with the rows
-				// it names. The project's HEADER: a multi-group host lands
-				// folded, so the service row the cursor sat on is gone, and a
-				// lone group draws no header at all, so there the target misses
-				// and restoreCursorRow clamps. The entryLocal fast track drills
-				// out carrying no name — it never looks one up — so it arms
-				// nothing rather than an id ok() would refuse to spend.
+				// Both AFTER the call, which drops them with the rows they
+				// name. The layout the drill-in captured is the one thing this
+				// transition has to carry across its own cleanup.
+				m.groupFoldRestore = folds
+				// The project's HEADER, never the service row the drilled
+				// cursor sat on: the landing can arrive folded — a fresh one
+				// always does, a restored one wherever the user left that group
+				// closed — so that row need not exist. Where no header is drawn
+				// either (a lone group the restore leaves open) the target
+				// misses and restoreCursorRow clamps to row 0, which is that
+				// project anyway. The entryLocal fast track drills out carrying
+				// no name — it never looks one up — so it arms nothing rather
+				// than an id ok() would refuse to spend.
 				if proj != "" {
 					m.groupCursorPending = svcRowID{proj: proj, header: true}
 				}
@@ -6493,6 +6520,13 @@ func (m *Model) drillIntoGroup(gi int) tea.Cmd {
 	// row-derived one-shots by hand.
 	m.groupFoldPending = false
 	m.groupCursorPending = svcRowID{}
+	// Drill-IN is the only place the host's fold layout can still be read:
+	// setSingleGroup below replaces the groups that carry it. See
+	// groupFoldRestore.
+	m.groupFoldRestore = make(map[string]bool, len(m.svcGroups))
+	for _, sg := range m.svcGroups {
+		m.groupFoldRestore[sg.proj.Name] = sg.folded
+	}
 	// The grouped view is the parent screen from here on: canGoBack and the
 	// footer's back label both read drilledFromHost on the drilled screen.
 	m.drilledFromHost = true
@@ -6616,14 +6650,19 @@ func (m *Model) bumpFetchSessions() {
 //
 // The three one-shots it carries — svcReloadPending, groupFoldPending and
 // groupCursorPending — are row-derived like the rest: each names a payload for
-// rows this call just dropped. enterGroupedContainers re-arms groupFoldPending
-// AFTER calling this, which is what makes the landing fold survive its own
-// cleanup, and the drill-out site arms groupCursorPending the same way.
+// rows this call just dropped. groupFoldRestore goes with them: it names the
+// host those rows came from, so leaving it standing would apply one host's
+// folds to another's projects of the same name.
+//
+// enterGroupedContainers re-arms groupFoldPending AFTER calling this, which is
+// what makes the landing fold survive its own cleanup; the drill-out site
+// carries groupCursorPending and groupFoldRestore over the same way.
 func (m *Model) clearContainerScreen() {
 	m.clearSvcGroups()
 	m.svcReloadPending = false
 	m.groupFoldPending = false
 	m.groupCursorPending = svcRowID{}
+	m.groupFoldRestore = nil
 	m.svcStatus = nil
 	m.stats = nil
 	m.statsErr = nil
@@ -6690,28 +6729,61 @@ func (m *Model) clampSvcCursor() {
 	}
 }
 
-// applyPendingGroupFold folds every group once per landing on the grouped host
-// view. Only a payload the user actually SAW rows from spends the one-shot,
-// and the two nearly-identical cases below are the reason that distinction
-// matters:
+// applyPendingGroupFold spends the landing one-shot and settles the fold layout
+// the payload lands under. Only a payload the user actually SAW rows from
+// spends it, and the two nearly-identical cases below are the reason that
+// distinction matters:
 //
-//   - a payload carrying ONE group clears the flag. The lone group is left open
-//     on purpose (folding it leaves one header and nothing else on screen), and
-//     the landing frame the user saw was that group's rows — so a host that
-//     later gains a second project must not fold under an ordinary reload.
-//   - a payload carrying ZERO groups keeps the flag armed. buildSvcGroups
-//     always returns a non-nil slice, so an empty one is a real answer — a
-//     docker host with nothing up, or a remote box whose containers start a few
-//     seconds after the connect. The user saw no rows, so the landing has not
-//     happened yet; the first payload that brings rows still folds them.
+//   - a payload carrying ONE group spends the flag. The landing frame the user
+//     saw was that group's rows, so a host that later gains a second project
+//     must not fold under an ordinary reload. It stays OPEN unless a drill-in
+//     snapshot says otherwise — see the two helpers below.
+//   - a payload carrying ZERO groups keeps the flag armed, and the snapshot
+//     with it. buildSvcGroups always returns a non-nil slice, so an empty one
+//     is a real answer — a docker host with nothing up, or a remote box whose
+//     containers start a few seconds after the connect. The user saw no rows,
+//     so the landing has not happened yet; the first payload that brings rows
+//     still folds them.
 //
-// setGroups already built the entries from the unfolded state, so the fold has
-// to rebuild them again.
+// A drill-out is the ONE landing carrying groupFoldRestore, and the branch asks
+// exactly that: was a snapshot TAKEN? A size test asks a different question —
+// an empty non-nil map would fall through to the blanket fold, whose lone-group
+// carve-out leaves a group OPEN where the snapshot's !seen rule folds it.
 func (m *Model) applyPendingGroupFold() {
 	if !m.groupFoldPending || len(m.svcGroups) == 0 {
 		return
 	}
 	m.groupFoldPending = false
+	restore := m.groupFoldRestore
+	m.groupFoldRestore = nil
+	if restore != nil {
+		m.restoreGroupFold(restore)
+		return
+	}
+	m.foldGroupsForLanding()
+}
+
+// restoreGroupFold puts the host view back in the layout the drill-in captured.
+// A project the snapshot does not name lands FOLDED: it appeared while the user
+// was inside another project, and the host view is compact by default. A LONE
+// group honours the snapshot, where the blanket landing fold refuses to close
+// one — groupsHaveHeaders keeps a folded lone group's header, so the row that
+// unfolds it again is still on screen.
+//
+// setGroups already built the entries from the unfolded state, so the fold has
+// to rebuild them.
+func (m *Model) restoreGroupFold(snapshot map[string]bool) {
+	for i := range m.svcGroups {
+		folded, seen := snapshot[m.svcGroups[i].proj.Name]
+		m.svcGroups[i].folded = folded || !seen
+	}
+	m.svcEntries = rebuildSvcEntries(m.svcGroups)
+}
+
+// foldGroupsForLanding folds the whole host view on a landing that carries no
+// snapshot. A LONE group is left open: folding it leaves one header and nothing
+// else on screen, hiding the whole host to summarise one project.
+func (m *Model) foldGroupsForLanding() {
 	if len(m.svcGroups) == 1 {
 		return
 	}
