@@ -1215,9 +1215,10 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.applyPendingGroupFold()
 			// A drill-out overrides the captured cursor: the row it names is
 			// the project the user just left, which the drilled screen's own
-			// cursor cannot name. The fold above renumbers rows but changes no
-			// group count, so only the restoreCursorRow below — the one
-			// consumer of cursorID — has to stay under this.
+			// cursor cannot name. The window is setGroups → here →
+			// restoreCursorRow: the take reads len(svcGroups), and
+			// restoreCursorRow is the one consumer of cursorID. Where the fold
+			// sits either side of this is free.
 			if id, ok := m.takePendingGroupCursor(); ok {
 				cursorID = id
 			}
