@@ -12353,12 +12353,13 @@ func TestUpdatesMsg_InspectRebuildIsScreenScoped(t *testing.T) {
 }
 
 // readOnlyDetailComposer is a read-only composer that ALSO satisfies
-// UpdateDetailer — the shape *compose.HostContainers really has. The plain
-// readOnlyMockComposer does not implement it, so a read-only test built on that
-// double would pass on the missing capability rather than on the
-// autoUpdatesAllowed() gate under test (the capableReadOnlyComposer precedent).
+// UpdateDetailer and Inspector — the shape *compose.HostContainers really has.
+// The plain readOnlyMockComposer implements neither, so a read-only test built
+// on that double would pass on the missing capability rather than on the
+// autoUpdatesAllowed() gate under test (the capableReadOnlyComposer precedent);
+// the Inspector half is what lets `i` reach the screen's own detail fetch.
 type readOnlyDetailComposer struct {
-	readOnlyMockComposer
+	readOnlyInspectComposer
 	details      map[string]compose.UpdateDetail
 	detailsCalls int
 	detailsArgs  [][]string
@@ -12668,6 +12669,61 @@ func TestReadOnly_NoAutomaticDetailFetch(t *testing.T) {
 		}
 		if got := c.detailsArgs[0]; len(got) != 1 || got[0] != "watchtower" {
 			t.Errorf("UpdateDetails services = %v, want [watchtower] — only U's own true verdicts", got)
+		}
+	})
+
+	t.Run("the inspect screen spends nothing on a cold cache", func(t *testing.T) {
+		// fetchInspectDetail deliberately does NOT consult
+		// autoUpdatesAllowed(), and this is where that decision is either safe
+		// or not: it can only fire for an entry that ALREADY exists under this
+		// key, and the first subtest pins that no automatic path creates one
+		// here. A cold read-only screen therefore spends nothing.
+		c := newComposer()
+		c.inspectRaw = []byte(inspectFixtureJSON)
+		m := inspectTestModel(t, c, c.services)
+
+		result, cmd := m.Update(keyMsgFor("i"))
+		if cmd == nil {
+			t.Fatal("i must open the inspect screen on the read-only view")
+		}
+		_, detailCmd := result.(Model).Update(cmd())
+		if detailCmd != nil {
+			t.Errorf("the cold read-only screen dispatched a detail fetch: %T", detailCmd())
+		}
+		if c.detailsCalls != 0 {
+			t.Errorf("UpdateDetails calls = %d, want 0", c.detailsCalls)
+		}
+	})
+
+	t.Run("the inspect screen completes U's own verdict", func(t *testing.T) {
+		// The other half of the same decision. The entry below is what U
+		// leaves: verdicts written, details still nil because the unmanaged
+		// screen is grouped-shaped and no batch reported. The screen then fills
+		// its ONE service, which is U's own true verdict rather than a fan-out.
+		c := newComposer()
+		c.inspectRaw = []byte(inspectFixtureJSON)
+		m := inspectTestModel(t, c, c.services)
+		m.updateCache = map[string]updateEntry{m.updatesCacheKey(): {
+			fetchedAt: time.Now(),
+			results:   map[string]bool{"watchtower": true},
+		}}
+
+		result, cmd := m.Update(keyMsgFor("i"))
+		result, detailCmd := result.(Model).Update(cmd())
+		if detailCmd == nil {
+			t.Fatal("U's verdict was left without its rows on the read-only screen")
+		}
+		shown := modelOf(result.(Model).Update(detailCmd()))
+
+		if c.detailsCalls != 1 {
+			t.Fatalf("UpdateDetails calls = %d, want exactly 1", c.detailsCalls)
+		}
+		if got := c.detailsArgs[0]; len(got) != 1 || got[0] != "watchtower" {
+			t.Errorf("UpdateDetails services = %v, want [watchtower]", got)
+		}
+		want := detailFixtureFor("watchtower")["watchtower"].NewID
+		if !strings.Contains(shown.inspectSummary, inspectRow("update id", want)) {
+			t.Errorf("the rows must render on the read-only screen:\n%s", shown.inspectSummary)
 		}
 	})
 

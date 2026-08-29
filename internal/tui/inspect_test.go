@@ -1958,20 +1958,20 @@ func (c *inspectDetailComposer) UpdateDetails(_ context.Context, services []stri
 }
 
 // TestInspectDetail_FiresOnlyOnATrueVerdict is the whole refusal set, plus the
-// one row that DOES fire — without it the table would pass on a fetch that never
-// works. The empty-service row is not a nicety: filterServices reads an empty
-// slice as ALL services, so it would cost registry round-trips per service.
+// two rows that DO fire — without them the table would pass on a fetch that
+// never works.
 func TestInspectDetail_FiresOnlyOnATrueVerdict(t *testing.T) {
 	const key = "\x00|"
 	entry := func(e updateEntry) map[string]updateEntry { return map[string]updateEntry{key: e} }
 	trueVerdict := updateEntry{fetchedAt: time.Now(), results: map[string]bool{"web": true}}
 
 	tests := []struct {
-		name         string
-		cache        map[string]updateEntry
-		noDetailer   bool
-		emptyService bool
-		wantCalls    int
+		name          string
+		cache         map[string]updateEntry
+		noDetailer    bool
+		emptyService  bool
+		batchInFlight bool
+		wantCalls     int
 	}{
 		{name: "no entry for this context"},
 		{name: "errored entry is untrusted", cache: entry(updateEntry{fetchedAt: time.Now(), err: true, errMsg: "boom"})},
@@ -1985,8 +1985,25 @@ func TestInspectDetail_FiresOnlyOnATrueVerdict(t *testing.T) {
 				details:   map[string]compose.UpdateDetail{},
 			}),
 		},
+		{
+			// detailsInFlight bounds the BATCH phase and one service is not a
+			// batch, so a running batch must not blank this screen's rows.
+			name:          "a batch is in flight elsewhere",
+			cache:         entry(trueVerdict),
+			batchInFlight: true,
+			wantCalls:     1,
+		},
 		{name: "composer is not an UpdateDetailer", cache: entry(trueVerdict), noDetailer: true},
-		{name: "no service on screen", cache: entry(trueVerdict), emptyService: true},
+		{
+			// The entry names "" so the empty-service guard is the SOLE
+			// refusal: under trueVerdict the row would pass with the guard
+			// deleted, because results[""] is false anyway. UpdateDetails runs
+			// its discovery call — `docker compose config`, a full SSH
+			// round-trip when remote — before filterServices ever sees a name.
+			name:         "no service on screen",
+			cache:        entry(updateEntry{fetchedAt: time.Now(), results: map[string]bool{"": true}}),
+			emptyService: true,
+		},
 		{name: "true verdict, nothing reported", cache: entry(trueVerdict), wantCalls: 1},
 	}
 
@@ -2002,12 +2019,13 @@ func TestInspectDetail_FiresOnlyOnATrueVerdict(t *testing.T) {
 				service = ""
 			}
 			m := Model{
-				screen:         screenInspect,
-				inspectSession: 1,
-				inspectService: service,
-				composer:       c,
-				ctx:            context.Background(),
-				updateCache:    tt.cache,
+				screen:          screenInspect,
+				inspectSession:  1,
+				inspectService:  service,
+				composer:        c,
+				ctx:             context.Background(),
+				updateCache:     tt.cache,
+				detailsInFlight: tt.batchInFlight,
 			}
 
 			cmd := m.fetchInspectDetail()
@@ -2200,4 +2218,121 @@ func TestInspectScreen_ResizeKeepsTheDetailRows(t *testing.T) {
 			t.Errorf("the resize dropped %q:\n%s", row, resized.inspectSummary)
 		}
 	}
+}
+
+// The batch still owns the rows in drilled mode. An entry whose details a batch
+// already reported must cost the screen nothing: without the entry.details half
+// of the guard, every `i` press would re-spend the registry round-trips the
+// batch had already paid for.
+func TestInspectDetail_ReportedBatchCostsNoSecondFetch(t *testing.T) {
+	c := &inspectDetailComposer{details: detailFixture()}
+	c.inspectRaw = []byte(inspectFixtureJSON)
+	c.services = []string{"web"}
+	m := inspectTestModel(t, c, c.services)
+	m.updateCache = map[string]updateEntry{m.updatesCacheKey(): {
+		fetchedAt: time.Now(),
+		results:   map[string]bool{"web": true},
+		details:   detailFixture(),
+	}}
+
+	result, cmd := m.Update(keyMsgFor("i"))
+	if cmd == nil {
+		t.Fatal("i should return the inspect fetch")
+	}
+	result, detailCmd := result.(Model).Update(cmd())
+	if detailCmd != nil {
+		t.Errorf("the batch's rows are already cached; the screen refetched them: %T", detailCmd())
+	}
+	if c.detailsCalls != 0 {
+		t.Errorf("UpdateDetails ran %d times, want 0", c.detailsCalls)
+	}
+	got := result.(Model)
+	if !strings.Contains(got.inspectSummary, inspectRow("update id", detailFixture()["web"].NewID)) {
+		t.Errorf("the batch's rows must still render:\n%s", got.inspectSummary)
+	}
+}
+
+// The consequence of the pure-read rule, followed one step out: the screen's
+// fetch resolves ONE service, so the entry must still read as "no batch has
+// reported" and refillUpdateDetailsCmd must still fetch EVERY updated service.
+// Writing the one service into entry.details would strand the others for the
+// entry's whole 10-minute TTL — a display gap traded for a data gap.
+func TestInspectDetail_LeavesTheRefillToTheBatch(t *testing.T) {
+	c := &inspectDetailComposer{details: detailFixture()}
+	c.inspectRaw = []byte(inspectFixtureJSON)
+	c.services = []string{"web", "db"}
+	m := inspectTestModel(t, c, c.services)
+	m.updateCache = map[string]updateEntry{m.updatesCacheKey(): {
+		fetchedAt: time.Now(),
+		results:   map[string]bool{"web": true, "db": true},
+	}}
+
+	result, cmd := m.Update(keyMsgFor("i")) // the cursor sits on web
+	result, detailCmd := result.(Model).Update(cmd())
+	if detailCmd == nil {
+		t.Fatal("the document's arrival should chain the screen's own detail fetch")
+	}
+	after := modelOf(result.(Model).Update(detailCmd()))
+
+	refill := after.refillUpdateDetailsCmd()
+	if refill == nil {
+		t.Fatal("the screen's own fetch suppressed the batch that fills every other service")
+	}
+	refill()
+	if len(c.detailsArgs) != 2 {
+		t.Fatalf("UpdateDetails was called %d times, want 2 (the screen's one, then the batch)", len(c.detailsArgs))
+	}
+	if !reflect.DeepEqual(c.detailsArgs, [][]string{{"web"}, {"db", "web"}}) {
+		t.Errorf("UpdateDetails was asked for %v, want [[web] [db web]]", c.detailsArgs)
+	}
+}
+
+// Both reset sites, each pinned on its own. One service's rows painting under
+// another's is not hypothetical: `update id` and `update built` render off their
+// own fields, with no verdict gate, so a leftover value draws confidently under
+// a service whose verdict is false.
+func TestInspectDetail_ResetAtBothSites(t *testing.T) {
+	stale := compose.UpdateDetail{NewID: "sha256:" + strings.Repeat("a", 64)}
+
+	t.Run("clearInspect drops them on the way out", func(t *testing.T) {
+		m := inspectScreenModel(t)
+		m.inspectDetail = stale
+
+		got := modelOf(m.Update(tea.KeyMsg{Type: tea.KeyEsc}))
+
+		if got.screen != screenSelectContainers {
+			t.Fatalf("screen = %d, want screenSelectContainers", got.screen)
+		}
+		if got.inspectDetail != (compose.UpdateDetail{}) {
+			t.Errorf("inspectDetail = %+v survived the departure", got.inspectDetail)
+		}
+	})
+
+	t.Run("enterInspect starts from the zero value", func(t *testing.T) {
+		c := &inspectDetailComposer{details: detailFixture()}
+		c.inspectRaw = []byte(inspectFixtureJSON)
+		c.services = []string{"web", "db"}
+		m := inspectTestModel(t, c, c.services)
+		// The entry has to EXIST, or currentUpdateInfo returns before the
+		// fallback and the leak cannot be observed.
+		m.updateCache = map[string]updateEntry{m.updatesCacheKey(): {
+			fetchedAt: time.Now(),
+			results:   map[string]bool{"web": true, "db": false},
+		}}
+		m.inspectDetail = stale // what the previously inspected service left
+		m.svcCursor = 1         // db, whose verdict is false
+
+		result, cmd := m.Update(keyMsgFor("i"))
+		got := modelOf(result.(Model).Update(cmd()))
+
+		if got.inspectService != "db" {
+			t.Fatalf("inspectService = %q, want db", got.inspectService)
+		}
+		if got.inspectDetail != (compose.UpdateDetail{}) {
+			t.Errorf("inspectDetail = %+v, want the zero value", got.inspectDetail)
+		}
+		if strings.Contains(got.inspectSummary, stale.NewID) {
+			t.Errorf("web's update id painted under db:\n%s", got.inspectSummary)
+		}
+	})
 }
