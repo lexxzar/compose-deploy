@@ -470,11 +470,11 @@ type Model struct {
 	// nil means "no snapshot", and a selection holding no KEYS captures as
 	// nil, so a round trip that ticked nothing restores nothing. An untick
 	// leaves a false entry rather than dropping the key, so tick-then-untick
-	// captures a non-nil all-false map instead — harmless, because every
-	// selection read is truthiness-based. The spend is guarded on rows
-	// arriving, like applyPendingGroupFold: a payload with no groups is not
-	// the landing, and eating the snapshot there would lose the selection to a
-	// host that was merely slow.
+	// captures a non-nil all-false map instead — harmless, because the reads
+	// that decide what an operation acts on (selectedContainers,
+	// selectedCount, groupSelected, allVisibleSelected) are truthiness-based.
+	// applyPendingGroupSelection spends it, under the same zero-group rule as
+	// the fold.
 	//
 	// It rides clearContainerScreen for the same reason the fold snapshot does
 	// — the keys name ONE host's projects — so the drill-out esc carries it
