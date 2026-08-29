@@ -2336,3 +2336,101 @@ func TestInspectDetail_ResetAtBothSites(t *testing.T) {
 		}
 	})
 }
+
+// A document the parser refuses leaves no summary and forces raw mode, and
+// every redraw re-parses the same bytes and fails again — so the rows have
+// nowhere to land. Dispatching anyway spent one local probe plus up to three
+// registry calls on a result nothing could render.
+func TestInspectDetail_ParseFailureSpendsNoFetch(t *testing.T) {
+	c := &inspectDetailComposer{details: detailFixture()}
+	c.inspectRaw = []byte("[]") // what docker prints for a container it cannot find
+	c.services = []string{"web"}
+	m := inspectTestModel(t, c, c.services)
+	m.updateCache = map[string]updateEntry{m.updatesCacheKey(): {
+		fetchedAt: time.Now(),
+		results:   map[string]bool{"web": true},
+	}}
+
+	result, cmd := m.Update(keyMsgFor("i"))
+	if cmd == nil {
+		t.Fatal("i should return the inspect fetch")
+	}
+	result, detailCmd := result.(Model).Update(cmd())
+	got := result.(Model)
+
+	if got.inspectErr == nil {
+		t.Fatal("precondition: the parse should have failed")
+	}
+	if !got.inspectShowRaw {
+		t.Error("a parse failure must still land the user on the raw bytes")
+	}
+	if detailCmd != nil {
+		t.Errorf("the detail fetch was dispatched for an unrenderable document: %T", detailCmd())
+	}
+	if c.detailsCalls != 0 {
+		t.Errorf("UpdateDetails ran %d times, want 0", c.detailsCalls)
+	}
+}
+
+// The memo names the SERVICE as well as the entry. Both services here share one
+// cache entry, so an identity of (key, fetchedAt) alone would answer db with
+// web's rows — drawn confidently, under a heading that invites the comparison.
+func TestInspectDetail_MemoIsPerService(t *testing.T) {
+	c := &inspectDetailComposer{details: map[string]compose.UpdateDetail{
+		"web": detailFixture()["web"],
+		"db":  {NewID: "sha256:" + strings.Repeat("b", 64)},
+	}}
+	c.inspectRaw = []byte(inspectFixtureJSON)
+	c.services = []string{"db", "web"}
+	m := inspectTestModel(t, c, c.services)
+	m.updateCache = map[string]updateEntry{m.updatesCacheKey(): {
+		fetchedAt: time.Now(),
+		results:   map[string]bool{"web": true, "db": true},
+	}}
+
+	m.svcCursor = 1 // web
+	m = inspectVisit(t, m)
+	if got := m.inspectDetail.NewID; got != detailFixture()["web"].NewID {
+		t.Fatalf("precondition: web's rows = %q, want the fixture's", got)
+	}
+	m = inspectLeave(t, m)
+
+	m.svcCursor = 0 // db, the same key and the same entry
+	m = inspectVisit(t, m)
+
+	if got, want := m.inspectDetail.NewID, c.details["db"].NewID; got != want {
+		t.Errorf("db's update id = %q, want %q", got, want)
+	}
+	if !reflect.DeepEqual(c.detailsArgs, [][]string{{"web"}, {"db"}}) {
+		t.Errorf("UpdateDetails was asked for %v, want [[web] [db]]", c.detailsArgs)
+	}
+}
+
+// inspectVisit presses `i` and delivers both messages it chains: the document,
+// then whatever the document's arrival dispatched (a fetch or a memo replay).
+func inspectVisit(t *testing.T, m Model) Model {
+	t.Helper()
+	result, cmd := m.Update(keyMsgFor("i"))
+	if cmd == nil {
+		t.Fatal("i must dispatch the inspect fetch")
+	}
+	result, detailCmd := result.(Model).Update(cmd())
+	if detailCmd == nil {
+		t.Fatal("the document's arrival must chain the detail command")
+	}
+	return modelOf(result.(Model).Update(detailCmd()))
+}
+
+// inspectLeave presses esc and runs the reload the grouped path returns with it.
+func inspectLeave(t *testing.T, m Model) Model {
+	t.Helper()
+	result, cmd := m.Update(tea.KeyMsg{Type: tea.KeyEsc})
+	m = result.(Model)
+	if m.screen != screenSelectContainers {
+		t.Fatalf("esc left screen %d, want the container screen", m.screen)
+	}
+	if cmd != nil {
+		m = modelOf(m.Update(cmd()))
+	}
+	return m
+}

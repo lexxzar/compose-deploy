@@ -12005,9 +12005,10 @@ func TestUpdateDetails_GuardIsNotClearedByNavigation(t *testing.T) {
 // TestUpdateDetails_SelfHealsAtEveryScreenEntry covers the other half: an entry
 // that a lost batch left with no detail rows is refetched at the next screen
 // entry, at every site that consults maybeRefreshUpdatesCmd. Without it the
-// entry is a fresh SUCCESS, so the statusMsg self-heal skips it too and the
-// inspect screen — a pure consumer — shows `update available` with no `built`,
-// no `update id` and no `update built` for the full 10-minute TTL.
+// entry is a fresh SUCCESS, so the statusMsg self-heal skips it too, and the
+// inspect screen fetches only the ONE service it renders and writes no cache
+// back — so every OTHER updated service shows `update available` with no
+// `update id` and no `update built` for the full 10-minute TTL.
 func TestUpdateDetails_SelfHealsAtEveryScreenEntry(t *testing.T) {
 	servers := []config.Server{{Name: "s1", Host: "h1"}}
 	cases := []struct {
@@ -12222,8 +12223,9 @@ func TestUpdatesMsg_StaleSessionDoesNotWriteTheEntry(t *testing.T) {
 	}
 }
 
-// TestUpdatesMsg_RefreshesInspectSummary: the inspect screen is a consumer of
-// the update cache and never fetches details itself. Entering `i` on a cold
+// TestUpdatesMsg_RefreshesInspectSummary: the inspect screen consumes the
+// update cache, and fetches only what the cache has no detail for — one
+// service, never written back. Entering `i` on a cold
 // cache is exactly when the fetch is still in flight, so without this rebuild
 // the new IMAGE rows would stay absent until a back-out and re-entry. The
 // assertions read the MESSAGE's own data back out of the summary, so a rebuild

@@ -458,12 +458,13 @@ type Model struct {
 	// = local). projDir is empty for the local-fast-track entry, giving that
 	// context a single cache slot of "".
 	updateCache     map[string]updateEntry
-	updatesSession  uint64          // mirror of statsSession — bumped at the 7 context-change sites so a stale CheckUpdates response can't hydrate UpdateAvailable into a different project's svcStatus map
-	updateInFlight  bool            // mirror of refreshInFlight for refreshUpdates — prevents a slow CheckUpdates from stacking on the next screen entry / `U` press
-	detailsInFlight bool            // updateInFlight's twin for the detail phase; a GLOBAL one-batch bound — no context-change site resets it, and its only clear is the unconditional one on every updateDetailsMsg arrival
-	updatesErr      string          // last error from CheckUpdates; rendered as soft warning below statsErr (priority: svcErr > statsErr > updatesErr)
-	projDir         string          // active project's config dir; used for the updateCache key
-	selected        map[string]bool // svcKey → selected; index keys would not survive a fold rebuild, which renumbers every row
+	updatesSession  uint64            // mirror of statsSession — bumped at the 7 context-change sites so a stale CheckUpdates response can't hydrate UpdateAvailable into a different project's svcStatus map
+	updateInFlight  bool              // mirror of refreshInFlight for refreshUpdates — prevents a slow CheckUpdates from stacking on the next screen entry / `U` press
+	detailsInFlight bool              // updateInFlight's twin for the detail phase; a GLOBAL one-batch bound — no context-change site resets it, and its only clear is the unconditional one on every updateDetailsMsg arrival
+	inspectMemo     inspectDetailMemo // one slot: the last detail the inspect screen fetched, keyed to the cache entry it annotates so it expires with it — survives every departure, which is what stops `i` refetching
+	updatesErr      string            // last error from CheckUpdates; rendered as soft warning below statsErr (priority: svcErr > statsErr > updatesErr)
+	projDir         string            // active project's config dir; used for the updateCache key
+	selected        map[string]bool   // svcKey → selected; index keys would not survive a fold rebuild, which renumbers every row
 	svcCursor       int
 	svcOffset       int // index of first visible service in scroll window
 	svcErr          error
@@ -787,6 +788,30 @@ type updateEntry struct {
 	errMsg string
 }
 
+// inspectDetailMemo is the one-slot memo behind fetchInspectDetail. The screen
+// renders ONE service and never writes entry.details, so without it every `i`
+// on a grouped row re-spent one local probe plus up to three registry calls for
+// the cache entry's whole 10-minute TTL.
+//
+// The identity is the cache entry's own fetchedAt alongside the key and the
+// service, so the memo dies with the entry it describes: a fresh U writes a new
+// stamp and the next `i` fetches again, with no departure site to reset. One
+// slot rather than a map because the screen shows one service at a time — the
+// repeat is `i` on the same row — and a slot cannot grow across a session.
+type inspectDetailMemo struct {
+	key     string    // inspectUpdateKey() the fetch was dispatched under
+	service string    // the ONE service it resolved
+	entry   time.Time // fetchedAt of the cache entry it annotates
+	detail  compose.UpdateDetail
+}
+
+// answers reports whether the memo already holds the result of this exact
+// fetch. The zero memo answers nothing: every cache key carries the NUL
+// separator, so an empty key matches none of them.
+func (memo inspectDetailMemo) answers(key, service string, entry time.Time) bool {
+	return memo.key == key && memo.service == service && memo.entry.Equal(entry)
+}
+
 // updatesMsg carries the result of a refreshUpdates fetch. session is
 // captured at fetch time and compared against m.updatesSession in the
 // handler to drop stale responses from a previous project/server context.
@@ -969,9 +994,16 @@ type inspectDataMsg struct {
 // of the detail BATCH: grouped mode dispatches no batch at all, and a batch
 // resolves N services for a screen that renders one. It never reaches the
 // update cache — see fetchInspectDetail.
+//
+// forKey and forEntry are the memo's identity, captured at DISPATCH and never
+// re-derived: an updatesMsg can replace the cache entry while this screen is up
+// and under the SAME session, so a handler-time read would file one entry's
+// rows under another's stamp and suppress that entry's own fetch.
 type inspectDetailMsg struct {
-	detail  compose.UpdateDetail
-	session uint64
+	detail   compose.UpdateDetail
+	forKey   string
+	forEntry time.Time
+	session  uint64
 }
 
 // NewModel creates a new TUI model.
@@ -1489,6 +1521,16 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			// omits the detail ones, which is that type's documented "unknown".
 			if !m.grouped {
 				detailsCmd = m.updateDetailsCmd(entry, key)
+			} else if m.screen == screenInspect && key == m.inspectUpdateKey() {
+				// The verdicts these rows annotate have only just landed, so
+				// the fetch the inspect screen chains off its own document
+				// found no entry and returned nil. Nothing on screenInspect
+				// binds U, so without this the rows stay absent for the whole
+				// visit — and docker inspect is one call against CheckUpdates'
+				// many, so the document almost always wins that race. The
+				// composer is the one `i` bound from the cursor row's group,
+				// which is the group this key names.
+				detailsCmd = m.fetchInspectDetail()
 			}
 		} else {
 			m.updateCache[key] = updateEntry{
@@ -1498,13 +1540,15 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				errMsg:    msg.err.Error(),
 			}
 		}
-		// The inspect screen is a pure CONSUMER of this cache — it never fetches
-		// details of its own. Without this rebuild, pressing `i` while the first
-		// fetch is still in flight (a cold cache is exactly when that happens)
-		// would leave the new IMAGE rows permanently absent until the user backs
-		// out and re-enters. Runs on the failure path too: the entry that just
-		// landed carries no details, so a summary drawn from a previous one must
-		// stop showing them. rebuildInspectSummary early-returns when no raw
+		// The inspect screen CONSUMES this cache and fetches only what the cache
+		// has no detail for — one service, never written back. Without this
+		// rebuild, pressing `i` while the first fetch is still in flight (a cold
+		// cache is exactly when that happens) would leave the new IMAGE rows
+		// absent until the user backs out and re-enters (the branch above is
+		// the other half of that, for the arrival that lands on the screen).
+		// Runs on the failure path too: the entry that just landed carries no
+		// details, so a summary drawn from a previous one must stop showing
+		// them. rebuildInspectSummary early-returns when no raw
 		// bytes are in hand, so this is a no-op before the inspect fetch lands.
 		m.redrawInspectFromCache()
 		// State mutations below happen regardless of which screen the user is
@@ -1875,6 +1919,11 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			// not in rebuildInspectSummary — that also runs on every resize,
 			// which would silently undo a later `r` back to the summary.
 			m.inspectShowRaw = true
+			m.setInspectContent()
+			// No summary was built and every redraw re-parses the same bytes
+			// and fails again, so the rows have nowhere to land: the fetch
+			// would spend up to four round-trips on a result that is discarded.
+			return m, nil
 		}
 		m.setInspectContent()
 		// The update rows are a SECOND message, for updateDetailsCmd's reason:
@@ -1888,6 +1937,16 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 		m.inspectDetail = msg.detail
+		// The service is the screen's, not the message's: the session gate
+		// above pins the visit, and one visit inspects one service — the same
+		// trust the assignment above already makes. The key and the stamp are
+		// the message's, because neither is pinned by that gate.
+		m.inspectMemo = inspectDetailMemo{
+			key:     msg.forKey,
+			service: m.inspectService,
+			entry:   msg.forEntry,
+			detail:  msg.detail,
+		}
 		m.redrawInspectFromCache()
 		return m, nil
 
@@ -4611,7 +4670,8 @@ func (m Model) fetchInspect() tea.Cmd {
 //
 // The key is inspectUpdateKey()'s, the same resolution currentUpdateInfo makes
 // — grouped mode's entry belongs to the CURSOR row's group, not to the
-// degenerate key updatesCacheKey() yields there.
+// degenerate key updatesCacheKey() yields there. A repeat visit inside one
+// cache entry is answered from inspectDetailMemo rather than refetched.
 func (m Model) fetchInspectDetail() tea.Cmd {
 	if m.inspectService == "" {
 		return nil
@@ -4620,23 +4680,33 @@ func (m Model) fetchInspectDetail() tea.Cmd {
 	if !ok {
 		return nil
 	}
-	entry, ok := m.updateCache[m.inspectUpdateKey()]
+	key := m.inspectUpdateKey()
+	entry, ok := m.updateCache[key]
 	if !ok || entry.err {
 		return nil
 	}
 	if !entry.results[m.inspectService] || entry.details != nil {
 		return nil
 	}
-	ctx := m.ctx
 	svc := m.inspectService
 	session := m.inspectSession
+	// The memo replays instead of refetching. Returning nil here would be the
+	// cheaper refusal and the wrong one: enterInspect resets inspectDetail, so
+	// the second visit would draw `update available` with no rows under it.
+	if memo := m.inspectMemo; memo.answers(key, svc, entry.fetchedAt) {
+		return func() tea.Msg {
+			return inspectDetailMsg{detail: memo.detail, forKey: memo.key, forEntry: memo.entry, session: session}
+		}
+	}
+	ctx := m.ctx
+	fetchedAt := entry.fetchedAt
 	return func() tea.Msg {
 		fetchCtx, cancel := context.WithTimeout(ctx, updateDetailsTimeout)
 		defer cancel()
 		// Discarded for updateDetailsCmd's reason: a 429 while annotating the
 		// signal must not degrade the signal. The rows are simply omitted.
 		details, _ := d.UpdateDetails(fetchCtx, []string{svc})
-		return inspectDetailMsg{detail: details[svc], session: session}
+		return inspectDetailMsg{detail: details[svc], forKey: key, forEntry: fetchedAt, session: session}
 	}
 }
 
@@ -5511,8 +5581,9 @@ func (m *Model) updateDetailsCmd(entry updateEntry, key string) tea.Cmd {
 //
 // Losing a batch is otherwise PERMANENT. The entry the verdicts wrote is a fresh
 // SUCCESS, so maybeRefreshUpdatesCmd and the statusMsg self-heal both skip it,
-// and the inspect screen is a pure consumer that never fetches — the rows are
-// then absent for the full 10-minute TTL with nothing on screen explaining why.
+// and the inspect screen fetches only the ONE service it renders and writes no
+// cache back — so every OTHER updated service is absent for the full 10-minute
+// TTL, with nothing on screen explaining why.
 // The retry therefore keys off the ENTRY'S OWN STATE, not off any mechanism:
 // however a batch goes missing, the entry still says "no batch reported" and the
 // next trigger refills it.

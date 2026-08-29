@@ -4524,6 +4524,214 @@ func TestGroupedInspect_DetailFetchAsksOneServiceOfTheCursorGroup(t *testing.T) 
 	}
 }
 
+// The repeat guard. Grouped mode dispatches no detail batch and the screen
+// writes no entry.details, so the entry keeps details == nil for its whole
+// 10-minute TTL: without the memo every `i` on that row re-spent one local probe
+// plus up to three registry calls, unbounded. The memo's identity carries the
+// entry's fetchedAt, so a fresh U pays once more with no reset anywhere.
+func TestGroupedInspect_RepeatVisitSpendsNoSecondFetch(t *testing.T) {
+	m, per := groupedDetailModel(t)
+	m.svcCursor = 3 // shop/api
+	m = pressU(t, m)
+	key := m.inspectUpdateKey()
+	firstScan := m.updateCache[key].fetchedAt
+	want := detailFixtureFor("api")["api"]
+	assertRows := func(t *testing.T, m Model, visit string) {
+		t.Helper()
+		for _, row := range []string{
+			inspectRow("update id", want.NewID),
+			inspectRow("update built", "2026-08-19 19:14:43"),
+		} {
+			if !strings.Contains(m.inspectSummary, row) {
+				t.Errorf("%s: summary missing %q:\n%s", visit, row, m.inspectSummary)
+			}
+		}
+	}
+
+	m = inspectVisit(t, m)
+	assertRows(t, m, "first visit")
+	if got := per["shop"].detailsCalls; got != 1 {
+		t.Fatalf("precondition: the first visit ran UpdateDetails %d times, want 1", got)
+	}
+
+	m = inspectLeave(t, m)
+	if got := m.svcKeyAt(m.svcCursor); got != svcKey("shop", "api") {
+		t.Fatalf("the reload left the cursor on %q, want shop/api", got)
+	}
+	m = inspectVisit(t, m)
+	assertRows(t, m, "second visit")
+	if got := per["shop"].detailsCalls; got != 1 {
+		t.Errorf("UpdateDetails ran %d times over two visits of one cache entry, want 1", got)
+	}
+
+	m = inspectLeave(t, m)
+	m = pressU(t, m)
+	if m.updateCache[key].fetchedAt.Equal(firstScan) {
+		t.Fatal("precondition: the second scan must write a new stamp")
+	}
+	m = inspectVisit(t, m)
+	assertRows(t, m, "after a fresh U")
+	if got := per["shop"].detailsCalls; got != 2 {
+		t.Errorf("UpdateDetails ran %d times after a fresh U, want 2", got)
+	}
+}
+
+// The race the screen cannot recover from on its own: `docker inspect` is ONE
+// call and CheckUpdates is many, so the document almost always arrives first,
+// finds no cache entry and dispatches nothing — and screenInspect binds no U.
+// The verdicts' own arrival is therefore the second trigger.
+func TestGroupedInspect_VerdictsArrivingOnScreenFetchTheRows(t *testing.T) {
+	// scanThenInspect presses U, HOLDS the scan's message, and opens the
+	// inspect screen on the cursor row while it is still outstanding.
+	scanThenInspect := func(t *testing.T, m Model) (Model, updatesMsg) {
+		t.Helper()
+		updated, scan := m.Update(keyMsgFor("U"))
+		m = updated.(Model)
+		if scan == nil {
+			t.Fatal("U must dispatch the scan")
+		}
+		msg, ok := scan().(updatesMsg)
+		if !ok {
+			t.Fatalf("U's command produced %T, want updatesMsg", scan())
+		}
+		updated, cmd := m.Update(keyMsgFor("i"))
+		m = updated.(Model)
+		if m.screen != screenInspect {
+			t.Fatalf("i left screen %d, want screenInspect", m.screen)
+		}
+		if cmd == nil {
+			t.Fatal("i must dispatch the inspect fetch")
+		}
+		updated, detailCmd := m.Update(cmd())
+		m = updated.(Model)
+		if detailCmd != nil {
+			t.Fatal("precondition: with no cache entry the document must chain nothing")
+		}
+		return m, msg
+	}
+
+	t.Run("the verdicts land while the screen is up", func(t *testing.T) {
+		m, per := groupedDetailModel(t)
+		m.svcCursor = 3 // shop/api
+		m, msg := scanThenInspect(t, m)
+		if strings.Contains(m.inspectSummary, inspectRow("update", "available")) {
+			t.Fatalf("precondition: no verdict has landed yet:\n%s", m.inspectSummary)
+		}
+
+		updated, cmd := m.Update(msg)
+		m = updated.(Model)
+		if cmd == nil {
+			t.Fatal("the verdicts' arrival must fetch the rows the screen is missing")
+		}
+		got := modelOf(m.Update(cmd()))
+
+		want := detailFixtureFor("api")["api"]
+		for _, row := range []string{
+			inspectRow("update", "available"),
+			inspectRow("update id", want.NewID),
+			inspectRow("update built", "2026-08-19 19:14:43"),
+		} {
+			if !strings.Contains(got.inspectSummary, row) {
+				t.Errorf("summary missing %q:\n%s", row, got.inspectSummary)
+			}
+		}
+		if calls := per["shop"].detailsCalls; calls != 1 {
+			t.Errorf("shop's UpdateDetails ran %d times, want 1", calls)
+		}
+		if got.detailsInFlight {
+			t.Error("the screen's own fetch must not raise the BATCH guard")
+		}
+	})
+
+	t.Run("another group's verdicts fetch nothing", func(t *testing.T) {
+		m, per := groupedDetailModel(t)
+		m.svcCursor = 3 // shop/api
+		m = pressU(t, m)
+
+		// The screen's own fetch is left OUTSTANDING, so shop's entry is one
+		// this arrival could refetch — the key is the only thing refusing.
+		updated, cmd := m.Update(keyMsgFor("i"))
+		m = updated.(Model)
+		updated, held := m.Update(cmd())
+		m = updated.(Model)
+		if held == nil {
+			t.Fatal("precondition: the screen must have a detail fetch outstanding")
+		}
+
+		updated, cmd = m.Update(updatesMsg{
+			results: map[string]bool{"web": true},
+			session: m.updatesSession,
+			forKey:  m.projUpdatesCacheKey(compose.Project{Name: "blog", ConfigDir: "/srv/blog"}),
+		})
+		if cmd != nil {
+			t.Errorf("a foreign entry triggered a fetch: %T", cmd())
+		}
+		if calls := per["shop"].detailsCalls + per["blog"].detailsCalls; calls != 0 {
+			t.Errorf("UpdateDetails ran %d times for a key the screen does not read", calls)
+		}
+		if updated.(Model).detailsInFlight {
+			t.Error("grouped mode must dispatch no detail batch either")
+		}
+	})
+
+	t.Run("off the inspect screen fetches nothing", func(t *testing.T) {
+		m, per := groupedDetailModel(t)
+		m.svcCursor = 3 // shop/api
+		updated, scan := m.Update(keyMsgFor("U"))
+		m = updated.(Model)
+		msg, ok := scan().(updatesMsg)
+		if !ok {
+			t.Fatalf("U's command produced %T, want updatesMsg", scan())
+		}
+		// An armed x prompt leaves a composer bound, so the inspect fields are
+		// seeded by hand: the SCREEN check has to be the refusal here, not the
+		// empty-service guard downstream of it.
+		m.composer = per["shop"]
+		m.inspectService = "api"
+
+		updated, cmd := m.Update(msg)
+		if cmd != nil {
+			t.Errorf("an arrival landing off the inspect screen fetched: %T", cmd())
+		}
+		if per["shop"].detailsCalls != 0 {
+			t.Errorf("UpdateDetails ran %d times with no inspect screen up, want 0", per["shop"].detailsCalls)
+		}
+		if updated.(Model).detailsInFlight {
+			t.Error("grouped mode must dispatch no detail batch")
+		}
+	})
+
+	t.Run("drilled mode leaves it to the batch", func(t *testing.T) {
+		m, per := groupedDetailModel(t)
+		m.svcCursor = 2 // the shop header
+		updated, _ := m.Update(keyMsgFor("enter"))
+		m = updated.(Model)
+		if m.grouped {
+			t.Fatal("enter on a header must drill in")
+		}
+		// The drill's own screen-entry scan raised the in-flight guard, and U
+		// refuses while it is up. Dropping it keeps this subtest driving
+		// exactly one updatesMsg — the same one that scan would deliver.
+		m.updateInFlight = false
+		m, msg := scanThenInspect(t, m)
+
+		updated, cmd := m.Update(msg)
+		m = updated.(Model)
+		if cmd == nil {
+			t.Fatal("drilled mode must still dispatch its detail batch")
+		}
+		if _, ok := cmd().(updateDetailsMsg); !ok {
+			t.Errorf("the drilled arrival dispatched %T, want the batch's updateDetailsMsg", cmd())
+		}
+		if !m.detailsInFlight {
+			t.Error("the batch must raise the guard the screen's own fetch never touches")
+		}
+		if calls := per["shop"].detailsCalls; calls != 1 {
+			t.Errorf("shop's UpdateDetails ran %d times, want 1 (the batch alone)", calls)
+		}
+	})
+}
+
 // Grouped mode fetches no detail rows: it holds no composer of its own, and one
 // an armed prompt left bound may belong to a different project entirely.
 func TestGroupedU_FetchesNoDetailBatch(t *testing.T) {
