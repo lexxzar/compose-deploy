@@ -4224,11 +4224,22 @@ func TestGroupedSelectionRestore_DrilledScreenInheritsNothing(t *testing.T) {
 // guard reads "no snapshot" and the landing keeps what the reload found. An
 // empty map would be indistinguishable from a plan and would hand pruneSelection
 // a map to reconcile for nothing.
+//
+// The stale value below is what pins drillIntoGroup's `= nil`, the line ABOVE
+// its conditional clone. The fold twin needs no such pin because its capture is
+// an unconditional make(...) that overwrites whatever stood there; the selection
+// capture is CONDITIONAL, so on the empty-selection path that one line is the
+// only thing that drops a stale snapshot — and a drill-in from a host with rows
+// ticked masks it, since the clone overwrites either way. Arming it by hand is
+// the only way to reach the state: a payload with rows spends the snapshot in
+// the same handler, so a drill-in never runs with the field set today. That
+// makes the line defensive code, not dead code, and this is its only pin.
 func TestGroupedSelectionRestore_NothingTickedRestoresNothing(t *testing.T) {
 	m, _ := drillTestModel(t)
 	if len(m.selected) != 0 {
 		t.Fatalf("precondition: the fixture starts with %v ticked", m.selected)
 	}
+	m.groupSelectionRestore = map[string]bool{svcKey("ghost", "svc"): true}
 
 	m, cmd := drillOut(t, m, headerIndexFor(t, m.svcEntries, 1))
 	if m.groupSelectionRestore != nil {
@@ -4545,33 +4556,6 @@ func TestGroupedOneShots_SettledAtEveryNavigationSite(t *testing.T) {
 				m.groupSelectionRestore = stalePicks
 				// The host plan this site has to capture as it clears.
 				m = tickRows(t, m, 1)
-				m.svcCursor = headerIndexFor(t, m.svcEntries, 1)
-				updated, _ := m.Update(keyMsgFor("enter"))
-				m = updated.(Model)
-				if m.grouped {
-					t.Fatal("precondition: enter did not drill in")
-				}
-				return m
-			},
-		},
-		{
-			// The selection capture is CONDITIONAL, unlike the fold's
-			// unconditional make(...), so the `= nil` above it is the only
-			// thing that drops a stale snapshot when the host plan is empty —
-			// and the row above cannot see it, because its clone overwrites
-			// either way. Unreachable through the UI today (a payload with
-			// rows spends the snapshot in the same handler, so a drill-in only
-			// ever runs with the field already nil), which is exactly why
-			// nothing else would notice the line being deleted.
-			name:          "drill in with nothing ticked",
-			wantRestore:   hostFolds,
-			wantSelection: nil,
-			run: func(t *testing.T) Model {
-				m, _ := drillTestModel(t)
-				if len(m.selected) != 0 {
-					t.Fatalf("precondition: the host view starts with %v ticked", m.selected)
-				}
-				m.groupSelectionRestore = stalePicks
 				m.svcCursor = headerIndexFor(t, m.svcEntries, 1)
 				updated, _ := m.Update(keyMsgFor("enter"))
 				m = updated.(Model)
