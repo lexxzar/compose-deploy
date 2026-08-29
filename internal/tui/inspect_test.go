@@ -1911,10 +1911,9 @@ func TestInspectScreen_ProbeFailureKeepsTheDocument(t *testing.T) {
 	}
 }
 
-// TestInspectScreen_ResizeKeepsTheBuiltRow: rebuildInspectSummary re-parses the
-// raw bytes, which cannot carry the image build date, so the resize path has to
-// merge it back from the Model. Without that the row vanishes on the first
-// resize and returns only on a re-entry.
+// TestInspectScreen_ResizeKeepsTheBuiltRow: the raw bytes cannot carry the build
+// date, so rebuildInspectSummary merges it back from the Model. Entry takes that
+// same path, so dropping the merge costs the row everywhere, not just on resize.
 func TestInspectScreen_ResizeKeepsTheBuiltRow(t *testing.T) {
 	m := inspectScreenModel(t)
 	result, _ := m.Update(inspectDataMsg{
