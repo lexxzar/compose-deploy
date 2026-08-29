@@ -11472,6 +11472,10 @@ func TestUpdateDetails_ColdCacheFillsEveryRow(t *testing.T) {
 	mc.updates = map[string]bool{"web": true}
 	m := inspectScreenModel(t)
 	m.composer = mc
+	// `built` rides the inspect fetch's own probe, not the detail batch, so the
+	// date it already delivered has to be on the Model for the fourth row to be
+	// there at all.
+	m.inspectImageCreated = time.Date(2026, 7, 7, 17, 47, 22, 0, time.UTC)
 	m.svcStatus = qStatus(m, map[string]runner.ServiceStatus{"web": {Running: true}})
 	if _, ok := m.updateCache[m.updatesCacheKey()]; ok {
 		t.Fatal("precondition: the cache must be cold")
@@ -12273,10 +12277,13 @@ func TestUpdatesMsg_RefreshesInspectSummary(t *testing.T) {
 // TestUpdatesMsg_FailurePathClearsInspectRows: the rebuild runs on the FAILURE
 // path too. The entry that just landed carries no verdicts and no details, so a
 // summary drawn from a previous one must stop showing them — otherwise the
-// glyph column blanks while the inspect screen keeps contradicting it.
+// glyph column blanks while the inspect screen keeps contradicting it. `built`
+// is the control: it comes from the inspect fetch's own probe, so a failed
+// update check may not take it down with them.
 func TestUpdatesMsg_FailurePathClearsInspectRows(t *testing.T) {
 	m := inspectScreenModel(t)
 	m.svcStatus = qStatus(m, map[string]runner.ServiceStatus{"web": {Running: true}})
+	m.inspectImageCreated = time.Date(2026, 7, 7, 17, 47, 22, 0, time.UTC)
 	m.updateCache = map[string]updateEntry{m.updatesCacheKey(): {
 		fetchedAt: time.Now().Add(-3 * time.Minute),
 		results:   map[string]bool{"web": true},
@@ -12294,10 +12301,13 @@ func TestUpdatesMsg_FailurePathClearsInspectRows(t *testing.T) {
 		session: m.updatesSession,
 	}))
 
-	for _, row := range []string{"update", "update id", "update built", "built"} {
+	for _, row := range []string{"update", "update id", "update built"} {
 		if strings.Contains(model.inspectSummary, inspectRow(row, "")) {
 			t.Errorf("a failed check must drop the %q row:\n%s", row, model.inspectSummary)
 		}
+	}
+	if !strings.Contains(model.inspectSummary, inspectRow("built", "2026-07-07 17:47:22")) {
+		t.Errorf("a failed check must keep the probed build date:\n%s", model.inspectSummary)
 	}
 }
 
@@ -12368,10 +12378,11 @@ func (c *readOnlyDetailComposer) UpdateDetails(ctx context.Context, services []s
 // The false-verdict entry deliberately carries NO details, because that is the
 // shape refreshUpdates really writes.
 //
-// `built` is NOT in the verdict-following set. It describes the image the
-// container runs, so its own source is the image probe the inspect fetch makes
-// (TestInspectScreen_BuiltRowIgnoresTheVerdict); the cache entry only supplies
-// it as a fallback, which is what the true-verdict case below still reads.
+// `built` is NOT in the verdict-following set, and it is not in the cache's
+// gift either. It describes the image the container runs, so its ONLY source is
+// the image probe the inspect fetch makes — the whole path is pinned by
+// TestInspectScreen_BuiltRowIgnoresTheVerdict. The messages below carry no
+// probed date, so every case here skips the row.
 func TestInspectScreen_UpdateRowsFollowTheVerdict(t *testing.T) {
 	fetched := time.Now().Add(-3 * time.Minute)
 	detailRows := []string{"update id", "update built"}
@@ -12391,17 +12402,19 @@ func TestInspectScreen_UpdateRowsFollowTheVerdict(t *testing.T) {
 			},
 			wantRows: []string{
 				inspectRow("update", "available  (checked 3m ago)"),
-				inspectRow("built", "2026-07-07 17:47:22"),
 				inspectRow("update id", detailFixture()["web"].NewID),
 				inspectRow("update built", "2026-08-19 19:14:43"),
 			},
+			// The detail's LocalCreated is in the cache and may not be
+			// borrowed; the row prefix keeps the needle off "update built".
+			skipRows: []string{"\n  built"},
 		},
 		{
 			name:     "false verdict draws the verdict alone",
 			entry:    &updateEntry{fetchedAt: fetched, results: map[string]bool{"web": false}},
 			wantRows: []string{inspectRow("update", "up to date  (checked 3m ago)")},
 			// `built` is absent because the message below carries no probed
-			// date either, not because the verdict is false.
+			// date, not because the verdict is false.
 			skipRows: append([]string{"built"}, detailRows...),
 		},
 		{
@@ -17844,7 +17857,9 @@ func TestInspectScreen_ResizeKeepsUpdateRows(t *testing.T) {
 
 	got := modelOf(m.Update(tea.WindowSizeMsg{Width: 120, Height: 30}))
 
-	for _, row := range []string{"built", "update", "update id", "update built"} {
+	// `built` is not among them: it rides the image probe, and
+	// TestInspectScreen_ResizeKeepsTheBuiltRow pins its own survival.
+	for _, row := range []string{"update", "update id", "update built"} {
 		if !strings.Contains(got.inspectSummary, inspectRow(row, "")) {
 			t.Errorf("a resize dropped the %q row:\n%s", row, got.inspectSummary)
 		}
