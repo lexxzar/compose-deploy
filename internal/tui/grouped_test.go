@@ -4394,6 +4394,136 @@ func TestGroupedU_InFlightGuardBindsNothing(t *testing.T) {
 	}
 }
 
+// detailingComposer is capableComposer plus UpdateDetailer. It is a double of
+// its own rather than a method on capableComposer, which backs drillTestModel
+// and every other grouped test: making THAT type an UpdateDetailer would arm the
+// detail path in ~30 tests whose subject is something else entirely.
+type detailingComposer struct {
+	capableComposer
+	details      map[string]compose.UpdateDetail
+	detailsErr   error
+	detailsCalls int
+	detailsArgs  [][]string // one entry per call, the services slice as received
+}
+
+func (c *detailingComposer) UpdateDetails(_ context.Context, services []string) (map[string]compose.UpdateDetail, error) {
+	c.detailsCalls++
+	c.detailsArgs = append(c.detailsArgs, append([]string(nil), services...))
+	return c.details, c.detailsErr
+}
+
+// groupedDetailModel is groupedFixture's host over composers that answer both
+// halves of the update check, one per project, so a detail fetch can be
+// attributed to the project it was dispatched for. Row order is the fixture's:
+//
+//	0 ▼ blog · 1 web · 2 ▼ shop · 3 api · 4 db · 5 ▼ (unmanaged) · 6 watchtower
+func groupedDetailModel(t *testing.T) (Model, map[string]*detailingComposer) {
+	t.Helper()
+	g, projects := groupedFixture()
+	per := map[string]*detailingComposer{
+		"blog": newDetailingComposer("blog", map[string]bool{"web": true}, detailFixtureFor("web")),
+		"shop": newDetailingComposer("shop", map[string]bool{"api": true, "db": false}, detailFixtureFor("api")),
+	}
+	m := groupedTestModel(g, projects)
+	m.width, m.height = 120, 40
+	m.composerFactory = func(p compose.Project) runner.Composer {
+		if p.Unmanaged {
+			return g
+		}
+		if c, ok := per[p.Name]; ok {
+			return c
+		}
+		return nil
+	}
+	updated, _ := m.Update(m.loadGroups()())
+	m = updated.(Model)
+	if got := len(m.svcEntries); got != 7 {
+		t.Fatalf("precondition: %d rows, want 7", got)
+	}
+	return m, per
+}
+
+func newDetailingComposer(proj string, updates map[string]bool, details map[string]compose.UpdateDetail) *detailingComposer {
+	c := &detailingComposer{details: details}
+	c.proj = proj
+	c.updates = updates
+	for svc := range updates {
+		c.services = append(c.services, svc)
+	}
+	slices.Sort(c.services)
+	return c
+}
+
+// TestGroupedInspect_FetchesItsOwnDetailRows is the symptom, pinned end to end:
+// grouped mode dispatches no detail BATCH, so the screen that renders one
+// service fetches for that one service. Before this, the IMAGE section drew
+// `update available` and neither `update id` nor `update built`, for ever.
+func TestGroupedInspect_FetchesItsOwnDetailRows(t *testing.T) {
+	m, per := groupedDetailModel(t)
+	m.svcCursor = 3 // shop/api
+	m = pressU(t, m)
+	if entry := m.updateCache[m.inspectUpdateKey()]; entry.details != nil {
+		t.Fatal("precondition: grouped mode must leave the entry's details nil")
+	}
+
+	updated, cmd := m.Update(keyMsgFor("i"))
+	m = updated.(Model)
+	if cmd == nil {
+		t.Fatal("i must dispatch the inspect fetch")
+	}
+	updated, detailCmd := m.Update(cmd())
+	m = updated.(Model)
+	if m.inspectErr != nil {
+		t.Fatalf("inspectErr = %v, want nil", m.inspectErr)
+	}
+	if detailCmd == nil {
+		t.Fatal("the document's arrival must chain the screen's own detail fetch")
+	}
+	if !strings.Contains(m.inspectSummary, inspectRow("update", "available")) {
+		t.Fatalf("precondition: the verdict row must already be drawn:\n%s", m.inspectSummary)
+	}
+	got := modelOf(m.Update(detailCmd()))
+
+	want := detailFixtureFor("api")["api"]
+	for _, row := range []string{
+		inspectRow("update", "available"),
+		inspectRow("update id", want.NewID),
+		inspectRow("update built", "2026-08-19 19:14:43"),
+	} {
+		if !strings.Contains(got.inspectSummary, row) {
+			t.Errorf("summary missing %q:\n%s", row, got.inspectSummary)
+		}
+	}
+	if per["shop"].detailsCalls != 1 {
+		t.Errorf("shop's UpdateDetails ran %d times, want 1", per["shop"].detailsCalls)
+	}
+}
+
+// The screen asks for the ONE service it renders, of the CURSOR row's group. An
+// empty slice would be read as ALL services by filterServices — two or three
+// registry round-trips per service in the project, which is the 429 the whole
+// subsystem is built around avoiding.
+func TestGroupedInspect_DetailFetchAsksOneServiceOfTheCursorGroup(t *testing.T) {
+	m, per := groupedDetailModel(t)
+	m.svcCursor = 3 // shop/api
+	m = pressU(t, m)
+
+	updated, cmd := m.Update(keyMsgFor("i"))
+	m = updated.(Model)
+	_, detailCmd := m.Update(cmd())
+	if detailCmd == nil {
+		t.Fatal("the document's arrival must chain the screen's own detail fetch")
+	}
+	detailCmd()
+
+	if got := per["shop"].detailsArgs; !reflect.DeepEqual(got, [][]string{{"api"}}) {
+		t.Errorf("shop's UpdateDetails was asked for %v, want exactly [[api]]", got)
+	}
+	if per["blog"].detailsCalls != 0 {
+		t.Errorf("blog's UpdateDetails ran %d times; only the cursor row's group may be asked", per["blog"].detailsCalls)
+	}
+}
+
 // Grouped mode fetches no detail rows: it holds no composer of its own, and one
 // an armed prompt left bound may belong to a different project entirely.
 func TestGroupedU_FetchesNoDetailBatch(t *testing.T) {

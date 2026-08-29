@@ -607,14 +607,15 @@ type Model struct {
 	configSession  uint64         // monotonic counter for stale message rejection
 
 	// Screen: inspect
-	inspectService      string         // service whose container is being inspected
-	inspectRaw          []byte         // raw `docker inspect` JSON, verbatim (raw mode)
-	inspectSummary      string         // rendered curated summary (cached; rebuilt on resize)
-	inspectShowRaw      bool           // false = summary (default), true = raw JSON
-	inspectViewport     viewport.Model // viewport for whichever mode is active
-	inspectErr          error          // fetch or parse failure
-	inspectImageCreated time.Time      // build date fetchInspect probed; re-merged on every re-parse
-	inspectSession      uint64         // monotonic counter for stale message rejection
+	inspectService      string               // service whose container is being inspected
+	inspectRaw          []byte               // raw `docker inspect` JSON, verbatim (raw mode)
+	inspectSummary      string               // rendered curated summary (cached; rebuilt on resize)
+	inspectShowRaw      bool                 // false = summary (default), true = raw JSON
+	inspectViewport     viewport.Model       // viewport for whichever mode is active
+	inspectErr          error                // fetch or parse failure
+	inspectImageCreated time.Time            // build date fetchInspect probed; re-merged on every re-parse
+	inspectDetail       compose.UpdateDetail // update rows fetched for THIS service; the cache entry wins over it
+	inspectSession      uint64               // monotonic counter for stale message rejection
 
 	// Screen: settings list
 	settingsCursor int  // cursor in settings list
@@ -961,6 +962,16 @@ type inspectDataMsg struct {
 	imageCreated time.Time
 	err          error
 	session      uint64
+}
+
+// inspectDetailMsg carries the update rows the inspect screen fetched for the
+// ONE service it is showing. It is the screen's own fetch rather than a share
+// of the detail BATCH: grouped mode dispatches no batch at all, and a batch
+// resolves N services for a screen that renders one. It never reaches the
+// update cache — see fetchInspectDetail.
+type inspectDetailMsg struct {
+	detail  compose.UpdateDetail
+	session uint64
 }
 
 // NewModel creates a new TUI model.
@@ -1866,6 +1877,18 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.inspectShowRaw = true
 		}
 		m.setInspectContent()
+		// The update rows are a SECOND message, for updateDetailsCmd's reason:
+		// they cost registry round-trips and the document must not wait on them.
+		// The local image probe rides the fetch above because it is one local
+		// call.
+		return m, m.fetchInspectDetail()
+
+	case inspectDetailMsg:
+		if m.screen != screenInspect || msg.session != m.inspectSession {
+			return m, nil
+		}
+		m.inspectDetail = msg.detail
+		m.redrawInspectFromCache()
 		return m, nil
 
 	case execDoneMsg:
@@ -4311,6 +4334,7 @@ func (m *Model) enterInspect() (tea.Model, tea.Cmd) {
 	m.inspectShowRaw = false
 	m.inspectErr = nil
 	m.inspectImageCreated = time.Time{}
+	m.inspectDetail = compose.UpdateDetail{}
 
 	w, vpHeight := inspectViewportSize(m.width, m.height)
 	m.inspectViewport = viewport.New(w, vpHeight)
@@ -4447,6 +4471,12 @@ func (m Model) currentUpdateInfo() inspectUpdateInfo {
 	// contract that type already documents — every field is checked on its own
 	// by the renderer, so absent and zero draw the same nothing.
 	upd.detail = entry.details[m.inspectService]
+	// The screen fetches its own rows when no batch has reported (grouped mode
+	// dispatches none at all). The fallback is STRUCT-level so the two sources
+	// never blend inside one value, and the cache always wins.
+	if upd.detail == (compose.UpdateDetail{}) {
+		upd.detail = m.inspectDetail
+	}
 	return upd
 }
 
@@ -4499,6 +4529,7 @@ func (m *Model) clearInspect() {
 	m.inspectViewport = viewport.Model{}
 	m.inspectErr = nil
 	m.inspectImageCreated = time.Time{}
+	m.inspectDetail = compose.UpdateDetail{}
 }
 
 // setInspectContent is the single SetContent chokepoint for the inspect
@@ -4557,6 +4588,54 @@ func (m Model) fetchInspect() tea.Cmd {
 			imageCreated: probeImageCreated(ctx, prober, data),
 			session:      session,
 		}
+	}
+}
+
+// fetchInspectDetail resolves the update rows for the ONE service the inspect
+// screen is showing. The detail BATCH cannot serve this screen: grouped mode
+// dispatches none at all (it holds no composer of its own), and a batch resolves
+// every updated service in a project for a screen that renders exactly one.
+//
+// It is a pure READ of the cache, never a write. Filling entry.details with this
+// one service would tell refillUpdateDetailsCmd that a batch has reported, and a
+// later drill-in would then strand every OTHER updated service of that entry for
+// its full TTL — a display gap traded for a data gap. detailsInFlight is left
+// alone for the same reason: it bounds the BATCH phase, and one service is not
+// a batch.
+//
+// The verdict must be true and the entry must be non-errored, so the screen
+// never spends registry round-trips the "⇧" column would not have spent. The
+// empty-service guard is load-bearing rather than defensive: filterServices
+// reads an empty services slice as ALL services.
+//
+// The key is inspectUpdateKey()'s, the same resolution currentUpdateInfo makes
+// — grouped mode's entry belongs to the CURSOR row's group, not to the
+// degenerate key updatesCacheKey() yields there.
+func (m Model) fetchInspectDetail() tea.Cmd {
+	if m.inspectService == "" {
+		return nil
+	}
+	d, ok := m.composer.(UpdateDetailer)
+	if !ok {
+		return nil
+	}
+	entry, ok := m.updateCache[m.inspectUpdateKey()]
+	if !ok || entry.err {
+		return nil
+	}
+	if !entry.results[m.inspectService] || entry.details != nil {
+		return nil
+	}
+	ctx := m.ctx
+	svc := m.inspectService
+	session := m.inspectSession
+	return func() tea.Msg {
+		fetchCtx, cancel := context.WithTimeout(ctx, updateDetailsTimeout)
+		defer cancel()
+		// Discarded for updateDetailsCmd's reason: a 429 while annotating the
+		// signal must not degrade the signal. The rows are simply omitted.
+		details, _ := d.UpdateDetails(fetchCtx, []string{svc})
+		return inspectDetailMsg{detail: details[svc], session: session}
 	}
 }
 
