@@ -2982,7 +2982,8 @@ func TestContainerFooter_GroupedClampsToWidth(t *testing.T) {
 // double that could never have served the key.
 type capableComposer struct {
 	mockComposer
-	proj string
+	proj      string
+	imageRefs []string
 }
 
 func (c *capableComposer) ConfigFile(context.Context) ([]byte, error) {
@@ -3005,6 +3006,16 @@ func (c *capableComposer) ExecCommand(_ context.Context, service string, _ []str
 
 func (c *capableComposer) Inspect(context.Context, string) ([]byte, error) {
 	return []byte(inspectFixtureJSON), nil
+}
+
+// capableImageCreated is the build date this double's image probe reports, and
+// imageRefs records what it was asked about: grouped mode binds the composer at
+// action time, so WHICH double answered is half the assertion.
+var capableImageCreated = time.Date(2023, 11, 2, 13, 2, 50, 0, time.UTC)
+
+func (c *capableComposer) ImageCreated(_ context.Context, image string) (time.Time, error) {
+	c.imageRefs = append(c.imageRefs, image)
+	return capableImageCreated, nil
 }
 
 // drillFactory hands out one capableComposer per project and keeps them, so a
@@ -4287,6 +4298,50 @@ func TestGroupedInspect_ReadsCursorGroupEntry(t *testing.T) {
 	m.inspectService = "web"
 	if upd := m.currentUpdateInfo(); upd.verdict != nil || !upd.checkedAt.IsZero() {
 		t.Errorf("an unscanned group must read as unknown, got %+v", upd)
+	}
+}
+
+// TestGroupedInspect_DrawsTheBuiltRow pins the context the old update-detail
+// source could never reach: grouped mode dispatches NO detail batch at all
+// (autoUpdatesAllowed is false here and U is the only trigger), so a `built`
+// row that rode on one was always absent on the host view. The cache is cold
+// and stays cold — the row comes from the image probe the inspect fetch makes,
+// through the composer `i` bound from the cursor row's group.
+func TestGroupedInspect_DrawsTheBuiltRow(t *testing.T) {
+	m, f := drillTestModel(t)
+	m.svcCursor = 3 // shop/api
+	if len(m.updateCache) != 0 {
+		t.Fatal("precondition: the grouped view starts on a cold update cache")
+	}
+
+	updated, cmd := m.Update(keyMsgFor("i"))
+	m = updated.(Model)
+	if m.screen != screenInspect {
+		t.Fatalf("i left screen %d, want screenInspect", m.screen)
+	}
+	if cmd == nil {
+		t.Fatal("i must dispatch the inspect fetch")
+	}
+	got := modelOf(m.Update(cmd()))
+
+	if got.inspectErr != nil {
+		t.Fatalf("inspectErr = %v, want nil", got.inspectErr)
+	}
+	if !strings.Contains(got.inspectSummary, inspectRow("built", "2023-11-02 13:02:50")) {
+		t.Errorf("the grouped host view must draw the build date too:\n%s", got.inspectSummary)
+	}
+	if got.currentUpdateInfo().verdict != nil {
+		t.Error("precondition: nothing may have scanned this group; the row must not depend on a verdict")
+	}
+	// The probe rode the action-time binding: the cursor row's project answered
+	// it, addressed by the resolved image id, and no other project was asked.
+	if refs := f.made["shop"].imageRefs; len(refs) != 1 || refs[0] != "sha256:0123456789abcdef" {
+		t.Errorf("shop's composer was asked for %v, want one probe of the resolved image id", refs)
+	}
+	for proj, c := range f.made {
+		if proj != "shop" && len(c.imageRefs) != 0 {
+			t.Errorf("%s's composer was probed %v; only the cursor row's group may be", proj, c.imageRefs)
+		}
 	}
 }
 

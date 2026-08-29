@@ -7,6 +7,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/charmbracelet/bubbles/viewport"
 	"github.com/charmbracelet/x/ansi"
 	"github.com/lexxzar/compose-deploy/internal/compose"
 )
@@ -899,6 +900,15 @@ func TestBuildInspectSummary_BuiltRowSource(t *testing.T) {
 		{
 			name: "neither source draws no row",
 		},
+		{
+			// The probe already maps the reproducible-build sentinel to the
+			// zero time (parseImageTimestamp), so this is the renderer's own
+			// guard rather than a shape production can currently produce: an
+			// epoch document must never draw a 1970 row, whichever source put
+			// it there.
+			name:     "an epoch document draws no row",
+			docBuilt: time.Unix(0, 0).UTC(),
+		},
 	}
 
 	for _, tt := range tests {
@@ -1596,4 +1606,94 @@ func TestInspectUpdateInfo_NoCache(t *testing.T) {
 			t.Errorf("another context's entry must not be read, got %+v", got)
 		}
 	})
+}
+
+// ---------------------------------------------------------------------------
+// The `built` row: the two sources through the whole path, and the raw buffer.
+// ---------------------------------------------------------------------------
+
+// TestInspectScreen_BuiltRowFallsBackToTheUpdateDetail drives the SECOND source
+// end to end. inspectOnlyComposer implements Inspector but not ImageInspector,
+// so the fetch spends no probe and the document reaches the renderer with a
+// zero ImageCreated — the row can then only come from the update-detail entry
+// already in the cache, which is the whole reason imageBuiltAt has two arms.
+func TestInspectScreen_BuiltRowFallsBackToTheUpdateDetail(t *testing.T) {
+	c := &inspectOnlyComposer{raw: []byte(inspectFixtureJSON)}
+	c.services = []string{"web"}
+	m := inspectTestModel(t, c, c.services)
+	m.updateCache = map[string]updateEntry{m.updatesCacheKey(): {
+		fetchedAt: time.Now().Add(-3 * time.Minute),
+		results:   map[string]bool{"web": true},
+		details:   detailFixture(),
+	}}
+
+	result, cmd := m.Update(keyMsgFor("i"))
+	if cmd == nil {
+		t.Fatal("i should return the inspect fetch")
+	}
+	msg, ok := cmd().(inspectDataMsg)
+	if !ok {
+		t.Fatalf("the fetch produced %T, want inspectDataMsg", cmd())
+	}
+	if !msg.imageCreated.IsZero() {
+		t.Fatalf("precondition: a composer that is not an ImageInspector must probe nothing, got %v", msg.imageCreated)
+	}
+	got := modelOf(result.(Model).Update(msg))
+
+	if got.inspectErr != nil {
+		t.Fatalf("inspectErr = %v, want nil", got.inspectErr)
+	}
+	// detailFixture's LocalCreated. The leading newline keeps the needle off
+	// the "update built" row, which the true verdict also draws here.
+	if !strings.Contains(got.inspectSummary, "\n  "+inspectRow("built", "2026-07-07 17:47:22")) {
+		t.Errorf("the update detail must supply the built row when the probe cannot:\n%s", got.inspectSummary)
+	}
+	if n := strings.Count(got.inspectSummary, "\n  built"); n != 1 {
+		t.Errorf("summary carries %d built rows, want 1:\n%s", n, got.inspectSummary)
+	}
+}
+
+// TestInspectScreen_RawModeIgnoresTheImageProbe is the sibling of
+// TestInspectScreen_RawModeIgnoresUpdateDetails, for the other value that
+// reaches the screen beside the document: the probed date lives on the Model
+// and is merged onto the PARSED doc, so raw mode has to stay byte-identical to
+// `docker inspect`. The summary is the control — it must differ exactly where
+// the raw buffer must not.
+func TestInspectScreen_RawModeIgnoresTheImageProbe(t *testing.T) {
+	build := func(t *testing.T, created time.Time) Model {
+		t.Helper()
+		m := Model{screen: screenInspect, inspectSession: 1, inspectService: "web"}
+		m.width, m.height = 120, 24
+		m.inspectViewport = viewport.New(m.width-4, m.height-6)
+		model := modelOf(m.Update(inspectDataMsg{
+			data:         []byte(inspectFixtureJSON),
+			imageCreated: created,
+			session:      1,
+		}))
+		if model.inspectSummary == "" {
+			t.Fatal("precondition: the summary should be rendered")
+		}
+		return model
+	}
+
+	probed := build(t, time.Date(2023, 11, 2, 13, 2, 50, 0, time.UTC))
+	blank := build(t, time.Time{})
+	if probed.inspectSummary == blank.inspectSummary {
+		t.Fatal("precondition: the probed date should change the SUMMARY")
+	}
+
+	probedRaw := modelOf(probed.Update(keyMsgFor("r")))
+	blankRaw := modelOf(blank.Update(keyMsgFor("r")))
+	if !probedRaw.inspectShowRaw || !blankRaw.inspectShowRaw {
+		t.Fatal("r should have switched both models to raw mode")
+	}
+	if got, want := probedRaw.inspectViewport.View(), blankRaw.inspectViewport.View(); got != want {
+		t.Errorf("the image probe changed raw mode:\nwith:\n%s\nwithout:\n%s", got, want)
+	}
+	if string(probedRaw.inspectRaw) != inspectFixtureJSON {
+		t.Error("inspectRaw must stay verbatim in raw mode")
+	}
+	if strings.Contains(probedRaw.inspectViewport.View(), "2023-11-02") {
+		t.Error("the built row must not leak into the raw buffer")
+	}
 }
