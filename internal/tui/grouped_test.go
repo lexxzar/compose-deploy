@@ -4555,6 +4555,33 @@ func TestGroupedOneShots_SettledAtEveryNavigationSite(t *testing.T) {
 			},
 		},
 		{
+			// The selection capture is CONDITIONAL, unlike the fold's
+			// unconditional make(...), so the `= nil` above it is the only
+			// thing that drops a stale snapshot when the host plan is empty —
+			// and the row above cannot see it, because its clone overwrites
+			// either way. Unreachable through the UI today (a payload with
+			// rows spends the snapshot in the same handler, so a drill-in only
+			// ever runs with the field already nil), which is exactly why
+			// nothing else would notice the line being deleted.
+			name:          "drill in with nothing ticked",
+			wantRestore:   hostFolds,
+			wantSelection: nil,
+			run: func(t *testing.T) Model {
+				m, _ := drillTestModel(t)
+				if len(m.selected) != 0 {
+					t.Fatalf("precondition: the host view starts with %v ticked", m.selected)
+				}
+				m.groupSelectionRestore = stalePicks
+				m.svcCursor = headerIndexFor(t, m.svcEntries, 1)
+				updated, _ := m.Update(keyMsgFor("enter"))
+				m = updated.(Model)
+				if m.grouped {
+					t.Fatal("precondition: enter did not drill in")
+				}
+				return m
+			},
+		},
+		{
 			name: "back to the server screen",
 			run: func(t *testing.T) Model {
 				g, projects := groupedFixture()
