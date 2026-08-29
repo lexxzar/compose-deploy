@@ -299,11 +299,8 @@ func inspectHealthSection(b *inspectBuilder, doc compose.InspectDoc) {
 // against "update id", "built" against "update built". Each row is omitted on
 // its own, and the section's presence gate is unchanged — an update verdict
 // describes the image, so a doc with no image at all still has nothing to say.
-//
-// `built` comes from the image probe alone, and a failed probe draws no row.
-// upd.detail.LocalCreated is NOT a fallback for it: that one describes the tag
-// the compose file declares, which a local pull can move off the image the
-// container is still running.
+// `built` reads doc.ImageCreated alone; upd.detail.LocalCreated names the
+// declared TAG, which a local pull can move off the running image.
 func inspectImageSection(b *inspectBuilder, doc compose.InspectDoc, upd inspectUpdateInfo) {
 	cmd := strings.Join(doc.Config.Cmd, " ")
 	entrypoint := strings.Join(doc.Config.Entrypoint, " ")
@@ -318,7 +315,7 @@ func inspectImageSection(b *inspectBuilder, doc compose.InspectDoc, upd inspectU
 	if doc.Image != "" {
 		b.kv("image id", doc.Image)
 	}
-	if built := formatTimeWithAge(imageBuiltAt(doc), upd.now); built != "" {
+	if built := formatTimeWithAge(doc.ImageCreated, upd.now); built != "" {
 		b.kv("built", built)
 	}
 	if upd.verdict != nil {
@@ -336,13 +333,6 @@ func inspectImageSection(b *inspectBuilder, doc compose.InspectDoc, upd inspectU
 	if entrypoint != "" {
 		b.kv("entrypoint", entrypoint)
 	}
-}
-
-// imageBuiltAt is the source of the `built` row: the build date the inspect
-// fetch probed for the container's RESOLVED image id. See inspectImageSection
-// for why the update detail cannot stand in for it.
-func imageBuiltAt(doc compose.InspectDoc) time.Time {
-	return doc.ImageCreated
 }
 
 // formatUpdateVerdict renders the "update" row's value: the verdict, plus how

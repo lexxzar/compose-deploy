@@ -496,13 +496,9 @@ func scanUpdateDetails(ctx context.Context, wanted map[string]string, d dockerRu
 // matching field stays zero and its row is omitted, while the rows the other
 // steps filled still render.
 func fetchUpdateDetail(ctx context.Context, d dockerRunner, image string) (UpdateDetail, error) {
-	localOut, err := d.run(ctx, localProbeArgs(image)...)
+	probe, err := probeLocalImage(ctx, d, image)
 	if err != nil {
-		return UpdateDetail{}, fmt.Errorf("inspecting local image %q: %w", image, err)
-	}
-	probe, err := parseLocalProbe(localOut)
-	if err != nil {
-		return UpdateDetail{}, fmt.Errorf("inspecting local image %q: %w", image, err)
+		return UpdateDetail{}, err
 	}
 
 	indexOut, err := d.run(ctx, manifestIndexArgs(image)...)
@@ -561,35 +557,33 @@ func pinnedImageRef(image string, indexOut []byte, probe localProbe) (ref string
 	}
 }
 
-// fetchImageCreated returns the build time of a LOCAL image: step 1 of the
-// detail fetch on its own, with steps 2-4 (the registry half) left out.
-//
-// The inspect screen's `built` row describes the image the container is running
-// right now, so it must not depend on an update verdict, on the detail batch
-// having been dispatched, or on a registry being reachable. Step 1 is purely
-// local — one `docker image inspect` — which is why it can be reused verbatim
-// here instead of a second parser: localProbeFormat names NO field, and an
-// unknown field would be a hard template error.
-//
-// A top-level docker command, so it goes through the dockerRunner seam and
-// never through command() / remoteCommand(), which would build a malformed
-// `docker compose image inspect` argv.
-//
-// parseLocalProbe's platform requirement is inherited rather than relaxed: a
-// document with no os/architecture is malformed for either caller, and every
-// failure here is discarded by the caller anyway — the row is omitted and the
-// rest of the container document still renders.
-func fetchImageCreated(ctx context.Context, d dockerRunner, image string) (time.Time, error) {
+// probeLocalImage runs step 1 for both callers: one TOP-LEVEL, purely local
+// `docker image inspect` through the dockerRunner seam. fetchUpdateDetail
+// aborts its registry sequence on a failure here; fetchImageCreated's caller
+// discards it and omits the `built` row.
+func probeLocalImage(ctx context.Context, d dockerRunner, image string) (localProbe, error) {
 	if strings.TrimSpace(image) == "" {
-		return time.Time{}, errors.New("no image reference to inspect")
+		return localProbe{}, errors.New("no image reference to inspect")
 	}
 	out, err := d.run(ctx, localProbeArgs(image)...)
 	if err != nil {
-		return time.Time{}, fmt.Errorf("inspecting local image %q: %w", image, err)
+		return localProbe{}, fmt.Errorf("inspecting local image %q: %w", image, err)
 	}
 	probe, err := parseLocalProbe(out)
 	if err != nil {
-		return time.Time{}, fmt.Errorf("inspecting local image %q: %w", image, err)
+		return localProbe{}, fmt.Errorf("inspecting local image %q: %w", image, err)
+	}
+	return probe, nil
+}
+
+// fetchImageCreated returns the build time of a LOCAL image: step 1 of the
+// detail fetch on its own, with the registry half left out. The inspect
+// screen's `built` row must not depend on an update verdict, on the detail
+// batch having been dispatched, or on a registry being reachable.
+func fetchImageCreated(ctx context.Context, d dockerRunner, image string) (time.Time, error) {
+	probe, err := probeLocalImage(ctx, d, image)
+	if err != nil {
+		return time.Time{}, err
 	}
 	return probe.created, nil
 }

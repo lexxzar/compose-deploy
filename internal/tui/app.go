@@ -114,21 +114,10 @@ type Inspector interface {
 
 // ImageInspector returns the local build time of one image reference — the
 // `built` row of the inspect screen's IMAGE section. Declared here beside
-// Inspector and type-asserted on the concrete composer, so runner.Composer and
-// its five mocks stay untouched; a composer that does not implement it simply
-// draws no `built` row.
-//
-// It is separate from Inspector rather than a second method on it because the
-// two answer different questions: Inspect describes the CONTAINER and its
-// bytes are the raw view, which stays byte-identical to `docker inspect`, so
-// the image's build date has nowhere to ride inside them.
-//
-// It is separate from UpdateDetailer for the reason the row exists: that batch
-// runs only for services whose verdict is true, and only in drilled mode with a
-// warm cache, while `built` describes what the container runs and must appear
-// for every container. All three composers implement it, over one purely LOCAL
-// `docker image inspect` — no registry traffic, so nothing here can trip a
-// rate limit.
+// Inspector and type-asserted the same way, so runner.Composer and its five
+// mocks stay untouched; a composer that does not implement it draws no `built`
+// row. All three composers satisfy it, over one purely LOCAL
+// `docker image inspect`.
 type ImageInspector interface {
 	ImageCreated(ctx context.Context, image string) (time.Time, error)
 }
@@ -618,17 +607,14 @@ type Model struct {
 	configSession  uint64         // monotonic counter for stale message rejection
 
 	// Screen: inspect
-	inspectService  string         // service whose container is being inspected
-	inspectRaw      []byte         // raw `docker inspect` JSON, verbatim (raw mode)
-	inspectSummary  string         // rendered curated summary (cached; rebuilt on resize)
-	inspectShowRaw  bool           // false = summary (default), true = raw JSON
-	inspectViewport viewport.Model // viewport for whichever mode is active
-	inspectErr      error          // fetch or parse failure
-	// inspectImageCreated is the image build date fetchInspect probed, kept on
-	// the Model because rebuildInspectSummary re-parses the raw bytes on every
-	// resize and redraw and the container document cannot supply it.
-	inspectImageCreated time.Time
-	inspectSession      uint64 // monotonic counter for stale message rejection
+	inspectService      string         // service whose container is being inspected
+	inspectRaw          []byte         // raw `docker inspect` JSON, verbatim (raw mode)
+	inspectSummary      string         // rendered curated summary (cached; rebuilt on resize)
+	inspectShowRaw      bool           // false = summary (default), true = raw JSON
+	inspectViewport     viewport.Model // viewport for whichever mode is active
+	inspectErr          error          // fetch or parse failure
+	inspectImageCreated time.Time      // build date fetchInspect probed; re-merged on every re-parse
+	inspectSession      uint64         // monotonic counter for stale message rejection
 
 	// Screen: settings list
 	settingsCursor int  // cursor in settings list
@@ -971,11 +957,7 @@ type configValidateMsg struct {
 	session uint64
 }
 type inspectDataMsg struct {
-	data []byte
-	// imageCreated is the build time of the image the container runs, probed
-	// in the same Cmd as the document itself so the screen stays a ONE-SHOT
-	// snapshot with one message. Zero when the probe failed or the composer is
-	// not an ImageInspector — a discarded failure, never an error slot.
+	data         []byte
 	imageCreated time.Time
 	err          error
 	session      uint64
@@ -4433,10 +4415,8 @@ func (m *Model) rebuildInspectSummary() {
 		return
 	}
 	m.inspectErr = nil
-	// The image build date is NOT in the container document — it arrived with
-	// the same fetch, from a second `docker image inspect` — so it is merged
-	// back onto every re-parse: the raw bytes stay verbatim and the resize and
-	// cache-redraw paths keep the row.
+	// Not in the container document: probed by the same fetch, so it is merged
+	// back on every re-parse or the resize and redraw paths drop the row.
 	doc.ImageCreated = m.inspectImageCreated
 	m.inspectSummary = buildInspectSummary(doc, m.inspectViewport.Width, m.currentUpdateInfo())
 }
@@ -4563,10 +4543,6 @@ func (m Model) fetchInspect() tea.Cmd {
 	if !ok {
 		return nil
 	}
-	// The image probe rides the SAME Cmd, so the screen keeps one message and
-	// stays the one-shot snapshot it is documented to be. It costs one extra
-	// LOCAL `docker image inspect` (one more SSH round-trip on a remote hop),
-	// never a registry call.
 	prober, _ := m.composer.(ImageInspector)
 	ctx := m.ctx
 	service := m.inspectService
@@ -4585,12 +4561,8 @@ func (m Model) fetchInspect() tea.Cmd {
 }
 
 // probeImageCreated resolves the build date of the image the inspected
-// container runs. Every failure is DISCARDED and yields the zero time: a
-// composer that is not an ImageInspector, a container document the narrow
-// parser cannot read, a document naming no image, and the probe itself. The
-// `built` row is then omitted and the rest of the document renders untouched —
-// the same asymmetry the update-detail rows follow, where the container view is
-// the load-bearing one and the image annotation is a bonus.
+// container runs. Every failure yields the zero time and is DISCARDED, so the
+// `built` row is omitted and the rest of the document still renders.
 func probeImageCreated(ctx context.Context, prober ImageInspector, raw []byte) time.Time {
 	if prober == nil {
 		return time.Time{}

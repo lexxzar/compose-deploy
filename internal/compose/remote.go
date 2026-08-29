@@ -808,12 +808,7 @@ func (r *RemoteCompose) UpdateDetails(ctx context.Context, services []string) (m
 }
 
 // ImageCreated is RemoteCompose's binding of fetchImageCreated. See
-// Compose.ImageCreated for the contract; only the seam differs, and going
-// through remoteDockerRunner is what makes the remote form correct for free —
-// `docker image inspect` is a TOP-LEVEL docker command, so remoteCommand()
-// would build a malformed `docker compose image inspect` argv, while the seam
-// gives SSH argv construction with SSHExtraArgs spliced immediately before the
-// host argument, shell escaping, and classifySSHError.
+// Compose.ImageCreated for the contract; the only difference is the seam.
 func (r *RemoteCompose) ImageCreated(ctx context.Context, image string) (time.Time, error) {
 	return fetchImageCreated(ctx, remoteDockerRunner{r: r}, image)
 }
