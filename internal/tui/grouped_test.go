@@ -1894,6 +1894,448 @@ func TestGroupFoldPending_SettledAtEveryNavigationSite(t *testing.T) {
 	}
 }
 
+// ---------------------------------------------------------------------------
+// The drill-out cursor target (groupCursorPending): the host view comes back on
+// the project the user just visited, once.
+// ---------------------------------------------------------------------------
+
+// hostState is the docker host behind mutableHostModel, rewritable BETWEEN
+// payloads. drillTestModel closes over a fixed project list, but a drill-out
+// dispatches its own reload from inside the esc handler, so the only way to
+// change what THAT payload carries is to make the loader and the grouper read
+// state the test still holds.
+type hostState struct {
+	grouper  *mockGrouper
+	projects []compose.Project
+}
+
+func (h *hostState) set(projects []compose.Project, status map[string]map[string]runner.ServiceStatus) {
+	h.projects = projects
+	h.grouper.groupedStatus = status
+}
+
+// mutableHostModel is drillTestModel over a host the test can rewrite: the same
+// already-landed grouped screen and the same drillFactory, but the loader reads
+// h.projects on every call instead of a slice captured at construction.
+func mutableHostModel(t *testing.T, projects []compose.Project, status map[string]map[string]runner.ServiceStatus) (Model, *hostState) {
+	t.Helper()
+	h := &hostState{grouper: &mockGrouper{groupedStatus: status}, projects: projects}
+	m := NewModel(nil, io.Discard, newDrillFactory(h.grouper).factory(), nil, nil)
+	installFakeTick(&m)
+	m.projectLoader = func(context.Context) ([]compose.Project, error) { return h.projects, nil }
+	m.screen = screenSelectContainers
+	m.grouped = true
+	m.groupFoldPending = false // already landed; see groupedTestModel
+	m.width, m.height = 120, 40
+	updated, _ := m.Update(m.loadGroups()())
+	return updated.(Model), h
+}
+
+// drillOut drills into the group the row at `row` belongs to and presses esc,
+// returning the model plus the host-view reload that drill-out dispatched. The
+// payload is deliberately NOT delivered: the tests that rewrite the host
+// between the keypress and the arrival need that gap.
+func drillOut(t *testing.T, m Model, row int) (Model, tea.Cmd) {
+	t.Helper()
+	m.svcCursor = row
+	updated, _ := m.Update(keyMsgFor("enter"))
+	m = updated.(Model)
+	if m.grouped || !m.drilledFromHost {
+		t.Fatalf("precondition: enter left grouped=%v drilledFromHost=%v, want the drilled screen",
+			m.grouped, m.drilledFromHost)
+	}
+	updated, cmd := m.Update(tea.KeyMsg{Type: tea.KeyEsc})
+	if cmd == nil {
+		t.Fatal("drill-out must dispatch the host-view reload")
+	}
+	return updated.(Model), cmd
+}
+
+// The host view comes back on the project the drill-out left. It used to come
+// back on row 0, and the row order is a live docker ps, so finding the project
+// again was a scroll through whatever the host is running.
+//
+// The target names the project's HEADER because the landing folds: the service
+// row the drilled cursor sat on is not on screen to receive it.
+func TestGroupedDrillOut_CursorLandsOnTheProjectJustVisited(t *testing.T) {
+	m, _ := drillTestModel(t)
+	shopHeader := headerIndexFor(t, m.svcEntries, 1)
+	if shopHeader == 0 {
+		t.Fatal("fixture drift: the visited project must not be first in screen order")
+	}
+
+	m, cmd := drillOut(t, m, shopHeader)
+	if want := (svcRowID{proj: "shop", header: true}); m.groupCursorPending != want {
+		t.Fatalf("groupCursorPending = %+v, want %+v (armed AFTER enterGroupedContainers clears it)",
+			m.groupCursorPending, want)
+	}
+
+	updated, _ := m.Update(cmd())
+	m = updated.(Model)
+
+	if got := foldedCount(m); got != 3 || len(m.svcGroups) != 3 {
+		t.Fatalf("precondition: %d of %d groups folded, want all 3 (the target names a header)", got, len(m.svcGroups))
+	}
+	if got, want := m.cursorRowID(), (svcRowID{proj: "shop", header: true}); got != want {
+		t.Errorf("cursor row = %+v, want %+v", got, want)
+	}
+	if want := headerIndexFor(t, m.svcEntries, 1); m.svcCursor != want {
+		t.Errorf("svcCursor = %d, want %d (shop's header, not row 0)", m.svcCursor, want)
+	}
+}
+
+// The target is a ONE-SHOT. The branch that spends it is also the 5-second
+// reload, so a persistent field would drag the cursor back onto the visited
+// project every tick and fight every arrow key the user presses.
+func TestGroupedDrillOut_CursorTargetIsSpentByTheLandingPayload(t *testing.T) {
+	m, _ := drillTestModel(t)
+	m, cmd := drillOut(t, m, headerIndexFor(t, m.svcEntries, 1))
+	updated, _ := m.Update(cmd())
+	m = updated.(Model)
+
+	if m.groupCursorPending.ok() {
+		t.Fatalf("the landing payload left %+v armed", m.groupCursorPending)
+	}
+
+	// The user moves on, one row down the folded host.
+	m = pressGroupKey(m, "down")
+	moved := m.cursorRowID()
+	if moved == (svcRowID{proj: "shop", header: true}) {
+		t.Fatalf("precondition: the cursor did not leave the visited project (row %+v)", moved)
+	}
+
+	// The 5-second reload, which is this same message.
+	updated, _ = m.Update(m.loadGroups()())
+	m = updated.(Model)
+
+	if got := m.cursorRowID(); got != moved {
+		t.Errorf("cursor row = %+v, want %+v (the reload re-aimed at the project the user had left)", got, moved)
+	}
+}
+
+// A payload with no groups is not the landing — a remote box whose containers
+// come up a few seconds after the connect sends one — so it must NOT spend the
+// target. Same rule applyPendingGroupFold follows, for the same reason: the
+// user has seen no rows yet.
+func TestGroupedDrillOut_EmptyPayloadKeepsTheCursorTarget(t *testing.T) {
+	projects := []compose.Project{
+		{Name: "blog", ConfigDir: "/srv/blog"},
+		{Name: "shop", ConfigDir: "/srv/shop"},
+	}
+	status := map[string]map[string]runner.ServiceStatus{
+		"blog": {"web": {Running: true}},
+		"shop": {"api": {Running: true}, "db": {}},
+	}
+	m, h := mutableHostModel(t, projects, status)
+	m, cmd := drillOut(t, m, headerIndexFor(t, m.svcEntries, 1))
+
+	h.set(nil, map[string]map[string]runner.ServiceStatus{})
+	updated, _ := m.Update(cmd())
+	m = updated.(Model)
+
+	if len(m.svcGroups) != 0 {
+		t.Fatalf("precondition: landed with %d groups, want the empty host", len(m.svcGroups))
+	}
+	if want := (svcRowID{proj: "shop", header: true}); m.groupCursorPending != want {
+		t.Fatalf("a payload with no rows spent the target: %+v, want %+v", m.groupCursorPending, want)
+	}
+
+	// The containers come up. THIS is the frame the user first sees rows in.
+	h.set(projects, status)
+	updated, _ = m.Update(m.loadGroups()())
+	m = updated.(Model)
+
+	if got, want := m.cursorRowID(), (svcRowID{proj: "shop", header: true}); got != want {
+		t.Errorf("cursor row = %+v, want %+v", got, want)
+	}
+	if m.groupCursorPending.ok() {
+		t.Error("the payload that brought rows did not spend the target")
+	}
+}
+
+// The other two landing sites have no project to come back to, and both go
+// through enterGroupedContainers, whose clearContainerScreen drops the target
+// with the rows it names. A target that leaked past them would aim the cursor
+// at a project the user never visited on THIS host — or at one that is not on
+// it at all.
+func TestGroupedLandings_WithoutADrillOutStartAtRowZero(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		run  func(t *testing.T) (Model, tea.Cmd)
+	}{
+		{
+			name: "connect success",
+			run: func(t *testing.T) (Model, tea.Cmd) {
+				g, projects := groupedFixture()
+				m := groupedTestModel(g, projects)
+				m.screen = screenSelectServer
+				m.grouped = false
+				m.serverName = "prod"
+				// A previous host's drill-out, still armed.
+				m.groupCursorPending = svcRowID{proj: "shop", header: true}
+				updated, cmd := m.Update(connectResultMsg{err: nil})
+				m = updated.(Model)
+				if !m.grouped {
+					t.Fatal("precondition: connect success must land on the host view")
+				}
+				return m, cmd
+			},
+		},
+		{
+			name: "entryLocal grouped landing",
+			run: func(t *testing.T) (Model, tea.Cmd) {
+				g, projects := groupedFixture()
+				loader := func(context.Context) ([]compose.Project, error) { return projects, nil }
+				m := NewModel(nil, io.Discard, func(compose.Project) runner.Composer { return g },
+					testServers, mockConnectCb(&g.mockComposer), WithLocalProjectLoader(loader))
+				installFakeTick(&m)
+				m.screen = screenSelectServer
+				for i, e := range m.serverEntries {
+					if e.kind == entryLocal {
+						m.serverCursor = i
+					}
+				}
+				m.groupCursorPending = svcRowID{proj: "shop", header: true}
+				updated, cmd := m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+				m = updated.(Model)
+				if !m.grouped {
+					t.Fatal("precondition: no local composer must land on the host view")
+				}
+				return m, cmd
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			m, cmd := tc.run(t)
+			if m.groupCursorPending.ok() {
+				t.Errorf("the landing kept %+v armed; only the drill-out esc arms a target", m.groupCursorPending)
+			}
+			if cmd == nil {
+				t.Fatal("the landing dispatched no host-view load")
+			}
+			updated, _ := m.Update(cmd())
+			m = updated.(Model)
+
+			if len(m.svcGroups) != 3 {
+				t.Fatalf("landed with %d groups, want 3", len(m.svcGroups))
+			}
+			if m.svcCursor != 0 {
+				t.Errorf("svcCursor = %d, want 0 (this landing has no project to come back to)", m.svcCursor)
+			}
+		})
+	}
+}
+
+// The visited project's last container stops while the user is inside it, so
+// the row the target names is not in the payload that lands. restoreCursorRow
+// owns the fallback; this pins that the new path routes through it rather than
+// indexing something arbitrary.
+func TestGroupedDrillOut_VanishedProjectFallsBackToTheClamp(t *testing.T) {
+	projects := []compose.Project{
+		{Name: "blog", ConfigDir: "/srv/blog"},
+		{Name: "shop", ConfigDir: "/srv/shop"},
+		{Name: "ops", ConfigDir: "/srv/ops"},
+	}
+	status := map[string]map[string]runner.ServiceStatus{
+		"blog": {"web": {Running: true}},
+		"shop": {"api": {Running: true}},
+		"ops":  {"grafana": {Running: true}},
+	}
+	m, h := mutableHostModel(t, projects, status)
+	m, cmd := drillOut(t, m, headerIndexFor(t, m.svcEntries, 1))
+
+	h.set(
+		[]compose.Project{{Name: "blog", ConfigDir: "/srv/blog"}, {Name: "ops", ConfigDir: "/srv/ops"}},
+		map[string]map[string]runner.ServiceStatus{
+			"blog": {"web": {Running: true}},
+			"ops":  {"grafana": {Running: true}},
+		},
+	)
+	updated, _ := m.Update(cmd())
+	m = updated.(Model)
+
+	for _, g := range m.svcGroups {
+		if g.proj.Name == "shop" {
+			t.Fatal("precondition: shop must be gone from the payload that lands")
+		}
+	}
+	if m.svcCursor != 0 {
+		t.Errorf("svcCursor = %d, want 0 (the row is gone, so restoreCursorRow clamps)", m.svcCursor)
+	}
+	if m.svcCursor >= len(m.svcEntries) {
+		t.Errorf("cursor %d is out of range for %d rows", m.svcCursor, len(m.svcEntries))
+	}
+	if m.groupCursorPending.ok() {
+		t.Errorf("a payload WITH rows left %+v armed; the row being gone is an answer, not a retry",
+			m.groupCursorPending)
+	}
+}
+
+// A LONE group emits no header at all, so on a single-project host the target
+// names a row that does not exist even though its project is right there. The
+// payload must still SPEND it: left armed, it would jump the cursor onto that
+// project's header minutes later, the moment the host gained a second project
+// and started drawing headers — a keystroke-free cursor move on a screen whose
+// row order already changes under the user every 5 seconds. Same shape as
+// TestGroupedLanding_SingleGroupHostDoesNotFoldWhenItGrows.
+func TestGroupedDrillOut_SingleProjectHostSpendsTheTargetItCannotUse(t *testing.T) {
+	projects := []compose.Project{{Name: "shop", ConfigDir: "/srv/shop"}}
+	status := map[string]map[string]runner.ServiceStatus{"shop": {"api": {Running: true}, "db": {}}}
+	m, h := mutableHostModel(t, projects, status)
+
+	for _, e := range m.svcEntries {
+		if e.kind == entrySvcGroupHeader {
+			t.Fatal("precondition: a single group must emit no header row")
+		}
+	}
+	// No header to drill from, so the drill-out starts on a service row.
+	m, cmd := drillOut(t, m, 0)
+	updated, _ := m.Update(cmd())
+	m = updated.(Model)
+
+	if m.groupCursorPending.ok() {
+		t.Fatalf("the payload left %+v armed; a host with rows is the landing, header or not",
+			m.groupCursorPending)
+	}
+	if m.svcCursor != 0 {
+		t.Errorf("svcCursor = %d, want 0 (no header row for the target to land on)", m.svcCursor)
+	}
+
+	// The host gains a second project, so headers appear for the first time.
+	h.set(
+		[]compose.Project{{Name: "blog", ConfigDir: "/srv/blog"}, {Name: "shop", ConfigDir: "/srv/shop"}},
+		map[string]map[string]runner.ServiceStatus{
+			"blog": {"web": {Running: true}},
+			"shop": {"api": {Running: true}, "db": {}},
+		},
+	)
+	updated, _ = m.Update(m.loadGroups()())
+	m = updated.(Model)
+
+	if got, want := m.cursorRowID(), (svcRowID{proj: "shop", service: "api"}); got != want {
+		t.Errorf("cursor row = %+v, want %+v (a spent target must not resurrect on the reload)", got, want)
+	}
+}
+
+// The visited project can be below the fold of a tall host, and the cursor
+// override runs BEFORE fixSvcOffset for exactly that reason: the window has to
+// scroll to it. Moving the override below the offset fix leaves the cursor on a
+// row nobody can see.
+func TestGroupedDrillOut_ScrollsTheVisitedProjectIntoView(t *testing.T) {
+	var projects []compose.Project
+	status := map[string]map[string]runner.ServiceStatus{}
+	for i := 0; i < 8; i++ {
+		name := fmt.Sprintf("proj-%d", i)
+		projects = append(projects, compose.Project{Name: name, ConfigDir: "/srv/" + name})
+		status[name] = map[string]runner.ServiceStatus{"api": {Running: true}}
+	}
+	m, _ := mutableHostModel(t, projects, status)
+	m.height = 12
+
+	last := len(projects) - 1
+	m, cmd := drillOut(t, m, headerIndexFor(t, m.svcEntries, last))
+	updated, _ := m.Update(cmd())
+	m = updated.(Model)
+
+	if m.svcVisibleCount() >= len(m.svcEntries) {
+		t.Fatalf("fixture drift: %d rows fit a %d-row pane, so nothing has to scroll",
+			len(m.svcEntries), m.svcVisibleCount())
+	}
+	if want := headerIndexFor(t, m.svcEntries, last); m.svcCursor != want {
+		t.Fatalf("svcCursor = %d, want %d (the last project's header)", m.svcCursor, want)
+	}
+	if m.svcOffset == 0 {
+		t.Error("svcOffset = 0: the window never scrolled to the row the target aimed at")
+	}
+	assertCursorVisible(t, m)
+}
+
+// groupCursorPending is departure-site state exactly like groupFoldPending: the
+// invariant is LOCAL to each navigation site rather than emergent from whatever
+// svcGroups happens to hold. drillIntoGroup is the one site with no
+// clearContainerScreen behind it, so it disarms by hand — a target surviving a
+// drill-in would land on some later grouped payload the user reached another
+// way. The drill-out esc is the single arming site.
+func TestGroupCursorPending_SettledAtEveryNavigationSite(t *testing.T) {
+	stale := svcRowID{proj: "blog", header: true}
+	for _, tc := range []struct {
+		name string
+		run  func(t *testing.T) Model
+		want svcRowID
+	}{
+		{
+			name: "drill in",
+			run: func(t *testing.T) Model {
+				m, _ := drillTestModel(t)
+				m.groupCursorPending = stale // a landing payload still in flight
+				m.svcCursor = headerIndexFor(t, m.svcEntries, 1)
+				updated, _ := m.Update(keyMsgFor("enter"))
+				m = updated.(Model)
+				if m.grouped {
+					t.Fatal("precondition: enter did not drill in")
+				}
+				return m
+			},
+		},
+		{
+			name: "back to the server screen",
+			run: func(t *testing.T) Model {
+				g, projects := groupedFixture()
+				m := groupedTestModel(g, projects)
+				m.groupCursorPending = stale
+				m.backToServerScreen()
+				return m
+			},
+		},
+		{
+			name: "connect failure",
+			run: func(t *testing.T) Model {
+				g, projects := groupedFixture()
+				m := groupedTestModel(g, projects)
+				m.groupCursorPending = stale
+				updated, _ := m.Update(connectResultMsg{err: errors.New("ssh: connect refused")})
+				return updated.(Model)
+			},
+		},
+		{
+			name: "entryLocal fast track",
+			run: func(t *testing.T) Model {
+				mc := &mockComposer{services: []string{"api", "web"}}
+				m := NewModel(mc, io.Discard, mockFactory(mc), testServers, mockConnectCb(mc))
+				installFakeTick(&m)
+				m.screen = screenSelectServer
+				for i, e := range m.serverEntries {
+					if e.kind == entryLocal {
+						m.serverCursor = i
+					}
+				}
+				m.groupCursorPending = stale
+				updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+				m = updated.(Model)
+				if m.grouped {
+					t.Fatal("precondition: a local composer must fast-track to the drilled screen")
+				}
+				return m
+			},
+		},
+		{
+			name: "drill out",
+			want: svcRowID{proj: "shop", header: true},
+			run: func(t *testing.T) Model {
+				m, _ := drillTestModel(t)
+				m, _ = drillOut(t, m, headerIndexFor(t, m.svcEntries, 1))
+				return m
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := tc.run(t).groupCursorPending; got != tc.want {
+				t.Errorf("groupCursorPending = %+v, want %+v", got, tc.want)
+			}
+		})
+	}
+}
+
 // ← folds from a SERVICE row, which is the whole point: space folds only from
 // the header, twenty rows above. The cursor lands on the header, because the
 // row it sat on is gone.
