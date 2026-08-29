@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"maps"
 	"os"
 	"os/exec"
 	"slices"
@@ -456,6 +457,30 @@ type Model struct {
 	// one site that needs it ACROSS the landing, so it carries it over
 	// enterGroupedContainers by hand, the same shape groupCursorPending uses.
 	groupFoldRestore map[string]bool
+
+	// groupSelectionRestore is groupFoldRestore's twin for the selection: the
+	// host view's ticked services come back after a drill-out, so looking
+	// inside a project is not a destructive act on a plan the user built row by
+	// row across the host.
+	//
+	// It carries only OUTWARDS. drillIntoGroup captures it and then still
+	// clears m.selected, because the drilled screen addresses one project and
+	// inherits nothing — the same asymmetry the fold snapshot has.
+	//
+	// nil means "no snapshot", and a selection holding no KEYS captures as
+	// nil, so a round trip that ticked nothing restores nothing. An untick
+	// leaves a false entry rather than dropping the key, so tick-then-untick
+	// captures a non-nil all-false map instead — harmless, because the reads
+	// that decide what an operation acts on (selectedContainers,
+	// selectedCount, groupSelected, allVisibleSelected) are truthiness-based.
+	// applyPendingGroupSelection spends it, under the same zero-group rule as
+	// the fold.
+	//
+	// It rides clearContainerScreen for the same reason the fold snapshot does
+	// — the keys name ONE host's projects — so the drill-out esc carries it
+	// across enterGroupedContainers BY HAND. Deleting that hand-carry silently
+	// restores the old behaviour.
+	groupSelectionRestore map[string]bool
 
 	// svcStatus and stats are keyed by the QUALIFIED key svcKey produces, not
 	// by the bare service name a Composer returns: two projects on one host
@@ -1295,6 +1320,10 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			// ever clear the text — or put it back after a landing site blanked
 			// it. See syncGroupedUpdatesErr.
 			m.syncGroupedUpdatesErr()
+			// Above pruneSelection on purpose: the restored keys are then
+			// reconciled against the rows this payload actually carries by the
+			// same walk that reconciles the live selection.
+			m.applyPendingGroupSelection()
 			m.pruneSelection()
 			m.restoreCursorRow(cursorID)
 			// searchMatches indexes svcEntries, which the rebuild renumbered.
@@ -2621,11 +2650,13 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 				// Hoisted: pointer receiver, same m as the return.
 				proj := m.projName
 				folds := m.groupFoldRestore
+				picks := m.groupSelectionRestore
 				cmd := m.enterGroupedContainers()
-				// Both AFTER the call, which drops them with the rows they
-				// name. The layout the drill-in captured is the one thing this
-				// transition has to carry across its own cleanup.
+				// All AFTER the call, which drops them with the rows they
+				// name. The layout and the selection the drill-in captured are
+				// what this transition has to carry across its own cleanup.
 				m.groupFoldRestore = folds
+				m.groupSelectionRestore = picks
 				// The project's HEADER, never the service row the drilled
 				// cursor sat on: the landing can arrive folded — a fresh one
 				// always does, a restored one wherever the user left that group
@@ -6527,6 +6558,18 @@ func (m *Model) drillIntoGroup(gi int) tea.Cmd {
 	for _, sg := range m.svcGroups {
 		m.groupFoldRestore[sg.proj.Name] = sg.folded
 	}
+	// The selection is captured here for the narrower reason that the reset
+	// below drops it. Its keys are already qualified and sanitized, so they
+	// survive the round trip as they are; pruneSelection drops the ones whose
+	// service went away while the user was inside a project.
+	//
+	// CLONED, not aliased: the reset below reassigns m.selected rather than
+	// emptying it in place, so an alias would survive today and stop surviving
+	// the moment that line becomes clear(m.selected).
+	m.groupSelectionRestore = nil
+	if len(m.selected) > 0 {
+		m.groupSelectionRestore = maps.Clone(m.selected)
+	}
 	// The grouped view is the parent screen from here on: canGoBack and the
 	// footer's back label both read drilledFromHost on the drilled screen.
 	m.drilledFromHost = true
@@ -6650,19 +6693,21 @@ func (m *Model) bumpFetchSessions() {
 //
 // The three one-shots it carries — svcReloadPending, groupFoldPending and
 // groupCursorPending — are row-derived like the rest: each names a payload for
-// rows this call just dropped. groupFoldRestore goes with them: it names the
-// host those rows came from, so leaving it standing would apply one host's
-// folds to another's projects of the same name.
+// rows this call just dropped. The two drill-in snapshots go with them for a
+// second reason: groupFoldRestore and groupSelectionRestore both name ONE
+// host's projects, so leaving either standing would apply one host's folds — or
+// one host's ticked services — to another's projects of the same name.
 //
 // enterGroupedContainers re-arms groupFoldPending AFTER calling this, which is
 // what makes the landing fold survive its own cleanup; the drill-out site
-// carries groupCursorPending and groupFoldRestore over the same way.
+// carries groupCursorPending and both snapshots over the same way.
 func (m *Model) clearContainerScreen() {
 	m.clearSvcGroups()
 	m.svcReloadPending = false
 	m.groupFoldPending = false
 	m.groupCursorPending = svcRowID{}
 	m.groupFoldRestore = nil
+	m.groupSelectionRestore = nil
 	m.svcStatus = nil
 	m.stats = nil
 	m.statsErr = nil
@@ -6789,6 +6834,23 @@ func (m *Model) foldGroupsForLanding() {
 	}
 	m.setAllFolded(true)
 	m.svcEntries = rebuildSvcEntries(m.svcGroups)
+}
+
+// applyPendingGroupSelection puts the host view's ticked services back after a
+// drill-out. It is the selection half of applyPendingGroupFold and obeys the
+// same zero-group rule for the same reason: a payload with no groups is not the
+// landing, so the snapshot survives until rows arrive rather than being eaten
+// by a host that was merely slow to answer.
+//
+// The map is handed over rather than copied — nothing else holds it once the
+// field is cleared — and pruneSelection, which runs below the call site, drops
+// the keys whose service disappeared while the user was inside a project.
+func (m *Model) applyPendingGroupSelection() {
+	if m.groupSelectionRestore == nil || len(m.svcGroups) == 0 {
+		return
+	}
+	m.selected = m.groupSelectionRestore
+	m.groupSelectionRestore = nil
 }
 
 // takePendingGroupCursor spends the one-shot drill-out cursor target and
