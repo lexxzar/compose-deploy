@@ -437,6 +437,24 @@ type Model struct {
 	// enterGroupedContainers returns.
 	groupCursorPending svcRowID
 
+	// groupFoldRestore carries the host view's fold layout across a drill-in /
+	// drill-out round trip, so a project the user left open comes back open.
+	// drillIntoGroup is its ONE writer, because setSingleGroup replaces the
+	// host groups that hold the flags: by the time the drill-out esc runs there
+	// is nothing left to read them from.
+	//
+	// It is keyed by the sanitized project NAME, like buildSvcGroups' own
+	// carry-forward, and a project the map does not name lands FOLDED — it
+	// appeared while the user was inside a project, and the host view is
+	// compact by default.
+	//
+	// applyPendingGroupFold spends it together with groupFoldPending, and it
+	// deliberately OUTLIVES clearContainerScreen: it is a name-keyed memo
+	// rather than row-derived state, and the drill-out lands through that very
+	// helper. The three sites that leave the SERVER context clear it instead,
+	// or host A's folds would be applied to host B's projects of the same name.
+	groupFoldRestore map[string]bool
+
 	// svcStatus and stats are keyed by the QUALIFIED key svcKey produces, not
 	// by the bare service name a Composer returns: two projects on one host
 	// routinely both own a "db", and a bare key would let one overwrite the
@@ -1718,9 +1736,12 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.rollbackCleanup = nil
 			m.rollbackFetchSession++
 			// The failed connect leaves the user on the server screen, so the
-			// grouped host view a previous server populated must go with it.
+			// grouped host view a previous server populated must go with it —
+			// including the fold layout clearContainerScreen keeps. See
+			// groupFoldRestore.
 			m.grouped = false
 			m.clearContainerScreen()
+			m.groupFoldRestore = nil
 			m.clearSearch()
 			m.clearWaitState()
 			return m, nil
@@ -2380,6 +2401,10 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 				m.projDir = ""
 				m.projName = ""
 				m.updatesErr = ""
+				// Above both branches below: clearContainerScreen keeps the
+				// fold layout, and a previous server's is not this host's. See
+				// groupFoldRestore.
+				m.groupFoldRestore = nil
 				m.rollbackSnapshot = nil
 				m.rollbackTargets = nil
 				m.rollbackProj = compose.Project{}
@@ -6493,6 +6518,13 @@ func (m *Model) drillIntoGroup(gi int) tea.Cmd {
 	// row-derived one-shots by hand.
 	m.groupFoldPending = false
 	m.groupCursorPending = svcRowID{}
+	// Drill-IN is the only place the host's fold layout can still be read:
+	// setSingleGroup below replaces the groups that carry it. See
+	// groupFoldRestore.
+	m.groupFoldRestore = make(map[string]bool, len(m.svcGroups))
+	for _, sg := range m.svcGroups {
+		m.groupFoldRestore[sg.proj.Name] = sg.folded
+	}
 	// The grouped view is the parent screen from here on: canGoBack and the
 	// footer's back label both read drilledFromHost on the drilled screen.
 	m.drilledFromHost = true
@@ -6552,6 +6584,10 @@ func (m *Model) backToServerScreen() tea.Cmd {
 	m.projDir = ""
 	m.drilledFromHost = false
 	m.clearContainerScreen()
+	// clearContainerScreen deliberately keeps it — this is one of the three
+	// sites that leave the server context, where it would name another host's
+	// projects. See groupFoldRestore.
+	m.groupFoldRestore = nil
 	m.rollbackSnapshot = nil
 	m.rollbackTargets = nil
 	m.rollbackProj = compose.Project{}
@@ -6705,6 +6741,10 @@ func (m *Model) clampSvcCursor() {
 //     seconds after the connect. The user saw no rows, so the landing has not
 //     happened yet; the first payload that brings rows still folds them.
 //
+// A drill-out lands here too, and it carries groupFoldRestore: the layout the
+// user left the host view in replaces the blanket fold, including on a lone
+// group, which groupsHaveHeaders keeps a header for once it is folded.
+//
 // setGroups already built the entries from the unfolded state, so the fold has
 // to rebuild them again.
 func (m *Model) applyPendingGroupFold() {
@@ -6712,6 +6752,16 @@ func (m *Model) applyPendingGroupFold() {
 		return
 	}
 	m.groupFoldPending = false
+	restore := m.groupFoldRestore
+	m.groupFoldRestore = nil
+	if len(restore) > 0 {
+		for i := range m.svcGroups {
+			folded, seen := restore[m.svcGroups[i].proj.Name]
+			m.svcGroups[i].folded = folded || !seen
+		}
+		m.svcEntries = rebuildSvcEntries(m.svcGroups)
+		return
+	}
 	if len(m.svcGroups) == 1 {
 		return
 	}

@@ -1695,27 +1695,146 @@ func TestGroupedLanding_SingleGroupHostDoesNotFoldWhenItGrows(t *testing.T) {
 	}
 }
 
-// Drill-out lands through enterGroupedContainers like every other entry, so it
-// re-folds — that is the intent, not a side effect.
-func TestGroupedLanding_DrillOutRefolds(t *testing.T) {
+// A drill-in / drill-out round trip comes back to the layout the user left.
+// Drill-out lands through enterGroupedContainers, whose clearContainerScreen
+// drops the groups the fold flags live on, so the layout is carried across by
+// project NAME in groupFoldRestore and spent by the landing payload.
+func TestGroupedDrillOut_RestoresTheFoldLayout(t *testing.T) {
 	m, _ := drillTestModel(t)
-	m.svcCursor = 2 // the shop header
-	updated, _ := m.Update(keyMsgFor("enter"))
-	m = updated.(Model)
-	if m.grouped {
-		t.Fatal("precondition: drill-in should have left grouped mode")
+	m.svcCursor = 0 // the blog header
+	m = pressGroupKey(m, "left")
+	if got, want := foldStates(m), []bool{true, false, false}; !slices.Equal(got, want) {
+		t.Fatalf("precondition: fold layout = %v, want %v", got, want)
 	}
 
-	updated, cmd := m.Update(tea.KeyMsg{Type: tea.KeyEsc})
+	m, cmd := drillOut(t, m, headerIndexFor(t, m.svcEntries, 1))
+	if len(m.groupFoldRestore) != 3 {
+		t.Fatalf("drill-in captured %v, want all three groups", m.groupFoldRestore)
+	}
+	updated, _ := m.Update(cmd())
+	m = updated.(Model)
+
+	if len(m.svcGroups) != 3 {
+		t.Fatalf("landed with %d groups, want 3", len(m.svcGroups))
+	}
+	if got, want := foldStates(m), []bool{true, false, false}; !slices.Equal(got, want) {
+		t.Errorf("fold layout = %v, want %v (the one the drill-in left)", got, want)
+	}
+	if m.groupFoldRestore != nil {
+		t.Error("the landing payload did not spend the fold snapshot")
+	}
+}
+
+// A project that appeared while the user was inside another one is not in the
+// snapshot, and lands FOLDED: the host view is compact by default, and the
+// three groups the user did arrange keep their layout.
+func TestGroupedDrillOut_ANewProjectArrivesFolded(t *testing.T) {
+	projects := []compose.Project{
+		{Name: "blog", ConfigDir: "/srv/blog"},
+		{Name: "shop", ConfigDir: "/srv/shop"},
+	}
+	status := map[string]map[string]runner.ServiceStatus{
+		"blog": {"web": {Running: true}},
+		"shop": {"api": {Running: true}},
+	}
+	m, h := mutableHostModel(t, projects, status)
+	m, cmd := drillOut(t, m, headerIndexFor(t, m.svcEntries, 1))
+
+	h.set(
+		[]compose.Project{
+			{Name: "blog", ConfigDir: "/srv/blog"},
+			{Name: "shop", ConfigDir: "/srv/shop"},
+			{Name: "ops", ConfigDir: "/srv/ops"},
+		},
+		map[string]map[string]runner.ServiceStatus{
+			"blog": {"web": {Running: true}},
+			"shop": {"api": {Running: true}},
+			"ops":  {"grafana": {Running: true}},
+		},
+	)
+	updated, _ := m.Update(cmd())
+	m = updated.(Model)
+
+	if len(m.svcGroups) != 3 || m.svcGroups[2].proj.Name != "ops" {
+		t.Fatalf("groups = %+v, want blog/shop/ops in loader order", m.svcGroups)
+	}
+	if got, want := foldStates(m), []bool{false, false, true}; !slices.Equal(got, want) {
+		t.Errorf("fold layout = %v, want %v (only the project the user never saw is folded)", got, want)
+	}
+}
+
+// A restored fold on a LONE group is honoured, which the blanket landing fold
+// refuses. groupsHaveHeaders keeps that group's header, so the screen still has
+// a row to unfold from — zero rows would be a trap.
+func TestGroupedDrillOut_LoneRestoredFoldKeepsItsHeader(t *testing.T) {
+	projects := []compose.Project{
+		{Name: "blog", ConfigDir: "/srv/blog"},
+		{Name: "shop", ConfigDir: "/srv/shop"},
+	}
+	status := map[string]map[string]runner.ServiceStatus{
+		"blog": {"web": {Running: true}},
+		"shop": {"api": {Running: true}},
+	}
+	m, h := mutableHostModel(t, projects, status)
+	m.svcCursor = headerIndexFor(t, m.svcEntries, 1)
+	m = pressGroupKey(m, "left")
+	if !m.svcGroups[1].folded {
+		t.Fatal("precondition: the user folded shop before drilling in")
+	}
+
+	m, cmd := drillOut(t, m, headerIndexFor(t, m.svcEntries, 1))
+	// blog's last container stops while the user is inside shop.
+	h.set(
+		[]compose.Project{{Name: "shop", ConfigDir: "/srv/shop"}},
+		map[string]map[string]runner.ServiceStatus{"shop": {"api": {Running: true}}},
+	)
+	updated, _ := m.Update(cmd())
+	m = updated.(Model)
+
+	if len(m.svcGroups) != 1 || !m.svcGroups[0].folded {
+		t.Fatalf("groups = %+v, want the lone shop group folded", m.svcGroups)
+	}
+	if len(m.svcEntries) != 1 || m.svcEntries[0].kind != entrySvcGroupHeader {
+		t.Fatalf("rows = %+v, want the folded group's own header", m.svcEntries)
+	}
+
+	m.svcCursor = 0
+	m = pressGroupKey(m, "right")
+	if m.svcGroups[0].folded {
+		t.Error("the header the fold left on screen did not unfold the group")
+	}
+}
+
+// The snapshot is keyed by project name, and two hosts routinely run projects
+// of the same name, so every site that leaves the SERVER context drops it. A
+// leak would apply host A's folds to host B, and the fresh landing folds all.
+func TestGroupedFoldRestore_DoesNotSurviveAServerSwitch(t *testing.T) {
+	_, projects := groupedFixture()
+	m, f := drillTestModel(t)
+	m, _ = drillOut(t, m, headerIndexFor(t, m.svcEntries, 1))
+	if len(m.groupFoldRestore) == 0 {
+		t.Fatal("precondition: the drill-in captured no fold layout")
+	}
+
+	m.backToServerScreen()
+	if m.groupFoldRestore != nil {
+		t.Fatalf("the server screen kept %v; it names another host's projects", m.groupFoldRestore)
+	}
+
+	// The next server's connect installs its own loader and factory.
+	m.projectLoader = func(context.Context) ([]compose.Project, error) { return projects, nil }
+	m.composerFactory = f.factory()
+	updated, cmd := m.Update(connectResultMsg{err: nil})
 	m = updated.(Model)
 	if cmd == nil {
-		t.Fatal("drill-out must reload the host view")
+		t.Fatal("connect success dispatched no host-view load")
 	}
 	updated, _ = m.Update(cmd())
 	m = updated.(Model)
 
-	if got := foldedCount(m); got != len(m.svcGroups) || len(m.svcGroups) != 3 {
-		t.Errorf("%d of %d groups folded after drill-out, want all 3", got, len(m.svcGroups))
+	if got := foldedCount(m); got != 3 || len(m.svcGroups) != 3 {
+		t.Errorf("%d of %d groups folded on the new host, want all 3 (a landing with no snapshot)",
+			got, len(m.svcGroups))
 	}
 }
 
@@ -3586,8 +3705,9 @@ func drillOut(t *testing.T, m Model, row int) (Model, tea.Cmd) {
 // back on row 0, and the row order is a live docker ps, so finding the project
 // again was a scroll through whatever the host is running.
 //
-// The target names the project's HEADER because the landing folds: the service
-// row the drilled cursor sat on is not on screen to receive it.
+// The target names the project's HEADER, never the service row the drilled
+// cursor sat on: the host view can come back folded, where that row is not on
+// screen to receive it.
 func TestGroupedDrillOut_CursorLandsOnTheProjectJustVisited(t *testing.T) {
 	m, _ := drillTestModel(t)
 	shopHeader := headerIndexFor(t, m.svcEntries, 1)
@@ -3604,8 +3724,8 @@ func TestGroupedDrillOut_CursorLandsOnTheProjectJustVisited(t *testing.T) {
 	updated, _ := m.Update(cmd())
 	m = updated.(Model)
 
-	if got := foldedCount(m); got != 3 || len(m.svcGroups) != 3 {
-		t.Fatalf("precondition: %d of %d groups folded, want all 3 (the target names a header)", got, len(m.svcGroups))
+	if got := len(m.svcGroups); got != 3 {
+		t.Fatalf("precondition: landed with %d groups, want 3 (a header per group for the target to name)", got)
 	}
 	if got, want := m.cursorRowID(), (svcRowID{proj: "shop", header: true}); got != want {
 		t.Errorf("cursor row = %+v, want %+v", got, want)
@@ -3628,11 +3748,11 @@ func TestGroupedDrillOut_CursorTargetIsSpentByTheLandingPayload(t *testing.T) {
 		t.Fatalf("the landing payload left %+v armed", m.groupCursorPending)
 	}
 
-	// The user moves on, one row down the folded host.
+	// The user moves on, one row down the restored host.
 	m = pressGroupKey(m, "down")
 	moved := m.cursorRowID()
 	if moved == (svcRowID{proj: "shop", header: true}) {
-		t.Fatalf("precondition: the cursor did not leave the visited project (row %+v)", moved)
+		t.Fatalf("precondition: the cursor did not leave the row the target named (%+v)", moved)
 	}
 
 	// The 5-second reload, which is this same message.
@@ -3881,32 +4001,43 @@ func TestGroupedDrillOut_ScrollsTheVisitedProjectIntoView(t *testing.T) {
 	assertCursorVisible(t, m)
 }
 
-// Both row-derived one-shots are departure-site state: the invariant is LOCAL
-// to each navigation site rather than emergent from whatever svcGroups happens
-// to hold. enterGroupedContainers is the exception — it is the landing body, so
-// it ARMS the fold, and the drill-out esc arms the cursor target right after
-// it. drillIntoGroup is the one site with no clearContainerScreen behind it, so
-// it disarms both by hand — either one surviving a drill-in would fire on some
-// later grouped payload the user reached another way.
+// The two row-derived one-shots and the fold snapshot are departure-site state:
+// the invariant is LOCAL to each navigation site rather than emergent from
+// whatever svcGroups happens to hold. enterGroupedContainers is the exception —
+// it is the landing body, so it ARMS the fold, and the drill-out esc arms the
+// cursor target right after it. drillIntoGroup is the one site with no
+// clearContainerScreen behind it, so it disarms both one-shots by hand — either
+// one surviving a drill-in would fire on some later grouped payload the user
+// reached another way — and it is also the ONE site that WRITES the snapshot.
 //
-// ONE row per site covers BOTH fields: a seventh navigation site that settles
-// only one of them fails here, rather than in whichever of two parallel tables
-// nobody remembered to edit.
+// groupFoldRestore settles by a different rule from the other two, which is
+// exactly why it belongs in this table: clearContainerScreen keeps it (it is
+// name-keyed rather than row-derived, and the drill-out lands through that
+// helper), so the three sites leaving the SERVER context clear it themselves.
+//
+// ONE row per site covers ALL THREE fields: a seventh navigation site that
+// settles only some of them fails here, rather than in whichever of three
+// parallel tables nobody remembered to edit.
 func TestGroupedOneShots_SettledAtEveryNavigationSite(t *testing.T) {
 	stale := svcRowID{proj: "blog", header: true}
+	staleFolds := map[string]bool{"ghost": true}
+	hostFolds := map[string]bool{"blog": false, "shop": false, compose.UnmanagedProjectName: false}
 	for _, tc := range []struct {
-		name       string
-		run        func(t *testing.T) Model
-		wantFold   bool
-		wantCursor svcRowID
+		name        string
+		run         func(t *testing.T) Model
+		wantFold    bool
+		wantCursor  svcRowID
+		wantRestore map[string]bool
 	}{
 		{
-			name: "drill in",
+			name:        "drill in",
+			wantRestore: hostFolds,
 			run: func(t *testing.T) Model {
 				m, _ := drillTestModel(t)
 				// A landing payload still in flight.
 				m.groupFoldPending = true
 				m.groupCursorPending = stale
+				m.groupFoldRestore = staleFolds
 				m.svcCursor = headerIndexFor(t, m.svcEntries, 1)
 				updated, _ := m.Update(keyMsgFor("enter"))
 				m = updated.(Model)
@@ -3923,6 +4054,7 @@ func TestGroupedOneShots_SettledAtEveryNavigationSite(t *testing.T) {
 				m := groupedTestModel(g, projects)
 				m.groupFoldPending = true
 				m.groupCursorPending = stale
+				m.groupFoldRestore = staleFolds
 				m.backToServerScreen()
 				return m
 			},
@@ -3934,6 +4066,7 @@ func TestGroupedOneShots_SettledAtEveryNavigationSite(t *testing.T) {
 				m := groupedTestModel(g, projects)
 				m.groupFoldPending = true
 				m.groupCursorPending = stale
+				m.groupFoldRestore = staleFolds
 				updated, _ := m.Update(connectResultMsg{err: errors.New("ssh: connect refused")})
 				return updated.(Model)
 			},
@@ -3944,6 +4077,7 @@ func TestGroupedOneShots_SettledAtEveryNavigationSite(t *testing.T) {
 				m := localFastTrackModel(t)
 				m.groupFoldPending = true
 				m.groupCursorPending = stale
+				m.groupFoldRestore = staleFolds
 				updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyEnter})
 				m = updated.(Model)
 				if m.grouped {
@@ -3960,6 +4094,7 @@ func TestGroupedOneShots_SettledAtEveryNavigationSite(t *testing.T) {
 			wantFold: true,
 			run: func(t *testing.T) Model {
 				m := localFastTrackModel(t)
+				m.groupFoldRestore = staleFolds
 				updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyEnter})
 				m = updated.(Model)
 				if !m.drilledFromHost || m.projName != "" {
@@ -3970,9 +4105,12 @@ func TestGroupedOneShots_SettledAtEveryNavigationSite(t *testing.T) {
 			},
 		},
 		{
-			name:       "drill out",
-			wantFold:   true,
-			wantCursor: svcRowID{proj: "shop", header: true},
+			// The drill-out CARRIES the snapshot the drill-in wrote: the
+			// landing payload is what spends it, not this site.
+			name:        "drill out",
+			wantFold:    true,
+			wantCursor:  svcRowID{proj: "shop", header: true},
+			wantRestore: hostFolds,
 			run: func(t *testing.T) Model {
 				m, _ := drillTestModel(t)
 				m, _ = drillOut(t, m, headerIndexFor(t, m.svcEntries, 1))
@@ -3987,6 +4125,9 @@ func TestGroupedOneShots_SettledAtEveryNavigationSite(t *testing.T) {
 			}
 			if got := m.groupCursorPending; got != tc.wantCursor {
 				t.Errorf("groupCursorPending = %+v, want %+v", got, tc.wantCursor)
+			}
+			if got := m.groupFoldRestore; !reflect.DeepEqual(got, tc.wantRestore) {
+				t.Errorf("groupFoldRestore = %v, want %v", got, tc.wantRestore)
 			}
 		})
 	}
