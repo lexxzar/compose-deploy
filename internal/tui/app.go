@@ -467,11 +467,14 @@ type Model struct {
 	// clears m.selected, because the drilled screen addresses one project and
 	// inherits nothing — the same asymmetry the fold snapshot has.
 	//
-	// nil means "no snapshot", and an EMPTY selection captures as nil so a
-	// round trip that ticked nothing restores nothing. The spend is guarded on
-	// rows arriving, like applyPendingGroupFold: a payload with no groups is
-	// not the landing, and eating the snapshot there would lose the selection
-	// to a host that was merely slow.
+	// nil means "no snapshot", and a selection holding no KEYS captures as
+	// nil, so a round trip that ticked nothing restores nothing. An untick
+	// leaves a false entry rather than dropping the key, so tick-then-untick
+	// captures a non-nil all-false map instead — harmless, because every
+	// selection read is truthiness-based. The spend is guarded on rows
+	// arriving, like applyPendingGroupFold: a payload with no groups is not
+	// the landing, and eating the snapshot there would lose the selection to a
+	// host that was merely slow.
 	//
 	// It rides clearContainerScreen for the same reason the fold snapshot does
 	// — the keys name ONE host's projects — so the drill-out esc carries it
@@ -6559,6 +6562,10 @@ func (m *Model) drillIntoGroup(gi int) tea.Cmd {
 	// below drops it. Its keys are already qualified and sanitized, so they
 	// survive the round trip as they are; pruneSelection drops the ones whose
 	// service went away while the user was inside a project.
+	//
+	// CLONED, not aliased: the reset below reassigns m.selected rather than
+	// emptying it in place, so an alias would survive today and stop surviving
+	// the moment that line becomes clear(m.selected).
 	m.groupSelectionRestore = nil
 	if len(m.selected) > 0 {
 		m.groupSelectionRestore = maps.Clone(m.selected)
