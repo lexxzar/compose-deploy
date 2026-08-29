@@ -10,6 +10,7 @@ import (
 	"regexp"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/lexxzar/compose-deploy/internal/runner"
 )
@@ -301,6 +302,15 @@ func (h *HostContainers) UpdateDetails(ctx context.Context, services []string) (
 		return nil, err
 	}
 	return scanUpdateDetails(ctx, filterServices(hostImageMap(entries), services), h.docker)
+}
+
+// ImageCreated is HostContainers' binding of fetchImageCreated, over its own
+// dockerRunner. See Compose.ImageCreated for the contract. It is a READ, so it
+// is live on the read-only unmanaged screen exactly like Inspect: the `built`
+// row describes what an unmanaged container runs, and no compose project is
+// needed to answer that.
+func (h *HostContainers) ImageCreated(ctx context.Context, image string) (time.Time, error) {
+	return fetchImageCreated(ctx, h.docker, image)
 }
 
 // bareImageIDRe matches the image-ID form `docker ps` reports for a container

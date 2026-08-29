@@ -496,13 +496,9 @@ func scanUpdateDetails(ctx context.Context, wanted map[string]string, d dockerRu
 // matching field stays zero and its row is omitted, while the rows the other
 // steps filled still render.
 func fetchUpdateDetail(ctx context.Context, d dockerRunner, image string) (UpdateDetail, error) {
-	localOut, err := d.run(ctx, localProbeArgs(image)...)
+	probe, err := probeLocalImage(ctx, d, image)
 	if err != nil {
-		return UpdateDetail{}, fmt.Errorf("inspecting local image %q: %w", image, err)
-	}
-	probe, err := parseLocalProbe(localOut)
-	if err != nil {
-		return UpdateDetail{}, fmt.Errorf("inspecting local image %q: %w", image, err)
+		return UpdateDetail{}, err
 	}
 
 	indexOut, err := d.run(ctx, manifestIndexArgs(image)...)
@@ -559,4 +555,35 @@ func pinnedImageRef(image string, indexOut []byte, probe localProbe) (ref string
 	default:
 		return stripTag(image) + "@" + digest, true, nil
 	}
+}
+
+// probeLocalImage runs step 1 for both callers: one TOP-LEVEL, purely local
+// `docker image inspect` through the dockerRunner seam. fetchUpdateDetail
+// aborts its registry sequence on a failure here; fetchImageCreated's caller
+// discards it and omits the `built` row.
+func probeLocalImage(ctx context.Context, d dockerRunner, image string) (localProbe, error) {
+	if strings.TrimSpace(image) == "" {
+		return localProbe{}, errors.New("no image reference to inspect")
+	}
+	out, err := d.run(ctx, localProbeArgs(image)...)
+	if err != nil {
+		return localProbe{}, fmt.Errorf("inspecting local image %q: %w", image, err)
+	}
+	probe, err := parseLocalProbe(out)
+	if err != nil {
+		return localProbe{}, fmt.Errorf("inspecting local image %q: %w", image, err)
+	}
+	return probe, nil
+}
+
+// fetchImageCreated returns the build time of a LOCAL image: step 1 of the
+// detail fetch on its own, with the registry half left out. The inspect
+// screen's `built` row must not depend on an update verdict, on the detail
+// batch having been dispatched, or on a registry being reachable.
+func fetchImageCreated(ctx context.Context, d dockerRunner, image string) (time.Time, error) {
+	probe, err := probeLocalImage(ctx, d, image)
+	if err != nil {
+		return time.Time{}, err
+	}
+	return probe.created, nil
 }

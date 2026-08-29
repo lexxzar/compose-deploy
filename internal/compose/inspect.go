@@ -144,6 +144,20 @@ type InspectDoc struct {
 	Config       InspectConfig     `json:"Config"`
 	HostConfig   InspectHostConfig `json:"HostConfig"`
 	Mounts       []InspectMount    `json:"Mounts"`
+
+	// Filled by a SECOND, local `docker image inspect`, never by the container
+	// document: docker's own `Created` key there is when the CONTAINER was
+	// created, so the tag keeps that value out of this field.
+	ImageCreated time.Time `json:"-"`
+}
+
+// ImageRef names the image to ask image-level questions about. The resolved ID
+// wins: it addresses what the container runs even after the tag has moved.
+func (d InspectDoc) ImageRef() string {
+	if d.Image != "" {
+		return d.Image
+	}
+	return d.Config.Image
 }
 
 // InspectState mirrors the `.State` object. Health is a pointer because docker

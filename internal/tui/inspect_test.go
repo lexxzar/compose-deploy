@@ -1,14 +1,20 @@
 package tui
 
 import (
+	"context"
+	"fmt"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/charmbracelet/bubbles/viewport"
+	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/x/ansi"
 	"github.com/lexxzar/compose-deploy/internal/compose"
+	"github.com/lexxzar/compose-deploy/internal/runner"
 )
 
 // loadInspectFixture reads one of the real `docker inspect` captures. The
@@ -745,13 +751,18 @@ func TestBuildInspectSummary_UpdateRows(t *testing.T) {
 	fullDetail := compose.UpdateDetail{LocalCreated: localBuilt, NewID: newID, NewCreated: newBuilt}
 
 	tests := []struct {
-		name     string
+		name string
+		// docBuilt is the image build date the inspect fetch probed. It is the
+		// ONLY source of the `built` row: upd.detail.LocalCreated describes the
+		// DECLARED tag, which a local pull can move off the running image.
+		docBuilt time.Time
 		upd      inspectUpdateInfo
 		wantRows []string
 		skipRows []string
 	}{
 		{
-			name: "update available draws every row",
+			name:     "update available draws every row",
+			docBuilt: localBuilt,
 			upd: inspectUpdateInfo{
 				now:       now,
 				verdict:   &yes,
@@ -766,7 +777,10 @@ func TestBuildInspectSummary_UpdateRows(t *testing.T) {
 			},
 		},
 		{
-			name: "up to date draws the verdict alone",
+			// `built` is absent here because the probe supplied none — not
+			// because the verdict is false. The next case is the one that says
+			// so: an up-to-date container draws its own build date.
+			name: "up to date with no probed build date draws the verdict alone",
 			upd: inspectUpdateInfo{
 				now:       now,
 				verdict:   &no,
@@ -776,20 +790,43 @@ func TestBuildInspectSummary_UpdateRows(t *testing.T) {
 			skipRows: []string{"built", "update id"},
 		},
 		{
-			name:     "no verdict draws nothing",
+			name:     "up to date still draws the document's build date",
+			docBuilt: localBuilt,
+			upd: inspectUpdateInfo{
+				now:       now,
+				verdict:   &no,
+				checkedAt: now.Add(-90 * time.Minute),
+			},
+			wantRows: []string{
+				inspectRow("built", "2026-07-07 17:47:22  (47d ago)"),
+				inspectRow("update", "up to date  (checked 1h ago)"),
+			},
+			// The registry half stays verdict-driven; only `built` left it.
+			skipRows: []string{"update id", "update built"},
+		},
+		{
+			name:     "no verdict and no probe draws nothing",
 			upd:      inspectUpdateInfo{now: now},
 			skipRows: []string{"built", "update", "update id", "update built"},
+		},
+		{
+			name:     "the document's build date needs no verdict at all",
+			docBuilt: localBuilt,
+			upd:      inspectUpdateInfo{now: now},
+			wantRows: []string{inspectRow("built", "2026-07-07 17:47:22  (47d ago)")},
+			skipRows: []string{"update", "update id", "update built"},
 		},
 		{
 			name: "a detail without a verdict still draws its own rows",
 			upd:  inspectUpdateInfo{now: now, detail: fullDetail},
 			wantRows: []string{
-				inspectRow("built", "2026-07-07 17:47:22  (47d ago)"),
 				inspectRow("update id", newID),
 				inspectRow("update built", "2026-08-19 19:14:43  (3d ago)"),
 			},
-			// The verdict row is the one thing a detail cannot imply.
-			skipRows: []string{inspectRow("update", "available"), inspectRow("update", "up to date")},
+			// The verdict row is the one thing a detail cannot imply, and
+			// `built` is the one row a detail cannot supply at all — the row
+			// prefix keeps that needle off the "update built" row above.
+			skipRows: []string{inspectRow("update", "available"), inspectRow("update", "up to date"), "\n  built"},
 		},
 		{
 			name:     "an unstamped check reports no age",
@@ -798,7 +835,8 @@ func TestBuildInspectSummary_UpdateRows(t *testing.T) {
 			skipRows: []string{"(checked"},
 		},
 		{
-			name: "an empty new id omits only its own row",
+			name:     "an empty new id omits only its own row",
+			docBuilt: localBuilt,
 			upd: inspectUpdateInfo{
 				now:     now,
 				verdict: &yes,
@@ -814,7 +852,9 @@ func TestBuildInspectSummary_UpdateRows(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			out := buildInspectSummary(updateRowsDoc(), 120, tt.upd)
+			doc := updateRowsDoc()
+			doc.ImageCreated = tt.docBuilt
+			out := buildInspectSummary(doc, 120, tt.upd)
 			for _, want := range tt.wantRows {
 				if !strings.Contains(out, want) {
 					t.Errorf("summary missing %q:\n%s", want, out)
@@ -829,20 +869,92 @@ func TestBuildInspectSummary_UpdateRows(t *testing.T) {
 	}
 }
 
+// TestBuildInspectSummary_BuiltRowSource pins the row's ONE source: the image
+// probe the inspect fetch makes against the container's resolved image id. The
+// update detail is NOT a second source — its LocalCreated describes the tag the
+// compose file declares, and a local pull moves that tag while the container
+// keeps running the old image, so a fallback would label a date belonging to a
+// different image. No row beats a wrong one, and the row is drawn exactly once.
+func TestBuildInspectSummary_BuiltRowSource(t *testing.T) {
+	now := time.Date(2026, 8, 23, 19, 0, 0, 0, time.UTC)
+	fromDoc := time.Date(2026, 7, 7, 17, 47, 22, 0, time.UTC)
+	fromDetail := time.Date(2025, 1, 2, 3, 4, 5, 0, time.UTC)
+
+	tests := []struct {
+		name     string
+		docBuilt time.Time
+		detail   compose.UpdateDetail
+		wantRow  string
+	}{
+		{
+			name:     "the document alone",
+			docBuilt: fromDoc,
+			wantRow:  inspectRow("built", "2026-07-07 17:47:22  (47d ago)"),
+		},
+		{
+			// A composer that is not an ImageInspector, or a probe that failed,
+			// with an update-detail batch that resolved the DECLARED tag. The
+			// two can name different images, so this draws no row at all.
+			name:   "the detail alone draws nothing",
+			detail: compose.UpdateDetail{LocalCreated: fromDetail},
+		},
+		{
+			name:     "the document is used and the row is drawn once",
+			docBuilt: fromDoc,
+			detail:   compose.UpdateDetail{LocalCreated: fromDetail},
+			wantRow:  inspectRow("built", "2026-07-07 17:47:22  (47d ago)"),
+		},
+		{
+			name: "neither source draws no row",
+		},
+		{
+			// The probe already maps the reproducible-build sentinel to the
+			// zero time (parseImageTimestamp), so this is the renderer's own
+			// guard rather than a shape production can currently produce: an
+			// epoch document must never draw a 1970 row, whichever source put
+			// it there.
+			name:     "an epoch document draws no row",
+			docBuilt: time.Unix(0, 0).UTC(),
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			doc := updateRowsDoc()
+			doc.ImageCreated = tt.docBuilt
+			out := buildInspectSummary(doc, 120, inspectUpdateInfo{now: now, detail: tt.detail})
+
+			// Two spaces before the label, so the "update built" row below is
+			// not counted: the point of the case is that ONE row is drawn.
+			want := 1
+			if tt.wantRow == "" {
+				want = 0
+			}
+			if got := strings.Count(out, "  built"); got != want {
+				t.Fatalf("summary carries %d `built` rows, want %d:\n%s", got, want, out)
+			}
+			if tt.wantRow != "" && !strings.Contains(out, tt.wantRow) {
+				t.Errorf("summary missing %q:\n%s", tt.wantRow, out)
+			}
+		})
+	}
+}
+
 // TestBuildInspectSummary_UpdateRowOrder pins where the block sits: the two ids
 // and the two build dates have to read as pairs, so "built" follows "image id"
 // and the command pair stays at the bottom of the section.
 func TestBuildInspectSummary_UpdateRowOrder(t *testing.T) {
 	yes := true
 	now := time.Date(2026, 8, 23, 19, 0, 0, 0, time.UTC)
-	out := buildInspectSummary(updateRowsDoc(), 120, inspectUpdateInfo{
+	doc := updateRowsDoc()
+	doc.ImageCreated = time.Date(2026, 7, 7, 17, 47, 22, 0, time.UTC)
+	out := buildInspectSummary(doc, 120, inspectUpdateInfo{
 		now:       now,
 		verdict:   &yes,
 		checkedAt: now.Add(-3 * time.Minute),
 		detail: compose.UpdateDetail{
-			LocalCreated: time.Date(2026, 7, 7, 17, 47, 22, 0, time.UTC),
-			NewID:        "sha256:" + strings.Repeat("c", 64),
-			NewCreated:   time.Date(2026, 8, 19, 19, 14, 43, 0, time.UTC),
+			NewID:      "sha256:" + strings.Repeat("c", 64),
+			NewCreated: time.Date(2026, 8, 19, 19, 14, 43, 0, time.UTC),
 		},
 	})
 
@@ -860,8 +972,9 @@ func TestBuildInspectSummary_UpdateRowOrder(t *testing.T) {
 }
 
 // TestBuildInspectSummary_UpdateRowsEpochSentinel pins the reproducible-build
-// guard on both date rows independently. distroless, ko, Bazel and nix images
-// report 1970-01-01, which is a sentinel rather than a build date, so the row is
+// guard on both date rows independently — `built` off the image probe, `update
+// built` off the update detail. distroless, ko, Bazel and nix images report
+// 1970-01-01, which is a sentinel rather than a build date, so the row is
 // dropped instead of claiming the image was built 56 years ago.
 func TestBuildInspectSummary_UpdateRowsEpochSentinel(t *testing.T) {
 	now := time.Date(2026, 8, 23, 19, 0, 0, 0, time.UTC)
@@ -870,37 +983,42 @@ func TestBuildInspectSummary_UpdateRowsEpochSentinel(t *testing.T) {
 	yes := true
 
 	tests := []struct {
-		name    string
-		detail  compose.UpdateDetail
-		wantRow string
-		skipRow string
+		name     string
+		docBuilt time.Time
+		detail   compose.UpdateDetail
+		wantRow  string
+		skipRow  string
 	}{
 		{
-			name:    "local epoch drops built only",
-			detail:  compose.UpdateDetail{LocalCreated: epoch, NewCreated: real},
-			wantRow: inspectRow("update built", "2026-08-19 19:14:43  (3d ago)"),
+			name:     "local epoch drops built only",
+			docBuilt: epoch,
+			detail:   compose.UpdateDetail{NewCreated: real},
+			wantRow:  inspectRow("update built", "2026-08-19 19:14:43  (3d ago)"),
 			// The row prefix is part of the needle: "built" alone is a
 			// substring of the "update built" row this case must keep.
 			skipRow: "\n  built",
 		},
 		{
-			name:    "registry epoch drops update built only",
-			detail:  compose.UpdateDetail{LocalCreated: real, NewCreated: epoch},
-			wantRow: inspectRow("built", "2026-08-19 19:14:43  (3d ago)"),
-			skipRow: "update built",
+			name:     "registry epoch drops update built only",
+			docBuilt: real,
+			detail:   compose.UpdateDetail{NewCreated: epoch},
+			wantRow:  inspectRow("built", "2026-08-19 19:14:43  (3d ago)"),
+			skipRow:  "update built",
 		},
 		{
-			name:    "both epoch drops both",
-			detail:  compose.UpdateDetail{LocalCreated: epoch, NewCreated: epoch, NewID: "sha256:" + strings.Repeat("c", 64)},
-			wantRow: inspectRow("update id", "sha256:"+strings.Repeat("c", 64)),
-			skipRow: "built",
+			name:     "both epoch drops both",
+			docBuilt: epoch,
+			detail:   compose.UpdateDetail{NewCreated: epoch, NewID: "sha256:" + strings.Repeat("c", 64)},
+			wantRow:  inspectRow("update id", "sha256:"+strings.Repeat("c", 64)),
+			skipRow:  "built",
 		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			detail := tt.detail
-			out := buildInspectSummary(updateRowsDoc(), 120, inspectUpdateInfo{now: now, verdict: &yes, detail: detail})
+			doc := updateRowsDoc()
+			doc.ImageCreated = tt.docBuilt
+			out := buildInspectSummary(doc, 120, inspectUpdateInfo{now: now, verdict: &yes, detail: tt.detail})
 			if !strings.Contains(out, tt.wantRow) {
 				t.Errorf("summary missing %q:\n%s", tt.wantRow, out)
 			}
@@ -927,14 +1045,15 @@ func TestBuildInspectSummary_UpdateRowsWrapNarrow(t *testing.T) {
 		verdict:   &yes,
 		checkedAt: now.Add(-3 * time.Minute),
 		detail: compose.UpdateDetail{
-			LocalCreated: time.Date(2026, 7, 7, 17, 47, 22, 0, time.UTC),
-			NewID:        newID,
-			NewCreated:   time.Date(2026, 8, 19, 19, 14, 43, 0, time.UTC),
+			NewID:      newID,
+			NewCreated: time.Date(2026, 8, 19, 19, 14, 43, 0, time.UTC),
 		},
 	}
+	doc := updateRowsDoc()
+	doc.ImageCreated = time.Date(2026, 7, 7, 17, 47, 22, 0, time.UTC)
 
 	for _, width := range []int{1, 4, 10, 16, 20, 30, 40, 60, 80} {
-		out := buildInspectSummary(updateRowsDoc(), width, upd)
+		out := buildInspectSummary(doc, width, upd)
 		for i, line := range strings.Split(out, "\n") {
 			if w := ansi.StringWidth(line); w > width {
 				t.Errorf("width %d: line %d is %d cells: %q", width, i, w, line)
@@ -1502,4 +1621,734 @@ func TestInspectUpdateInfo_NoCache(t *testing.T) {
 			t.Errorf("another context's entry must not be read, got %+v", got)
 		}
 	})
+}
+
+// ---------------------------------------------------------------------------
+// The `built` row: its one source through the whole path, and the raw buffer.
+// ---------------------------------------------------------------------------
+
+// TestInspectScreen_BuiltRowNeedsTheProbe drives the no-probe path end to end.
+// inspectOnlyComposer implements Inspector but not ImageInspector, so the fetch
+// spends no probe and the document reaches the renderer with a zero
+// ImageCreated. The warm cache carries a LocalCreated for the same service, and
+// it must NOT be borrowed: that date belongs to the tag `docker compose config`
+// declares, which a local pull moves while the container keeps running the old
+// image. A failed probe draws no row, which is the same contract.
+func TestInspectScreen_BuiltRowNeedsTheProbe(t *testing.T) {
+	c := &inspectOnlyComposer{raw: []byte(inspectFixtureJSON)}
+	c.services = []string{"web"}
+	m := inspectTestModel(t, c, c.services)
+	m.updateCache = map[string]updateEntry{m.updatesCacheKey(): {
+		fetchedAt: time.Now().Add(-3 * time.Minute),
+		results:   map[string]bool{"web": true},
+		details:   detailFixture(),
+	}}
+
+	result, cmd := m.Update(keyMsgFor("i"))
+	if cmd == nil {
+		t.Fatal("i should return the inspect fetch")
+	}
+	msg, ok := cmd().(inspectDataMsg)
+	if !ok {
+		t.Fatalf("the fetch produced %T, want inspectDataMsg", cmd())
+	}
+	if !msg.imageCreated.IsZero() {
+		t.Fatalf("precondition: a composer that is not an ImageInspector must probe nothing, got %v", msg.imageCreated)
+	}
+	got := modelOf(result.(Model).Update(msg))
+
+	if got.inspectErr != nil {
+		t.Fatalf("inspectErr = %v, want nil", got.inspectErr)
+	}
+	// The leading newline keeps the needle off the "update built" row, which
+	// the true verdict draws here and which the cache DOES supply.
+	if strings.Contains(got.inspectSummary, "\n  built") {
+		t.Errorf("the update detail must not supply the built row:\n%s", got.inspectSummary)
+	}
+	// The control: the rows the cache legitimately owns still arrive, so the
+	// case cannot pass by rendering nothing at all.
+	for _, want := range []string{
+		inspectRow("update id", detailFixture()["web"].NewID),
+		inspectRow("update built", "2026-08-19 19:14:43"),
+	} {
+		if !strings.Contains(got.inspectSummary, want) {
+			t.Errorf("summary missing %q:\n%s", want, got.inspectSummary)
+		}
+	}
+}
+
+// TestInspectScreen_RawModeIgnoresTheImageProbe is the sibling of
+// TestInspectScreen_RawModeIgnoresUpdateDetails, for the other value that
+// reaches the screen beside the document: the probed date lives on the Model
+// and is merged onto the PARSED doc, so raw mode has to stay byte-identical to
+// `docker inspect`. The summary is the control — it must differ exactly where
+// the raw buffer must not.
+func TestInspectScreen_RawModeIgnoresTheImageProbe(t *testing.T) {
+	build := func(t *testing.T, created time.Time) Model {
+		t.Helper()
+		m := Model{screen: screenInspect, inspectSession: 1, inspectService: "web"}
+		m.width, m.height = 120, 24
+		m.inspectViewport = viewport.New(m.width-4, m.height-6)
+		model := modelOf(m.Update(inspectDataMsg{
+			data:         []byte(inspectFixtureJSON),
+			imageCreated: created,
+			session:      1,
+		}))
+		if model.inspectSummary == "" {
+			t.Fatal("precondition: the summary should be rendered")
+		}
+		return model
+	}
+
+	probed := build(t, inspectProbeCreated)
+	blank := build(t, time.Time{})
+	if probed.inspectSummary == blank.inspectSummary {
+		t.Fatal("precondition: the probed date should change the SUMMARY")
+	}
+
+	probedRaw := modelOf(probed.Update(keyMsgFor("r")))
+	blankRaw := modelOf(blank.Update(keyMsgFor("r")))
+	if !probedRaw.inspectShowRaw || !blankRaw.inspectShowRaw {
+		t.Fatal("r should have switched both models to raw mode")
+	}
+	if got, want := probedRaw.inspectViewport.View(), blankRaw.inspectViewport.View(); got != want {
+		t.Errorf("the image probe changed raw mode:\nwith:\n%s\nwithout:\n%s", got, want)
+	}
+	if string(probedRaw.inspectRaw) != inspectFixtureJSON {
+		t.Error("inspectRaw must stay verbatim in raw mode")
+	}
+	if strings.Contains(probedRaw.inspectViewport.View(), "2023-11-02") {
+		t.Error("the built row must not leak into the raw buffer")
+	}
+}
+
+// inspectProbeCreated is the build date the inspect doubles' image probe
+// reports, shared by every test that asserts the `built` row.
+var inspectProbeCreated = time.Date(2023, 11, 2, 13, 2, 50, 0, time.UTC)
+
+// ImageInspector is reached by the same runtime type assertion as Inspector
+// (pinned in app_test.go) and fails as silently: a drifted signature costs no
+// key, and the `built` row — which every container has, with or without an
+// update verdict — just stops appearing. All three composers must implement it,
+// because the row describes what the container runs rather than what the
+// registry offers.
+var (
+	_ ImageInspector = (*compose.Compose)(nil)
+	_ ImageInspector = (*compose.RemoteCompose)(nil)
+	_ ImageInspector = (*compose.HostContainers)(nil)
+)
+
+// inspectOnlyComposer satisfies Inspector but NOT ImageInspector — the shape a
+// composer takes when it cannot answer the image half. The fetch must then
+// spend no probe and the document must render without a `built` row, which is
+// the same outcome a failed probe produces.
+type inspectOnlyComposer struct {
+	mockComposer
+	raw []byte
+}
+
+func (c *inspectOnlyComposer) Inspect(context.Context, string) ([]byte, error) {
+	return c.raw, nil
+}
+
+// TestFetchInspect_ProbesTheResolvedImage pins the second call the inspect
+// fetch makes: the image the container ACTUALLY runs, addressed by the ID
+// docker resolved the tag to, carried back on the same message.
+func TestFetchInspect_ProbesTheResolvedImage(t *testing.T) {
+	mc := &mockInspectComposer{inspectRaw: []byte(inspectFixtureJSON), imageCreated: inspectProbeCreated}
+	m := Model{composer: mc, ctx: context.Background(), inspectService: "web", inspectSession: 3}
+
+	msg, ok := m.fetchInspect()().(inspectDataMsg)
+	if !ok {
+		t.Fatal("want inspectDataMsg")
+	}
+	if !msg.imageCreated.Equal(inspectProbeCreated) {
+		t.Errorf("imageCreated = %v, want %v", msg.imageCreated, inspectProbeCreated)
+	}
+	if len(mc.imageCreatedRefs) != 1 {
+		t.Fatalf("made %d image probes, want 1: %v", len(mc.imageCreatedRefs), mc.imageCreatedRefs)
+	}
+	// The resolved ID, not the tag: the tag can have been moved to a newer
+	// image since the container started.
+	if mc.imageCreatedRefs[0] != "sha256:0123456789abcdef" {
+		t.Errorf("probed %q, want the document's resolved image id", mc.imageCreatedRefs[0])
+	}
+	if string(msg.data) != inspectFixtureJSON {
+		t.Error("the probe must not disturb the raw bytes")
+	}
+}
+
+// TestFetchInspect_ProbeFailureIsDiscarded pins the non-fatal rule: the image
+// probe is an annotation, so its failure costs its own row and nothing else.
+func TestFetchInspect_ProbeFailureIsDiscarded(t *testing.T) {
+	mc := &mockInspectComposer{
+		inspectRaw:      []byte(inspectFixtureJSON),
+		imageCreatedErr: fmt.Errorf("No such image"),
+	}
+	m := Model{composer: mc, ctx: context.Background(), inspectService: "web"}
+
+	msg, ok := m.fetchInspect()().(inspectDataMsg)
+	if !ok {
+		t.Fatal("want inspectDataMsg")
+	}
+	if msg.err != nil {
+		t.Errorf("err = %v, want nil: a probe failure must never take the error slot", msg.err)
+	}
+	if !msg.imageCreated.IsZero() {
+		t.Errorf("imageCreated = %v, want the zero time", msg.imageCreated)
+	}
+	if string(msg.data) != inspectFixtureJSON {
+		t.Error("a failed probe must still deliver the container document")
+	}
+}
+
+// TestFetchInspect_WithoutAProberSpendsNoProbe: the capability is
+// type-asserted, so a composer that lacks it makes the second call not happen
+// rather than making the whole fetch fail.
+func TestFetchInspect_WithoutAProberSpendsNoProbe(t *testing.T) {
+	m := Model{
+		composer:       &inspectOnlyComposer{raw: []byte(inspectFixtureJSON)},
+		ctx:            context.Background(),
+		inspectService: "web",
+	}
+
+	msg, ok := m.fetchInspect()().(inspectDataMsg)
+	if !ok {
+		t.Fatal("want inspectDataMsg")
+	}
+	if msg.err != nil || !msg.imageCreated.IsZero() {
+		t.Errorf("msg = %+v, want the document with no build date and no error", msg)
+	}
+	if string(msg.data) != inspectFixtureJSON {
+		t.Error("the document must arrive unchanged")
+	}
+}
+
+// TestFetchInspect_UnreadableDocumentSpendsNoProbe: the probe needs an image
+// reference, and the only source of one is the document. A document the narrow
+// parser cannot read names nothing, so asking docker about it would be a
+// malformed call whose failure is discarded anyway.
+func TestFetchInspect_UnreadableDocumentSpendsNoProbe(t *testing.T) {
+	mc := &mockInspectComposer{inspectRaw: []byte("[]"), imageCreated: time.Now()}
+	m := Model{composer: mc, ctx: context.Background(), inspectService: "web"}
+
+	msg, ok := m.fetchInspect()().(inspectDataMsg)
+	if !ok {
+		t.Fatal("want inspectDataMsg")
+	}
+	if len(mc.imageCreatedRefs) != 0 {
+		t.Errorf("made %d image probes, want none: %v", len(mc.imageCreatedRefs), mc.imageCreatedRefs)
+	}
+	// The bytes still travel, so raw mode remains the escape hatch.
+	if string(msg.data) != "[]" {
+		t.Error("the raw bytes must reach the screen even when the parse fails")
+	}
+}
+
+// TestInspectScreen_BuiltRowIgnoresTheVerdict is the headline of the feature:
+// the `built` row is drawn for EVERY container, whatever the update check has
+// or has not said. It drives the whole path — the `i` key, the fetch Cmd, the
+// probe, the message, the render — with an up-to-date verdict in the cache and
+// NO details, the shape refreshUpdates really writes for a false verdict.
+func TestInspectScreen_BuiltRowIgnoresTheVerdict(t *testing.T) {
+	mc := &mockInspectComposer{inspectRaw: []byte(inspectFixtureJSON), imageCreated: inspectProbeCreated}
+	mc.services = []string{"web"}
+	m := inspectTestModel(t, mc, mc.services)
+	m.updateCache = map[string]updateEntry{m.updatesCacheKey(): {
+		fetchedAt: time.Now().Add(-8 * time.Minute),
+		results:   map[string]bool{"web": false},
+	}}
+
+	result, cmd := m.Update(keyMsgFor("i"))
+	if cmd == nil {
+		t.Fatal("i should return the inspect fetch")
+	}
+	result, _ = result.(Model).Update(cmd())
+	got := result.(Model)
+
+	if got.inspectErr != nil {
+		t.Fatalf("inspectErr = %v, want nil", got.inspectErr)
+	}
+	if !strings.Contains(got.inspectSummary, inspectRow("built", "2023-11-02 13:02:50")) {
+		t.Errorf("an up-to-date container must still draw its build date:\n%s", got.inspectSummary)
+	}
+	if !strings.Contains(got.inspectSummary, "up to date") {
+		t.Errorf("precondition: the verdict row should still be drawn:\n%s", got.inspectSummary)
+	}
+	// The registry half stays verdict-driven, so nothing here may invent one.
+	for _, skip := range []string{"update id", "update built"} {
+		if strings.Contains(got.inspectSummary, skip) {
+			t.Errorf("summary must not contain %q:\n%s", skip, got.inspectSummary)
+		}
+	}
+}
+
+// TestInspectScreen_ProbeFailureKeepsTheDocument pins the failure half of the
+// same path: no row, no error line, everything else intact.
+func TestInspectScreen_ProbeFailureKeepsTheDocument(t *testing.T) {
+	mc := &mockInspectComposer{
+		inspectRaw:      []byte(inspectFixtureJSON),
+		imageCreatedErr: fmt.Errorf("Error: No such image"),
+	}
+	mc.services = []string{"web"}
+	m := inspectTestModel(t, mc, mc.services)
+
+	result, cmd := m.Update(keyMsgFor("i"))
+	result, _ = result.(Model).Update(cmd())
+	got := result.(Model)
+
+	if got.inspectErr != nil {
+		t.Fatalf("inspectErr = %v, want nil: a probe failure is discarded", got.inspectErr)
+	}
+	if strings.Contains(got.inspectSummary, "  built") {
+		t.Errorf("a failed probe must draw no build date:\n%s", got.inspectSummary)
+	}
+	for _, want := range []string{"STATE", "running", "IMAGE", "nginx:1.27", "sha256:0123456789abcdef"} {
+		if !strings.Contains(got.inspectSummary, want) {
+			t.Errorf("summary missing %q:\n%s", want, got.inspectSummary)
+		}
+	}
+	if view := got.viewInspect(); strings.Contains(view, "Error") {
+		t.Errorf("the screen must show no error line:\n%s", view)
+	}
+}
+
+// TestInspectScreen_ResizeKeepsTheBuiltRow: the raw bytes cannot carry the build
+// date, so rebuildInspectSummary merges it back from the Model. Entry takes that
+// same path, so dropping the merge costs the row everywhere, not just on resize.
+func TestInspectScreen_ResizeKeepsTheBuiltRow(t *testing.T) {
+	m := inspectScreenModel(t)
+	result, _ := m.Update(inspectDataMsg{
+		data:         []byte(inspectFixtureJSON),
+		imageCreated: inspectProbeCreated,
+		session:      m.inspectSession,
+	})
+	got := result.(Model)
+	row := inspectRow("built", "2023-11-02 13:02:50")
+	if !strings.Contains(got.inspectSummary, row) {
+		t.Fatalf("precondition: the summary should carry the built row:\n%s", got.inspectSummary)
+	}
+
+	result, _ = got.Update(tea.WindowSizeMsg{Width: 100, Height: 30})
+	resized := result.(Model)
+	if !strings.Contains(resized.inspectSummary, row) {
+		t.Errorf("the resize dropped the built row:\n%s", resized.inspectSummary)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// The screen's OWN detail fetch: one service, no batch, no cache write.
+// ---------------------------------------------------------------------------
+
+// inspectDetailComposer answers all three capabilities the inspect screen
+// asserts on — Inspector, ImageInspector and UpdateDetailer — which is the shape
+// every production composer has.
+type inspectDetailComposer struct {
+	mockInspectComposer
+	detailRecorder
+}
+
+// TestInspectDetail_FiresOnlyOnATrueVerdict is the whole refusal set, plus the
+// two rows that DO fire — without them the table would pass on a fetch that
+// never works.
+func TestInspectDetail_FiresOnlyOnATrueVerdict(t *testing.T) {
+	const key = "\x00|"
+	entry := func(e updateEntry) map[string]updateEntry { return map[string]updateEntry{key: e} }
+	trueVerdict := updateEntry{fetchedAt: time.Now(), results: map[string]bool{"web": true}}
+
+	tests := []struct {
+		name          string
+		cache         map[string]updateEntry
+		noDetailer    bool
+		emptyService  bool
+		batchInFlight bool
+		wantCalls     int
+	}{
+		{name: "no entry for this context"},
+		{name: "errored entry is untrusted", cache: entry(updateEntry{fetchedAt: time.Now(), err: true, errMsg: "boom"})},
+		{name: "verdict is false", cache: entry(updateEntry{fetchedAt: time.Now(), results: map[string]bool{"web": false}})},
+		{name: "verdict is absent", cache: entry(updateEntry{fetchedAt: time.Now(), results: map[string]bool{"db": true}})},
+		{
+			name: "a batch has already reported",
+			cache: entry(updateEntry{
+				fetchedAt: time.Now(),
+				results:   map[string]bool{"web": true},
+				details:   map[string]compose.UpdateDetail{},
+			}),
+		},
+		{
+			// detailsInFlight bounds the BATCH phase and one service is not a
+			// batch, so a running batch must not blank this screen's rows.
+			name:          "a batch is in flight elsewhere",
+			cache:         entry(trueVerdict),
+			batchInFlight: true,
+			wantCalls:     1,
+		},
+		{name: "composer is not an UpdateDetailer", cache: entry(trueVerdict), noDetailer: true},
+		{
+			// The entry names "" so the empty-service guard is the SOLE
+			// refusal: under trueVerdict the row would pass with the guard
+			// deleted, because results[""] is false anyway. UpdateDetails runs
+			// its discovery call — `docker compose config`, a full SSH
+			// round-trip when remote — before filterServices ever sees a name.
+			name:         "no service on screen",
+			cache:        entry(updateEntry{fetchedAt: time.Now(), results: map[string]bool{"": true}}),
+			emptyService: true,
+		},
+		{name: "true verdict, nothing reported", cache: entry(trueVerdict), wantCalls: 1},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			rec := &inspectDetailComposer{detailRecorder: detailRecorder{details: detailFixture()}}
+			var c runner.Composer = rec
+			if tt.noDetailer {
+				c = &mockInspectComposer{}
+			}
+			service := "web"
+			if tt.emptyService {
+				service = ""
+			}
+			m := Model{
+				screen:          screenInspect,
+				inspectSession:  1,
+				inspectService:  service,
+				composer:        c,
+				ctx:             context.Background(),
+				updateCache:     tt.cache,
+				detailsInFlight: tt.batchInFlight,
+			}
+
+			cmd := m.fetchInspectDetail()
+			if (cmd != nil) != (tt.wantCalls > 0) {
+				t.Fatalf("fetchInspectDetail returned %v, want a command = %v", cmd, tt.wantCalls > 0)
+			}
+			if cmd != nil {
+				cmd()
+			}
+			if rec.detailsCalls != tt.wantCalls {
+				t.Errorf("UpdateDetails ran %d times, want %d", rec.detailsCalls, tt.wantCalls)
+			}
+			if tt.wantCalls > 0 && !reflect.DeepEqual(rec.detailsArgs, [][]string{{"web"}}) {
+				t.Errorf("UpdateDetails was asked for %v, want exactly [[web]]", rec.detailsArgs)
+			}
+		})
+	}
+}
+
+// warmInspectDetailModel is the container screen over a composer that answers
+// all four capabilities `i` asserts, with a cache entry naming every service as
+// updated — the state the detail rows are read from. The caller owns both
+// halves afterwards: the composer's answers and the entry.
+func warmInspectDetailModel(t *testing.T, services ...string) (Model, *inspectDetailComposer) {
+	t.Helper()
+	c := &inspectDetailComposer{detailRecorder: detailRecorder{details: detailFixture()}}
+	c.inspectRaw = []byte(inspectFixtureJSON)
+	c.services = services
+	m := inspectTestModel(t, c, services)
+	results := make(map[string]bool, len(services))
+	for _, svc := range services {
+		results[svc] = true
+	}
+	m.updateCache = map[string]updateEntry{m.updatesCacheKey(): {
+		fetchedAt: time.Now(),
+		results:   results,
+	}}
+	return m, c
+}
+
+// warmInspectScreen is inspectScreenModel over the same warm entry, for the
+// tests that drive the messages by hand rather than through `i`.
+func warmInspectScreen(t *testing.T) (Model, string) {
+	t.Helper()
+	m := inspectScreenModel(t)
+	key := m.updatesCacheKey()
+	m.updateCache = map[string]updateEntry{key: {
+		fetchedAt: time.Now(),
+		results:   map[string]bool{"web": true},
+	}}
+	m.rebuildInspectSummary()
+	return m, key
+}
+
+// inspectDocument presses `i` and delivers the document, RETURNING whatever the
+// arrival chained — a detail fetch, a memo replay, or nil. The tests that assert
+// on that command need it in hand; inspectVisit is the wrapper for the rest.
+func inspectDocument(t *testing.T, m Model) (Model, tea.Cmd) {
+	t.Helper()
+	result, cmd := m.Update(keyMsgFor("i"))
+	if cmd == nil {
+		t.Fatal("i must dispatch the inspect fetch")
+	}
+	result, chained := result.(Model).Update(cmd())
+	return result.(Model), chained
+}
+
+// inspectVisit presses `i` and delivers both messages it chains: the document,
+// then whatever the document's arrival dispatched.
+func inspectVisit(t *testing.T, m Model) Model {
+	t.Helper()
+	m, detailCmd := inspectDocument(t, m)
+	if detailCmd == nil {
+		t.Fatal("the document's arrival must chain the detail command")
+	}
+	return modelOf(m.Update(detailCmd()))
+}
+
+// inspectLeave presses esc and runs the reload the grouped path returns with it.
+func inspectLeave(t *testing.T, m Model) Model {
+	t.Helper()
+	result, cmd := m.Update(tea.KeyMsg{Type: tea.KeyEsc})
+	m = result.(Model)
+	if m.screen != screenSelectContainers {
+		t.Fatalf("esc left screen %d, want the container screen", m.screen)
+	}
+	if cmd != nil {
+		m = modelOf(m.Update(cmd()))
+	}
+	return m
+}
+
+// A detail failure is DISCARDED, exactly as the batch's is: the rows are omitted
+// and the document renders untouched. Promoting it would let a 429 blank the
+// signal it was annotating.
+func TestInspectDetail_FailureIsDiscarded(t *testing.T) {
+	m, c := warmInspectDetailModel(t, "web")
+	c.details, c.detailsErr = nil, fmt.Errorf("429 Too Many Requests")
+
+	m, detailCmd := inspectDocument(t, m)
+	if detailCmd == nil {
+		t.Fatal("the document's arrival should chain the detail fetch")
+	}
+	got := modelOf(m.Update(detailCmd()))
+
+	if got.inspectErr != nil {
+		t.Fatalf("inspectErr = %v, want nil: a detail failure is discarded", got.inspectErr)
+	}
+	if got.inspectMemo.detail != (compose.UpdateDetail{}) {
+		t.Errorf("the memo holds %+v, want the zero value", got.inspectMemo.detail)
+	}
+	for _, want := range []string{"STATE", "running", "IMAGE", "nginx:1.27", inspectRow("update", "available")} {
+		if !strings.Contains(got.inspectSummary, want) {
+			t.Errorf("summary missing %q:\n%s", want, got.inspectSummary)
+		}
+	}
+	for _, skip := range []string{"update id", "update built"} {
+		if strings.Contains(got.inspectSummary, skip) {
+			t.Errorf("summary must not contain %q:\n%s", skip, got.inspectSummary)
+		}
+	}
+	if view := got.viewInspect(); strings.Contains(view, "Error") {
+		t.Errorf("the screen must show no error line:\n%s", view)
+	}
+}
+
+// inspectSession is the screen's counter and the only gate the message needs:
+// a reply that outlives its screen or its entry is dropped.
+func TestInspectDetail_StaleMessageDiscarded(t *testing.T) {
+	t.Run("another entry's session", func(t *testing.T) {
+		m, key := warmInspectScreen(t)
+		before := m.inspectSummary
+		got := modelOf(m.Update(inspectDetailMsg{
+			detail:   detailFixture()["web"],
+			forKey:   key,
+			forEntry: m.updateCache[key].fetchedAt,
+			session:  m.inspectSession + 1,
+		}))
+		if got.inspectMemo != (inspectDetailMemo{}) {
+			t.Errorf("a stale reply wrote the memo: %+v", got.inspectMemo)
+		}
+		if got.inspectSummary != before {
+			t.Errorf("a stale reply repainted the screen:\n%s", got.inspectSummary)
+		}
+	})
+
+	t.Run("off the inspect screen", func(t *testing.T) {
+		m, key := warmInspectScreen(t)
+		before := m.inspectSummary
+		m.screen = screenSelectContainers
+		got := modelOf(m.Update(inspectDetailMsg{
+			detail:   detailFixture()["web"],
+			forKey:   key,
+			forEntry: m.updateCache[key].fetchedAt,
+			session:  m.inspectSession,
+		}))
+		if got.inspectMemo != (inspectDetailMemo{}) {
+			t.Errorf("a reply landing off-screen wrote the memo: %+v", got.inspectMemo)
+		}
+		if got.inspectSummary != before {
+			t.Errorf("a reply landing off-screen repainted the summary:\n%s", got.inspectSummary)
+		}
+	})
+}
+
+// The screen's fetch writes neither entry.details nor detailsInFlight.
+func TestInspectDetail_LeavesTheCacheAndTheGuardAlone(t *testing.T) {
+	m, _ := warmInspectDetailModel(t, "web")
+	key := m.updatesCacheKey()
+
+	m, detailCmd := inspectDocument(t, m)
+	if detailCmd == nil {
+		t.Fatal("the document's arrival should chain the detail fetch")
+	}
+	if m.detailsInFlight {
+		t.Error("the dispatch raised the BATCH guard; one service is not a batch")
+	}
+	got := modelOf(m.Update(detailCmd()))
+
+	if got.updateCache[key].details != nil {
+		t.Errorf("the screen's fetch wrote the cache: %+v", got.updateCache[key].details)
+	}
+	if got.detailsInFlight {
+		t.Error("the arrival raised the batch guard")
+	}
+	if !strings.Contains(got.inspectSummary, inspectRow("update id", detailFixture()["web"].NewID)) {
+		t.Errorf("the rows must still render from the memo:\n%s", got.inspectSummary)
+	}
+}
+
+// The cache wins over the memo: a batch landing while the screen is up repaints
+// from the entry, not from what the screen fetched for itself.
+func TestInspectDetail_CacheWinsOverTheScreenFetch(t *testing.T) {
+	m, key := warmInspectScreen(t)
+	fetched := m.updateCache[key].fetchedAt
+	own := compose.UpdateDetail{NewID: "sha256:" + strings.Repeat("5", 64)}
+	m.inspectMemo = inspectDetailMemo{key: key, service: "web", entry: fetched, detail: own}
+	m.rebuildInspectSummary()
+	if !strings.Contains(m.inspectSummary, inspectRow("update id", own.NewID)) {
+		t.Fatalf("precondition: the screen's own row should be drawn:\n%s", m.inspectSummary)
+	}
+
+	got := modelOf(m.Update(updateDetailsMsg{details: detailFixture(), forKey: key, forEntry: fetched}))
+
+	if !strings.Contains(got.inspectSummary, inspectRow("update id", detailFixture()["web"].NewID)) {
+		t.Errorf("the cache entry must win:\n%s", got.inspectSummary)
+	}
+	if strings.Contains(got.inspectSummary, own.NewID) {
+		t.Errorf("the screen's own row survived the batch:\n%s", got.inspectSummary)
+	}
+}
+
+// TestInspectScreen_ResizeKeepsTheDetailRows is the sibling of
+// TestInspectScreen_ResizeKeepsTheBuiltRow: the rows live on the Model, not in
+// the raw bytes, so every re-parse has to read them back.
+func TestInspectScreen_ResizeKeepsTheDetailRows(t *testing.T) {
+	m, key := warmInspectScreen(t)
+	got := modelOf(m.Update(inspectDetailMsg{
+		detail:   detailFixture()["web"],
+		forKey:   key,
+		forEntry: m.updateCache[key].fetchedAt,
+		session:  m.inspectSession,
+	}))
+	rows := []string{
+		inspectRow("update id", detailFixture()["web"].NewID),
+		inspectRow("update built", "2026-08-19 19:14:43"),
+	}
+	for _, row := range rows {
+		if !strings.Contains(got.inspectSummary, row) {
+			t.Fatalf("precondition: the summary should carry %q:\n%s", row, got.inspectSummary)
+		}
+	}
+
+	resized := modelOf(got.Update(tea.WindowSizeMsg{Width: 100, Height: 30}))
+	for _, row := range rows {
+		if !strings.Contains(resized.inspectSummary, row) {
+			t.Errorf("the resize dropped %q:\n%s", row, resized.inspectSummary)
+		}
+	}
+}
+
+// The batch still owns the rows in drilled mode. An entry whose details a batch
+// already reported must cost the screen nothing: without the entry.details half
+// of the guard, every `i` press would re-spend the registry round-trips the
+// batch had already paid for.
+func TestInspectDetail_ReportedBatchCostsNoSecondFetch(t *testing.T) {
+	m, c := warmInspectDetailModel(t, "web")
+	key := m.updatesCacheKey()
+	reported := m.updateCache[key]
+	reported.details = detailFixture()
+	m.updateCache[key] = reported
+
+	got, detailCmd := inspectDocument(t, m)
+	if detailCmd != nil {
+		t.Errorf("the batch's rows are already cached; the screen refetched them: %T", detailCmd())
+	}
+	if c.detailsCalls != 0 {
+		t.Errorf("UpdateDetails ran %d times, want 0", c.detailsCalls)
+	}
+	if !strings.Contains(got.inspectSummary, inspectRow("update id", detailFixture()["web"].NewID)) {
+		t.Errorf("the batch's rows must still render:\n%s", got.inspectSummary)
+	}
+}
+
+// The same rule one step out: the entry still reads as "no batch has reported",
+// so refillUpdateDetailsCmd still fetches EVERY updated service.
+func TestInspectDetail_LeavesTheRefillToTheBatch(t *testing.T) {
+	m, c := warmInspectDetailModel(t, "web", "db") // the cursor sits on web
+
+	after := inspectVisit(t, m)
+
+	refill := after.refillUpdateDetailsCmd()
+	if refill == nil {
+		t.Fatal("the screen's own fetch suppressed the batch that fills every other service")
+	}
+	refill()
+	if len(c.detailsArgs) != 2 {
+		t.Fatalf("UpdateDetails was called %d times, want 2 (the screen's one, then the batch)", len(c.detailsArgs))
+	}
+	if !reflect.DeepEqual(c.detailsArgs, [][]string{{"web"}, {"db", "web"}}) {
+		t.Errorf("UpdateDetails was asked for %v, want [[web] [db web]]", c.detailsArgs)
+	}
+}
+
+// A document the parser refuses leaves no summary and forces raw mode, and
+// every redraw re-parses the same bytes and fails again — so the rows have
+// nowhere to land. Dispatching anyway spent one local probe plus up to three
+// registry calls on a result nothing could render.
+func TestInspectDetail_ParseFailureSpendsNoFetch(t *testing.T) {
+	m, c := warmInspectDetailModel(t, "web")
+	c.inspectRaw = []byte("[]") // what docker prints for a container it cannot find
+
+	got, detailCmd := inspectDocument(t, m)
+
+	if got.inspectErr == nil {
+		t.Fatal("precondition: the parse should have failed")
+	}
+	if !got.inspectShowRaw {
+		t.Error("a parse failure must still land the user on the raw bytes")
+	}
+	if detailCmd != nil {
+		t.Errorf("the detail fetch was dispatched for an unrenderable document: %T", detailCmd())
+	}
+	if c.detailsCalls != 0 {
+		t.Errorf("UpdateDetails ran %d times, want 0", c.detailsCalls)
+	}
+}
+
+// The memo names the SERVICE as well as the entry. Both services here share one
+// cache entry, so an identity of (key, fetchedAt) alone would answer db with
+// web's rows — drawn confidently, under a heading that invites the comparison.
+func TestInspectDetail_MemoIsPerService(t *testing.T) {
+	m, c := warmInspectDetailModel(t, "db", "web")
+	c.details = map[string]compose.UpdateDetail{
+		"web": detailFixture()["web"],
+		"db":  {NewID: "sha256:" + strings.Repeat("b", 64)},
+	}
+
+	m.svcCursor = 1 // web
+	m = inspectVisit(t, m)
+	if got := m.inspectMemo.detail.NewID; got != detailFixture()["web"].NewID {
+		t.Fatalf("precondition: web's rows = %q, want the fixture's", got)
+	}
+	m = inspectLeave(t, m)
+
+	m.svcCursor = 0 // db, the same key and the same entry
+	m = inspectVisit(t, m)
+
+	if got, want := m.inspectMemo.detail.NewID, c.details["db"].NewID; got != want {
+		t.Errorf("db's update id = %q, want %q", got, want)
+	}
+	if !reflect.DeepEqual(c.detailsArgs, [][]string{{"web"}, {"db"}}) {
+		t.Errorf("UpdateDetails was asked for %v, want [[web] [db]]", c.detailsArgs)
+	}
 }

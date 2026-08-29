@@ -860,3 +860,54 @@ func TestParseInspect_UnknownFieldsIgnored(t *testing.T) {
 		t.Errorf("doc = %+v, want the declared fields populated", doc)
 	}
 }
+
+// TestInspectDoc_ImageRef pins which reference the image probe addresses. The
+// resolved ID wins: it names exactly what the container runs, while the config's
+// tag can have been moved to a newer image since the container started.
+func TestInspectDoc_ImageRef(t *testing.T) {
+	tests := []struct {
+		name string
+		doc  InspectDoc
+		want string
+	}{
+		{
+			name: "the resolved id wins over the tag",
+			doc:  InspectDoc{Image: "sha256:abc", Config: InspectConfig{Image: "nginx:1.27"}},
+			want: "sha256:abc",
+		},
+		{
+			name: "the config ref is the fallback",
+			doc:  InspectDoc{Config: InspectConfig{Image: "nginx:1.27"}},
+			want: "nginx:1.27",
+		},
+		{
+			name: "nothing to ask about",
+			doc:  InspectDoc{},
+			want: "",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := tt.doc.ImageRef(); got != tt.want {
+				t.Errorf("ImageRef() = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
+// TestParseInspect_NeverFillsImageCreated pins the json:"-" tag. docker's
+// top-level `Created` key on a CONTAINER document is when the container was
+// created, not when its image was built, so unmarshalling it into the field the
+// `built` row draws would put a confidently wrong date on screen.
+func TestParseInspect_NeverFillsImageCreated(t *testing.T) {
+	raw := `[{"Name":"/web","Created":"2026-08-22T03:00:00Z","ImageCreated":"2026-08-22T03:00:00Z"}]`
+
+	doc, err := ParseInspect([]byte(raw))
+	if err != nil {
+		t.Fatalf("ParseInspect: %v", err)
+	}
+	if !doc.ImageCreated.IsZero() {
+		t.Errorf("ImageCreated = %v, want the zero time; only the image probe may fill it", doc.ImageCreated)
+	}
+}

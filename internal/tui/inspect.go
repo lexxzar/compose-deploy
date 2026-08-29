@@ -289,15 +289,18 @@ func inspectHealthSection(b *inspectBuilder, doc compose.InspectDoc) {
 }
 
 // inspectImageSection renders what the container actually runs: the ref the
-// compose file asked for, the local image ID docker resolved it to, and the
-// command pair. The image ID is the row that answers "did my deploy take?" — a
-// stale container keeps the old image ID under an unchanged tag.
+// compose file asked for, the local image ID docker resolved it to, when that
+// image was built, and the command pair. The image ID is the row that answers
+// "did my deploy take?" — a stale container keeps the old image ID under an
+// unchanged tag.
 //
-// The four update rows sit BETWEEN the image ID and the command pair, so the
-// two ids and the two build dates read as one block: "image id" against
-// "update id", "built" against "update built". Each row is omitted on its own,
-// and the section's presence gate is unchanged — an update verdict describes
-// the image, so a doc with no image at all still has nothing to say.
+// `built` and the three update rows sit BETWEEN the image ID and the command
+// pair, so the two ids and the two build dates read as one block: "image id"
+// against "update id", "built" against "update built". Each row is omitted on
+// its own, and the section's presence gate is unchanged — an update verdict
+// describes the image, so a doc with no image at all still has nothing to say.
+// `built` reads doc.ImageCreated alone; upd.detail.LocalCreated names the
+// declared TAG, which a local pull can move off the running image.
 func inspectImageSection(b *inspectBuilder, doc compose.InspectDoc, upd inspectUpdateInfo) {
 	cmd := strings.Join(doc.Config.Cmd, " ")
 	entrypoint := strings.Join(doc.Config.Entrypoint, " ")
@@ -312,7 +315,7 @@ func inspectImageSection(b *inspectBuilder, doc compose.InspectDoc, upd inspectU
 	if doc.Image != "" {
 		b.kv("image id", doc.Image)
 	}
-	if built := formatTimeWithAge(upd.detail.LocalCreated, upd.now); built != "" {
+	if built := formatTimeWithAge(doc.ImageCreated, upd.now); built != "" {
 		b.kv("built", built)
 	}
 	if upd.verdict != nil {

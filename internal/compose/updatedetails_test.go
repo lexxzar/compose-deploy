@@ -1976,3 +1976,181 @@ func TestHostContainersUpdateDetails_HonoursServiceFilter(t *testing.T) {
 		t.Errorf("made %d docker calls, want 5 (ps + 4 steps): %v", len(f.runCalls), f.runCalls)
 	}
 }
+
+// nginxImageCreated is the Created timestamp of the real
+// `docker image inspect` capture in testdata/image_inspect_nginx.json.
+var nginxImageCreated = time.Date(2026, 5, 13, 19, 5, 45, 115991558, time.UTC)
+
+// TestFetchImageCreated drives the probe the inspect screen makes for EVERY
+// container — step 1 of the detail fetch on its own, with no registry call
+// behind it. The real capture is the happy path, because the key spelling is
+// the one thing a hand-authored fixture cannot pin.
+//
+// Every failure yields the zero time WITH an error, which the caller discards:
+// the `built` row is omitted and the rest of the container document renders.
+func TestFetchImageCreated(t *testing.T) {
+	tests := []struct {
+		name      string
+		image     string
+		out       []byte
+		runErr    error
+		want      time.Time
+		wantErr   bool
+		wantCalls int
+	}{
+		{
+			name:      "real capture",
+			image:     "nginx:latest",
+			out:       readFixture(t, "image_inspect_nginx.json"),
+			want:      nginxImageCreated,
+			wantCalls: 1,
+		},
+		{
+			name:      "epoch sentinel is absent, not an error",
+			image:     "gcr.io/distroless/static",
+			out:       []byte(`{"Created":"1970-01-01T00:00:00Z","Os":"linux","Architecture":"amd64"}`),
+			wantCalls: 1,
+		},
+		{
+			name:      "docker failure",
+			image:     "nginx:latest",
+			runErr:    errors.New("No such image"),
+			wantErr:   true,
+			wantCalls: 1,
+		},
+		{
+			name:      "unparseable output",
+			image:     "nginx:latest",
+			out:       []byte("not json"),
+			wantErr:   true,
+			wantCalls: 1,
+		},
+		{
+			// parseLocalProbe's platform requirement is inherited rather than
+			// relaxed: one parser serves both callers.
+			name:      "no platform",
+			image:     "nginx:latest",
+			out:       []byte(`{"Created":"2026-05-13T19:05:45Z"}`),
+			wantErr:   true,
+			wantCalls: 1,
+		},
+		{
+			// An empty ref would turn `docker image inspect` into a malformed
+			// call, so it never leaves the process.
+			name:      "empty reference spends no call",
+			image:     "  ",
+			wantErr:   true,
+			wantCalls: 0,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			f := &fakeDockerRunner{runOut: tt.out, runErr: tt.runErr}
+
+			got, err := fetchImageCreated(context.Background(), f, tt.image)
+			if (err != nil) != tt.wantErr {
+				t.Fatalf("fetchImageCreated() error = %v, wantErr %v", err, tt.wantErr)
+			}
+			if !got.Equal(tt.want) {
+				t.Errorf("created = %v, want %v", got, tt.want)
+			}
+			if len(f.runCalls) != tt.wantCalls {
+				t.Fatalf("made %d docker calls, want %d: %v", len(f.runCalls), tt.wantCalls, f.runCalls)
+			}
+			for _, args := range f.runCalls {
+				if !slices.Equal(args, localProbeArgs(tt.image)) {
+					t.Errorf("argv = %v, want step 1's own %v", args, localProbeArgs(tt.image))
+				}
+				if slices.Contains(args, "compose") {
+					t.Errorf("argv %v must carry no compose element", args)
+				}
+			}
+		})
+	}
+}
+
+// TestComposeImageCreated_BypassesCompose pins the local binding: one
+// TOP-LEVEL docker call, no `docker compose image inspect`.
+func TestComposeImageCreated_BypassesCompose(t *testing.T) {
+	var argv [][]string
+	c := New(t.TempDir())
+	c.SetTestHooks(nil, func(cmd *exec.Cmd) ([]byte, error) {
+		argv = append(argv, append([]string(nil), cmd.Args...))
+		return readFixture(t, "image_inspect_nginx.json"), nil
+	})
+
+	got, err := c.ImageCreated(context.Background(), "nginx:latest")
+	if err != nil {
+		t.Fatalf("ImageCreated() error = %v, want nil", err)
+	}
+	if !got.Equal(nginxImageCreated) {
+		t.Errorf("created = %v, want %v", got, nginxImageCreated)
+	}
+	if len(argv) != 1 {
+		t.Fatalf("made %d docker calls, want 1: %v", len(argv), argv)
+	}
+	if argv[0][0] != "docker" || slices.Contains(argv[0], "compose") {
+		t.Errorf("argv = %v, want a top-level docker command", argv[0])
+	}
+}
+
+// TestRemoteImageCreated_SplicesSSHExtraArgsBeforeHost pins the remote binding
+// on the seam that gives it the splice for free.
+func TestRemoteImageCreated_SplicesSSHExtraArgsBeforeHost(t *testing.T) {
+	extras := []string{"-p", "2222"}
+	host := "user@example.com"
+	var argv [][]string
+
+	r := &RemoteCompose{
+		Host:         host,
+		ProjectDir:   "/srv/app",
+		SocketPath:   "/tmp/cdeploy-ctrl-abc-99",
+		SSHExtraArgs: extras,
+	}
+	r.SetTestHooks(nil, func(cmd *exec.Cmd) ([]byte, error) {
+		argv = append(argv, append([]string(nil), cmd.Args...))
+		return readFixture(t, "image_inspect_nginx.json"), nil
+	})
+
+	got, err := r.ImageCreated(context.Background(), "nginx:latest")
+	if err != nil {
+		t.Fatalf("ImageCreated() error = %v, want nil", err)
+	}
+	if !got.Equal(nginxImageCreated) {
+		t.Errorf("created = %v, want %v", got, nginxImageCreated)
+	}
+	if len(argv) != 1 {
+		t.Fatalf("made %d ssh calls, want 1: %v", len(argv), argv)
+	}
+	assertExtraBeforeHost(t, "RemoteCompose.ImageCreated", argv[0], host, extras)
+	remote := argv[0][len(argv[0])-1]
+	if strings.Contains(remote, "compose") {
+		t.Errorf("remote command = %q, must not go through compose", remote)
+	}
+	// Every remote arg is shell-escaped, so the command reads
+	// `docker 'image' 'inspect' …` rather than a bare argv.
+	if !strings.HasPrefix(remote, "docker ") || !strings.Contains(remote, "'image' 'inspect'") {
+		t.Errorf("remote command = %q, want a top-level docker image inspect", remote)
+	}
+}
+
+// TestHostContainersImageCreated_UsesTheSeam pins the read-only binding: the
+// `built` row is a READ, so it is live on the unmanaged screen.
+func TestHostContainersImageCreated_UsesTheSeam(t *testing.T) {
+	f := &fakeDockerRunner{runOut: readFixture(t, "image_inspect_nginx.json")}
+
+	got, err := (&HostContainers{docker: f}).ImageCreated(context.Background(), "nginx:latest")
+	if err != nil {
+		t.Fatalf("ImageCreated() error = %v, want nil", err)
+	}
+	if !got.Equal(nginxImageCreated) {
+		t.Errorf("created = %v, want %v", got, nginxImageCreated)
+	}
+	if len(f.runCalls) != 1 {
+		t.Fatalf("made %d docker calls, want 1: %v", len(f.runCalls), f.runCalls)
+	}
+	if slices.Contains(f.runCalls[0], "compose") {
+		t.Errorf("argv %v must carry no compose element", f.runCalls[0])
+	}
+}

@@ -136,12 +136,11 @@ func (m *mockComposer) Logs(ctx context.Context, service string, follow bool, ta
 	return nil
 }
 
-// mockDetailComposer implements runner.Composer AND UpdateDetailer, so the
-// detail half of refreshUpdates can be driven without Docker. The plain
-// mockComposer deliberately does NOT implement the interface — that is the
-// "composer without the capability" case, which must still produce verdicts.
-type mockDetailComposer struct {
-	mockComposer
+// detailRecorder is the UpdateDetailer half every detail double shares: the
+// answers it hands back plus the record of what it was asked. Embedded, so each
+// double is a base composer plus this mixin. capableComposer deliberately does
+// NOT take it — see detailingComposer.
+type detailRecorder struct {
 	details    map[string]compose.UpdateDetail
 	detailsErr error
 
@@ -150,12 +149,21 @@ type mockDetailComposer struct {
 	detailsDeadlines []time.Time // one entry per call, zero when the ctx carried none
 }
 
-func (m *mockDetailComposer) UpdateDetails(ctx context.Context, services []string) (map[string]compose.UpdateDetail, error) {
-	m.detailsCalls++
-	m.detailsArgs = append(m.detailsArgs, append([]string(nil), services...))
+func (r *detailRecorder) UpdateDetails(ctx context.Context, services []string) (map[string]compose.UpdateDetail, error) {
+	r.detailsCalls++
+	r.detailsArgs = append(r.detailsArgs, append([]string(nil), services...))
 	deadline, _ := ctx.Deadline()
-	m.detailsDeadlines = append(m.detailsDeadlines, deadline)
-	return m.details, m.detailsErr
+	r.detailsDeadlines = append(r.detailsDeadlines, deadline)
+	return r.details, r.detailsErr
+}
+
+// mockDetailComposer implements runner.Composer AND UpdateDetailer, so the
+// detail half of refreshUpdates can be driven without Docker. The plain
+// mockComposer deliberately does NOT implement the interface — that is the
+// "composer without the capability" case, which must still produce verdicts.
+type mockDetailComposer struct {
+	mockComposer
+	detailRecorder
 }
 
 // mockConfigComposer implements both runner.Composer and ConfigProvider.
@@ -11169,7 +11177,7 @@ func deliverUpdates(t *testing.T, m Model, msg updatesMsg) (Model, *updateDetail
 // updated image — with updateInFlight pinned true, which makes U a no-op and
 // gates off the statusMsg self-heal for that whole window.
 func TestRefreshUpdates_VerdictsDoNotWaitOnDetails(t *testing.T) {
-	mc := &mockDetailComposer{details: detailFixture()}
+	mc := &mockDetailComposer{detailRecorder: detailRecorder{details: detailFixture()}}
 	mc.updates = map[string]bool{"web": true}
 	m := NewModel(mc, io.Discard, mockFactory(&mc.mockComposer), nil, nil)
 	m.composer = mc
@@ -11204,7 +11212,7 @@ func TestRefreshUpdates_VerdictsDoNotWaitOnDetails(t *testing.T) {
 // verdicts would walk straight into Docker Hub's anonymous quota. Sorted so the
 // argument is deterministic.
 func TestRefreshUpdates_PassesOnlyTrueVerdicts(t *testing.T) {
-	mc := &mockDetailComposer{details: detailFixture()}
+	mc := &mockDetailComposer{detailRecorder: detailRecorder{details: detailFixture()}}
 	mc.updates = map[string]bool{"web": true, "db": false, "api": true, "cache": false, "edge": true}
 	m := NewModel(mc, io.Discard, mockFactory(&mc.mockComposer), nil, nil)
 	m.composer = mc
@@ -11240,7 +11248,7 @@ func TestRefreshUpdates_PassesOnlyTrueVerdicts(t *testing.T) {
 // services", so a call with no true verdicts would fetch details for the
 // entire project.
 func TestRefreshUpdates_SkipsDetailsWhenNoVerdictIsTrue(t *testing.T) {
-	mc := &mockDetailComposer{details: detailFixture()}
+	mc := &mockDetailComposer{detailRecorder: detailRecorder{details: detailFixture()}}
 	mc.updates = map[string]bool{"web": false, "db": false}
 	m := NewModel(mc, io.Discard, mockFactory(&mc.mockComposer), nil, nil)
 	m.composer = mc
@@ -11265,7 +11273,7 @@ func TestRefreshUpdates_SkipsDetailsWhenNoVerdictIsTrue(t *testing.T) {
 // up — and the detail fetch would spend registry round-trips on a path that is
 // already broken.
 func TestRefreshUpdates_SkipsDetailsOnCheckError(t *testing.T) {
-	mc := &mockDetailComposer{details: detailFixture()}
+	mc := &mockDetailComposer{detailRecorder: detailRecorder{details: detailFixture()}}
 	mc.updates = map[string]bool{"web": true}
 	mc.updatesErr = errors.New("registry unreachable")
 	m := NewModel(mc, io.Discard, mockFactory(&mc.mockComposer), nil, nil)
@@ -11317,7 +11325,7 @@ func TestRefreshUpdates_ComposerWithoutDetailerStillProducesVerdicts(t *testing.
 // updatesMsg.err would blank the ⇧ column and cut the cache entry down to the
 // 30-second error TTL — the detail rows would degrade the signal they annotate.
 func TestRefreshUpdates_DetailErrorKeepsVerdictsAndSuccessTTL(t *testing.T) {
-	mc := &mockDetailComposer{detailsErr: errors.New("429 Too Many Requests")}
+	mc := &mockDetailComposer{detailRecorder: detailRecorder{detailsErr: errors.New("429 Too Many Requests")}}
 	mc.updates = map[string]bool{"web": true}
 	m := NewModel(mc, io.Discard, mockFactory(&mc.mockComposer), nil, nil)
 	m.composer = mc
@@ -11358,7 +11366,7 @@ func TestRefreshUpdates_DetailErrorKeepsVerdictsAndSuccessTTL(t *testing.T) {
 // the abort are still correct. Discarding the map along with the error would
 // throw them away silently.
 func TestRefreshUpdates_PartialDetailsSurviveTheirError(t *testing.T) {
-	mc := &mockDetailComposer{details: detailFixture(), detailsErr: errors.New("update detail transport failure")}
+	mc := &mockDetailComposer{detailRecorder: detailRecorder{details: detailFixture(), detailsErr: errors.New("update detail transport failure")}}
 	mc.updates = map[string]bool{"web": true}
 	m := NewModel(mc, io.Discard, mockFactory(&mc.mockComposer), nil, nil)
 	m.composer = mc
@@ -11468,10 +11476,14 @@ func TestUpdateDetailsMsg_ForeignMergeDoesNotRedrawTheScreen(t *testing.T) {
 // exactly when a cold cache happens, and without the rebuild the rows would
 // stay absent until a back-out and re-entry.
 func TestUpdateDetails_ColdCacheFillsEveryRow(t *testing.T) {
-	mc := &mockDetailComposer{details: detailFixture()}
+	mc := &mockDetailComposer{detailRecorder: detailRecorder{details: detailFixture()}}
 	mc.updates = map[string]bool{"web": true}
 	m := inspectScreenModel(t)
 	m.composer = mc
+	// `built` rides the inspect fetch's own probe, not the detail batch, so the
+	// date it already delivered has to be on the Model for the fourth row to be
+	// there at all.
+	m.inspectImageCreated = time.Date(2026, 7, 7, 17, 47, 22, 0, time.UTC)
 	m.svcStatus = qStatus(m, map[string]runner.ServiceStatus{"web": {Running: true}})
 	if _, ok := m.updateCache[m.updatesCacheKey()]; ok {
 		t.Fatal("precondition: the cache must be cold")
@@ -11635,7 +11647,7 @@ func TestUpdateDetailsMsg_LandsAfterNavigatingAway(t *testing.T) {
 // statusMsg self-heal both skip. The arrival therefore refills from the entry's
 // own details == nil, with no further keystroke.
 func TestUpdateDetails_OneBatchAtATime(t *testing.T) {
-	mc := &mockDetailComposer{details: detailFixture()}
+	mc := &mockDetailComposer{detailRecorder: detailRecorder{details: detailFixture()}}
 	mc.updates = map[string]bool{"web": true}
 	m := NewModel(mc, io.Discard, mockFactory(&mc.mockComposer), nil, nil)
 	m.composer = mc
@@ -11706,7 +11718,7 @@ func TestUpdateDetails_OneBatchAtATime(t *testing.T) {
 // refusals produce ONE batch — against the newest verdict set — however hard
 // the key is mashed.
 func TestUpdateDetails_RefillTargetsTheNewestEntry(t *testing.T) {
-	mc := &mockDetailComposer{details: detailFixture()}
+	mc := &mockDetailComposer{detailRecorder: detailRecorder{details: detailFixture()}}
 	mc.updates = map[string]bool{"web": true}
 	m := NewModel(mc, io.Discard, mockFactory(&mc.mockComposer), nil, nil)
 	m.composer = mc
@@ -11755,7 +11767,7 @@ func TestUpdateDetails_RefillTargetsTheNewestEntry(t *testing.T) {
 // entry for the entry's whole 10-minute TTL, which is the amplification the
 // error-swallowing at the fetch site exists to prevent.
 func TestUpdateDetails_EmptyResultIsNotRetried(t *testing.T) {
-	mc := &mockDetailComposer{detailsErr: errors.New("429 Too Many Requests")}
+	mc := &mockDetailComposer{detailRecorder: detailRecorder{detailsErr: errors.New("429 Too Many Requests")}}
 	mc.updates = map[string]bool{"web": true}
 	m := NewModel(mc, io.Discard, mockFactory(&mc.mockComposer), nil, nil)
 	m.composer = mc
@@ -11836,7 +11848,7 @@ func TestRefillUpdateDetails_FailsClosed(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			mc := &mockDetailComposer{details: detailFixture()}
+			mc := &mockDetailComposer{detailRecorder: detailRecorder{details: detailFixture()}}
 			m := NewModel(mc, io.Discard, mockFactory(&mc.mockComposer), nil, nil)
 			m.composer = mc
 			m.screen = screenSelectContainers
@@ -11855,7 +11867,7 @@ func TestRefillUpdateDetails_FailsClosed(t *testing.T) {
 	// The control: without one case that DOES fire, every assertion above would
 	// pass on a refill that never works at all.
 	t.Run("a fresh entry with no reported batch", func(t *testing.T) {
-		mc := &mockDetailComposer{details: detailFixture()}
+		mc := &mockDetailComposer{detailRecorder: detailRecorder{details: detailFixture()}}
 		m := NewModel(mc, io.Discard, mockFactory(&mc.mockComposer), nil, nil)
 		m.composer = mc
 		m.screen = screenSelectContainers
@@ -11880,7 +11892,7 @@ func TestRefillUpdateDetails_FailsClosed(t *testing.T) {
 // image, tens of seconds over SSH — and refusing U for that window is exactly
 // the dead-U window the message split removed.
 func TestUpdateDetails_UStaysLiveDuringTheDetailScan(t *testing.T) {
-	mc := &mockDetailComposer{details: detailFixture()}
+	mc := &mockDetailComposer{detailRecorder: detailRecorder{details: detailFixture()}}
 	m := NewModel(mc, io.Discard, mockFactory(&mc.mockComposer), nil, nil)
 	m.composer = mc
 	m.screen = screenSelectContainers
@@ -11981,7 +11993,7 @@ func TestUpdateDetails_GuardIsNotClearedByNavigation(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			mc := &mockDetailComposer{details: detailFixture()}
+			mc := &mockDetailComposer{detailRecorder: detailRecorder{details: detailFixture()}}
 			mc.services = []string{"web"}
 			mc.updates = map[string]bool{"web": true}
 			m := NewModel(mc, io.Discard, func(compose.Project) runner.Composer { return mc }, servers, nil)
@@ -12001,9 +12013,10 @@ func TestUpdateDetails_GuardIsNotClearedByNavigation(t *testing.T) {
 // TestUpdateDetails_SelfHealsAtEveryScreenEntry covers the other half: an entry
 // that a lost batch left with no detail rows is refetched at the next screen
 // entry, at every site that consults maybeRefreshUpdatesCmd. Without it the
-// entry is a fresh SUCCESS, so the statusMsg self-heal skips it too and the
-// inspect screen — a pure consumer — shows `update available` with no `built`,
-// no `update id` and no `update built` for the full 10-minute TTL.
+// entry is a fresh SUCCESS, so the statusMsg self-heal skips it too, and the
+// inspect screen fetches only the ONE service it renders and writes no cache
+// back — so every OTHER updated service shows `update available` with no
+// `update id` and no `update built` for the full 10-minute TTL.
 func TestUpdateDetails_SelfHealsAtEveryScreenEntry(t *testing.T) {
 	servers := []config.Server{{Name: "s1", Host: "h1"}}
 	cases := []struct {
@@ -12054,7 +12067,7 @@ func TestUpdateDetails_SelfHealsAtEveryScreenEntry(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			mc := &mockDetailComposer{details: detailFixture()}
+			mc := &mockDetailComposer{detailRecorder: detailRecorder{details: detailFixture()}}
 			mc.services = []string{"web"}
 			mc.updates = map[string]bool{"web": true}
 			m := NewModel(mc, io.Discard, func(compose.Project) runner.Composer { return mc }, servers, nil)
@@ -12084,7 +12097,7 @@ func TestUpdateDetails_SelfHealsAtEveryScreenEntry(t *testing.T) {
 // happens while the running one is still out, and the refused batch's entry
 // must still end up with its rows.
 func TestUpdateDetails_LostBatchHealsAfterNavigating(t *testing.T) {
-	mc := &mockDetailComposer{details: detailFixture()}
+	mc := &mockDetailComposer{detailRecorder: detailRecorder{details: detailFixture()}}
 	mc.services = []string{"web"}
 	mc.updates = map[string]bool{"web": true}
 	m := NewModel(mc, io.Discard, mockFactory(&mc.mockComposer), nil, nil)
@@ -12166,7 +12179,7 @@ func TestUpdateDetailsMsg_SupersededEntryIsDropped(t *testing.T) {
 // detail phase for the rest of the session — no departure site resets the flag
 // and U cannot force it.
 func TestUpdateDetails_FetchCarriesADeadline(t *testing.T) {
-	mc := &mockDetailComposer{details: detailFixture()}
+	mc := &mockDetailComposer{detailRecorder: detailRecorder{details: detailFixture()}}
 	mc.updates = map[string]bool{"web": true}
 	m := NewModel(mc, io.Discard, mockFactory(&mc.mockComposer), nil, nil)
 	m.composer = mc
@@ -12218,8 +12231,9 @@ func TestUpdatesMsg_StaleSessionDoesNotWriteTheEntry(t *testing.T) {
 	}
 }
 
-// TestUpdatesMsg_RefreshesInspectSummary: the inspect screen is a consumer of
-// the update cache and never fetches details itself. Entering `i` on a cold
+// TestUpdatesMsg_RefreshesInspectSummary: the inspect screen consumes the
+// update cache, and fetches only what the cache has no detail for — one
+// service, never written back. Entering `i` on a cold
 // cache is exactly when the fetch is still in flight, so without this rebuild
 // the new IMAGE rows would stay absent until a back-out and re-entry. The
 // assertions read the MESSAGE's own data back out of the summary, so a rebuild
@@ -12273,10 +12287,13 @@ func TestUpdatesMsg_RefreshesInspectSummary(t *testing.T) {
 // TestUpdatesMsg_FailurePathClearsInspectRows: the rebuild runs on the FAILURE
 // path too. The entry that just landed carries no verdicts and no details, so a
 // summary drawn from a previous one must stop showing them — otherwise the
-// glyph column blanks while the inspect screen keeps contradicting it.
+// glyph column blanks while the inspect screen keeps contradicting it. `built`
+// is the control: it comes from the inspect fetch's own probe, so a failed
+// update check may not take it down with them.
 func TestUpdatesMsg_FailurePathClearsInspectRows(t *testing.T) {
 	m := inspectScreenModel(t)
 	m.svcStatus = qStatus(m, map[string]runner.ServiceStatus{"web": {Running: true}})
+	m.inspectImageCreated = time.Date(2026, 7, 7, 17, 47, 22, 0, time.UTC)
 	m.updateCache = map[string]updateEntry{m.updatesCacheKey(): {
 		fetchedAt: time.Now().Add(-3 * time.Minute),
 		results:   map[string]bool{"web": true},
@@ -12294,10 +12311,13 @@ func TestUpdatesMsg_FailurePathClearsInspectRows(t *testing.T) {
 		session: m.updatesSession,
 	}))
 
-	for _, row := range []string{"update", "update id", "update built", "built"} {
+	for _, row := range []string{"update", "update id", "update built"} {
 		if strings.Contains(model.inspectSummary, inspectRow(row, "")) {
 			t.Errorf("a failed check must drop the %q row:\n%s", row, model.inspectSummary)
 		}
+	}
+	if !strings.Contains(model.inspectSummary, inspectRow("built", "2026-07-07 17:47:22")) {
+		t.Errorf("a failed check must keep the probed build date:\n%s", model.inspectSummary)
 	}
 }
 
@@ -12343,21 +12363,14 @@ func TestUpdatesMsg_InspectRebuildIsScreenScoped(t *testing.T) {
 }
 
 // readOnlyDetailComposer is a read-only composer that ALSO satisfies
-// UpdateDetailer — the shape *compose.HostContainers really has. The plain
-// readOnlyMockComposer does not implement it, so a read-only test built on that
-// double would pass on the missing capability rather than on the
-// autoUpdatesAllowed() gate under test (the capableReadOnlyComposer precedent).
+// UpdateDetailer and Inspector — the shape *compose.HostContainers really has.
+// The plain readOnlyMockComposer implements neither, so a read-only test built
+// on that double would pass on the missing capability rather than on the
+// autoUpdatesAllowed() gate under test (the capableReadOnlyComposer precedent);
+// the Inspector half is what lets `i` reach the screen's own detail fetch.
 type readOnlyDetailComposer struct {
-	readOnlyMockComposer
-	details      map[string]compose.UpdateDetail
-	detailsCalls int
-	detailsArgs  [][]string
-}
-
-func (c *readOnlyDetailComposer) UpdateDetails(ctx context.Context, services []string) (map[string]compose.UpdateDetail, error) {
-	c.detailsCalls++
-	c.detailsArgs = append(c.detailsArgs, append([]string(nil), services...))
-	return c.details, nil
+	readOnlyInspectComposer
+	detailRecorder
 }
 
 // TestInspectScreen_UpdateRowsFollowTheVerdict is the end-to-end half of the
@@ -12367,9 +12380,15 @@ func (c *readOnlyDetailComposer) UpdateDetails(ctx context.Context, services []s
 // is left is the path between them — the cache entry the inspect screen reads.
 // The false-verdict entry deliberately carries NO details, because that is the
 // shape refreshUpdates really writes.
+//
+// `built` is NOT in the verdict-following set, and it is not in the cache's
+// gift either. It describes the image the container runs, so its ONLY source is
+// the image probe the inspect fetch makes — the whole path is pinned by
+// TestInspectScreen_BuiltRowIgnoresTheVerdict. The messages below carry no
+// probed date, so every case here skips the row.
 func TestInspectScreen_UpdateRowsFollowTheVerdict(t *testing.T) {
 	fetched := time.Now().Add(-3 * time.Minute)
-	detailRows := []string{"built", "update id", "update built"}
+	detailRows := []string{"update id", "update built"}
 
 	tests := []struct {
 		name     string
@@ -12386,25 +12405,29 @@ func TestInspectScreen_UpdateRowsFollowTheVerdict(t *testing.T) {
 			},
 			wantRows: []string{
 				inspectRow("update", "available  (checked 3m ago)"),
-				inspectRow("built", "2026-07-07 17:47:22"),
 				inspectRow("update id", detailFixture()["web"].NewID),
 				inspectRow("update built", "2026-08-19 19:14:43"),
 			},
+			// The detail's LocalCreated is in the cache and may not be
+			// borrowed; the row prefix keeps the needle off "update built".
+			skipRows: []string{"\n  built"},
 		},
 		{
 			name:     "false verdict draws the verdict alone",
 			entry:    &updateEntry{fetchedAt: fetched, results: map[string]bool{"web": false}},
 			wantRows: []string{inspectRow("update", "up to date  (checked 3m ago)")},
-			skipRows: detailRows,
+			// `built` is absent because the message below carries no probed
+			// date, not because the verdict is false.
+			skipRows: append([]string{"built"}, detailRows...),
 		},
 		{
 			name:     "no entry draws nothing",
-			skipRows: append([]string{"update"}, detailRows...),
+			skipRows: append([]string{"update", "built"}, detailRows...),
 		},
 		{
 			name:     "another service's verdict is not borrowed",
 			entry:    &updateEntry{fetchedAt: fetched, results: map[string]bool{"db": true}, details: detailFixtureFor("db")},
-			skipRows: append([]string{"update"}, detailRows...),
+			skipRows: append([]string{"update", "built"}, detailRows...),
 		},
 	}
 
@@ -12450,7 +12473,7 @@ func detailFixtureFor(service string) map[string]compose.UpdateDetail {
 // three; this is what keeps a future second mechanism from drifting away.
 func TestUpdateDetails_FireOnTheGlyphTriggers(t *testing.T) {
 	newComposer := func() *mockDetailComposer {
-		mc := &mockDetailComposer{details: detailFixture()}
+		mc := &mockDetailComposer{detailRecorder: detailRecorder{details: detailFixture()}}
 		mc.services = []string{"web"}
 		mc.status = map[string]runner.ServiceStatus{"web": {Running: true}}
 		mc.updates = map[string]bool{"web": true}
@@ -12561,7 +12584,7 @@ func TestUpdateDetails_FireOnTheGlyphTriggers(t *testing.T) {
 // opt-in exists to prevent. U must still reach both halves.
 func TestReadOnly_NoAutomaticDetailFetch(t *testing.T) {
 	newComposer := func() *readOnlyDetailComposer {
-		c := &readOnlyDetailComposer{details: detailFixtureFor("watchtower")}
+		c := &readOnlyDetailComposer{detailRecorder: detailRecorder{details: detailFixtureFor("watchtower")}}
 		c.services = []string{"watchtower"}
 		c.status = map[string]runner.ServiceStatus{"watchtower": {Running: true}}
 		c.updates = map[string]bool{"watchtower": true}
@@ -12648,6 +12671,61 @@ func TestReadOnly_NoAutomaticDetailFetch(t *testing.T) {
 		}
 		if got := c.detailsArgs[0]; len(got) != 1 || got[0] != "watchtower" {
 			t.Errorf("UpdateDetails services = %v, want [watchtower] — only U's own true verdicts", got)
+		}
+	})
+
+	t.Run("the inspect screen spends nothing on a cold cache", func(t *testing.T) {
+		// fetchInspectDetail deliberately does NOT consult
+		// autoUpdatesAllowed(), and this is where that decision is either safe
+		// or not: it can only fire for an entry that ALREADY exists under this
+		// key, and the first subtest pins that no automatic path creates one
+		// here. A cold read-only screen therefore spends nothing.
+		c := newComposer()
+		c.inspectRaw = []byte(inspectFixtureJSON)
+		m := inspectTestModel(t, c, c.services)
+
+		result, cmd := m.Update(keyMsgFor("i"))
+		if cmd == nil {
+			t.Fatal("i must open the inspect screen on the read-only view")
+		}
+		_, detailCmd := result.(Model).Update(cmd())
+		if detailCmd != nil {
+			t.Errorf("the cold read-only screen dispatched a detail fetch: %T", detailCmd())
+		}
+		if c.detailsCalls != 0 {
+			t.Errorf("UpdateDetails calls = %d, want 0", c.detailsCalls)
+		}
+	})
+
+	t.Run("the inspect screen completes U's own verdict", func(t *testing.T) {
+		// The other half of the same decision. The entry below is what U
+		// leaves: verdicts written, details still nil because the unmanaged
+		// screen is grouped-shaped and no batch reported. The screen then fills
+		// its ONE service, which is U's own true verdict rather than a fan-out.
+		c := newComposer()
+		c.inspectRaw = []byte(inspectFixtureJSON)
+		m := inspectTestModel(t, c, c.services)
+		m.updateCache = map[string]updateEntry{m.updatesCacheKey(): {
+			fetchedAt: time.Now(),
+			results:   map[string]bool{"watchtower": true},
+		}}
+
+		result, cmd := m.Update(keyMsgFor("i"))
+		result, detailCmd := result.(Model).Update(cmd())
+		if detailCmd == nil {
+			t.Fatal("U's verdict was left without its rows on the read-only screen")
+		}
+		shown := modelOf(result.(Model).Update(detailCmd()))
+
+		if c.detailsCalls != 1 {
+			t.Fatalf("UpdateDetails calls = %d, want exactly 1", c.detailsCalls)
+		}
+		if got := c.detailsArgs[0]; len(got) != 1 || got[0] != "watchtower" {
+			t.Errorf("UpdateDetails services = %v, want [watchtower]", got)
+		}
+		want := detailFixtureFor("watchtower")["watchtower"].NewID
+		if !strings.Contains(shown.inspectSummary, inspectRow("update id", want)) {
+			t.Errorf("the rows must render on the read-only screen:\n%s", shown.inspectSummary)
 		}
 	})
 
@@ -16026,6 +16104,9 @@ func TestHostContainers_CapabilityInterfaces(t *testing.T) {
 	if _, ok := c.(UpdateDetailer); !ok {
 		t.Error("HostContainers must satisfy UpdateDetailer so U fills the inspect update rows")
 	}
+	if _, ok := c.(ImageInspector); !ok {
+		t.Error("HostContainers must satisfy ImageInspector so the built row works on the unmanaged screen")
+	}
 	if _, ok := c.(ConfigProvider); ok {
 		t.Error("HostContainers must NOT satisfy ConfigProvider; the c key has to gate itself")
 	}
@@ -16919,12 +17000,26 @@ type mockInspectComposer struct {
 	inspectErr     error
 	inspectCalls   int
 	inspectService string
+	// The ImageInspector half. The zero time is the common case: it draws no
+	// `built` row, so every test that predates the image probe reads exactly as
+	// it did.
+	imageCreated     time.Time
+	imageCreatedErr  error
+	imageCreatedRefs []string
 }
 
 func (m *mockInspectComposer) Inspect(ctx context.Context, service string) ([]byte, error) {
 	m.inspectCalls++
 	m.inspectService = service
 	return m.inspectRaw, m.inspectErr
+}
+
+func (m *mockInspectComposer) ImageCreated(ctx context.Context, image string) (time.Time, error) {
+	m.imageCreatedRefs = append(m.imageCreatedRefs, image)
+	if m.imageCreatedErr != nil {
+		return time.Time{}, m.imageCreatedErr
+	}
+	return m.imageCreated, nil
 }
 
 // inspectFixtureJSON is a minimal but structurally real `docker inspect`
@@ -17127,17 +17222,23 @@ func TestFetchInspect_PropagatesError(t *testing.T) {
 
 // readOnlyInspectComposer is the read-only counterpart of mockInspectComposer:
 // the exact capability set of *compose.HostContainers, which is ReadOnlyComposer
-// + ExecProvider + Inspector (all three pinned against the real type by the
-// compile-time assertions above). The `i` key is the one container key that is
-// NOT gated on m.readOnly(), so this double is what proves the key reaches
-// enterInspect on the unmanaged screen.
+// + ExecProvider + Inspector + ImageInspector (all pinned against the real type
+// by the compile-time assertions above). The `i` key is the one container key
+// that is NOT gated on m.readOnly(), so this double is what proves the key
+// reaches enterInspect on the unmanaged screen — and the image probe behind the
+// `built` row is a READ, so it is live there too.
 type readOnlyInspectComposer struct {
 	readOnlyMockComposer
-	inspectRaw []byte
+	inspectRaw   []byte
+	imageCreated time.Time
 }
 
 func (m *readOnlyInspectComposer) Inspect(ctx context.Context, service string) ([]byte, error) {
 	return m.inspectRaw, nil
+}
+
+func (m *readOnlyInspectComposer) ImageCreated(ctx context.Context, image string) (time.Time, error) {
+	return m.imageCreated, nil
 }
 
 // inspectTestModel builds a container screen sitting on the given composer,
@@ -17275,6 +17376,7 @@ func TestInspectKey_EntersOnReadOnlyComposer(t *testing.T) {
 	mc := &readOnlyInspectComposer{
 		readOnlyMockComposer: *readOnlyTestComposer(),
 		inspectRaw:           []byte(inspectFixtureJSON),
+		imageCreated:         inspectProbeCreated,
 	}
 	m := inspectTestModel(t, mc, mc.services)
 
@@ -17290,6 +17392,14 @@ func TestInspectKey_EntersOnReadOnlyComposer(t *testing.T) {
 	}
 	if cmd == nil {
 		t.Fatal("enterInspect must return the fetch command on the read-only screen too")
+	}
+
+	// The image probe is a READ, so it runs here too: the unmanaged screen has
+	// no update verdict of its own until U is pressed, and the build date must
+	// not wait on one.
+	result, _ = got.Update(cmd())
+	if summary := result.(Model).inspectSummary; !strings.Contains(summary, inspectRow("built", "2023-11-02 13:02:50")) {
+		t.Errorf("the read-only screen must draw the build date too:\n%s", summary)
 	}
 }
 
@@ -17591,7 +17701,9 @@ func TestInspectScreen_ResizeKeepsUpdateRows(t *testing.T) {
 
 	got := modelOf(m.Update(tea.WindowSizeMsg{Width: 120, Height: 30}))
 
-	for _, row := range []string{"built", "update", "update id", "update built"} {
+	// `built` is not among them: it rides the image probe, and
+	// TestInspectScreen_ResizeKeepsTheBuiltRow pins its own survival.
+	for _, row := range []string{"update", "update id", "update built"} {
 		if !strings.Contains(got.inspectSummary, inspectRow(row, "")) {
 			t.Errorf("a resize dropped the %q row:\n%s", row, got.inspectSummary)
 		}

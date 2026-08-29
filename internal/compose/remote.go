@@ -807,6 +807,12 @@ func (r *RemoteCompose) UpdateDetails(ctx context.Context, services []string) (m
 	return scanUpdateDetails(ctx, filterServices(images, services), remoteDockerRunner{r: r})
 }
 
+// ImageCreated is RemoteCompose's binding of fetchImageCreated. See
+// Compose.ImageCreated for the contract; the only difference is the seam.
+func (r *RemoteCompose) ImageCreated(ctx context.Context, image string) (time.Time, error) {
+	return fetchImageCreated(ctx, remoteDockerRunner{r: r}, image)
+}
+
 // fetchServiceImages runs `docker compose config --format json` on the
 // remote host and returns the service-name → image map. Build-only services
 // (no `image:`) are absent. Goes through remoteCommand() — regular compose
