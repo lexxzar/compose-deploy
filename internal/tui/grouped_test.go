@@ -4010,36 +4010,46 @@ func localFastTrackModel(t *testing.T) Model {
 
 // --- Task 10: sequential batch pipeline -------------------------------------
 
-// groupedUpdatesModel is groupedOpModel with a factory that hands out a
-// DISTINCT composer per project, so a scan can be attributed to the project it
-// was dispatched for. The row order it produces is the fixture's:
+// groupedPerProjectModel is groupedOpModel with a factory that hands out the
+// caller's composer per project, so a scan or a detail fetch can be attributed
+// to the project it was dispatched for. A project the map omits gets a nil
+// composer, the way a factory that cannot serve one behaves. The row order it
+// produces is the fixture's:
 //
 //	0 blog header   1 blog/web
 //	2 shop header   3 shop/api   4 shop/db
 //	5 (unmanaged) header   6 watchtower
-func groupedUpdatesModel(t *testing.T) (Model, map[string]*mockComposer) {
+func groupedPerProjectModel(t *testing.T, per map[string]runner.Composer) Model {
 	t.Helper()
 	g, projects := groupedFixture()
-	per := map[string]*mockComposer{
-		"blog": {updates: map[string]bool{"web": true}},
-		"shop": {updates: map[string]bool{"api": true, "db": false}},
-	}
 	m := groupedTestModel(g, projects)
+	m.width, m.height = 120, 40
 	m.composerFactory = func(p compose.Project) runner.Composer {
 		if p.Unmanaged {
 			return g
 		}
-		if c, ok := per[p.Name]; ok {
-			return c
-		}
-		return nil
+		return per[p.Name]
 	}
 	updated, _ := m.Update(m.loadGroups()())
 	m = updated.(Model)
 	if got := len(m.svcEntries); got != 7 {
 		t.Fatalf("precondition: %d rows, want 7", got)
 	}
-	return m, per
+	return m
+}
+
+// groupedUpdatesModel is groupedPerProjectModel over composers that answer the
+// verdict half only.
+func groupedUpdatesModel(t *testing.T) (Model, map[string]*mockComposer) {
+	t.Helper()
+	per := map[string]*mockComposer{
+		"blog": {updates: map[string]bool{"web": true}},
+		"shop": {updates: map[string]bool{"api": true, "db": false}},
+	}
+	return groupedPerProjectModel(t, map[string]runner.Composer{
+		"blog": per["blog"],
+		"shop": per["shop"],
+	}), per
 }
 
 // pressU drives the U key and runs the Cmd it returns, delivering the resulting
@@ -4345,106 +4355,31 @@ func TestGroupedInspect_DrawsTheBuiltRow(t *testing.T) {
 	}
 }
 
-// The three automatic entry points stay shut in grouped mode: the screen-entry
-// helper, the statusMsg self-heal and NewModel's in-flight seed.
-func TestGroupedMode_AllAutoScanEntryPointsRefuse(t *testing.T) {
-	m, per := groupedUpdatesModel(t)
-
-	if m.autoUpdatesAllowed() {
-		t.Error("autoUpdatesAllowed must be false in grouped mode")
-	}
-	if cmd := m.maybeRefreshUpdatesCmd(); cmd != nil {
-		t.Error("maybeRefreshUpdatesCmd must schedule nothing in grouped mode")
-	}
-	if m.updateInFlight {
-		t.Error("a grouped model must start with the in-flight guard clear, or the first U is refused")
-	}
-
-	// The statusMsg self-heal: no cache entry, nothing in flight — and still
-	// no fetch, because U is the only trigger here.
-	updated, cmd := m.Update(statusMsg{status: map[string]runner.ServiceStatus{}, session: m.statusSession})
-	m = updated.(Model)
-	if cmd != nil {
-		t.Error("the statusMsg self-heal must not fire in grouped mode")
-	}
-	for name, c := range per {
-		if c.updatesCalls != 0 {
-			t.Errorf("%s CheckUpdates ran %d times with no U press", name, c.updatesCalls)
-		}
-	}
-}
-
-// The in-flight guard is checked BEFORE anything is bound, so a refused U
-// leaves the grouped screen exactly as it found it.
-func TestGroupedU_InFlightGuardBindsNothing(t *testing.T) {
-	m, per := groupedUpdatesModel(t)
-	m.svcCursor = 3
-	m.updateInFlight = true
-
-	updated, cmd := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'U'}})
-	m = updated.(Model)
-	if cmd != nil {
-		t.Error("U must be refused while a scan is in flight")
-	}
-	if m.composer != nil {
-		t.Error("a refused U must not leave a composer bound")
-	}
-	if per["shop"].updatesCalls != 0 {
-		t.Errorf("shop CheckUpdates ran %d times, want 0", per["shop"].updatesCalls)
-	}
-}
-
 // detailingComposer is capableComposer plus UpdateDetailer. It is a double of
 // its own so that capableComposer, which backs drillTestModel and every other
 // grouped test, stays inert as coverage grows: no grouped test presses `i`
 // against a warm entry today, so arming it would be silent until one does.
 type detailingComposer struct {
 	capableComposer
-	details      map[string]compose.UpdateDetail
-	detailsErr   error
-	detailsCalls int
-	detailsArgs  [][]string // one entry per call, the services slice as received
+	detailRecorder
 }
 
-func (c *detailingComposer) UpdateDetails(_ context.Context, services []string) (map[string]compose.UpdateDetail, error) {
-	c.detailsCalls++
-	c.detailsArgs = append(c.detailsArgs, append([]string(nil), services...))
-	return c.details, c.detailsErr
-}
-
-// groupedDetailModel is groupedFixture's host over composers that answer both
-// halves of the update check, one per project, so a detail fetch can be
-// attributed to the project it was dispatched for. Row order is the fixture's:
-//
-//	0 ▼ blog · 1 web · 2 ▼ shop · 3 api · 4 db · 5 ▼ (unmanaged) · 6 watchtower
+// groupedDetailModel is groupedPerProjectModel over composers that answer BOTH
+// halves of the update check.
 func groupedDetailModel(t *testing.T) (Model, map[string]*detailingComposer) {
 	t.Helper()
-	g, projects := groupedFixture()
 	per := map[string]*detailingComposer{
 		"blog": newDetailingComposer("blog", map[string]bool{"web": true}, detailFixtureFor("web")),
 		"shop": newDetailingComposer("shop", map[string]bool{"api": true, "db": false}, detailFixtureFor("api")),
 	}
-	m := groupedTestModel(g, projects)
-	m.width, m.height = 120, 40
-	m.composerFactory = func(p compose.Project) runner.Composer {
-		if p.Unmanaged {
-			return g
-		}
-		if c, ok := per[p.Name]; ok {
-			return c
-		}
-		return nil
-	}
-	updated, _ := m.Update(m.loadGroups()())
-	m = updated.(Model)
-	if got := len(m.svcEntries); got != 7 {
-		t.Fatalf("precondition: %d rows, want 7", got)
-	}
-	return m, per
+	return groupedPerProjectModel(t, map[string]runner.Composer{
+		"blog": per["blog"],
+		"shop": per["shop"],
+	}), per
 }
 
 func newDetailingComposer(proj string, updates map[string]bool, details map[string]compose.UpdateDetail) *detailingComposer {
-	c := &detailingComposer{details: details}
+	c := &detailingComposer{detailRecorder: detailRecorder{details: details}}
 	c.proj = proj
 	c.updates = updates
 	for svc := range updates {
@@ -4732,13 +4667,123 @@ func TestGroupedInspect_VerdictsArrivingOnScreenFetchTheRows(t *testing.T) {
 	})
 }
 
+// The memo answers for ONE cache entry, and an updatesMsg can replace that entry
+// mid-visit under the same session. The reply still in flight then describes a
+// scan the screen has moved past — `update id` and `update built` would name a
+// registry image the fresh verdicts never checked — so it must draw nothing, and
+// the arrival that superseded it dispatches the refill that does.
+func TestGroupedInspect_SupersededReplyDrawsNoRows(t *testing.T) {
+	m, per := groupedDetailModel(t)
+	m.svcCursor = 3 // shop/api
+	key := m.projUpdatesCacheKey(compose.Project{Name: "shop", ConfigDir: "/srv/shop"})
+	firstScan := time.Now().Add(-time.Minute)
+	m.updateCache = map[string]updateEntry{key: {
+		fetchedAt: firstScan,
+		results:   map[string]bool{"api": true},
+	}}
+
+	m, held := inspectDocument(t, m)
+	if held == nil {
+		t.Fatal("precondition: the document's arrival must chain the screen's own fetch")
+	}
+
+	// A fresh scan lands while that fetch is outstanding.
+	updated, refill := m.Update(updatesMsg{
+		results: map[string]bool{"api": true, "db": false},
+		session: m.updatesSession,
+		forKey:  key,
+	})
+	m = updated.(Model)
+	if m.updateCache[key].fetchedAt.Equal(firstScan) {
+		t.Fatal("precondition: the arrival must write a new stamp")
+	}
+	if refill == nil {
+		t.Fatal("the arrival that superseded the entry must refetch the rows")
+	}
+
+	superseded := modelOf(m.Update(held()))
+
+	if !strings.Contains(superseded.inspectSummary, inspectRow("update", "available")) {
+		t.Fatalf("precondition: the verdict row must still be drawn:\n%s", superseded.inspectSummary)
+	}
+	for _, row := range []string{"update id", "update built"} {
+		if strings.Contains(superseded.inspectSummary, row) {
+			t.Errorf("a reply for a superseded scan drew %q:\n%s", row, superseded.inspectSummary)
+		}
+	}
+
+	filled := modelOf(superseded.Update(refill()))
+
+	want := detailFixtureFor("api")["api"]
+	for _, row := range []string{
+		inspectRow("update id", want.NewID),
+		inspectRow("update built", "2026-08-19 19:14:43"),
+	} {
+		if !strings.Contains(filled.inspectSummary, row) {
+			t.Errorf("the refill did not fill %q:\n%s", row, filled.inspectSummary)
+		}
+	}
+	if got := per["shop"].detailsCalls; got != 2 {
+		t.Errorf("shop's UpdateDetails ran %d times, want 2 (the superseded fetch, then the refill)", got)
+	}
+}
+
+// The three automatic entry points stay shut in grouped mode: the screen-entry
+// helper, the statusMsg self-heal and NewModel's in-flight seed.
+func TestGroupedMode_AllAutoScanEntryPointsRefuse(t *testing.T) {
+	m, per := groupedUpdatesModel(t)
+
+	if m.autoUpdatesAllowed() {
+		t.Error("autoUpdatesAllowed must be false in grouped mode")
+	}
+	if cmd := m.maybeRefreshUpdatesCmd(); cmd != nil {
+		t.Error("maybeRefreshUpdatesCmd must schedule nothing in grouped mode")
+	}
+	if m.updateInFlight {
+		t.Error("a grouped model must start with the in-flight guard clear, or the first U is refused")
+	}
+
+	// The statusMsg self-heal: no cache entry, nothing in flight — and still
+	// no fetch, because U is the only trigger here.
+	updated, cmd := m.Update(statusMsg{status: map[string]runner.ServiceStatus{}, session: m.statusSession})
+	m = updated.(Model)
+	if cmd != nil {
+		t.Error("the statusMsg self-heal must not fire in grouped mode")
+	}
+	for name, c := range per {
+		if c.updatesCalls != 0 {
+			t.Errorf("%s CheckUpdates ran %d times with no U press", name, c.updatesCalls)
+		}
+	}
+}
+
+// The in-flight guard is checked BEFORE anything is bound, so a refused U
+// leaves the grouped screen exactly as it found it.
+func TestGroupedU_InFlightGuardBindsNothing(t *testing.T) {
+	m, per := groupedUpdatesModel(t)
+	m.svcCursor = 3
+	m.updateInFlight = true
+
+	updated, cmd := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'U'}})
+	m = updated.(Model)
+	if cmd != nil {
+		t.Error("U must be refused while a scan is in flight")
+	}
+	if m.composer != nil {
+		t.Error("a refused U must not leave a composer bound")
+	}
+	if per["shop"].updatesCalls != 0 {
+		t.Errorf("shop CheckUpdates ran %d times, want 0", per["shop"].updatesCalls)
+	}
+}
+
 // Grouped mode fetches no detail rows: it holds no composer of its own, and one
 // an armed prompt left bound may belong to a different project entirely.
 func TestGroupedU_FetchesNoDetailBatch(t *testing.T) {
 	g, projects := groupedFixture()
 	detail := &mockDetailComposer{
-		mockComposer: mockComposer{updates: map[string]bool{"api": true}},
-		details:      map[string]compose.UpdateDetail{"api": {NewID: "sha256:beef"}},
+		mockComposer:   mockComposer{updates: map[string]bool{"api": true}},
+		detailRecorder: detailRecorder{details: map[string]compose.UpdateDetail{"api": {NewID: "sha256:beef"}}},
 	}
 	m := groupedTestModel(g, projects)
 	m.composerFactory = func(p compose.Project) runner.Composer {

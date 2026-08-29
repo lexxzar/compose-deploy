@@ -136,12 +136,11 @@ func (m *mockComposer) Logs(ctx context.Context, service string, follow bool, ta
 	return nil
 }
 
-// mockDetailComposer implements runner.Composer AND UpdateDetailer, so the
-// detail half of refreshUpdates can be driven without Docker. The plain
-// mockComposer deliberately does NOT implement the interface — that is the
-// "composer without the capability" case, which must still produce verdicts.
-type mockDetailComposer struct {
-	mockComposer
+// detailRecorder is the UpdateDetailer half every detail double shares: the
+// answers it hands back plus the record of what it was asked. Embedded, so each
+// double is a base composer plus this mixin. capableComposer deliberately does
+// NOT take it — see detailingComposer.
+type detailRecorder struct {
 	details    map[string]compose.UpdateDetail
 	detailsErr error
 
@@ -150,12 +149,21 @@ type mockDetailComposer struct {
 	detailsDeadlines []time.Time // one entry per call, zero when the ctx carried none
 }
 
-func (m *mockDetailComposer) UpdateDetails(ctx context.Context, services []string) (map[string]compose.UpdateDetail, error) {
-	m.detailsCalls++
-	m.detailsArgs = append(m.detailsArgs, append([]string(nil), services...))
+func (r *detailRecorder) UpdateDetails(ctx context.Context, services []string) (map[string]compose.UpdateDetail, error) {
+	r.detailsCalls++
+	r.detailsArgs = append(r.detailsArgs, append([]string(nil), services...))
 	deadline, _ := ctx.Deadline()
-	m.detailsDeadlines = append(m.detailsDeadlines, deadline)
-	return m.details, m.detailsErr
+	r.detailsDeadlines = append(r.detailsDeadlines, deadline)
+	return r.details, r.detailsErr
+}
+
+// mockDetailComposer implements runner.Composer AND UpdateDetailer, so the
+// detail half of refreshUpdates can be driven without Docker. The plain
+// mockComposer deliberately does NOT implement the interface — that is the
+// "composer without the capability" case, which must still produce verdicts.
+type mockDetailComposer struct {
+	mockComposer
+	detailRecorder
 }
 
 // mockConfigComposer implements both runner.Composer and ConfigProvider.
@@ -11169,7 +11177,7 @@ func deliverUpdates(t *testing.T, m Model, msg updatesMsg) (Model, *updateDetail
 // updated image — with updateInFlight pinned true, which makes U a no-op and
 // gates off the statusMsg self-heal for that whole window.
 func TestRefreshUpdates_VerdictsDoNotWaitOnDetails(t *testing.T) {
-	mc := &mockDetailComposer{details: detailFixture()}
+	mc := &mockDetailComposer{detailRecorder: detailRecorder{details: detailFixture()}}
 	mc.updates = map[string]bool{"web": true}
 	m := NewModel(mc, io.Discard, mockFactory(&mc.mockComposer), nil, nil)
 	m.composer = mc
@@ -11204,7 +11212,7 @@ func TestRefreshUpdates_VerdictsDoNotWaitOnDetails(t *testing.T) {
 // verdicts would walk straight into Docker Hub's anonymous quota. Sorted so the
 // argument is deterministic.
 func TestRefreshUpdates_PassesOnlyTrueVerdicts(t *testing.T) {
-	mc := &mockDetailComposer{details: detailFixture()}
+	mc := &mockDetailComposer{detailRecorder: detailRecorder{details: detailFixture()}}
 	mc.updates = map[string]bool{"web": true, "db": false, "api": true, "cache": false, "edge": true}
 	m := NewModel(mc, io.Discard, mockFactory(&mc.mockComposer), nil, nil)
 	m.composer = mc
@@ -11240,7 +11248,7 @@ func TestRefreshUpdates_PassesOnlyTrueVerdicts(t *testing.T) {
 // services", so a call with no true verdicts would fetch details for the
 // entire project.
 func TestRefreshUpdates_SkipsDetailsWhenNoVerdictIsTrue(t *testing.T) {
-	mc := &mockDetailComposer{details: detailFixture()}
+	mc := &mockDetailComposer{detailRecorder: detailRecorder{details: detailFixture()}}
 	mc.updates = map[string]bool{"web": false, "db": false}
 	m := NewModel(mc, io.Discard, mockFactory(&mc.mockComposer), nil, nil)
 	m.composer = mc
@@ -11265,7 +11273,7 @@ func TestRefreshUpdates_SkipsDetailsWhenNoVerdictIsTrue(t *testing.T) {
 // up — and the detail fetch would spend registry round-trips on a path that is
 // already broken.
 func TestRefreshUpdates_SkipsDetailsOnCheckError(t *testing.T) {
-	mc := &mockDetailComposer{details: detailFixture()}
+	mc := &mockDetailComposer{detailRecorder: detailRecorder{details: detailFixture()}}
 	mc.updates = map[string]bool{"web": true}
 	mc.updatesErr = errors.New("registry unreachable")
 	m := NewModel(mc, io.Discard, mockFactory(&mc.mockComposer), nil, nil)
@@ -11317,7 +11325,7 @@ func TestRefreshUpdates_ComposerWithoutDetailerStillProducesVerdicts(t *testing.
 // updatesMsg.err would blank the ⇧ column and cut the cache entry down to the
 // 30-second error TTL — the detail rows would degrade the signal they annotate.
 func TestRefreshUpdates_DetailErrorKeepsVerdictsAndSuccessTTL(t *testing.T) {
-	mc := &mockDetailComposer{detailsErr: errors.New("429 Too Many Requests")}
+	mc := &mockDetailComposer{detailRecorder: detailRecorder{detailsErr: errors.New("429 Too Many Requests")}}
 	mc.updates = map[string]bool{"web": true}
 	m := NewModel(mc, io.Discard, mockFactory(&mc.mockComposer), nil, nil)
 	m.composer = mc
@@ -11358,7 +11366,7 @@ func TestRefreshUpdates_DetailErrorKeepsVerdictsAndSuccessTTL(t *testing.T) {
 // the abort are still correct. Discarding the map along with the error would
 // throw them away silently.
 func TestRefreshUpdates_PartialDetailsSurviveTheirError(t *testing.T) {
-	mc := &mockDetailComposer{details: detailFixture(), detailsErr: errors.New("update detail transport failure")}
+	mc := &mockDetailComposer{detailRecorder: detailRecorder{details: detailFixture(), detailsErr: errors.New("update detail transport failure")}}
 	mc.updates = map[string]bool{"web": true}
 	m := NewModel(mc, io.Discard, mockFactory(&mc.mockComposer), nil, nil)
 	m.composer = mc
@@ -11468,7 +11476,7 @@ func TestUpdateDetailsMsg_ForeignMergeDoesNotRedrawTheScreen(t *testing.T) {
 // exactly when a cold cache happens, and without the rebuild the rows would
 // stay absent until a back-out and re-entry.
 func TestUpdateDetails_ColdCacheFillsEveryRow(t *testing.T) {
-	mc := &mockDetailComposer{details: detailFixture()}
+	mc := &mockDetailComposer{detailRecorder: detailRecorder{details: detailFixture()}}
 	mc.updates = map[string]bool{"web": true}
 	m := inspectScreenModel(t)
 	m.composer = mc
@@ -11639,7 +11647,7 @@ func TestUpdateDetailsMsg_LandsAfterNavigatingAway(t *testing.T) {
 // statusMsg self-heal both skip. The arrival therefore refills from the entry's
 // own details == nil, with no further keystroke.
 func TestUpdateDetails_OneBatchAtATime(t *testing.T) {
-	mc := &mockDetailComposer{details: detailFixture()}
+	mc := &mockDetailComposer{detailRecorder: detailRecorder{details: detailFixture()}}
 	mc.updates = map[string]bool{"web": true}
 	m := NewModel(mc, io.Discard, mockFactory(&mc.mockComposer), nil, nil)
 	m.composer = mc
@@ -11710,7 +11718,7 @@ func TestUpdateDetails_OneBatchAtATime(t *testing.T) {
 // refusals produce ONE batch — against the newest verdict set — however hard
 // the key is mashed.
 func TestUpdateDetails_RefillTargetsTheNewestEntry(t *testing.T) {
-	mc := &mockDetailComposer{details: detailFixture()}
+	mc := &mockDetailComposer{detailRecorder: detailRecorder{details: detailFixture()}}
 	mc.updates = map[string]bool{"web": true}
 	m := NewModel(mc, io.Discard, mockFactory(&mc.mockComposer), nil, nil)
 	m.composer = mc
@@ -11759,7 +11767,7 @@ func TestUpdateDetails_RefillTargetsTheNewestEntry(t *testing.T) {
 // entry for the entry's whole 10-minute TTL, which is the amplification the
 // error-swallowing at the fetch site exists to prevent.
 func TestUpdateDetails_EmptyResultIsNotRetried(t *testing.T) {
-	mc := &mockDetailComposer{detailsErr: errors.New("429 Too Many Requests")}
+	mc := &mockDetailComposer{detailRecorder: detailRecorder{detailsErr: errors.New("429 Too Many Requests")}}
 	mc.updates = map[string]bool{"web": true}
 	m := NewModel(mc, io.Discard, mockFactory(&mc.mockComposer), nil, nil)
 	m.composer = mc
@@ -11840,7 +11848,7 @@ func TestRefillUpdateDetails_FailsClosed(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			mc := &mockDetailComposer{details: detailFixture()}
+			mc := &mockDetailComposer{detailRecorder: detailRecorder{details: detailFixture()}}
 			m := NewModel(mc, io.Discard, mockFactory(&mc.mockComposer), nil, nil)
 			m.composer = mc
 			m.screen = screenSelectContainers
@@ -11859,7 +11867,7 @@ func TestRefillUpdateDetails_FailsClosed(t *testing.T) {
 	// The control: without one case that DOES fire, every assertion above would
 	// pass on a refill that never works at all.
 	t.Run("a fresh entry with no reported batch", func(t *testing.T) {
-		mc := &mockDetailComposer{details: detailFixture()}
+		mc := &mockDetailComposer{detailRecorder: detailRecorder{details: detailFixture()}}
 		m := NewModel(mc, io.Discard, mockFactory(&mc.mockComposer), nil, nil)
 		m.composer = mc
 		m.screen = screenSelectContainers
@@ -11884,7 +11892,7 @@ func TestRefillUpdateDetails_FailsClosed(t *testing.T) {
 // image, tens of seconds over SSH — and refusing U for that window is exactly
 // the dead-U window the message split removed.
 func TestUpdateDetails_UStaysLiveDuringTheDetailScan(t *testing.T) {
-	mc := &mockDetailComposer{details: detailFixture()}
+	mc := &mockDetailComposer{detailRecorder: detailRecorder{details: detailFixture()}}
 	m := NewModel(mc, io.Discard, mockFactory(&mc.mockComposer), nil, nil)
 	m.composer = mc
 	m.screen = screenSelectContainers
@@ -11985,7 +11993,7 @@ func TestUpdateDetails_GuardIsNotClearedByNavigation(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			mc := &mockDetailComposer{details: detailFixture()}
+			mc := &mockDetailComposer{detailRecorder: detailRecorder{details: detailFixture()}}
 			mc.services = []string{"web"}
 			mc.updates = map[string]bool{"web": true}
 			m := NewModel(mc, io.Discard, func(compose.Project) runner.Composer { return mc }, servers, nil)
@@ -12059,7 +12067,7 @@ func TestUpdateDetails_SelfHealsAtEveryScreenEntry(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			mc := &mockDetailComposer{details: detailFixture()}
+			mc := &mockDetailComposer{detailRecorder: detailRecorder{details: detailFixture()}}
 			mc.services = []string{"web"}
 			mc.updates = map[string]bool{"web": true}
 			m := NewModel(mc, io.Discard, func(compose.Project) runner.Composer { return mc }, servers, nil)
@@ -12089,7 +12097,7 @@ func TestUpdateDetails_SelfHealsAtEveryScreenEntry(t *testing.T) {
 // happens while the running one is still out, and the refused batch's entry
 // must still end up with its rows.
 func TestUpdateDetails_LostBatchHealsAfterNavigating(t *testing.T) {
-	mc := &mockDetailComposer{details: detailFixture()}
+	mc := &mockDetailComposer{detailRecorder: detailRecorder{details: detailFixture()}}
 	mc.services = []string{"web"}
 	mc.updates = map[string]bool{"web": true}
 	m := NewModel(mc, io.Discard, mockFactory(&mc.mockComposer), nil, nil)
@@ -12171,7 +12179,7 @@ func TestUpdateDetailsMsg_SupersededEntryIsDropped(t *testing.T) {
 // detail phase for the rest of the session — no departure site resets the flag
 // and U cannot force it.
 func TestUpdateDetails_FetchCarriesADeadline(t *testing.T) {
-	mc := &mockDetailComposer{details: detailFixture()}
+	mc := &mockDetailComposer{detailRecorder: detailRecorder{details: detailFixture()}}
 	mc.updates = map[string]bool{"web": true}
 	m := NewModel(mc, io.Discard, mockFactory(&mc.mockComposer), nil, nil)
 	m.composer = mc
@@ -12362,15 +12370,7 @@ func TestUpdatesMsg_InspectRebuildIsScreenScoped(t *testing.T) {
 // the Inspector half is what lets `i` reach the screen's own detail fetch.
 type readOnlyDetailComposer struct {
 	readOnlyInspectComposer
-	details      map[string]compose.UpdateDetail
-	detailsCalls int
-	detailsArgs  [][]string
-}
-
-func (c *readOnlyDetailComposer) UpdateDetails(ctx context.Context, services []string) (map[string]compose.UpdateDetail, error) {
-	c.detailsCalls++
-	c.detailsArgs = append(c.detailsArgs, append([]string(nil), services...))
-	return c.details, nil
+	detailRecorder
 }
 
 // TestInspectScreen_UpdateRowsFollowTheVerdict is the end-to-end half of the
@@ -12473,7 +12473,7 @@ func detailFixtureFor(service string) map[string]compose.UpdateDetail {
 // three; this is what keeps a future second mechanism from drifting away.
 func TestUpdateDetails_FireOnTheGlyphTriggers(t *testing.T) {
 	newComposer := func() *mockDetailComposer {
-		mc := &mockDetailComposer{details: detailFixture()}
+		mc := &mockDetailComposer{detailRecorder: detailRecorder{details: detailFixture()}}
 		mc.services = []string{"web"}
 		mc.status = map[string]runner.ServiceStatus{"web": {Running: true}}
 		mc.updates = map[string]bool{"web": true}
@@ -12584,7 +12584,7 @@ func TestUpdateDetails_FireOnTheGlyphTriggers(t *testing.T) {
 // opt-in exists to prevent. U must still reach both halves.
 func TestReadOnly_NoAutomaticDetailFetch(t *testing.T) {
 	newComposer := func() *readOnlyDetailComposer {
-		c := &readOnlyDetailComposer{details: detailFixtureFor("watchtower")}
+		c := &readOnlyDetailComposer{detailRecorder: detailRecorder{details: detailFixtureFor("watchtower")}}
 		c.services = []string{"watchtower"}
 		c.status = map[string]runner.ServiceStatus{"watchtower": {Running: true}}
 		c.updates = map[string]bool{"watchtower": true}

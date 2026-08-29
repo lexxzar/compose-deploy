@@ -1945,16 +1945,7 @@ func TestInspectScreen_ResizeKeepsTheBuiltRow(t *testing.T) {
 // every production composer has.
 type inspectDetailComposer struct {
 	mockInspectComposer
-	details      map[string]compose.UpdateDetail
-	detailsErr   error
-	detailsCalls int
-	detailsArgs  [][]string // one entry per call, the services slice as received
-}
-
-func (c *inspectDetailComposer) UpdateDetails(_ context.Context, services []string) (map[string]compose.UpdateDetail, error) {
-	c.detailsCalls++
-	c.detailsArgs = append(c.detailsArgs, append([]string(nil), services...))
-	return c.details, c.detailsErr
+	detailRecorder
 }
 
 // TestInspectDetail_FiresOnlyOnATrueVerdict is the whole refusal set, plus the
@@ -2009,7 +2000,7 @@ func TestInspectDetail_FiresOnlyOnATrueVerdict(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			rec := &inspectDetailComposer{details: detailFixture()}
+			rec := &inspectDetailComposer{detailRecorder: detailRecorder{details: detailFixture()}}
 			var c runner.Composer = rec
 			if tt.noDetailer {
 				c = &mockInspectComposer{}
@@ -2045,34 +2036,97 @@ func TestInspectDetail_FiresOnlyOnATrueVerdict(t *testing.T) {
 	}
 }
 
+// warmInspectDetailModel is the container screen over a composer that answers
+// all four capabilities `i` asserts, with a cache entry naming every service as
+// updated — the state the detail rows are read from. The caller owns both
+// halves afterwards: the composer's answers and the entry.
+func warmInspectDetailModel(t *testing.T, services ...string) (Model, *inspectDetailComposer) {
+	t.Helper()
+	c := &inspectDetailComposer{detailRecorder: detailRecorder{details: detailFixture()}}
+	c.inspectRaw = []byte(inspectFixtureJSON)
+	c.services = services
+	m := inspectTestModel(t, c, services)
+	results := make(map[string]bool, len(services))
+	for _, svc := range services {
+		results[svc] = true
+	}
+	m.updateCache = map[string]updateEntry{m.updatesCacheKey(): {
+		fetchedAt: time.Now(),
+		results:   results,
+	}}
+	return m, c
+}
+
+// warmInspectScreen is inspectScreenModel over the same warm entry, for the
+// tests that drive the messages by hand rather than through `i`.
+func warmInspectScreen(t *testing.T) (Model, string) {
+	t.Helper()
+	m := inspectScreenModel(t)
+	key := m.updatesCacheKey()
+	m.updateCache = map[string]updateEntry{key: {
+		fetchedAt: time.Now(),
+		results:   map[string]bool{"web": true},
+	}}
+	m.rebuildInspectSummary()
+	return m, key
+}
+
+// inspectDocument presses `i` and delivers the document, RETURNING whatever the
+// arrival chained — a detail fetch, a memo replay, or nil. The tests that assert
+// on that command need it in hand; inspectVisit is the wrapper for the rest.
+func inspectDocument(t *testing.T, m Model) (Model, tea.Cmd) {
+	t.Helper()
+	result, cmd := m.Update(keyMsgFor("i"))
+	if cmd == nil {
+		t.Fatal("i must dispatch the inspect fetch")
+	}
+	result, chained := result.(Model).Update(cmd())
+	return result.(Model), chained
+}
+
+// inspectVisit presses `i` and delivers both messages it chains: the document,
+// then whatever the document's arrival dispatched.
+func inspectVisit(t *testing.T, m Model) Model {
+	t.Helper()
+	m, detailCmd := inspectDocument(t, m)
+	if detailCmd == nil {
+		t.Fatal("the document's arrival must chain the detail command")
+	}
+	return modelOf(m.Update(detailCmd()))
+}
+
+// inspectLeave presses esc and runs the reload the grouped path returns with it.
+func inspectLeave(t *testing.T, m Model) Model {
+	t.Helper()
+	result, cmd := m.Update(tea.KeyMsg{Type: tea.KeyEsc})
+	m = result.(Model)
+	if m.screen != screenSelectContainers {
+		t.Fatalf("esc left screen %d, want the container screen", m.screen)
+	}
+	if cmd != nil {
+		m = modelOf(m.Update(cmd()))
+	}
+	return m
+}
+
 // A detail failure is DISCARDED, exactly as the batch's is: the rows are omitted
 // and the document renders untouched. Promoting it would let a 429 blank the
 // signal it was annotating.
 func TestInspectDetail_FailureIsDiscarded(t *testing.T) {
-	c := &inspectDetailComposer{detailsErr: fmt.Errorf("429 Too Many Requests")}
-	c.inspectRaw = []byte(inspectFixtureJSON)
-	c.services = []string{"web"}
-	m := inspectTestModel(t, c, c.services)
-	m.updateCache = map[string]updateEntry{m.updatesCacheKey(): {
-		fetchedAt: time.Now(),
-		results:   map[string]bool{"web": true},
-	}}
+	m, c := warmInspectDetailModel(t, "web")
+	c.details, c.detailsErr = nil, fmt.Errorf("429 Too Many Requests")
 
-	result, cmd := m.Update(keyMsgFor("i"))
-	if cmd == nil {
-		t.Fatal("i should return the inspect fetch")
-	}
-	result, detailCmd := result.(Model).Update(cmd())
+	m, detailCmd := inspectDocument(t, m)
 	if detailCmd == nil {
 		t.Fatal("the document's arrival should chain the detail fetch")
 	}
-	got := modelOf(result.(Model).Update(detailCmd()))
+	got := modelOf(m.Update(detailCmd()))
 
 	if got.inspectErr != nil {
 		t.Fatalf("inspectErr = %v, want nil: a detail failure is discarded", got.inspectErr)
 	}
-	if got.inspectDetail != (compose.UpdateDetail{}) {
-		t.Errorf("inspectDetail = %+v, want the zero value", got.inspectDetail)
+	if got.inspectMemo.detail != (compose.UpdateDetail{}) {
+		t.Errorf("the memo holds %+v, want the zero value", got.inspectMemo.detail)
 	}
 	for _, want := range []string{"STATE", "running", "IMAGE", "nginx:1.27", inspectRow("update", "available")} {
 		if !strings.Contains(got.inspectSummary, want) {
@@ -2092,23 +2146,17 @@ func TestInspectDetail_FailureIsDiscarded(t *testing.T) {
 // inspectSession is the screen's counter and the only gate the message needs:
 // a reply that outlives its screen or its entry is dropped.
 func TestInspectDetail_StaleMessageDiscarded(t *testing.T) {
-	warm := func(t *testing.T) Model {
-		t.Helper()
-		m := inspectScreenModel(t)
-		m.updateCache = map[string]updateEntry{m.updatesCacheKey(): {
-			fetchedAt: time.Now(),
-			results:   map[string]bool{"web": true},
-		}}
-		m.rebuildInspectSummary()
-		return m
-	}
-
 	t.Run("another entry's session", func(t *testing.T) {
-		m := warm(t)
+		m, key := warmInspectScreen(t)
 		before := m.inspectSummary
-		got := modelOf(m.Update(inspectDetailMsg{detail: detailFixture()["web"], session: m.inspectSession + 1}))
-		if got.inspectDetail != (compose.UpdateDetail{}) {
-			t.Errorf("inspectDetail = %+v, want the zero value", got.inspectDetail)
+		got := modelOf(m.Update(inspectDetailMsg{
+			detail:   detailFixture()["web"],
+			forKey:   key,
+			forEntry: m.updateCache[key].fetchedAt,
+			session:  m.inspectSession + 1,
+		}))
+		if got.inspectMemo != (inspectDetailMemo{}) {
+			t.Errorf("a stale reply wrote the memo: %+v", got.inspectMemo)
 		}
 		if got.inspectSummary != before {
 			t.Errorf("a stale reply repainted the screen:\n%s", got.inspectSummary)
@@ -2116,12 +2164,17 @@ func TestInspectDetail_StaleMessageDiscarded(t *testing.T) {
 	})
 
 	t.Run("off the inspect screen", func(t *testing.T) {
-		m := warm(t)
+		m, key := warmInspectScreen(t)
 		before := m.inspectSummary
 		m.screen = screenSelectContainers
-		got := modelOf(m.Update(inspectDetailMsg{detail: detailFixture()["web"], session: m.inspectSession}))
-		if got.inspectDetail != (compose.UpdateDetail{}) {
-			t.Errorf("inspectDetail = %+v, want the zero value", got.inspectDetail)
+		got := modelOf(m.Update(inspectDetailMsg{
+			detail:   detailFixture()["web"],
+			forKey:   key,
+			forEntry: m.updateCache[key].fetchedAt,
+			session:  m.inspectSession,
+		}))
+		if got.inspectMemo != (inspectDetailMemo{}) {
+			t.Errorf("a reply landing off-screen wrote the memo: %+v", got.inspectMemo)
 		}
 		if got.inspectSummary != before {
 			t.Errorf("a reply landing off-screen repainted the summary:\n%s", got.inspectSummary)
@@ -2129,30 +2182,19 @@ func TestInspectDetail_StaleMessageDiscarded(t *testing.T) {
 	})
 }
 
-// The screen's fetch is a pure READ of the cache. Writing its one service into
-// entry.details would tell refillUpdateDetailsCmd that a batch has reported, and
-// a later drill-in would strand every OTHER updated service for the entry's full
-// TTL; raising detailsInFlight would refuse the batch that fills them.
+// The screen's fetch writes neither entry.details nor detailsInFlight.
 func TestInspectDetail_LeavesTheCacheAndTheGuardAlone(t *testing.T) {
-	c := &inspectDetailComposer{details: detailFixture()}
-	c.inspectRaw = []byte(inspectFixtureJSON)
-	c.services = []string{"web"}
-	m := inspectTestModel(t, c, c.services)
+	m, _ := warmInspectDetailModel(t, "web")
 	key := m.updatesCacheKey()
-	m.updateCache = map[string]updateEntry{key: {
-		fetchedAt: time.Now(),
-		results:   map[string]bool{"web": true},
-	}}
 
-	result, cmd := m.Update(keyMsgFor("i"))
-	result, detailCmd := result.(Model).Update(cmd())
+	m, detailCmd := inspectDocument(t, m)
 	if detailCmd == nil {
 		t.Fatal("the document's arrival should chain the detail fetch")
 	}
-	if result.(Model).detailsInFlight {
+	if m.detailsInFlight {
 		t.Error("the dispatch raised the BATCH guard; one service is not a batch")
 	}
-	got := modelOf(result.(Model).Update(detailCmd()))
+	got := modelOf(m.Update(detailCmd()))
 
 	if got.updateCache[key].details != nil {
 		t.Errorf("the screen's fetch wrote the cache: %+v", got.updateCache[key].details)
@@ -2161,23 +2203,19 @@ func TestInspectDetail_LeavesTheCacheAndTheGuardAlone(t *testing.T) {
 		t.Error("the arrival raised the batch guard")
 	}
 	if !strings.Contains(got.inspectSummary, inspectRow("update id", detailFixture()["web"].NewID)) {
-		t.Errorf("the rows must still render from the Model:\n%s", got.inspectSummary)
+		t.Errorf("the rows must still render from the memo:\n%s", got.inspectSummary)
 	}
 }
 
-// The cache always wins: a batch landing while the screen is up repaints from
-// the entry, not from whatever the screen fetched for itself.
+// The cache wins over the memo: a batch landing while the screen is up repaints
+// from the entry, not from what the screen fetched for itself.
 func TestInspectDetail_CacheWinsOverTheScreenFetch(t *testing.T) {
-	m := inspectScreenModel(t)
-	key := m.updatesCacheKey()
-	fetched := time.Now()
-	m.updateCache = map[string]updateEntry{key: {
-		fetchedAt: fetched,
-		results:   map[string]bool{"web": true},
-	}}
-	m.inspectDetail = compose.UpdateDetail{NewID: "sha256:" + strings.Repeat("5", 64)}
+	m, key := warmInspectScreen(t)
+	fetched := m.updateCache[key].fetchedAt
+	own := compose.UpdateDetail{NewID: "sha256:" + strings.Repeat("5", 64)}
+	m.inspectMemo = inspectDetailMemo{key: key, service: "web", entry: fetched, detail: own}
 	m.rebuildInspectSummary()
-	if !strings.Contains(m.inspectSummary, inspectRow("update id", m.inspectDetail.NewID)) {
+	if !strings.Contains(m.inspectSummary, inspectRow("update id", own.NewID)) {
 		t.Fatalf("precondition: the screen's own row should be drawn:\n%s", m.inspectSummary)
 	}
 
@@ -2186,7 +2224,7 @@ func TestInspectDetail_CacheWinsOverTheScreenFetch(t *testing.T) {
 	if !strings.Contains(got.inspectSummary, inspectRow("update id", detailFixture()["web"].NewID)) {
 		t.Errorf("the cache entry must win:\n%s", got.inspectSummary)
 	}
-	if strings.Contains(got.inspectSummary, m.inspectDetail.NewID) {
+	if strings.Contains(got.inspectSummary, own.NewID) {
 		t.Errorf("the screen's own row survived the batch:\n%s", got.inspectSummary)
 	}
 }
@@ -2195,13 +2233,13 @@ func TestInspectDetail_CacheWinsOverTheScreenFetch(t *testing.T) {
 // TestInspectScreen_ResizeKeepsTheBuiltRow: the rows live on the Model, not in
 // the raw bytes, so every re-parse has to read them back.
 func TestInspectScreen_ResizeKeepsTheDetailRows(t *testing.T) {
-	m := inspectScreenModel(t)
-	m.updateCache = map[string]updateEntry{m.updatesCacheKey(): {
-		fetchedAt: time.Now(),
-		results:   map[string]bool{"web": true},
-	}}
-	result, _ := m.Update(inspectDetailMsg{detail: detailFixture()["web"], session: m.inspectSession})
-	got := result.(Model)
+	m, key := warmInspectScreen(t)
+	got := modelOf(m.Update(inspectDetailMsg{
+		detail:   detailFixture()["web"],
+		forKey:   key,
+		forEntry: m.updateCache[key].fetchedAt,
+		session:  m.inspectSession,
+	}))
 	rows := []string{
 		inspectRow("update id", detailFixture()["web"].NewID),
 		inspectRow("update built", "2026-08-19 19:14:43"),
@@ -2225,54 +2263,30 @@ func TestInspectScreen_ResizeKeepsTheDetailRows(t *testing.T) {
 // of the guard, every `i` press would re-spend the registry round-trips the
 // batch had already paid for.
 func TestInspectDetail_ReportedBatchCostsNoSecondFetch(t *testing.T) {
-	c := &inspectDetailComposer{details: detailFixture()}
-	c.inspectRaw = []byte(inspectFixtureJSON)
-	c.services = []string{"web"}
-	m := inspectTestModel(t, c, c.services)
-	m.updateCache = map[string]updateEntry{m.updatesCacheKey(): {
-		fetchedAt: time.Now(),
-		results:   map[string]bool{"web": true},
-		details:   detailFixture(),
-	}}
+	m, c := warmInspectDetailModel(t, "web")
+	key := m.updatesCacheKey()
+	reported := m.updateCache[key]
+	reported.details = detailFixture()
+	m.updateCache[key] = reported
 
-	result, cmd := m.Update(keyMsgFor("i"))
-	if cmd == nil {
-		t.Fatal("i should return the inspect fetch")
-	}
-	result, detailCmd := result.(Model).Update(cmd())
+	got, detailCmd := inspectDocument(t, m)
 	if detailCmd != nil {
 		t.Errorf("the batch's rows are already cached; the screen refetched them: %T", detailCmd())
 	}
 	if c.detailsCalls != 0 {
 		t.Errorf("UpdateDetails ran %d times, want 0", c.detailsCalls)
 	}
-	got := result.(Model)
 	if !strings.Contains(got.inspectSummary, inspectRow("update id", detailFixture()["web"].NewID)) {
 		t.Errorf("the batch's rows must still render:\n%s", got.inspectSummary)
 	}
 }
 
-// The consequence of the pure-read rule, followed one step out: the screen's
-// fetch resolves ONE service, so the entry must still read as "no batch has
-// reported" and refillUpdateDetailsCmd must still fetch EVERY updated service.
-// Writing the one service into entry.details would strand the others for the
-// entry's whole 10-minute TTL — a display gap traded for a data gap.
+// The same rule one step out: the entry still reads as "no batch has reported",
+// so refillUpdateDetailsCmd still fetches EVERY updated service.
 func TestInspectDetail_LeavesTheRefillToTheBatch(t *testing.T) {
-	c := &inspectDetailComposer{details: detailFixture()}
-	c.inspectRaw = []byte(inspectFixtureJSON)
-	c.services = []string{"web", "db"}
-	m := inspectTestModel(t, c, c.services)
-	m.updateCache = map[string]updateEntry{m.updatesCacheKey(): {
-		fetchedAt: time.Now(),
-		results:   map[string]bool{"web": true, "db": true},
-	}}
+	m, c := warmInspectDetailModel(t, "web", "db") // the cursor sits on web
 
-	result, cmd := m.Update(keyMsgFor("i")) // the cursor sits on web
-	result, detailCmd := result.(Model).Update(cmd())
-	if detailCmd == nil {
-		t.Fatal("the document's arrival should chain the screen's own detail fetch")
-	}
-	after := modelOf(result.(Model).Update(detailCmd()))
+	after := inspectVisit(t, m)
 
 	refill := after.refillUpdateDetailsCmd()
 	if refill == nil {
@@ -2287,76 +2301,15 @@ func TestInspectDetail_LeavesTheRefillToTheBatch(t *testing.T) {
 	}
 }
 
-// Both reset sites, each pinned on its own. One service's rows painting under
-// another's is not hypothetical: `update id` and `update built` render off their
-// own fields, with no verdict gate, so a leftover value draws confidently under
-// a service whose verdict is false.
-func TestInspectDetail_ResetAtBothSites(t *testing.T) {
-	stale := compose.UpdateDetail{NewID: "sha256:" + strings.Repeat("a", 64)}
-
-	t.Run("clearInspect drops them on the way out", func(t *testing.T) {
-		m := inspectScreenModel(t)
-		m.inspectDetail = stale
-
-		got := modelOf(m.Update(tea.KeyMsg{Type: tea.KeyEsc}))
-
-		if got.screen != screenSelectContainers {
-			t.Fatalf("screen = %d, want screenSelectContainers", got.screen)
-		}
-		if got.inspectDetail != (compose.UpdateDetail{}) {
-			t.Errorf("inspectDetail = %+v survived the departure", got.inspectDetail)
-		}
-	})
-
-	t.Run("enterInspect starts from the zero value", func(t *testing.T) {
-		c := &inspectDetailComposer{details: detailFixture()}
-		c.inspectRaw = []byte(inspectFixtureJSON)
-		c.services = []string{"web", "db"}
-		m := inspectTestModel(t, c, c.services)
-		// The entry has to EXIST, or currentUpdateInfo returns before the
-		// fallback and the leak cannot be observed.
-		m.updateCache = map[string]updateEntry{m.updatesCacheKey(): {
-			fetchedAt: time.Now(),
-			results:   map[string]bool{"web": true, "db": false},
-		}}
-		m.inspectDetail = stale // what the previously inspected service left
-		m.svcCursor = 1         // db, whose verdict is false
-
-		result, cmd := m.Update(keyMsgFor("i"))
-		got := modelOf(result.(Model).Update(cmd()))
-
-		if got.inspectService != "db" {
-			t.Fatalf("inspectService = %q, want db", got.inspectService)
-		}
-		if got.inspectDetail != (compose.UpdateDetail{}) {
-			t.Errorf("inspectDetail = %+v, want the zero value", got.inspectDetail)
-		}
-		if strings.Contains(got.inspectSummary, stale.NewID) {
-			t.Errorf("web's update id painted under db:\n%s", got.inspectSummary)
-		}
-	})
-}
-
 // A document the parser refuses leaves no summary and forces raw mode, and
 // every redraw re-parses the same bytes and fails again — so the rows have
 // nowhere to land. Dispatching anyway spent one local probe plus up to three
 // registry calls on a result nothing could render.
 func TestInspectDetail_ParseFailureSpendsNoFetch(t *testing.T) {
-	c := &inspectDetailComposer{details: detailFixture()}
+	m, c := warmInspectDetailModel(t, "web")
 	c.inspectRaw = []byte("[]") // what docker prints for a container it cannot find
-	c.services = []string{"web"}
-	m := inspectTestModel(t, c, c.services)
-	m.updateCache = map[string]updateEntry{m.updatesCacheKey(): {
-		fetchedAt: time.Now(),
-		results:   map[string]bool{"web": true},
-	}}
 
-	result, cmd := m.Update(keyMsgFor("i"))
-	if cmd == nil {
-		t.Fatal("i should return the inspect fetch")
-	}
-	result, detailCmd := result.(Model).Update(cmd())
-	got := result.(Model)
+	got, detailCmd := inspectDocument(t, m)
 
 	if got.inspectErr == nil {
 		t.Fatal("precondition: the parse should have failed")
@@ -2376,21 +2329,15 @@ func TestInspectDetail_ParseFailureSpendsNoFetch(t *testing.T) {
 // cache entry, so an identity of (key, fetchedAt) alone would answer db with
 // web's rows — drawn confidently, under a heading that invites the comparison.
 func TestInspectDetail_MemoIsPerService(t *testing.T) {
-	c := &inspectDetailComposer{details: map[string]compose.UpdateDetail{
+	m, c := warmInspectDetailModel(t, "db", "web")
+	c.details = map[string]compose.UpdateDetail{
 		"web": detailFixture()["web"],
 		"db":  {NewID: "sha256:" + strings.Repeat("b", 64)},
-	}}
-	c.inspectRaw = []byte(inspectFixtureJSON)
-	c.services = []string{"db", "web"}
-	m := inspectTestModel(t, c, c.services)
-	m.updateCache = map[string]updateEntry{m.updatesCacheKey(): {
-		fetchedAt: time.Now(),
-		results:   map[string]bool{"web": true, "db": true},
-	}}
+	}
 
 	m.svcCursor = 1 // web
 	m = inspectVisit(t, m)
-	if got := m.inspectDetail.NewID; got != detailFixture()["web"].NewID {
+	if got := m.inspectMemo.detail.NewID; got != detailFixture()["web"].NewID {
 		t.Fatalf("precondition: web's rows = %q, want the fixture's", got)
 	}
 	m = inspectLeave(t, m)
@@ -2398,39 +2345,10 @@ func TestInspectDetail_MemoIsPerService(t *testing.T) {
 	m.svcCursor = 0 // db, the same key and the same entry
 	m = inspectVisit(t, m)
 
-	if got, want := m.inspectDetail.NewID, c.details["db"].NewID; got != want {
+	if got, want := m.inspectMemo.detail.NewID, c.details["db"].NewID; got != want {
 		t.Errorf("db's update id = %q, want %q", got, want)
 	}
 	if !reflect.DeepEqual(c.detailsArgs, [][]string{{"web"}, {"db"}}) {
 		t.Errorf("UpdateDetails was asked for %v, want [[web] [db]]", c.detailsArgs)
 	}
-}
-
-// inspectVisit presses `i` and delivers both messages it chains: the document,
-// then whatever the document's arrival dispatched (a fetch or a memo replay).
-func inspectVisit(t *testing.T, m Model) Model {
-	t.Helper()
-	result, cmd := m.Update(keyMsgFor("i"))
-	if cmd == nil {
-		t.Fatal("i must dispatch the inspect fetch")
-	}
-	result, detailCmd := result.(Model).Update(cmd())
-	if detailCmd == nil {
-		t.Fatal("the document's arrival must chain the detail command")
-	}
-	return modelOf(result.(Model).Update(detailCmd()))
-}
-
-// inspectLeave presses esc and runs the reload the grouped path returns with it.
-func inspectLeave(t *testing.T, m Model) Model {
-	t.Helper()
-	result, cmd := m.Update(tea.KeyMsg{Type: tea.KeyEsc})
-	m = result.(Model)
-	if m.screen != screenSelectContainers {
-		t.Fatalf("esc left screen %d, want the container screen", m.screen)
-	}
-	if cmd != nil {
-		m = modelOf(m.Update(cmd()))
-	}
-	return m
 }
