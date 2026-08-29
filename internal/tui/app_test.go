@@ -12367,9 +12367,14 @@ func (c *readOnlyDetailComposer) UpdateDetails(ctx context.Context, services []s
 // is left is the path between them — the cache entry the inspect screen reads.
 // The false-verdict entry deliberately carries NO details, because that is the
 // shape refreshUpdates really writes.
+//
+// `built` is NOT in the verdict-following set. It describes the image the
+// container runs, so its own source is the image probe the inspect fetch makes
+// (TestInspectScreen_BuiltRowIgnoresTheVerdict); the cache entry only supplies
+// it as a fallback, which is what the true-verdict case below still reads.
 func TestInspectScreen_UpdateRowsFollowTheVerdict(t *testing.T) {
 	fetched := time.Now().Add(-3 * time.Minute)
-	detailRows := []string{"built", "update id", "update built"}
+	detailRows := []string{"update id", "update built"}
 
 	tests := []struct {
 		name     string
@@ -12395,16 +12400,18 @@ func TestInspectScreen_UpdateRowsFollowTheVerdict(t *testing.T) {
 			name:     "false verdict draws the verdict alone",
 			entry:    &updateEntry{fetchedAt: fetched, results: map[string]bool{"web": false}},
 			wantRows: []string{inspectRow("update", "up to date  (checked 3m ago)")},
-			skipRows: detailRows,
+			// `built` is absent because the message below carries no probed
+			// date either, not because the verdict is false.
+			skipRows: append([]string{"built"}, detailRows...),
 		},
 		{
 			name:     "no entry draws nothing",
-			skipRows: append([]string{"update"}, detailRows...),
+			skipRows: append([]string{"update", "built"}, detailRows...),
 		},
 		{
 			name:     "another service's verdict is not borrowed",
 			entry:    &updateEntry{fetchedAt: fetched, results: map[string]bool{"db": true}, details: detailFixtureFor("db")},
-			skipRows: append([]string{"update"}, detailRows...),
+			skipRows: append([]string{"update", "built"}, detailRows...),
 		},
 	}
 
@@ -16007,6 +16014,17 @@ var (
 	_ UpdateDetailer = (*compose.HostContainers)(nil)
 )
 
+// ImageInspector is reached the same way and fails the same silently: a drifted
+// signature costs no key, and the `built` row — which every container has, with
+// or without an update verdict — just stops appearing. All three composers must
+// implement it, because the row describes what the container runs rather than
+// what the registry offers.
+var (
+	_ ImageInspector = (*compose.Compose)(nil)
+	_ ImageInspector = (*compose.RemoteCompose)(nil)
+	_ ImageInspector = (*compose.HostContainers)(nil)
+)
+
 // TestHostContainers_CapabilityInterfaces pins both halves of the read-only
 // capability contract. The positive half is the compile-time assertion above;
 // the negative half must be a runtime check, because Go cannot express "does
@@ -16025,6 +16043,9 @@ func TestHostContainers_CapabilityInterfaces(t *testing.T) {
 	}
 	if _, ok := c.(UpdateDetailer); !ok {
 		t.Error("HostContainers must satisfy UpdateDetailer so U fills the inspect update rows")
+	}
+	if _, ok := c.(ImageInspector); !ok {
+		t.Error("HostContainers must satisfy ImageInspector so the built row works on the unmanaged screen")
 	}
 	if _, ok := c.(ConfigProvider); ok {
 		t.Error("HostContainers must NOT satisfy ConfigProvider; the c key has to gate itself")
@@ -16919,12 +16940,26 @@ type mockInspectComposer struct {
 	inspectErr     error
 	inspectCalls   int
 	inspectService string
+	// The ImageInspector half. The zero time is the common case: it draws no
+	// `built` row, so every test that predates the image probe reads exactly as
+	// it did.
+	imageCreated     time.Time
+	imageCreatedErr  error
+	imageCreatedRefs []string
 }
 
 func (m *mockInspectComposer) Inspect(ctx context.Context, service string) ([]byte, error) {
 	m.inspectCalls++
 	m.inspectService = service
 	return m.inspectRaw, m.inspectErr
+}
+
+func (m *mockInspectComposer) ImageCreated(ctx context.Context, image string) (time.Time, error) {
+	m.imageCreatedRefs = append(m.imageCreatedRefs, image)
+	if m.imageCreatedErr != nil {
+		return time.Time{}, m.imageCreatedErr
+	}
+	return m.imageCreated, nil
 }
 
 // inspectFixtureJSON is a minimal but structurally real `docker inspect`
@@ -17125,19 +17160,133 @@ func TestFetchInspect_PropagatesError(t *testing.T) {
 	}
 }
 
+// inspectOnlyComposer satisfies Inspector but NOT ImageInspector — the shape a
+// composer takes when it cannot answer the image half. The fetch must then
+// spend no probe and the document must render without a `built` row, which is
+// the same outcome a failed probe produces.
+type inspectOnlyComposer struct {
+	mockComposer
+	raw []byte
+}
+
+func (c *inspectOnlyComposer) Inspect(context.Context, string) ([]byte, error) {
+	return c.raw, nil
+}
+
+// TestFetchInspect_ProbesTheResolvedImage pins the second call the inspect
+// fetch makes: the image the container ACTUALLY runs, addressed by the ID
+// docker resolved the tag to, carried back on the same message.
+func TestFetchInspect_ProbesTheResolvedImage(t *testing.T) {
+	built := time.Date(2023, 11, 2, 13, 2, 50, 0, time.UTC)
+	mc := &mockInspectComposer{inspectRaw: []byte(inspectFixtureJSON), imageCreated: built}
+	m := Model{composer: mc, ctx: context.Background(), inspectService: "web", inspectSession: 3}
+
+	msg, ok := m.fetchInspect()().(inspectDataMsg)
+	if !ok {
+		t.Fatal("want inspectDataMsg")
+	}
+	if !msg.imageCreated.Equal(built) {
+		t.Errorf("imageCreated = %v, want %v", msg.imageCreated, built)
+	}
+	if len(mc.imageCreatedRefs) != 1 {
+		t.Fatalf("made %d image probes, want 1: %v", len(mc.imageCreatedRefs), mc.imageCreatedRefs)
+	}
+	// The resolved ID, not the tag: the tag can have been moved to a newer
+	// image since the container started.
+	if mc.imageCreatedRefs[0] != "sha256:0123456789abcdef" {
+		t.Errorf("probed %q, want the document's resolved image id", mc.imageCreatedRefs[0])
+	}
+	if string(msg.data) != inspectFixtureJSON {
+		t.Error("the probe must not disturb the raw bytes")
+	}
+}
+
+// TestFetchInspect_ProbeFailureIsDiscarded pins the non-fatal rule: the image
+// probe is an annotation, so its failure costs its own row and nothing else.
+func TestFetchInspect_ProbeFailureIsDiscarded(t *testing.T) {
+	mc := &mockInspectComposer{
+		inspectRaw:      []byte(inspectFixtureJSON),
+		imageCreatedErr: fmt.Errorf("No such image"),
+	}
+	m := Model{composer: mc, ctx: context.Background(), inspectService: "web"}
+
+	msg, ok := m.fetchInspect()().(inspectDataMsg)
+	if !ok {
+		t.Fatal("want inspectDataMsg")
+	}
+	if msg.err != nil {
+		t.Errorf("err = %v, want nil: a probe failure must never take the error slot", msg.err)
+	}
+	if !msg.imageCreated.IsZero() {
+		t.Errorf("imageCreated = %v, want the zero time", msg.imageCreated)
+	}
+	if string(msg.data) != inspectFixtureJSON {
+		t.Error("a failed probe must still deliver the container document")
+	}
+}
+
+// TestFetchInspect_WithoutAProberSpendsNoProbe: the capability is
+// type-asserted, so a composer that lacks it makes the second call not happen
+// rather than making the whole fetch fail.
+func TestFetchInspect_WithoutAProberSpendsNoProbe(t *testing.T) {
+	m := Model{
+		composer:       &inspectOnlyComposer{raw: []byte(inspectFixtureJSON)},
+		ctx:            context.Background(),
+		inspectService: "web",
+	}
+
+	msg, ok := m.fetchInspect()().(inspectDataMsg)
+	if !ok {
+		t.Fatal("want inspectDataMsg")
+	}
+	if msg.err != nil || !msg.imageCreated.IsZero() {
+		t.Errorf("msg = %+v, want the document with no build date and no error", msg)
+	}
+	if string(msg.data) != inspectFixtureJSON {
+		t.Error("the document must arrive unchanged")
+	}
+}
+
+// TestFetchInspect_UnreadableDocumentSpendsNoProbe: the probe needs an image
+// reference, and the only source of one is the document. A document the narrow
+// parser cannot read names nothing, so asking docker about it would be a
+// malformed call whose failure is discarded anyway.
+func TestFetchInspect_UnreadableDocumentSpendsNoProbe(t *testing.T) {
+	mc := &mockInspectComposer{inspectRaw: []byte("[]"), imageCreated: time.Now()}
+	m := Model{composer: mc, ctx: context.Background(), inspectService: "web"}
+
+	msg, ok := m.fetchInspect()().(inspectDataMsg)
+	if !ok {
+		t.Fatal("want inspectDataMsg")
+	}
+	if len(mc.imageCreatedRefs) != 0 {
+		t.Errorf("made %d image probes, want none: %v", len(mc.imageCreatedRefs), mc.imageCreatedRefs)
+	}
+	// The bytes still travel, so raw mode remains the escape hatch.
+	if string(msg.data) != "[]" {
+		t.Error("the raw bytes must reach the screen even when the parse fails")
+	}
+}
+
 // readOnlyInspectComposer is the read-only counterpart of mockInspectComposer:
 // the exact capability set of *compose.HostContainers, which is ReadOnlyComposer
-// + ExecProvider + Inspector (all three pinned against the real type by the
-// compile-time assertions above). The `i` key is the one container key that is
-// NOT gated on m.readOnly(), so this double is what proves the key reaches
-// enterInspect on the unmanaged screen.
+// + ExecProvider + Inspector + ImageInspector (all pinned against the real type
+// by the compile-time assertions above). The `i` key is the one container key
+// that is NOT gated on m.readOnly(), so this double is what proves the key
+// reaches enterInspect on the unmanaged screen — and the image probe behind the
+// `built` row is a READ, so it is live there too.
 type readOnlyInspectComposer struct {
 	readOnlyMockComposer
-	inspectRaw []byte
+	inspectRaw   []byte
+	imageCreated time.Time
 }
 
 func (m *readOnlyInspectComposer) Inspect(ctx context.Context, service string) ([]byte, error) {
 	return m.inspectRaw, nil
+}
+
+func (m *readOnlyInspectComposer) ImageCreated(ctx context.Context, image string) (time.Time, error) {
+	return m.imageCreated, nil
 }
 
 // inspectTestModel builds a container screen sitting on the given composer,
@@ -17272,9 +17421,11 @@ func TestInspectKey_SessionIsMonotonic(t *testing.T) {
 // TestInspectKey_EntersOnReadOnlyComposer pins the deliberate asymmetry: every
 // other container key added recently is gated on m.readOnly(), and i is not.
 func TestInspectKey_EntersOnReadOnlyComposer(t *testing.T) {
+	built := time.Date(2023, 11, 2, 13, 2, 50, 0, time.UTC)
 	mc := &readOnlyInspectComposer{
 		readOnlyMockComposer: *readOnlyTestComposer(),
 		inspectRaw:           []byte(inspectFixtureJSON),
+		imageCreated:         built,
 	}
 	m := inspectTestModel(t, mc, mc.services)
 
@@ -17290,6 +17441,14 @@ func TestInspectKey_EntersOnReadOnlyComposer(t *testing.T) {
 	}
 	if cmd == nil {
 		t.Fatal("enterInspect must return the fetch command on the read-only screen too")
+	}
+
+	// The image probe is a READ, so it runs here too: the unmanaged screen has
+	// no update verdict of its own until U is pressed, and the build date must
+	// not wait on one.
+	result, _ = got.Update(cmd())
+	if summary := result.(Model).inspectSummary; !strings.Contains(summary, inspectRow("built", "2023-11-02 13:02:50")) {
+		t.Errorf("the read-only screen must draw the build date too:\n%s", summary)
 	}
 }
 
@@ -17571,6 +17730,100 @@ func TestInspectScreen_ResizeRebuildsAndKeepsRaw(t *testing.T) {
 		if ansi.StringWidth(line) > 40 {
 			t.Errorf("rebuilt line exceeds the new width: %q", line)
 		}
+	}
+}
+
+// TestInspectScreen_BuiltRowIgnoresTheVerdict is the headline of the feature:
+// the `built` row is drawn for EVERY container, whatever the update check has
+// or has not said. It drives the whole path — the `i` key, the fetch Cmd, the
+// probe, the message, the render — with an up-to-date verdict in the cache and
+// NO details, the shape refreshUpdates really writes for a false verdict.
+func TestInspectScreen_BuiltRowIgnoresTheVerdict(t *testing.T) {
+	built := time.Date(2023, 11, 2, 13, 2, 50, 0, time.UTC)
+	mc := &mockInspectComposer{inspectRaw: []byte(inspectFixtureJSON), imageCreated: built}
+	mc.services = []string{"web"}
+	m := inspectTestModel(t, mc, mc.services)
+	m.updateCache = map[string]updateEntry{m.updatesCacheKey(): {
+		fetchedAt: time.Now().Add(-8 * time.Minute),
+		results:   map[string]bool{"web": false},
+	}}
+
+	result, cmd := m.Update(keyMsgFor("i"))
+	if cmd == nil {
+		t.Fatal("i should return the inspect fetch")
+	}
+	result, _ = result.(Model).Update(cmd())
+	got := result.(Model)
+
+	if got.inspectErr != nil {
+		t.Fatalf("inspectErr = %v, want nil", got.inspectErr)
+	}
+	if !strings.Contains(got.inspectSummary, inspectRow("built", "2023-11-02 13:02:50")) {
+		t.Errorf("an up-to-date container must still draw its build date:\n%s", got.inspectSummary)
+	}
+	if !strings.Contains(got.inspectSummary, "up to date") {
+		t.Errorf("precondition: the verdict row should still be drawn:\n%s", got.inspectSummary)
+	}
+	// The registry half stays verdict-driven, so nothing here may invent one.
+	for _, skip := range []string{"update id", "update built"} {
+		if strings.Contains(got.inspectSummary, skip) {
+			t.Errorf("summary must not contain %q:\n%s", skip, got.inspectSummary)
+		}
+	}
+}
+
+// TestInspectScreen_ProbeFailureKeepsTheDocument pins the failure half of the
+// same path: no row, no error line, everything else intact.
+func TestInspectScreen_ProbeFailureKeepsTheDocument(t *testing.T) {
+	mc := &mockInspectComposer{
+		inspectRaw:      []byte(inspectFixtureJSON),
+		imageCreatedErr: fmt.Errorf("Error: No such image"),
+	}
+	mc.services = []string{"web"}
+	m := inspectTestModel(t, mc, mc.services)
+
+	result, cmd := m.Update(keyMsgFor("i"))
+	result, _ = result.(Model).Update(cmd())
+	got := result.(Model)
+
+	if got.inspectErr != nil {
+		t.Fatalf("inspectErr = %v, want nil: a probe failure is discarded", got.inspectErr)
+	}
+	if strings.Contains(got.inspectSummary, "  built") {
+		t.Errorf("a failed probe must draw no build date:\n%s", got.inspectSummary)
+	}
+	for _, want := range []string{"STATE", "running", "IMAGE", "nginx:1.27", "sha256:0123456789abcdef"} {
+		if !strings.Contains(got.inspectSummary, want) {
+			t.Errorf("summary missing %q:\n%s", want, got.inspectSummary)
+		}
+	}
+	if view := got.viewInspect(); strings.Contains(view, "Error") {
+		t.Errorf("the screen must show no error line:\n%s", view)
+	}
+}
+
+// TestInspectScreen_ResizeKeepsTheBuiltRow: rebuildInspectSummary re-parses the
+// raw bytes, which cannot carry the image build date, so the resize path has to
+// merge it back from the Model. Without that the row vanishes on the first
+// resize and returns only on a re-entry.
+func TestInspectScreen_ResizeKeepsTheBuiltRow(t *testing.T) {
+	built := time.Date(2023, 11, 2, 13, 2, 50, 0, time.UTC)
+	m := inspectScreenModel(t)
+	result, _ := m.Update(inspectDataMsg{
+		data:         []byte(inspectFixtureJSON),
+		imageCreated: built,
+		session:      m.inspectSession,
+	})
+	got := result.(Model)
+	row := inspectRow("built", "2023-11-02 13:02:50")
+	if !strings.Contains(got.inspectSummary, row) {
+		t.Fatalf("precondition: the summary should carry the built row:\n%s", got.inspectSummary)
+	}
+
+	result, _ = got.Update(tea.WindowSizeMsg{Width: 100, Height: 30})
+	resized := result.(Model)
+	if !strings.Contains(resized.inspectSummary, row) {
+		t.Errorf("the resize dropped the built row:\n%s", resized.inspectSummary)
 	}
 }
 

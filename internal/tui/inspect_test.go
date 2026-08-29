@@ -745,7 +745,12 @@ func TestBuildInspectSummary_UpdateRows(t *testing.T) {
 	fullDetail := compose.UpdateDetail{LocalCreated: localBuilt, NewID: newID, NewCreated: newBuilt}
 
 	tests := []struct {
-		name     string
+		name string
+		// docBuilt is the image build date the inspect fetch probed. It is the
+		// FIRST source of the `built` row; upd.detail.LocalCreated is only the
+		// fallback, so most rows here leave it zero to keep pinning the
+		// fallback path.
+		docBuilt time.Time
 		upd      inspectUpdateInfo
 		wantRows []string
 		skipRows []string
@@ -766,7 +771,10 @@ func TestBuildInspectSummary_UpdateRows(t *testing.T) {
 			},
 		},
 		{
-			name: "up to date draws the verdict alone",
+			// `built` is absent here because NEITHER source has it — not
+			// because the verdict is false. The next case is the one that says
+			// so: an up-to-date container draws its own build date.
+			name: "up to date with no build date anywhere draws the verdict alone",
 			upd: inspectUpdateInfo{
 				now:       now,
 				verdict:   &no,
@@ -776,9 +784,31 @@ func TestBuildInspectSummary_UpdateRows(t *testing.T) {
 			skipRows: []string{"built", "update id"},
 		},
 		{
-			name:     "no verdict draws nothing",
+			name:     "up to date still draws the document's build date",
+			docBuilt: localBuilt,
+			upd: inspectUpdateInfo{
+				now:       now,
+				verdict:   &no,
+				checkedAt: now.Add(-90 * time.Minute),
+			},
+			wantRows: []string{
+				inspectRow("built", "2026-07-07 17:47:22  (47d ago)"),
+				inspectRow("update", "up to date  (checked 1h ago)"),
+			},
+			// The registry half stays verdict-driven; only `built` left it.
+			skipRows: []string{"update id", "update built"},
+		},
+		{
+			name:     "no verdict and no probe draws nothing",
 			upd:      inspectUpdateInfo{now: now},
 			skipRows: []string{"built", "update", "update id", "update built"},
+		},
+		{
+			name:     "the document's build date needs no verdict at all",
+			docBuilt: localBuilt,
+			upd:      inspectUpdateInfo{now: now},
+			wantRows: []string{inspectRow("built", "2026-07-07 17:47:22  (47d ago)")},
+			skipRows: []string{"update", "update id", "update built"},
 		},
 		{
 			name: "a detail without a verdict still draws its own rows",
@@ -814,7 +844,9 @@ func TestBuildInspectSummary_UpdateRows(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			out := buildInspectSummary(updateRowsDoc(), 120, tt.upd)
+			doc := updateRowsDoc()
+			doc.ImageCreated = tt.docBuilt
+			out := buildInspectSummary(doc, 120, tt.upd)
 			for _, want := range tt.wantRows {
 				if !strings.Contains(out, want) {
 					t.Errorf("summary missing %q:\n%s", want, out)
@@ -824,6 +856,68 @@ func TestBuildInspectSummary_UpdateRows(t *testing.T) {
 				if strings.Contains(out, skip) {
 					t.Errorf("summary must not contain %q:\n%s", skip, out)
 				}
+			}
+		})
+	}
+}
+
+// TestBuildInspectSummary_BuiltRowSource pins the one row with two possible
+// sources. The DOCUMENT wins, the update detail is the fallback, and the row is
+// drawn exactly ONCE whichever supplied it — the doc's value is the image probe
+// the inspect fetch itself makes, so it is present for every container, while
+// the detail only exists for a service whose update verdict came back true.
+func TestBuildInspectSummary_BuiltRowSource(t *testing.T) {
+	now := time.Date(2026, 8, 23, 19, 0, 0, 0, time.UTC)
+	fromDoc := time.Date(2026, 7, 7, 17, 47, 22, 0, time.UTC)
+	fromDetail := time.Date(2025, 1, 2, 3, 4, 5, 0, time.UTC)
+
+	tests := []struct {
+		name     string
+		docBuilt time.Time
+		detail   compose.UpdateDetail
+		wantRow  string
+	}{
+		{
+			name:     "the document alone",
+			docBuilt: fromDoc,
+			wantRow:  inspectRow("built", "2026-07-07 17:47:22  (47d ago)"),
+		},
+		{
+			// A composer that is not an ImageInspector, or a probe that failed,
+			// with an update-detail batch that already resolved the same value
+			// from the same command.
+			name:    "the detail is the fallback",
+			detail:  compose.UpdateDetail{LocalCreated: fromDetail},
+			wantRow: inspectRow("built", "2025-01-02 03:04:05  (598d ago)"),
+		},
+		{
+			name:     "the document wins and the row is drawn once",
+			docBuilt: fromDoc,
+			detail:   compose.UpdateDetail{LocalCreated: fromDetail},
+			wantRow:  inspectRow("built", "2026-07-07 17:47:22  (47d ago)"),
+		},
+		{
+			name: "neither source draws no row",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			doc := updateRowsDoc()
+			doc.ImageCreated = tt.docBuilt
+			out := buildInspectSummary(doc, 120, inspectUpdateInfo{now: now, detail: tt.detail})
+
+			// Two spaces before the label, so the "update built" row below is
+			// not counted: the point of the case is that ONE row is drawn.
+			want := 1
+			if tt.wantRow == "" {
+				want = 0
+			}
+			if got := strings.Count(out, "  built"); got != want {
+				t.Fatalf("summary carries %d `built` rows, want %d:\n%s", got, want, out)
+			}
+			if tt.wantRow != "" && !strings.Contains(out, tt.wantRow) {
+				t.Errorf("summary missing %q:\n%s", tt.wantRow, out)
 			}
 		})
 	}

@@ -8,6 +8,7 @@ import (
 	"os/exec"
 	"regexp"
 	"strings"
+	"time"
 )
 
 // Update-detection parsers and helpers.
@@ -375,6 +376,18 @@ func (c *Compose) UpdateDetails(ctx context.Context, services []string) (map[str
 		return nil, err
 	}
 	return scanUpdateDetails(ctx, filterServices(images, services), localDockerRunner{c: c})
+}
+
+// ImageCreated returns the local build time of one image reference. It
+// satisfies the TUI-declared tui.ImageInspector, which the inspect screen
+// type-asserts to fill the InspectDoc.ImageCreated the `built` row draws.
+//
+// Deliberately NOT part of UpdateDetails: that batch runs only for services
+// whose update verdict is true, while the `built` row describes what the
+// container runs and must appear for every container — grouped mode, the
+// read-only unmanaged screen and a cold update cache included.
+func (c *Compose) ImageCreated(ctx context.Context, image string) (time.Time, error) {
+	return fetchImageCreated(ctx, localDockerRunner{c: c}, image)
 }
 
 // imageComparer is the per-image verdict function scanImageUpdates folds into

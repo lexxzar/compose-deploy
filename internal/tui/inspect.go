@@ -289,15 +289,24 @@ func inspectHealthSection(b *inspectBuilder, doc compose.InspectDoc) {
 }
 
 // inspectImageSection renders what the container actually runs: the ref the
-// compose file asked for, the local image ID docker resolved it to, and the
-// command pair. The image ID is the row that answers "did my deploy take?" — a
-// stale container keeps the old image ID under an unchanged tag.
+// compose file asked for, the local image ID docker resolved it to, when that
+// image was built, and the command pair. The image ID is the row that answers
+// "did my deploy take?" — a stale container keeps the old image ID under an
+// unchanged tag.
 //
-// The four update rows sit BETWEEN the image ID and the command pair, so the
-// two ids and the two build dates read as one block: "image id" against
-// "update id", "built" against "update built". Each row is omitted on its own,
-// and the section's presence gate is unchanged — an update verdict describes
-// the image, so a doc with no image at all still has nothing to say.
+// `built` and the three update rows sit BETWEEN the image ID and the command
+// pair, so the two ids and the two build dates read as one block: "image id"
+// against "update id", "built" against "update built". Each row is omitted on
+// its own, and the section's presence gate is unchanged — an update verdict
+// describes the image, so a doc with no image at all still has nothing to say.
+//
+// `built` is the one row with TWO possible sources, and the DOCUMENT WINS. It
+// comes from the image probe the inspect fetch itself makes, so it is present
+// for every container; upd.detail.LocalCreated is the fallback, for a composer
+// that is not an ImageInspector or a probe that failed while the update-detail
+// batch had already resolved the same value from the same command. Both are the
+// `Created` field of one `docker image inspect`, so they cannot disagree about
+// anything but freshness — and the row is drawn ONCE either way.
 func inspectImageSection(b *inspectBuilder, doc compose.InspectDoc, upd inspectUpdateInfo) {
 	cmd := strings.Join(doc.Config.Cmd, " ")
 	entrypoint := strings.Join(doc.Config.Entrypoint, " ")
@@ -312,7 +321,7 @@ func inspectImageSection(b *inspectBuilder, doc compose.InspectDoc, upd inspectU
 	if doc.Image != "" {
 		b.kv("image id", doc.Image)
 	}
-	if built := formatTimeWithAge(upd.detail.LocalCreated, upd.now); built != "" {
+	if built := formatTimeWithAge(imageBuiltAt(doc, upd), upd.now); built != "" {
 		b.kv("built", built)
 	}
 	if upd.verdict != nil {
@@ -330,6 +339,16 @@ func inspectImageSection(b *inspectBuilder, doc compose.InspectDoc, upd inspectU
 	if entrypoint != "" {
 		b.kv("entrypoint", entrypoint)
 	}
+}
+
+// imageBuiltAt picks the source of the `built` row: the container document's
+// own probe first, the update detail only when that is absent. See
+// inspectImageSection for why the document wins.
+func imageBuiltAt(doc compose.InspectDoc, upd inspectUpdateInfo) time.Time {
+	if !doc.ImageCreated.IsZero() {
+		return doc.ImageCreated
+	}
+	return upd.detail.LocalCreated
 }
 
 // formatUpdateVerdict renders the "update" row's value: the verdict, plus how
