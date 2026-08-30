@@ -50,7 +50,8 @@ type ServiceStats struct {
 	MemoryLimit int64   // bytes; whatever Docker reports (often host memory if no explicit limit)
 }
 
-// Composer is the interface consumed by the runner, implemented by compose.Compose.
+// Composer is the interface consumed by the runner, implemented by compose.Compose,
+// compose.RemoteCompose and compose.HostContainers.
 type Composer interface {
 	Stop(ctx context.Context, containers []string, w io.Writer) error
 	Remove(ctx context.Context, containers []string, w io.Writer) error
