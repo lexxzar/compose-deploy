@@ -2768,8 +2768,16 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 				return m, nil
 			}
 			if entry.kind == entrySvcGroupHeader {
-				m.toggleGroupFold(entry.groupIdx)
-				return m, nil
+				// A deliberate UNFOLD is a request to look at the group, so it
+				// earns a cache-first update scan for that group alone. Folding
+				// returns false and fetches nothing. Hoisted out of the return:
+				// the helper has a pointer receiver and mutates the same m the
+				// return carries.
+				if !m.toggleGroupFold(entry.groupIdx) {
+					return m, nil
+				}
+				cmd := m.groupUnfoldUpdatesCmd(entry.groupIdx)
+				return m, cmd
 			}
 			// An unmanaged container has no compose project to operate on, so
 			// its row draws no checkbox and space must not fill one in.
@@ -2796,9 +2804,18 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 				return m, nil
 			}
 			// Directional, not a toggle: left only ever folds, right only ever
-			// unfolds, so a held key settles instead of oscillating.
-			m.foldGroupAt(gi, key == "left")
-			return m, nil
+			// unfolds, so a held key settles instead of oscillating. That is
+			// also what makes the unfold update scan directional for free: ←
+			// passes folded == true and can never report an unfold, and a → on
+			// an already open group changes nothing and reports none.
+			//
+			// Hoisted out of the return: the helper has a pointer receiver and
+			// mutates the same m the return carries.
+			if !m.foldGroupAt(gi, key == "left") {
+				return m, nil
+			}
+			cmd := m.groupUnfoldUpdatesCmd(gi)
+			return m, cmd
 		case "z":
 			// One key with the shape `a` already uses for the selection: any
 			// group still open means fold everything, otherwise unfold.
@@ -5878,10 +5895,19 @@ func (m Model) groupedUpdatesErr() string {
 // results map is nil), so cached failures show as blank glyphs alongside
 // the updatesErr warning.
 func (m Model) updatesCacheLookup() (updateEntry, bool) {
+	return m.updatesCacheLookupFor(m.updatesCacheKey())
+}
+
+// updatesCacheLookupFor is updatesCacheLookup for a key the Model is not
+// currently pointed at — the grouped host view's unfold scan needs one, the way
+// projUpdatesCacheKey is the addressed twin of updatesCacheKey. The two-TTL rule
+// lives here alone, so the addressed reader cannot drift from the current-context
+// one.
+func (m Model) updatesCacheLookupFor(key string) (updateEntry, bool) {
 	if m.updateCache == nil {
 		return updateEntry{}, false
 	}
-	entry, ok := m.updateCache[m.updatesCacheKey()]
+	entry, ok := m.updateCache[key]
 	if !ok {
 		return updateEntry{}, false
 	}
@@ -5986,6 +6012,85 @@ func (m *Model) maybeRefreshUpdatesCmd() tea.Cmd {
 	}
 	m.updateInFlight = true
 	return m.refreshUpdates()
+}
+
+// groupUnfoldUpdatesCmd answers a DELIBERATE unfold of one group in the host
+// view: a cache-first update scan for that group and nothing else.
+//
+// It is a SIBLING of maybeRefreshUpdatesCmd rather than a widening of it.
+// That helper reads updatesCacheKey() and m.composer — the current context's
+// key, degenerate in grouped mode, and the composer grouped mode holds as nil
+// by design. Parameterising both would make its three automatic callers
+// (containerFetchBatch, the statusMsg self-heal, Init()) each responsible for
+// refusing in grouped mode, turning one structural refusal into three that hold
+// only by argument.
+//
+// The trigger deliberately bypasses autoUpdatesAllowed(). That predicate asks
+// whether a scan may fire for the CURRENT context with no target named; this
+// call names its target.
+//
+// The guard order below IS the specification:
+//
+//  1. grouped only — defensive, both call sites are already gated;
+//  2. the group must exist;
+//  3. the unmanaged bucket is refused SILENTLY — its cost is unbounded (every
+//     leftover container on the host is a distinct image) and unfolding it is an
+//     ordinary display action, so a warning would refuse nothing the user asked
+//     for. U keeps its manual behaviour there;
+//  4. a group with no compose directory is refused SILENTLY, and ABOVE the bind:
+//     bindProjComposer raises warnNoComposeDir, which a key pressed only to look
+//     at rows must not do;
+//  5. the cache FIRST — a fresh entry costs zero network. A success replays that
+//     ONE group's verdicts (hydrateUpdatesFor, never hydrateGroupedUpdates, which
+//     would touch every other group's column); a failure re-derives the soft
+//     warning from the visible groups;
+//  6. only THEN the in-flight guard, inverting maybeRefreshUpdatesCmd's
+//     guard-then-lookup order: a cache hit refuses nothing, so it must not warn.
+//     The warning re-spends the footer row settleFold just re-clamped with
+//     m.warning == "", which is why the re-clamp follows it;
+//  7. bind, read out, unbind in the SAME keystroke — the rule U already follows,
+//     so grouped mode never holds one project's composer while the cursor sits on
+//     another's row;
+//  8. the key is captured at DISPATCH and travels on updatesMsg.forKey.
+//
+// No detail batch follows: detailsCmdFor refuses in grouped mode, so
+// detailsInFlight is untouched here.
+func (m *Model) groupUnfoldUpdatesCmd(gi int) tea.Cmd {
+	if !m.grouped {
+		return nil
+	}
+	if gi < 0 || gi >= len(m.svcGroups) {
+		return nil
+	}
+	g := m.svcGroups[gi]
+	if g.proj.Unmanaged {
+		return nil
+	}
+	if !m.operableProject(g.proj) {
+		return nil
+	}
+	key := m.projUpdatesCacheKey(g.proj)
+	if entry, fresh := m.updatesCacheLookupFor(key); fresh {
+		if entry.err {
+			m.syncGroupedUpdatesErr()
+			return nil
+		}
+		m.hydrateUpdatesFor(g.proj.Name, entry.results)
+		return nil
+	}
+	if m.updateInFlight {
+		m.warning = warnUpdateScanBusy
+		m.fixSvcOffset()
+		return nil
+	}
+	if !m.bindProjComposer(g.proj) {
+		m.unbindGroupedComposer()
+		return nil
+	}
+	c := m.composer
+	m.unbindGroupedComposer()
+	m.updateInFlight = true
+	return m.refreshUpdatesFor(c, key)
 }
 
 // autoUpdatesAllowed reports whether the update check may fire on its own.
@@ -6932,24 +7037,34 @@ func (m *Model) setAllFolded(folded bool) {
 // they land on an already-folded (already-open) group routinely, and re-aiming
 // the cursor at the header there would move it for a keypress that did not
 // change the screen.
-func (m *Model) foldGroupAt(gi int, folded bool) {
+//
+// It reports whether the call OPENED the group, which is what makes the
+// deliberate-unfold update scan structural rather than a guard every caller has
+// to remember: only space-on-a-header and → reach this function, while every
+// path that must stay inert (z, the landing fold, the drill-out restore, the
+// search unfold) writes the fold flags without it. A no-op — out of range, or
+// the requested state already in place — reports false, so a → on an already
+// open group and a fold in either direction fetch nothing.
+func (m *Model) foldGroupAt(gi int, folded bool) (unfolded bool) {
 	if gi < 0 || gi >= len(m.svcGroups) || m.svcGroups[gi].folded == folded {
 		m.fixSvcOffset()
-		return
+		return false
 	}
 	m.svcGroups[gi].folded = folded
 	m.settleFold(gi)
+	return !folded
 }
 
-// toggleGroupFold flips one group's fold state. It exists so no caller has to
-// index svcGroups to read the current state and hand back its negation, which
-// would put an unguarded lookup in front of foldGroupAt's own bounds check.
-func (m *Model) toggleGroupFold(gi int) {
+// toggleGroupFold flips one group's fold state and reports whether that OPENED
+// it. It exists so no caller has to index svcGroups to read the current state
+// and hand back its negation, which would put an unguarded lookup in front of
+// foldGroupAt's own bounds check.
+func (m *Model) toggleGroupFold(gi int) (unfolded bool) {
 	if gi < 0 || gi >= len(m.svcGroups) {
 		m.fixSvcOffset()
-		return
+		return false
 	}
-	m.foldGroupAt(gi, !m.svcGroups[gi].folded)
+	return m.foldGroupAt(gi, !m.svcGroups[gi].folded)
 }
 
 // foldAllGroups writes one fold state across every group and settles the rows,
