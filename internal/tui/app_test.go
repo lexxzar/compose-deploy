@@ -12206,6 +12206,97 @@ func TestUpdateDetails_FetchCarriesADeadline(t *testing.T) {
 	}
 }
 
+// updatesDeadlineComposer records the deadline on the ctx CheckUpdates was
+// handed, and answers whatever the embedded double holds. Local to the two
+// scan-timeout pins so the shared mockComposer stays as it is.
+type updatesDeadlineComposer struct {
+	mockComposer
+	deadlines []time.Time
+}
+
+func (c *updatesDeadlineComposer) CheckUpdates(ctx context.Context, services []string) (map[string]bool, error) {
+	d, _ := ctx.Deadline()
+	c.deadlines = append(c.deadlines, d)
+	return c.updates, c.updatesErr
+}
+
+// TestRefreshUpdates_FetchCarriesADeadline: updateInFlight refuses every other
+// scan — automatic and U alike — until the updatesMsg arrival clears it, and
+// m.ctx lives for the whole program with no dockerRunner adding a deadline of
+// its own. Without this bound one hung registry call leaves the user with no
+// way to force a rescan from the screen they are on.
+func TestRefreshUpdates_FetchCarriesADeadline(t *testing.T) {
+	mc := &updatesDeadlineComposer{}
+	mc.updates = map[string]bool{"web": true}
+	m := NewModel(mc, io.Discard, mockFactory(&mc.mockComposer), nil, nil)
+	m.composer = mc
+
+	cmd := m.refreshUpdatesFor(mc, m.updatesCacheKey())
+	before := time.Now()
+	cmd()
+
+	if len(mc.deadlines) != 1 {
+		t.Fatalf("CheckUpdates calls = %d, want exactly 1", len(mc.deadlines))
+	}
+	if mc.deadlines[0].IsZero() {
+		t.Fatal("the ctx handed to CheckUpdates carries no deadline — a stalled scan pins updateInFlight and U is swallowed by that same guard")
+	}
+	// Within a second of the constant, so a hand-rolled window that happens to
+	// be non-zero does not pass for the one the design bounds the scan with.
+	if got := mc.deadlines[0].Sub(before); got > updatesScanTimeout+time.Second || got < updatesScanTimeout-time.Second {
+		t.Errorf("deadline is %v out, want updatesScanTimeout (%v)", got, updatesScanTimeout)
+	}
+}
+
+// updatesExpiryComposer is the shape an EXPIRED scan really returns:
+// scanImageUpdates has no ctx.Err() check, and a killed child's stderr matches
+// neither cascade classifier, so CheckUpdates hands back a PARTIAL map beside a
+// NIL error.
+type updatesExpiryComposer struct{ mockComposer }
+
+func (c *updatesExpiryComposer) CheckUpdates(ctx context.Context, services []string) (map[string]bool, error) {
+	return map[string]bool{"web": true}, nil
+}
+
+// TestRefreshUpdates_ExpiryBecomesAnError: without the synthesis the timeout
+// makes things WORSE than the stall it bounds — the partial map lands as a
+// SUCCESS entry, cached for the full 10-minute updatesCacheTTL with verdicts
+// silently missing, no warning on screen and nothing queued to refill it.
+func TestRefreshUpdates_ExpiryBecomesAnError(t *testing.T) {
+	mc := &updatesExpiryComposer{}
+	m := NewModel(mc, io.Discard, mockFactory(&mc.mockComposer), nil, nil)
+	m.composer = mc
+	m.screen = screenSelectContainers
+	// An already-expired parent, so the fetch ctx is Done the moment
+	// context.WithTimeout derives it — the 90-second wait in one step.
+	expired, cancel := context.WithDeadline(context.Background(), time.Now().Add(-time.Second))
+	defer cancel()
+	m.ctx = expired
+
+	key := m.updatesCacheKey()
+	msg, ok := m.refreshUpdatesFor(mc, key)().(updatesMsg)
+	if !ok {
+		t.Fatal("refreshUpdatesFor returned no updatesMsg")
+	}
+	if msg.err == nil {
+		t.Fatal("an expired scan reported no error — the partial map would cache as a success for the full updatesCacheTTL")
+	}
+	if !strings.Contains(msg.err.Error(), updatesScanTimeout.String()) {
+		t.Errorf("err = %q, want the timeout named in it (%s)", msg.err, updatesScanTimeout)
+	}
+
+	// And it must take the handler's ERROR branch, so the entry expires on the
+	// 30-second updatesErrorTTL rather than the 10-minute success one.
+	model, _ := m.Update(msg)
+	entry, cached := model.(Model).updateCache[key]
+	if !cached || !entry.err {
+		t.Fatalf("cached entry = %+v (cached=%v), want an err entry on the short TTL", entry, cached)
+	}
+	if model.(Model).updatesErr == "" {
+		t.Error("the soft warning slot stayed empty — the expiry is silent")
+	}
+}
+
 // TestUpdatesMsg_StaleSessionDoesNotWriteTheEntry: the cache write is gated by
 // the session check, so a response from a previous project or server context
 // cannot pollute the new context's entry.

@@ -50,6 +50,29 @@ const updatesCacheTTL = 10 * time.Minute
 // session resets and U keypress just like success entries.
 const updatesErrorTTL = 30 * time.Second
 
+// updatesScanTimeout bounds ONE CheckUpdates verdict scan, for the reason
+// updateDetailsTimeout and groupedStatsTimeout carry their own bounds: m.ctx
+// lives for the whole program and no dockerRunner adds a deadline of its own,
+// so one hung registry call pins m.updateInFlight until the user navigates to
+// a site that resets it — and U, the one key that would force a rescan, is
+// swallowed by that very guard.
+//
+// An expiry does NOT degrade on its own, which is why refreshUpdatesFor
+// synthesises an error out of it: scanImageUpdates has no ctx.Err() check
+// (unlike scanUpdateDetails), and a killed child's stderr matches neither
+// looksLikeNetworkErr nor looksLikeLocalDaemonErr, so CheckUpdates would
+// return a PARTIAL map with a NIL error — a success entry cached for the full
+// updatesCacheTTL with verdicts silently missing and no warning. The
+// synthesised error takes the 30-second updatesErrorTTL instead.
+//
+// The scan is serial and memoised per distinct image, at one local inspect
+// plus one or two registry round-trips each; 20+ services over SSH measures at
+// 10s+, so 90s clears roughly 60 distinct images. It sits above
+// groupedStatsTimeout (30s, one local call) and below updateDetailsTimeout
+// (3m, a strictly more expensive phase), and the user is blocked for the whole
+// window because updateInFlight refuses every other scan.
+const updatesScanTimeout = 90 * time.Second
+
 // updateDetailsTimeout bounds ONE inspect-detail batch.
 //
 // m.detailsInFlight is a GLOBAL one-batch guard whose only clear is the
@@ -5507,7 +5530,17 @@ func (m Model) refreshUpdatesFor(c runner.Composer, key string) tea.Cmd {
 	ctx := m.ctx
 	session := m.updatesSession
 	return func() tea.Msg {
-		results, err := c.CheckUpdates(ctx, nil)
+		fetchCtx, cancel := context.WithTimeout(ctx, updatesScanTimeout)
+		defer cancel()
+		results, err := c.CheckUpdates(fetchCtx, nil)
+		// An expiry arrives here as a nil error beside a partial map — see
+		// updatesScanTimeout — so it is synthesised into a real one. Without
+		// it the timeout makes things WORSE than the stall it bounds: the hole
+		// would be cached as a success for the full updatesCacheTTL, with no
+		// warning and nothing queued to refill it.
+		if err == nil && fetchCtx.Err() != nil {
+			err = fmt.Errorf("update check timed out after %s", updatesScanTimeout)
+		}
 		return updatesMsg{results: results, err: err, session: session, forKey: key}
 	}
 }
