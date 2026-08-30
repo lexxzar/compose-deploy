@@ -12214,7 +12214,11 @@ type updatesDeadlineComposer struct {
 	deadlines []time.Time
 }
 
+// The override still counts the call — detailRecorder keeps detailsDeadlines
+// beside detailsCalls for the same reason. Without the increment this double
+// reports zero to every call-count assertion in the package.
 func (c *updatesDeadlineComposer) CheckUpdates(ctx context.Context, services []string) (map[string]bool, error) {
+	c.updatesCalls++
 	d, _ := ctx.Deadline()
 	c.deadlines = append(c.deadlines, d)
 	return c.updates, c.updatesErr

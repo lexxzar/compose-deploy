@@ -1384,12 +1384,13 @@ func groupedScreenModel(groups ...svcGroup) Model {
 	return m
 }
 
-// pressGroupKey drives one key through Update. It is the string-keyed sibling
-// of pressKey (help_test.go) and delegates to keyMsgFor, so the package keeps
-// ONE table mapping a key name to the tea.KeyMsg a terminal would send.
+// pressGroupKey drives one key through Update and discards the Cmd. It is the
+// string-keyed sibling of pressKey (help_test.go) and the Cmd-discarding half of
+// pressFoldKey, so the package keeps ONE table mapping a key name to the
+// tea.KeyMsg a terminal would send.
 func pressGroupKey(m Model, key string) Model {
-	updated, _ := m.Update(keyMsgFor(key))
-	return updated.(Model)
+	m, _ = pressFoldKey(m, key)
+	return m
 }
 
 // TestGroupedPageKeys_PageOverHeaderRows pins pgup/pgdown in the host view: a
@@ -4720,31 +4721,41 @@ func groupedUpdatesModel(t *testing.T) (Model, map[string]*mockComposer) {
 	}), per
 }
 
-// pressU drives the U key and runs the Cmd it returns, delivering the resulting
-// updatesMsg. It returns the model after the scan has landed.
-func pressU(t *testing.T, m Model) Model {
+// runScan runs the Cmd an update trigger produced, asserts the in-flight guard
+// is raised and grouped mode holds no composer while the fetch is out, and
+// delivers the arrival. Both grouped triggers dispatch through the same
+// scanGroupCmd tail, so both are driven through this one body.
+func runScan(t *testing.T, m Model, cmd tea.Cmd) Model {
 	t.Helper()
-	updated, cmd := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'U'}})
-	m = updated.(Model)
 	if cmd == nil {
-		t.Fatal("U produced no scan command")
+		t.Fatal("the trigger produced no scan command")
 	}
 	if !m.updateInFlight {
-		t.Error("U must raise updateInFlight before the fetch returns")
+		t.Error("the scan must raise updateInFlight before the fetch returns")
 	}
 	if m.grouped && m.composer != nil {
-		t.Error("grouped mode must not stay holding the composer U bound")
+		t.Error("grouped mode must not stay holding the composer the scan bound")
 	}
 	msg, ok := cmd().(updatesMsg)
 	if !ok {
-		t.Fatalf("U's command produced %T, want updatesMsg", cmd())
+		t.Fatalf("the scan command produced %T, want updatesMsg", cmd())
 	}
-	updated, _ = m.Update(msg)
+	updated, _ := m.Update(msg)
 	m = updated.(Model)
 	if m.updateInFlight {
 		t.Error("the arrival must clear updateInFlight")
 	}
+	if m.grouped && m.composer != nil {
+		t.Error("the arrival must leave grouped mode holding no composer")
+	}
 	return m
+}
+
+// pressU drives the U key and runs the scan it returns.
+func pressU(t *testing.T, m Model) Model {
+	t.Helper()
+	m, cmd := pressFoldKey(m, "U")
+	return runScan(t, m, cmd)
 }
 
 // U scans ONE group — the cursor row's — through that group's own composer, and
@@ -7463,34 +7474,6 @@ func foldGroupByHand(m *Model, gi int) {
 	m.svcEntries = rebuildSvcEntries(m.svcGroups)
 }
 
-// runUnfoldScan runs the Cmd an unfold produced, asserts the guard is raised and
-// the composer unbound while it is out, and delivers the arrival.
-func runUnfoldScan(t *testing.T, m Model, cmd tea.Cmd) Model {
-	t.Helper()
-	if cmd == nil {
-		t.Fatal("a deliberate unfold produced no scan command")
-	}
-	if !m.updateInFlight {
-		t.Error("the unfold scan must raise updateInFlight before the fetch returns")
-	}
-	if m.composer != nil {
-		t.Error("grouped mode must not stay holding the composer the unfold bound")
-	}
-	msg, ok := cmd().(updatesMsg)
-	if !ok {
-		t.Fatalf("the unfold command produced %T, want updatesMsg", cmd())
-	}
-	updated, _ := m.Update(msg)
-	m = updated.(Model)
-	if m.updateInFlight {
-		t.Error("the arrival must clear updateInFlight")
-	}
-	if m.composer != nil {
-		t.Error("the arrival must leave grouped mode holding no composer")
-	}
-	return m
-}
-
 // assertScannedOnly names the ONE project whose composer may have seen
 // CheckUpdates; every other composer in the map must have seen none.
 func assertScannedOnly(t *testing.T, per map[string]*mockComposer, want string) {
@@ -7506,11 +7489,18 @@ func assertScannedOnly(t *testing.T, per map[string]*mockComposer, want string) 
 	}
 }
 
+// assertNoScans is assertScannedOnly with no project named: nothing on the host
+// may have reached the registry.
+func assertNoScans(t *testing.T, per map[string]*mockComposer) {
+	t.Helper()
+	assertScannedOnly(t, per, "")
+}
+
 // space on a group header is a deliberate unfold, so it scans that group — and
 // only that group. The fold direction of the same key fetches nothing.
 func TestGroupedUnfold_SpaceScansThatGroupOnly(t *testing.T) {
 	m, per := groupedUpdatesModel(t)
-	m.svcCursor = 2 // the shop header
+	m.svcCursor = headerIndexFor(t, m.svcEntries, 1) // shop
 
 	// Fold first: space toggles, and the fold direction must be silent.
 	m, cmd := pressFoldKey(m, " ")
@@ -7520,17 +7510,17 @@ func TestGroupedUnfold_SpaceScansThatGroupOnly(t *testing.T) {
 	if cmd != nil {
 		t.Fatal("folding must produce no command")
 	}
-	assertScannedOnly(t, per, "")
+	assertNoScans(t, per)
 
 	// settleFold aims the cursor at the folded group's own header.
-	if m.svcCursor != 2 {
-		t.Fatalf("cursor = %d, want the shop header at 2", m.svcCursor)
+	if want := headerIndexFor(t, m.svcEntries, 1); m.svcCursor != want {
+		t.Fatalf("cursor = %d, want the shop header at %d", m.svcCursor, want)
 	}
 	m, cmd = pressFoldKey(m, " ")
 	if m.svcGroups[1].folded {
 		t.Fatal("the second space did not unfold shop")
 	}
-	m = runUnfoldScan(t, m, cmd)
+	m = runScan(t, m, cmd)
 
 	assertScannedOnly(t, per, "shop")
 
@@ -7556,18 +7546,19 @@ func TestGroupedUnfold_SpaceScansThatGroupOnly(t *testing.T) {
 func TestGroupedUnfold_RightArrowScansThatGroupOnly(t *testing.T) {
 	m, per := groupedUpdatesModel(t)
 	foldGroupByHand(&m, 1) // shop
-	m.svcCursor = 2        // the shop header, the only shop row left
+	// The header is the only shop row left while the group is closed.
+	m.svcCursor = headerIndexFor(t, m.svcEntries, 1)
 
 	m, cmd := pressFoldKey(m, "right")
 	if m.svcGroups[1].folded {
 		t.Fatal("right did not unfold shop")
 	}
-	m = runUnfoldScan(t, m, cmd)
+	m = runScan(t, m, cmd)
 	assertScannedOnly(t, per, "shop")
 
 	// A second right is a no-op: the group is already open, so foldGroupAt
 	// reports no unfold and nothing is dispatched.
-	m.svcCursor = 3 // shop/api, a service row
+	m.svcCursor = headerIndexFor(t, m.svcEntries, 1) + 1 // shop/api, a service row
 	_, cmd = pressFoldKey(m, "right")
 	if cmd != nil {
 		t.Error("a right on an already open group must produce no command")
@@ -7581,7 +7572,7 @@ func TestGroupedUnfold_RightArrowScansThatGroupOnly(t *testing.T) {
 func TestGroupedUnfold_LeftAndFoldAllFetchNothing(t *testing.T) {
 	t.Run("left folds and fetches nothing", func(t *testing.T) {
 		m, per := groupedUpdatesModel(t)
-		m.svcCursor = 3 // shop/api
+		m.svcCursor = headerIndexFor(t, m.svcEntries, 1) + 1 // shop/api
 
 		m, cmd := pressFoldKey(m, "left")
 		if !m.svcGroups[1].folded {
@@ -7593,7 +7584,7 @@ func TestGroupedUnfold_LeftAndFoldAllFetchNothing(t *testing.T) {
 		if m.updateInFlight {
 			t.Error("left must not raise the in-flight guard")
 		}
-		assertScannedOnly(t, per, "")
+		assertNoScans(t, per)
 	})
 
 	t.Run("z unfolds every group and fetches nothing", func(t *testing.T) {
@@ -7602,7 +7593,7 @@ func TestGroupedUnfold_LeftAndFoldAllFetchNothing(t *testing.T) {
 			m.svcGroups[i].folded = true
 		}
 		m.svcEntries = rebuildSvcEntries(m.svcGroups)
-		m.svcCursor = 0
+		m.svcCursor = headerIndexFor(t, m.svcEntries, 0)
 
 		m, cmd := pressFoldKey(m, "z")
 		for i, g := range m.svcGroups {
@@ -7616,7 +7607,7 @@ func TestGroupedUnfold_LeftAndFoldAllFetchNothing(t *testing.T) {
 		if m.updateInFlight {
 			t.Error("z must not raise the in-flight guard")
 		}
-		assertScannedOnly(t, per, "")
+		assertNoScans(t, per)
 		if len(m.updateCache) != 0 {
 			t.Errorf("z wrote %d cache entries", len(m.updateCache))
 		}
@@ -7637,7 +7628,7 @@ func TestGroupedUnfold_FreshCacheEntryFetchesNothing(t *testing.T) {
 		results:   map[string]bool{"api": true, "db": false},
 	}
 	foldGroupByHand(&m, 1)
-	m.svcCursor = 2 // the shop header
+	m.svcCursor = headerIndexFor(t, m.svcEntries, 1) // shop
 
 	m, cmd := pressFoldKey(m, "right")
 	if m.svcGroups[1].folded {
@@ -7652,7 +7643,7 @@ func TestGroupedUnfold_FreshCacheEntryFetchesNothing(t *testing.T) {
 	if m.warning != "" {
 		t.Errorf("a cache hit refuses nothing, so it must warn nothing; got %q", m.warning)
 	}
-	assertScannedOnly(t, per, "")
+	assertNoScans(t, per)
 
 	if st := m.svcStatus[svcKey("shop", "api")]; st.UpdateAvailable == nil || !*st.UpdateAvailable {
 		t.Errorf("shop/api verdict = %v, want the cached true", st.UpdateAvailable)
@@ -7685,7 +7676,7 @@ func TestGroupedUnfold_FreshCacheEntryFetchesNothing(t *testing.T) {
 func TestGroupedUnfold_SearchTypingFetchesNothing(t *testing.T) {
 	m, per := groupedUpdatesModel(t)
 	foldGroupByHand(&m, 1) // shop, whose db row the query matches
-	m.svcCursor = 0
+	m.svcCursor = headerIndexFor(t, m.svcEntries, 0)
 
 	m = pressKey(m, '/')
 	if !m.searching {
@@ -7704,7 +7695,7 @@ func TestGroupedUnfold_SearchTypingFetchesNothing(t *testing.T) {
 	if len(m.searchMatches) != 1 {
 		t.Fatalf("searchMatches = %v, want the one db row", m.searchMatches)
 	}
-	assertScannedOnly(t, per, "")
+	assertNoScans(t, per)
 	if len(m.updateCache) != 0 {
 		t.Errorf("the search unfold wrote %d cache entries", len(m.updateCache))
 	}
@@ -7731,7 +7722,7 @@ func TestGroupedUnfold_DrillOutRestoreFetchesNothing(t *testing.T) {
 	if m.updateInFlight {
 		t.Error("the restore must dispatch no scan")
 	}
-	assertScannedOnly(t, per, "")
+	assertNoScans(t, per)
 	if len(m.updateCache) != 0 {
 		t.Errorf("the restore wrote %d cache entries", len(m.updateCache))
 	}
@@ -7751,7 +7742,7 @@ func TestGroupedUnfold_LandingFetchesNothing(t *testing.T) {
 		if m.updateInFlight {
 			t.Error("the landing fold must dispatch no scan")
 		}
-		assertScannedOnly(t, per, "")
+		assertNoScans(t, per)
 		if len(m.updateCache) != 0 {
 			t.Errorf("the landing wrote %d cache entries", len(m.updateCache))
 		}
@@ -7808,7 +7799,7 @@ func TestGroupedUnfold_UnmanagedGroupIsSilent(t *testing.T) {
 			if hostSeam.updatesCalls != 0 {
 				t.Errorf("the host-wide seam saw %d CheckUpdates calls", hostSeam.updatesCalls)
 			}
-			assertScannedOnly(t, per, "")
+			assertNoScans(t, per)
 			if len(m.updateCache) != 0 {
 				t.Errorf("the unmanaged unfold wrote %d cache entries", len(m.updateCache))
 			}
@@ -7878,11 +7869,11 @@ func TestGroupedUnfold_SecondUnfoldKeepsTheFirstGroupsVerdicts(t *testing.T) {
 
 	m.svcCursor = headerIndexFor(t, m.svcEntries, 0)
 	m, cmd := pressFoldKey(m, "right")
-	m = runUnfoldScan(t, m, cmd)
+	m = runScan(t, m, cmd)
 
 	m.svcCursor = headerIndexFor(t, m.svcEntries, 1)
 	m, cmd = pressFoldKey(m, "right")
-	m = runUnfoldScan(t, m, cmd)
+	m = runScan(t, m, cmd)
 
 	if st := m.svcStatus[svcKey("blog", "web")]; st.UpdateAvailable == nil || !*st.UpdateAvailable {
 		t.Errorf("blog/web verdict = %v after unfolding shop, want true", st.UpdateAvailable)
@@ -7911,8 +7902,13 @@ func TestGroupedUnfold_FreshErrorEntryRestoresTheWarning(t *testing.T) {
 	}
 	// Navigating away clears the warning; the cached failure is what puts it back.
 	m.updatesErr = ""
+	// Small enough that the list scrolls: the restored warning costs
+	// svcVisibleCount a footer row exactly as m.warning does, and settleFold
+	// already clamped one row earlier with the field still empty.
+	m.height = 10
 	foldGroupByHand(&m, 1)
 	m.svcCursor = headerIndexFor(t, m.svcEntries, 1)
+	m.fixSvcOffset()
 
 	m, cmd := pressFoldKey(m, "right")
 
@@ -7931,7 +7927,87 @@ func TestGroupedUnfold_FreshErrorEntryRestoresTheWarning(t *testing.T) {
 	if m.warning != "" {
 		t.Errorf("warning = %q, want none — a cache hit refuses nothing", m.warning)
 	}
-	assertScannedOnly(t, per, "")
+	assertNoScans(t, per)
+	assertCursorVisible(t, m)
+}
+
+// A cache hit is answered BEFORE the in-flight guard is even read, so a scan
+// already out for another group does not cost this unfold its verdicts. This is
+// the pin for that ORDER: lifting the in-flight guard above the cache lookup
+// blanks the column and raises a warning for a fetch this keypress never wanted.
+func TestGroupedUnfold_FreshCacheEntryOutrunsTheInFlightGuard(t *testing.T) {
+	m, per := groupedUpdatesModel(t)
+	shopKey := m.projUpdatesCacheKey(compose.Project{Name: "shop", ConfigDir: "/srv/shop"})
+	m.updateCache = map[string]updateEntry{
+		shopKey: {fetchedAt: time.Now(), results: map[string]bool{"api": true, "db": false}},
+	}
+	// Another group's scan is still out, so the guard is up.
+	m.updateInFlight = true
+	foldGroupByHand(&m, 1)
+	m.svcCursor = headerIndexFor(t, m.svcEntries, 1) // shop
+
+	m, cmd := pressFoldKey(m, "right")
+
+	if m.svcGroups[1].folded {
+		t.Fatal("precondition: right did not unfold shop")
+	}
+	if cmd != nil {
+		t.Fatal("a cache hit must dispatch nothing, guard or no guard")
+	}
+	if m.warning != "" {
+		t.Errorf("warning = %q, want none — a cache hit refuses nothing", m.warning)
+	}
+	if !m.updateInFlight {
+		t.Error("the guard belongs to the scan still running; this keypress must not clear it")
+	}
+	assertNoScans(t, per)
+
+	if st := m.svcStatus[svcKey("shop", "api")]; st.UpdateAvailable == nil || !*st.UpdateAvailable {
+		t.Errorf("shop/api verdict = %v, want the cached true", st.UpdateAvailable)
+	}
+	if st := m.svcStatus[svcKey("shop", "db")]; st.UpdateAvailable == nil || *st.UpdateAvailable {
+		t.Errorf("shop/db verdict = %v, want the cached false", st.UpdateAvailable)
+	}
+}
+
+// With nothing cached the unfold reaches scanGroupCmd's in-flight guard, which
+// NAMES its refusal rather than going silent — the group is now open with a
+// blank glyph column and nothing else on screen would say why. The warning line
+// then spends a footer row settleFold had just re-clamped without it, so the
+// refusal owes the same re-clamp every other gated container key owes.
+func TestGroupedUnfold_BusyScanWarnsAndReclamps(t *testing.T) {
+	m, per := groupedUpdatesModel(t)
+	m.height = 10 // three rows of list, so the window has to move
+	m.updateInFlight = true
+	foldGroupByHand(&m, 1)
+	m.svcCursor = headerIndexFor(t, m.svcEntries, 1) // shop
+	m.fixSvcOffset()
+	// The header must sit on the LAST visible row, or the warning line costs it
+	// nothing and the re-clamp is untested.
+	if last := m.svcOffset + m.svcVisibleCount() - 1; m.svcCursor != last {
+		t.Fatalf("precondition: cursor %d, want the last visible row %d", m.svcCursor, last)
+	}
+
+	m, cmd := pressFoldKey(m, "right")
+
+	if m.svcGroups[1].folded {
+		t.Fatal("precondition: right did not unfold shop")
+	}
+	if m.svcVisibleCount() >= len(m.svcEntries) {
+		t.Fatalf("precondition: %d rows all fit in %d — the window cannot move",
+			len(m.svcEntries), m.svcVisibleCount())
+	}
+	if cmd != nil {
+		t.Error("the unfold must fire no scan while one is already in flight")
+	}
+	if m.warning != warnUpdateScanBusy {
+		t.Errorf("warning = %q, want %q", m.warning, warnUpdateScanBusy)
+	}
+	if m.composer != nil {
+		t.Error("a refused unfold must leave no composer bound")
+	}
+	assertNoScans(t, per)
+	assertCursorVisible(t, m)
 }
 
 // Past its TTL an entry answers nothing, and the unfold spends the round trip.
