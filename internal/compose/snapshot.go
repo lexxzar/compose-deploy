@@ -637,9 +637,9 @@ func lockStateFile(statePath string) (func(), error) {
 //
 // An advisory flock (lockStateFile) serializes the read-modify-rename against
 // concurrent local deploys of the same project so their merges can't clobber one
-// another. It is best-effort: if the lock cannot be taken the write still
-// proceeds unlocked — exactly the prior behavior for the common single-deploy
-// case.
+// another. It BLOCKS until acquired and ignores ctx, so a second deploy of the
+// same project waits uninterruptibly. The unlocked fall-through covers a real
+// lock failure only (bad descriptor, unsupported filesystem), never contention.
 func (c *Compose) WriteSnapshot(ctx context.Context, fresh *Snapshot) error {
 	path, err := c.localStatePath()
 	if err != nil {
