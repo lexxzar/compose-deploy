@@ -6031,7 +6031,10 @@ func (m *Model) maybeRefreshUpdatesCmd() tea.Cmd {
 //
 // The guard order below IS the specification:
 //
-//  1. grouped only — defensive, both call sites are already gated;
+//  1. grouped only, and NOT merely defensive: the ←/→ site is grouped-gated,
+//     but the space site is gated on readOnly() ALONE, and a drilled lone
+//     group still draws a foldable header, so space DOES reach here off the
+//     grouped screen — this guard is what refuses it;
 //  2. the group must exist;
 //  3. the unmanaged bucket is refused SILENTLY — its cost is unbounded (every
 //     leftover container on the host is a distinct image) and unfolding it is an
