@@ -2,6 +2,7 @@ package tui
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"maps"
@@ -49,6 +50,30 @@ const updatesCacheTTL = 10 * time.Minute
 // instead of waiting the full 10-min success TTL. Bumped via context-change
 // session resets and U keypress just like success entries.
 const updatesErrorTTL = 30 * time.Second
+
+// updatesScanTimeout bounds ONE CheckUpdates verdict scan, for the reason
+// updateDetailsTimeout and groupedStatsTimeout carry their own bounds: m.ctx
+// lives for the whole program and no dockerRunner adds a deadline of its own,
+// so one hung registry call pins m.updateInFlight until the user navigates to
+// a site that resets it — and U, the one key that would force a rescan, is
+// swallowed by that very guard.
+//
+// An expiry does NOT degrade on its own, which is why refreshUpdatesFor
+// synthesises an error out of it: scanImageUpdates has no ctx.Err() check
+// (unlike scanUpdateDetails), and a killed child's stderr matches neither
+// looksLikeNetworkErr nor looksLikeLocalDaemonErr, so CheckUpdates would
+// return a PARTIAL map with a NIL error — a success entry cached for the full
+// updatesCacheTTL with verdicts silently missing and no warning. The
+// synthesised error takes the 30-second updatesErrorTTL instead.
+//
+// The scan is serial and memoised per distinct image, at one local inspect
+// plus one or two registry round-trips each; 20+ services over SSH measures at
+// 10s+, so 90s clears roughly 60 distinct images. It sits above
+// groupedStatsTimeout (30s, one call — a host-wide `docker stats` that runs
+// over SSH whenever the host view is remote) and below updateDetailsTimeout
+// (3m, a strictly more expensive phase), and the user is blocked for the whole
+// window because updateInFlight refuses every other scan.
+const updatesScanTimeout = 90 * time.Second
 
 // updateDetailsTimeout bounds ONE inspect-detail batch.
 //
@@ -243,6 +268,26 @@ const warnNoComposeDir = "No compose directory for this project yet — try agai
 // SELECTABLE, not visible: an unfolded `(unmanaged)` bucket can be drawing rows
 // while every compose group is closed, and those rows carry no checkbox.
 const warnAllSelectableFolded = "No selectable service is visible — unfold a group to select one"
+
+// warnUpdateScanBusy answers a scan refused because one is still out. The
+// in-flight guard refuses it so a slow CheckUpdates cannot stack on itself, and
+// going silent there made the key look broken: an update scan shows no
+// "checking…" state — the glyph column simply blanks until the result lands —
+// so nothing on screen separated a refused press from one that fired.
+//
+// TWO raisers: `U`, and groupUnfoldUpdatesCmd's guard 6 on a deliberate unfold.
+// The text names `U` as the retry because it is the only one both raisers
+// share. Waiting is not a way out of the second: the group is open by the time
+// the refusal lands, so a second → reports no unfold and never rescans —
+// walking → down a list of projects would otherwise scan the first and refuse
+// the rest with advice that does nothing.
+//
+// The unfold's guard 6 is the ONLY silent-refusal exception in that helper:
+// guards 3 and 4 refuse a scan the user could never have had (the unmanaged
+// bucket's cost is unbounded; a group with no compose directory has nothing to
+// scan through), so there is nothing to report. Guard 6 refuses one that WOULD
+// otherwise have happened, so the user loses something and has to be told.
+const warnUpdateScanBusy = "An update check is already running — press U when it finishes"
 
 // serverEntryKind distinguishes selectable items from visual group headers.
 type serverEntryKind int
@@ -2736,8 +2781,16 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 				return m, nil
 			}
 			if entry.kind == entrySvcGroupHeader {
-				m.toggleGroupFold(entry.groupIdx)
-				return m, nil
+				// A deliberate UNFOLD is a request to look at the group, so it
+				// earns a cache-first update scan for that group alone. Folding
+				// returns false and fetches nothing. Hoisted out of the return:
+				// the helper has a pointer receiver and mutates the same m the
+				// return carries.
+				if !m.toggleGroupFold(entry.groupIdx) {
+					return m, nil
+				}
+				cmd := m.groupUnfoldUpdatesCmd(entry.groupIdx)
+				return m, cmd
 			}
 			// An unmanaged container has no compose project to operate on, so
 			// its row draws no checkbox and space must not fill one in.
@@ -2764,9 +2817,16 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 				return m, nil
 			}
 			// Directional, not a toggle: left only ever folds, right only ever
-			// unfolds, so a held key settles instead of oscillating.
-			m.foldGroupAt(gi, key == "left")
-			return m, nil
+			// unfolds, so a held key settles instead of oscillating. That is
+			// also what makes the unfold update scan directional for free: ←
+			// passes folded == true and can never report an unfold, and a → on
+			// an already open group changes nothing and reports none. Hoisted
+			// out of the return for the reason the space handler above names.
+			if !m.foldGroupAt(gi, key == "left") {
+				return m, nil
+			}
+			cmd := m.groupUnfoldUpdatesCmd(gi)
+			return m, cmd
 		case "z":
 			// One key with the shape `a` already uses for the selection: any
 			// group still open means fold everything, otherwise unfold.
@@ -2996,36 +3056,31 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			// batch resolves.
 			//
 			// The guard is checked before the grouped branch binds anything:
-			// a refusal must leave the composer exactly as it found it.
+			// a refusal must leave the composer exactly as it found it, and it
+			// NAMES the refusal rather than going inert: the dispatch cleared
+			// m.warning above the switch, so the line costs svcVisibleCount a
+			// row and owes the same re-clamp every other gated container key
+			// owes.
 			if m.updateInFlight {
+				m.warning = warnUpdateScanBusy
+				m.fixSvcOffset()
 				return m, nil
 			}
 			if m.grouped {
-				// U is the ONLY update trigger in grouped mode, and it scans
-				// ONE group — the cursor row's. A host-wide scan would fan out
-				// across every project at once, which is the registry cost
-				// autoUpdatesAllowed refuses to spend automatically; asking for
-				// it by hand does not make it cheaper.
-				//
-				// The composer is bound, read out and unbound in the same
-				// keystroke: grouped mode must never hold one project's
-				// composer while the cursor sits on another's row.
+				// Grouped mode has two update triggers — U here and a
+				// deliberate single-group unfold (groupUnfoldUpdatesCmd) — and
+				// both scan ONE group. U's is the cursor row's. A host-wide
+				// scan would fan out across every project at once, which is the
+				// registry cost autoUpdatesAllowed refuses to spend
+				// automatically; asking for it by hand does not make it
+				// cheaper.
 				g, ok := m.cursorGroup()
-				if !ok || !m.bindProjComposer(g.proj) {
+				if !ok {
 					m.unbindGroupedComposer()
-					// bindProjComposer names warnNoComposeDir in the warning
-					// slot, and that line costs svcVisibleCount a row — every
-					// other gated container key re-clamps for the same reason.
 					m.fixSvcOffset()
 					return m, nil
 				}
-				c := m.composer
-				m.unbindGroupedComposer()
-				m.updateInFlight = true
-				// The key belongs to the GROUP, not to the Model — and it is
-				// the same key drilled mode uses for that project, so a scan
-				// started here still counts once the user drills in.
-				return m, m.refreshUpdatesFor(c, m.projUpdatesCacheKey(g.proj))
+				return m, m.scanGroupCmd(g.proj)
 			}
 			if m.composer == nil {
 				return m, nil
@@ -5507,7 +5562,21 @@ func (m Model) refreshUpdatesFor(c runner.Composer, key string) tea.Cmd {
 	ctx := m.ctx
 	session := m.updatesSession
 	return func() tea.Msg {
-		results, err := c.CheckUpdates(ctx, nil)
+		fetchCtx, cancel := context.WithTimeout(ctx, updatesScanTimeout)
+		defer cancel()
+		results, err := c.CheckUpdates(fetchCtx, nil)
+		// An expiry arrives here as a nil error beside a partial map — see
+		// updatesScanTimeout — so it is synthesised into a real one. Without
+		// it the timeout makes things WORSE than the stall it bounds: the hole
+		// would be cached as a success for the full updatesCacheTTL, with no
+		// warning and nothing queued to refill it.
+		//
+		// DeadlineExceeded specifically, not a bare ctx.Err(): a parent cancel
+		// is cdeploy shutting down, and it would otherwise be reported to the
+		// user as a timeout that never happened.
+		if err == nil && errors.Is(fetchCtx.Err(), context.DeadlineExceeded) {
+			err = fmt.Errorf("update check timed out after %s", updatesScanTimeout)
+		}
 		return updatesMsg{results: results, err: err, session: session, forKey: key}
 	}
 }
@@ -5763,11 +5832,12 @@ func (m *Model) reapplyUpdateVerdicts(results map[string]bool) {
 // and the only hydration path grouped mode has.
 //
 // The cache reads are RAW — deliberately not the TTL-checked updatesCacheLookup.
-// Grouped mode never refetches on its own (U is the only trigger), so a
-// TTL-gated replay would blank the glyph column ten minutes after a scan with
-// nothing queued to bring it back; the age of the check is reported on the
-// inspect screen instead. Error entries are skipped: their results map is nil
-// and their verdicts are untrusted by contract.
+// Grouped mode never refetches on its own — U and a deliberate single-group
+// unfold are the only triggers, and both need a keypress — so a TTL-gated replay
+// would blank the glyph column ten minutes after a scan with nothing queued to
+// bring it back; the age of the check is reported on the inspect screen instead.
+// Error entries are skipped: their results map is nil and their verdicts are
+// untrusted by contract.
 func (m *Model) hydrateGroupedUpdates() {
 	if m.svcStatus == nil || m.updateCache == nil {
 		return
@@ -5787,13 +5857,14 @@ func (m *Model) hydrateGroupedUpdates() {
 //
 // The restore half is not symmetry for its own sake — it is the cache-hit rule
 // every other path already keeps (see updatesCacheLookup's callers). Grouped
-// mode never refetches verdicts on its own, U is the only trigger, and the three
-// landing sites — enterGroupedContainers, drillIntoGroup and backToServerScreen
-// — all blank m.updatesErr on the way through. Without a restore, drilling into
-// one group and pressing esc erased the warning a failed U had raised for
-// another, leaving that group's glyph column blank with nothing on screen
-// explaining why and no path able to bring either back for the whole 30-second
-// error TTL. An early return on an already-empty field is exactly what made the
+// mode never refetches verdicts on its own: U and a deliberate single-group
+// unfold are its only two triggers, and both need a keypress. Meanwhile the
+// three landing sites (enterGroupedContainers, drillIntoGroup and
+// backToServerScreen) all blank m.updatesErr on the way through. Without a
+// restore, drilling into one group and pressing esc erased the warning a failed
+// U had raised for another, leaving that group's glyph column blank with nothing
+// on screen explaining why and no path able to bring either back for the whole
+// 30-second error TTL. An early return on an already-empty field is exactly what made the
 // old expire-only form unable to do it.
 func (m *Model) syncGroupedUpdatesErr() {
 	m.updatesErr = m.groupedUpdatesErr()
@@ -5806,15 +5877,17 @@ func (m *Model) syncGroupedUpdatesErr() {
 // It is the single derivation behind both the expiry on the periodic reload and
 // the clear a successful scan performs. A scan covers one group, so a flat
 // `updatesErr = ""` on success erased a warning that belonged to a different
-// one — and nothing in grouped mode would ever put it back, since U is the only
-// trigger there.
+// one — and nothing in grouped mode would ever put it back, since every trigger
+// there needs a keypress.
 func (m Model) groupedUpdatesErr() string {
 	if m.updateCache == nil {
 		return ""
 	}
 	for _, g := range m.svcGroups {
-		entry, ok := m.updateCache[m.projUpdatesCacheKey(g.proj)]
-		if ok && entry.err && time.Since(entry.fetchedAt) < updatesErrorTTL {
+		// Through updatesCacheLookupFor, not a hand-rolled window: the two-TTL
+		// rule is that helper's alone, and a grouped unfold runs both readers in
+		// one keypress.
+		if entry, fresh := m.updatesCacheLookupFor(m.projUpdatesCacheKey(g.proj)); fresh && entry.err {
 			return entry.errMsg
 		}
 	}
@@ -5830,10 +5903,19 @@ func (m Model) groupedUpdatesErr() string {
 // results map is nil), so cached failures show as blank glyphs alongside
 // the updatesErr warning.
 func (m Model) updatesCacheLookup() (updateEntry, bool) {
+	return m.updatesCacheLookupFor(m.updatesCacheKey())
+}
+
+// updatesCacheLookupFor is updatesCacheLookup for a key the Model is not
+// currently pointed at — the grouped host view's unfold scan needs one, the way
+// projUpdatesCacheKey is the addressed twin of updatesCacheKey. The two-TTL rule
+// lives here alone, so the addressed reader cannot drift from the current-context
+// one.
+func (m Model) updatesCacheLookupFor(key string) (updateEntry, bool) {
 	if m.updateCache == nil {
 		return updateEntry{}, false
 	}
-	entry, ok := m.updateCache[m.updatesCacheKey()]
+	entry, ok := m.updateCache[key]
 	if !ok {
 		return updateEntry{}, false
 	}
@@ -5940,6 +6022,115 @@ func (m *Model) maybeRefreshUpdatesCmd() tea.Cmd {
 	return m.refreshUpdates()
 }
 
+// groupUnfoldUpdatesCmd answers a DELIBERATE unfold of one group in the host
+// view: a cache-first update scan for that group and nothing else.
+//
+// It is a SIBLING of maybeRefreshUpdatesCmd rather than a widening of it.
+// That helper reads updatesCacheKey() and m.composer — the current context's
+// key, degenerate in grouped mode, and the composer grouped mode holds as nil
+// by design. Parameterising both would make its three automatic callers
+// (containerFetchBatch, the statusMsg self-heal, Init()) each responsible for
+// refusing in grouped mode, turning one structural refusal into three that hold
+// only by argument.
+//
+// The trigger deliberately bypasses autoUpdatesAllowed(). That predicate asks
+// whether a scan may fire for the CURRENT context with no target named; this
+// call names its target.
+//
+// The guard order below IS the specification:
+//
+//  1. grouped only, and NOT merely defensive: the ←/→ site is grouped-gated,
+//     but the space site is gated on readOnly() ALONE, and a drilled lone
+//     group still draws a foldable header, so space DOES reach here off the
+//     grouped screen — this guard is what refuses it;
+//  2. the group must exist;
+//  3. the unmanaged bucket is refused SILENTLY — its cost is unbounded (every
+//     leftover container on the host is a distinct image) and unfolding it is an
+//     ordinary display action, so a warning would refuse nothing the user asked
+//     for. U keeps its manual behaviour there;
+//  4. a group with no compose directory is refused SILENTLY, and ABOVE the bind:
+//     bindProjComposer raises warnNoComposeDir, which a key pressed only to look
+//     at rows must not do;
+//  5. the cache FIRST — a fresh entry costs zero network. A success replays that
+//     ONE group's verdicts (hydrateUpdatesFor, never hydrateGroupedUpdates, which
+//     would touch every other group's column); a failure re-derives the soft
+//     warning from the visible groups, and re-clamps: settleFold already clamped
+//     one row earlier with m.updatesErr as it found it, and a restored warning
+//     costs svcVisibleCount the same footer row m.warning does. The success
+//     branch owes nothing — a verdict changes no line count (hasStatusColumns
+//     ignores UpdateAvailable on purpose);
+//  6. only THEN the scan itself, through scanGroupCmd — whose in-flight guard
+//     therefore lands BELOW the cache lookup, inverting maybeRefreshUpdatesCmd's
+//     guard-then-lookup order: a cache hit refuses nothing, so it must not warn.
+//
+// No detail batch follows: detailsCmdFor refuses in grouped mode, so
+// detailsInFlight is untouched here.
+func (m *Model) groupUnfoldUpdatesCmd(gi int) tea.Cmd {
+	if !m.grouped {
+		return nil
+	}
+	if gi < 0 || gi >= len(m.svcGroups) {
+		return nil
+	}
+	g := m.svcGroups[gi]
+	if g.proj.Unmanaged {
+		return nil
+	}
+	if !m.operableProject(g.proj) {
+		return nil
+	}
+	if entry, fresh := m.updatesCacheLookupFor(m.projUpdatesCacheKey(g.proj)); fresh {
+		if entry.err {
+			m.syncGroupedUpdatesErr()
+			m.fixSvcOffset()
+			return nil
+		}
+		m.hydrateUpdatesFor(g.proj.Name, entry.results)
+		return nil
+	}
+	return m.scanGroupCmd(g.proj)
+}
+
+// scanGroupCmd dispatches an update scan for ONE named group and is the shared
+// tail of both grouped triggers: U on the cursor row's group, and
+// groupUnfoldUpdatesCmd on a deliberate unfold. Sharing it is structural, not
+// tidiness — the sequence carries three obligations no caller should have to
+// remember (name the refusal, unbind before staying on the grouped screen, and
+// capture the cache key at DISPATCH so a cursor move cannot re-address the
+// verdicts), and each was already written out twice.
+//
+// The in-flight refusal NAMES itself: see warnUpdateScanBusy. U checks the same
+// flag one line earlier, ABOVE its grouped branch, so the drilled screen refuses
+// through that copy and this one is unreachable from U — the unfold path has no
+// such caller-side guard and relies on this one.
+//
+// The composer is bound, read out and unbound within the call, so grouped mode
+// is never left holding one project's composer while the cursor sits on
+// another's row.
+func (m *Model) scanGroupCmd(proj compose.Project) tea.Cmd {
+	if m.updateInFlight {
+		m.warning = warnUpdateScanBusy
+		m.fixSvcOffset()
+		return nil
+	}
+	// Before the bind, so a failed bind cannot leave a half-addressed key —
+	// and it is the key drilled mode uses for the same project, so a scan
+	// started here still counts once the user drills in.
+	key := m.projUpdatesCacheKey(proj)
+	if !m.bindProjComposer(proj) {
+		m.unbindGroupedComposer()
+		// bindProjComposer names warnNoComposeDir in the warning slot, and that
+		// line costs svcVisibleCount a row — every other gated container key
+		// re-clamps for the same reason.
+		m.fixSvcOffset()
+		return nil
+	}
+	c := m.composer
+	m.unbindGroupedComposer()
+	m.updateInFlight = true
+	return m.refreshUpdatesFor(c, key)
+}
+
 // autoUpdatesAllowed reports whether the update check may fire on its own.
 // It is false on a read-only composer, where U is the only trigger.
 //
@@ -5958,7 +6149,13 @@ func (m *Model) maybeRefreshUpdatesCmd() tea.Cmd {
 //
 // Grouped mode is refused for the same reason and one more: it has no single
 // composer and no single cache key, so an automatic scan there would fan out
-// across every project on the host at once. U is the only trigger there too.
+// across every project on the host at once.
+//
+// TWO helpers bypass this predicate, and both do it by naming their target: U's
+// grouped branch and groupUnfoldUpdatesCmd. What the predicate answers is
+// whether a scan may fire for the CURRENT context with nothing named — so a
+// scoped scan is not the case it refuses. Anything ADDED here that fires without
+// naming a group is.
 func (m Model) autoUpdatesAllowed() bool {
 	return !m.readOnly() && !m.grouped
 }
@@ -6884,24 +7081,34 @@ func (m *Model) setAllFolded(folded bool) {
 // they land on an already-folded (already-open) group routinely, and re-aiming
 // the cursor at the header there would move it for a keypress that did not
 // change the screen.
-func (m *Model) foldGroupAt(gi int, folded bool) {
+//
+// It reports whether the call OPENED the group, which is what makes the
+// deliberate-unfold update scan structural rather than a guard every caller has
+// to remember: only space-on-a-header and → reach this function, while every
+// path that must stay inert (z, the landing fold, the drill-out restore, the
+// search unfold) writes the fold flags without it. A no-op — out of range, or
+// the requested state already in place — reports false, so a → on an already
+// open group and a fold in either direction fetch nothing.
+func (m *Model) foldGroupAt(gi int, folded bool) bool {
 	if gi < 0 || gi >= len(m.svcGroups) || m.svcGroups[gi].folded == folded {
 		m.fixSvcOffset()
-		return
+		return false
 	}
 	m.svcGroups[gi].folded = folded
 	m.settleFold(gi)
+	return !folded
 }
 
-// toggleGroupFold flips one group's fold state. It exists so no caller has to
-// index svcGroups to read the current state and hand back its negation, which
-// would put an unguarded lookup in front of foldGroupAt's own bounds check.
-func (m *Model) toggleGroupFold(gi int) {
+// toggleGroupFold flips one group's fold state and reports whether that OPENED
+// it. It exists so no caller has to index svcGroups to read the current state
+// and hand back its negation, which would put an unguarded lookup in front of
+// foldGroupAt's own bounds check.
+func (m *Model) toggleGroupFold(gi int) bool {
 	if gi < 0 || gi >= len(m.svcGroups) {
 		m.fixSvcOffset()
-		return
+		return false
 	}
-	m.foldGroupAt(gi, !m.svcGroups[gi].folded)
+	return m.foldGroupAt(gi, !m.svcGroups[gi].folded)
 }
 
 // foldAllGroups writes one fold state across every group and settles the rows,
