@@ -267,6 +267,15 @@ const warnNoComposeDir = "No compose directory for this project yet — try agai
 // while every compose group is closed, and those rows carry no checkbox.
 const warnAllSelectableFolded = "No selectable service is visible — unfold a group to select one"
 
+// warnUpdateScanBusy answers `U` while a scan is still out. The in-flight guard
+// refuses the press so a slow CheckUpdates cannot stack on itself, and going
+// silent there made the key look broken: an update scan shows no "checking…"
+// state — the glyph column simply blanks until the result lands — so nothing on
+// screen separated a refused press from one that fired. The scan already
+// running hydrates the same session, so the way out is to wait rather than to
+// press again.
+const warnUpdateScanBusy = "An update check is already running — wait for it to finish"
+
 // serverEntryKind distinguishes selectable items from visual group headers.
 type serverEntryKind int
 
@@ -3019,8 +3028,14 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			// batch resolves.
 			//
 			// The guard is checked before the grouped branch binds anything:
-			// a refusal must leave the composer exactly as it found it.
+			// a refusal must leave the composer exactly as it found it, and it
+			// NAMES the refusal rather than going inert: the dispatch cleared
+			// m.warning above the switch, so the line costs svcVisibleCount a
+			// row and owes the same re-clamp every other gated container key
+			// owes.
 			if m.updateInFlight {
+				m.warning = warnUpdateScanBusy
+				m.fixSvcOffset()
 				return m, nil
 			}
 			if m.grouped {

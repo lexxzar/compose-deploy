@@ -6066,6 +6066,43 @@ func TestGroupedU_RefusalReclamps(t *testing.T) {
 	}
 }
 
+// The in-flight guard NAMES its refusal. An update scan draws no "checking…"
+// state — the glyph column just blanks until the result lands — so a silent U
+// is indistinguishable from a broken key. The warning line then spends a footer
+// row the dispatch had just cleared, so the refusal owes the same re-clamp
+// every other gated container key owes. The group carries a ConfigDir, so the
+// only thing refusing this press is the guard itself.
+func TestGroupedU_BusyScanWarnsAndReclamps(t *testing.T) {
+	blog := svcGroupOf("blog", "a", "b", "c", "d", "e", "f")
+	blog.proj.ConfigDir = "/srv/blog"
+	shop := svcGroupOf("shop", "api", "web")
+	shop.proj.ConfigDir = "/srv/shop"
+
+	m := groupedScreenModel(blog, shop)
+	m.composerFactory = func(compose.Project) runner.Composer { return &mockComposer{} }
+	m.height = 10
+	m.updateInFlight = true
+	m.svcCursor = len(m.svcEntries) - 1
+	m.fixSvcOffset()
+	if m.svcOffset == 0 {
+		t.Fatal("precondition: the list must scroll at this height")
+	}
+
+	updated, cmd := m.Update(keyMsgFor("U"))
+	got := updated.(Model)
+
+	if cmd != nil {
+		t.Error("U must fire no scan while one is already in flight")
+	}
+	if got.warning != warnUpdateScanBusy {
+		t.Errorf("warning = %q, want %q", got.warning, warnUpdateScanBusy)
+	}
+	if got.composer != nil {
+		t.Error("a refused U must leave no composer bound")
+	}
+	assertCursorVisible(t, got)
+}
+
 // R's two CAPABILITY refusals — the composer is not a RollbackPreparer, and the
 // list is empty — are gated keys like every other: the dispatch clears m.warning
 // above the switch, which frees a footer row and grows svcVisibleCount() by one,
