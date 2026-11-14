@@ -37,3 +37,6 @@ Thumbs.db
 # Build artifacts
 /cdeploy*
 *.log
+
+# Kluris brain (own git repo)
+cdpl/
