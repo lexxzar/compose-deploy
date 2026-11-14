@@ -23,3 +23,10 @@ go mod tidy                     # After adding/removing imports
 No linter or formatter config — use standard `go fmt` and `go vet`. No Makefile
 or task runner. CI runs `go test ./... -covermode=atomic -coverprofile=coverage.out`
 via GitHub Actions (`.github/workflows/coveralls.yml`).
+
+## Knowledge base
+
+Read and write to the **cdpl** brain through kluris (never
+edit brain files by hand). Use the `kluris-cdpl` skill
+(usually `/kluris-cdpl`; Hermes: `/skill kluris-cdpl`) --
+search, learn, remember, create.

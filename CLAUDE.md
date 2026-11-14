@@ -217,3 +217,10 @@ Tests use stdlib `testing` only — no testify or other test frameworks.
 - `internal/logging/`: Use `t.TempDir()` for file creation tests
 - `skills/`: content pins on the embedded `cdeploy/SKILL.md` — frontmatter FIRST, `name` matches the dir + the regex, description ≤1024 chars, under 500 lines, **no `metadata:` key**: `docs/architecture/skill-distribution.md`
 - `cmd/`: Test flag registration, subcommand existence, and validation via `NewRootCmd()`; `cmd/skill_test.go` uses `t.Setenv` HOME/CODEX_HOME (never `t.Parallel`) for the path matrix, symlink dedupe, and the install/uninstall decision matrix in a temp HOME (render/verify round-trip is pure)
+
+## Knowledge base
+
+Read and write to the **cdpl** brain through kluris (never
+edit brain files by hand). Use the `kluris-cdpl` skill
+(usually `/kluris-cdpl`; Hermes: `/skill kluris-cdpl`) --
+search, learn, remember, create.
