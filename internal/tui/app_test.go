@@ -14268,10 +14268,7 @@ func assertSearchCleared(t *testing.T, m Model, where string) {
 	}
 }
 
-// TestSearchClearedOnServicesReload: a full list reload (servicesMsg) invalidates
-// searchMatches (indices into the OLD services), so the committed search must be
-// cleared. Uses an incoming service set that would make the old indices invalid.
-func TestSearchClearedOnServicesReload(t *testing.T) {
+func TestSearchRederivedOnServicesReload(t *testing.T) {
 	mc := &mockComposer{services: []string{"api", "web", "web-worker"}}
 	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
 	installFakeTick(&m)
@@ -14292,7 +14289,12 @@ func TestSearchClearedOnServicesReload(t *testing.T) {
 	})
 	m = updated.(Model)
 
-	assertSearchCleared(t, m, "after servicesMsg reload")
+	if m.searchQuery != "w" {
+		t.Errorf("after servicesMsg reload: searchQuery = %q, want %q", m.searchQuery, "w")
+	}
+	if m.searchMatches != nil {
+		t.Errorf("after servicesMsg reload: searchMatches = %v, want nil (re-derived against [db])", m.searchMatches)
+	}
 }
 
 // TestSearchClearedOnEscToProject: a context switch off the container screen
