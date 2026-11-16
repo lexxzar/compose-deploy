@@ -1335,7 +1335,8 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			// The grouped payload is BOTH the initial load and the 5-second
 			// refresh, so it must preserve what the user set: cursor,
 			// selection, fold state and an active search all survive.
-			// Resetting them here would fight the user every tick. The landing sites clear that state once, on entry.
+			// Resetting them here would fight the user every tick. The
+			// landing sites clear that state once, on entry.
 			// Capture the cursor's identity BEFORE the rebuild renumbers
 			// every row; restoreCursorRow puts it back on the same row below.
 			cursorID := m.cursorRowID()

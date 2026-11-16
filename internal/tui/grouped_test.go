@@ -6413,10 +6413,10 @@ func TestDrilledServicesMsg_ConfirmingReloadIsRedispatched(t *testing.T) {
 	}
 }
 
-func TestDrilledServicesMsg_ConfirmingReloadKeepsCursorAndSelection(t *testing.T) {
+func TestDrilledReload_ConfirmingReloadKeepsCursorAndSelection(t *testing.T) {
 	mc := &mockComposer{services: []string{"api", "web", "worker"}}
 	m := drilledConfirmModel(t, mc)
-	want := m.svcKeyAt(0)
+	webKey := m.svcKeyAt(0)
 
 	arrived, _ := m.Update(servicesMsg{services: mc.services, session: m.statusSession})
 	closed, cmd := arrived.(Model).Update(tea.KeyMsg{Type: tea.KeyEsc})
@@ -6430,11 +6430,11 @@ func TestDrilledServicesMsg_ConfirmingReloadKeepsCursorAndSelection(t *testing.T
 	if len(m.svcEntries) != 3 {
 		t.Fatalf("rows = %v, want the re-dispatched list", modelServices(m))
 	}
-	if got := rowIDAt(m.svcEntries, m.svcGroups, m.svcCursor).service; got != "web" {
+	if got, _ := m.cursorService(); got != "web" {
 		t.Errorf("cursor on %q, want web", got)
 	}
-	if !maps.Equal(m.selected, map[string]bool{want: true}) {
-		t.Errorf("selected = %v, want only %q", m.selected, want)
+	if !maps.Equal(m.selected, map[string]bool{webKey: true}) {
+		t.Errorf("selected = %v, want only %q", m.selected, webKey)
 	}
 }
 
@@ -6462,6 +6462,26 @@ func deliverDrilled(t *testing.T, m Model, services ...string) Model {
 		t.Fatalf("precondition: rows = %v, want the payload %v", modelServices(m), services)
 	}
 	return m
+}
+
+func TestDrilledReload_RederivesCommittedSearch(t *testing.T) {
+	m := drilledShopModel(t)
+	m.searchQuery = "w"
+	m.searchMatches = computeMatches(m.svcEntries, "w")
+
+	m = deliverDrilled(t, m, "db", "web")
+
+	if m.searchQuery != "w" {
+		t.Errorf("searchQuery = %q, want w", m.searchQuery)
+	}
+	if !slices.Equal(m.searchMatches, []int{1}) {
+		t.Errorf("searchMatches = %v, want [1] (re-derived against [db web])", m.searchMatches)
+	}
+	updated, _ := m.Update(keyMsgFor("n"))
+	m = updated.(Model)
+	if got, _ := m.cursorService(); got != "web" {
+		t.Errorf("n after the reload: cursor on %q, want web", got)
+	}
 }
 
 func TestDrilledReload_KeepsCursorMovedDuringLoad(t *testing.T) {

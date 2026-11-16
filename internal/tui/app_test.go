@@ -14268,40 +14268,6 @@ func assertSearchCleared(t *testing.T, m Model, where string) {
 	}
 }
 
-func TestSearchRederivedOnServicesReload(t *testing.T) {
-	mc := &mockComposer{services: []string{"api", "web", "web-worker"}}
-	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
-	installFakeTick(&m)
-	m.screen = screenSelectContainers
-	m.setSingleGroup(mc.services)
-	m.searchQuery = "w"
-	m.searchMatches = computeMatches(m.svcEntries, "w") // [1 2]
-	m.svcCursor = 0
-	if len(m.searchMatches) != 2 {
-		t.Fatalf("precondition: expected 2 matches, got %v", m.searchMatches)
-	}
-
-	updated, _ := m.Update(servicesMsg{
-		services: []string{"db", "web"},
-		status:   map[string]runner.ServiceStatus{},
-		session:  m.statusSession, // must match to be accepted
-	})
-	m = updated.(Model)
-
-	if m.searchQuery != "w" {
-		t.Errorf("after servicesMsg reload: searchQuery = %q, want %q", m.searchQuery, "w")
-	}
-	if !slices.Equal(m.searchMatches, []int{1}) {
-		t.Errorf("after servicesMsg reload: searchMatches = %v, want [1] (re-derived against [db web])", m.searchMatches)
-	}
-
-	updated, _ = m.Update(keyMsgFor("n"))
-	m = updated.(Model)
-	if name, _ := m.cursorService(); name != "web" {
-		t.Errorf("n after the reload: cursor on %q, want web", name)
-	}
-}
-
 // TestSearchClearedOnEscToProject: a context switch off the container screen
 // (esc → grouped host view) clears the committed search.
 func TestSearchClearedOnEscToProject(t *testing.T) {
