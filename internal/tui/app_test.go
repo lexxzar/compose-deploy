@@ -14258,7 +14258,7 @@ func TestSvcVisibleCount_ConstantAcrossConfirming(t *testing.T) {
 func assertSearchCleared(t *testing.T, m Model, where string) {
 	t.Helper()
 	if m.searchQuery != "" {
-		t.Errorf("%s: searchQuery = %q, want empty (search must be cleared on departure/reload)", where, m.searchQuery)
+		t.Errorf("%s: searchQuery = %q, want empty (search must be cleared on departure)", where, m.searchQuery)
 	}
 	if m.searchMatches != nil {
 		t.Errorf("%s: searchMatches = %v, want nil", where, m.searchMatches)
@@ -14266,33 +14266,6 @@ func assertSearchCleared(t *testing.T, m Model, where string) {
 	if m.searching {
 		t.Errorf("%s: searching = true, want false", where)
 	}
-}
-
-// TestSearchClearedOnServicesReload: a full list reload (servicesMsg) invalidates
-// searchMatches (indices into the OLD services), so the committed search must be
-// cleared. Uses an incoming service set that would make the old indices invalid.
-func TestSearchClearedOnServicesReload(t *testing.T) {
-	mc := &mockComposer{services: []string{"api", "web", "web-worker"}}
-	m := NewModel(mc, io.Discard, mockFactory(mc), nil, nil)
-	installFakeTick(&m)
-	m.screen = screenSelectContainers
-	m.setSingleGroup(mc.services)
-	m.searchQuery = "w"
-	m.searchMatches = computeMatches(m.svcEntries, "w") // [1 2]
-	m.svcCursor = 1
-	if len(m.searchMatches) != 2 {
-		t.Fatalf("precondition: expected 2 matches, got %v", m.searchMatches)
-	}
-
-	// Reload with a DIFFERENT, shorter list — old indices [1 2] would be invalid.
-	updated, _ := m.Update(servicesMsg{
-		services: []string{"db"},
-		status:   map[string]runner.ServiceStatus{},
-		session:  m.statusSession, // must match to be accepted
-	})
-	m = updated.(Model)
-
-	assertSearchCleared(t, m, "after servicesMsg reload")
 }
 
 // TestSearchClearedOnEscToProject: a context switch off the container screen

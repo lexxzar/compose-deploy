@@ -1313,10 +1313,10 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// Nothing is lost — the next tick after the prompt closes refetches —
 		// and refreshInFlight was already cleared above.
 		if m.confirming {
-			// The DRILLED payload is dropped for the same reason — it resets
-			// the selection and the cursor wholesale, so a confirm landing
-			// after it would resolve "restart: nginx" into "restart
-			// everything" — but unlike the grouped one nothing re-dispatches
+			// The DRILLED payload is dropped for the same reason — it can
+			// prune the selection or clamp the cursor onto another row, so a
+			// confirm landing after it would resolve a different target set
+			// — but unlike the grouped one nothing re-dispatches
 			// it: containerFetchBatch(false) resolves to refreshStatus, so the
 			// drilled screen would keep the host-ps-derived subset (and swallow
 			// a loadServices error) for the whole visit. Remember it and fire
@@ -1333,10 +1333,10 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.svcErr = nil
 		if msg.groupedPayload {
 			// The grouped payload is BOTH the initial load and the 5-second
-			// refresh, so — unlike the drilled branch below — it must preserve
-			// what the user set: cursor, selection, fold state and an active
-			// search all survive. Resetting them here would fight the user
-			// every tick. The landing sites clear that state once, on entry.
+			// refresh, so it must preserve what the user set: cursor,
+			// selection, fold state and an active search all survive.
+			// Resetting them here would fight the user every tick. The
+			// landing sites clear that state once, on entry.
 			// Capture the cursor's identity BEFORE the rebuild renumbers
 			// every row; restoreCursorRow puts it back on the same row below.
 			cursorID := m.cursorRowID()
@@ -1394,18 +1394,15 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 			return m, nil
 		}
+		cursorID := m.cursorRowID()
 		m.setSingleGroup(sortServices(msg.services))
 		// Qualify at arrival: the payload carries the bare names the composer
 		// knows, and the group installed a line above is the owner that turns
 		// them into the keys the rest of the Model reads.
 		m.svcStatus = qualifyMap(m.ownerProjName(), msg.status)
-		m.selected = make(map[string]bool)
-		m.svcCursor = 0
-		m.svcOffset = 0
-		// Full reload: searchMatches holds indices into the OLD svcEntries, so
-		// a committed search is invalid once the list is replaced. Clear it (search
-		// is ephemeral and re-opened with `/` if the user still wants it).
-		m.clearSearch()
+		m.pruneSelection()
+		m.restoreCursorRow(cursorID)
+		m.searchMatches = computeMatches(m.svcEntries, m.searchQuery)
 		// Re-apply any cached update verdicts so cached glyphs survive the
 		// status-map overwrite. Race-safe regardless of whether the synthetic
 		// cache-hit updatesMsg arrives before or after this messsage. On a
@@ -1420,6 +1417,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.hydrateUpdates(entry.results)
 			}
 		}
+		m.fixSvcOffset()
 		return m, nil
 
 	case statusMsg:
@@ -6249,8 +6247,8 @@ func (m Model) selectableCount() int {
 }
 
 // clearSearch resets all container-search state back to its zero value. Called
-// on every transition that leaves screenSelectContainers or reloads the rows,
-// so a committed search can never carry stale indices into svcEntries.
+// on every transition that leaves screenSelectContainers, so a committed search
+// can never carry stale indices into svcEntries.
 func (m *Model) clearSearch() {
 	m.searching = false
 	m.searchQuery = ""
