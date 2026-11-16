@@ -85,14 +85,16 @@ Three rules are packed into those four lines.
 
 Other pins: `TestPageKeys_MoveAFullPageAndClamp` (cursor 0→3→6→9→9, `svcOffset` 7 at the bottom, 0 at the top), `TestPageKeys_InertWhereTheOtherMovementKeysAre`, `TestPageKeys_WorkOnTheReadOnlyScreen` (paging writes nothing to docker, so it is NOT gated on `readOnly()`).
 
-## Where `svcOffset` is reset, and the one branch that must never reset it
+## Where `svcOffset` is reset, and the two branches that must never reset it
 
-`svcOffset` is reset to 0 alongside `svcCursor`:
+`svcOffset` is reset to 0 alongside `svcCursor` at every landing and drill site ONLY, through `clearContainerScreen()` (`enterGroupedContainers`, the `entryLocal` fast track, the `connectResultMsg` failure path) or by hand (`drillIntoGroup`, the one site with no `clearContainerScreen()` behind it). `NewModel`/`Init` start from the zero value. Every one of them resets BEFORE it dispatches the load, so the payload has nothing left to reset.
 
-- in the **DRILLED** `servicesMsg` branch — a full reload replaces the list wholesale;
-- at every landing and drill site, through `clearContainerScreen()` (`enterGroupedContainers`, the `entryLocal` fast track, the `connectResultMsg` failure path) or by hand (`drillIntoGroup`, the one site with no `clearContainerScreen()` behind it).
+**Never in either `servicesMsg` branch.** Both capture the cursor's IDENTITY (`cursorRowID()`) before the rebuild (`setGroups` / `setSingleGroup`) renumbers every row; both then `pruneSelection()`, `restoreCursorRow(cursorID)`, re-derive `searchMatches` with `computeMatches` (never `clearSearch()`) and replay the update cache, and both call `fixSvcOffset()` LAST. `restoreCursorRow`'s trailing `clampSvcCursor()` handles a row count that shrank, so a cursor row the payload does not list keeps its index, clamped. `fixSvcOffset` alone is not enough, because it moves only the WINDOW.
 
-**Never in the grouped `servicesMsg` branch.** That branch is BOTH the initial load and the 5-second reload, so resetting there would fight the user every tick: cursor, selection, fold state and an active search all have to survive it. It calls `restoreCursorRow(cursorRowID())` followed by `fixSvcOffset()` instead — capture the cursor's IDENTITY before `setGroups` renumbers every row, look it up after, and let `restoreCursorRow`'s trailing `clampSvcCursor()` handle a row count that shrank. `fixSvcOffset` alone is not enough there, because it moves only the WINDOW.
+- **GROUPED**: the branch is BOTH the initial load and the 5-second reload, so a reset would fight the user every tick. Cursor, selection, fold state and an active search all survive it.
+- **DRILLED**: `drillIntoGroup` paints the project's EXISTING rows at once and dispatches `loadServices()` behind them. Over SSH that payload lands 1–3 s later, and the old reset threw the cursor back to row 0, dropped the selection, and closed an open `/` search mid-word, so the letters typed after it fell through to `d`/`r`/`s`. The same branch also serves the `svcReloadPending` re-dispatch (`takeSvcReload`, `execDoneMsg`, `esc` from logs/progress), which now keeps the user's state too. **`fixSvcOffset()` runs LAST, after the cache replay**: a restored `updatesErr` costs a footer row, so a window fixed above it can leave the cursor one row below the pane.
+
+Pins: `TestGroupedServicesMsg_ReloadPreservesUserState`; `TestDrilledReload_KeepsCursorMovedDuringLoad`, `TestDrilledReload_KeepsSelectionMadeDuringLoad`, `TestDrilledReload_MissingCursorRowClamps`, `TestDrilledReload_OffsetFollowsCursor`, `TestDrilledReload_KeepsTypingSearchOpen`, `TestDrilledReload_RederivesCommittedSearch`, `TestDrilledReload_ConfirmingReloadKeepsCursorAndSelection`.
 
 **The cursor survives by IDENTITY, not by index** — `svcRowID{proj, service, header}`, the same rule the fold state (project name) and the selection (`svcKey`) already follow. The full rationale for that, the drill-out cursor target and the one-shot lifecycle around it live in `docs/architecture/tui-multi-project.md`; do not restate them here.
 
