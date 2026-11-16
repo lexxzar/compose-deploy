@@ -11,6 +11,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"maps"
 	"os/exec"
 	"reflect"
 	"slices"
@@ -6374,8 +6375,8 @@ func drilledConfirmModel(t *testing.T, mc *mockComposer) Model {
 }
 
 // TestDrilledServicesMsg_ConfirmingReloadIsRedispatched pins the completion of
-// the round-2 confirming guard. Dropping the drilled payload is right — it
-// resets the selection and the cursor wholesale — but nothing else re-dispatches
+// the round-2 confirming guard. Dropping the drilled payload is right — it can
+// prune the selection or clamp the cursor — but nothing else re-dispatches
 // loadServices during a drilled visit, so the screen would keep the host-ps
 // subset (and swallow the fetch's error) for the whole visit.
 func TestDrilledServicesMsg_ConfirmingReloadIsRedispatched(t *testing.T) {
@@ -6409,6 +6410,184 @@ func TestDrilledServicesMsg_ConfirmingReloadIsRedispatched(t *testing.T) {
 	}
 	if len(msg.services) != 3 {
 		t.Errorf("the re-dispatch returned %v, want all three compose services", msg.services)
+	}
+}
+
+func TestDrilledServicesMsg_ConfirmingReloadKeepsCursorAndSelection(t *testing.T) {
+	mc := &mockComposer{services: []string{"api", "web", "worker"}}
+	m := drilledConfirmModel(t, mc)
+	want := m.svcKeyAt(0)
+
+	arrived, _ := m.Update(servicesMsg{services: mc.services, session: m.statusSession})
+	closed, cmd := arrived.(Model).Update(tea.KeyMsg{Type: tea.KeyEsc})
+	m = closed.(Model)
+	if cmd == nil {
+		t.Fatal("closing the prompt must re-dispatch loadServices")
+	}
+	landed, _ := m.Update(cmd())
+	m = landed.(Model)
+
+	if len(m.svcEntries) != 3 {
+		t.Fatalf("rows = %v, want the re-dispatched list", modelServices(m))
+	}
+	if got := rowIDAt(m.svcEntries, m.svcGroups, m.svcCursor).service; got != "web" {
+		t.Errorf("cursor on %q, want web", got)
+	}
+	if !maps.Equal(m.selected, map[string]bool{want: true}) {
+		t.Errorf("selected = %v, want only %q", m.selected, want)
+	}
+}
+
+func drilledShopModel(t *testing.T) Model {
+	t.Helper()
+	m, _ := drillTestModel(t)
+	m.svcCursor = 2
+	updated, _ := m.Update(keyMsgFor("enter"))
+	m = updated.(Model)
+	if m.grouped || !slices.Equal(modelServices(m), []string{"api", "db"}) {
+		t.Fatalf("precondition: drilled rows = %v grouped=%v, want shop's api, db", modelServices(m), m.grouped)
+	}
+	return m
+}
+
+func deliverDrilled(t *testing.T, m Model, services ...string) Model {
+	t.Helper()
+	status := make(map[string]runner.ServiceStatus, len(services))
+	for _, s := range services {
+		status[s] = runner.ServiceStatus{Running: true}
+	}
+	updated, _ := m.Update(servicesMsg{services: services, status: status, session: m.statusSession})
+	m = updated.(Model)
+	if !slices.Equal(modelServices(m), sortServices(services)) {
+		t.Fatalf("precondition: rows = %v, want the payload %v", modelServices(m), services)
+	}
+	return m
+}
+
+func cursorName(m Model) string {
+	return rowIDAt(m.svcEntries, m.svcGroups, m.svcCursor).service
+}
+
+func TestDrilledReload_KeepsCursorMovedDuringLoad(t *testing.T) {
+	m := drilledShopModel(t)
+	updated, _ := m.Update(keyMsgFor("j"))
+	m = updated.(Model)
+	if cursorName(m) != "db" {
+		t.Fatalf("precondition: cursor on %q, want db", cursorName(m))
+	}
+
+	m = deliverDrilled(t, m, "db", "api", "aaa")
+
+	if got := cursorName(m); got != "db" {
+		t.Errorf("cursor on %q (row %d), want db", got, m.svcCursor)
+	}
+	if m.svcCursor != 2 {
+		t.Errorf("svcCursor = %d, want 2 (db after aaa and api)", m.svcCursor)
+	}
+}
+
+func TestDrilledReload_KeepsSelectionMadeDuringLoad(t *testing.T) {
+	m := drilledShopModel(t)
+	for _, k := range []string{" ", "j", " "} {
+		updated, _ := m.Update(keyMsgFor(k))
+		m = updated.(Model)
+	}
+	api, db := svcKey("shop", "api"), svcKey("shop", "db")
+	if !maps.Equal(m.selected, map[string]bool{api: true, db: true}) {
+		t.Fatalf("precondition: selected = %v, want api and db", m.selected)
+	}
+
+	m = deliverDrilled(t, m, "api", "cache")
+
+	if !m.selected[api] {
+		t.Errorf("selected = %v, want api to keep its tick", m.selected)
+	}
+	if m.selected[db] {
+		t.Errorf("selected = %v, want db pruned (the payload does not list it)", m.selected)
+	}
+}
+
+func TestDrilledReload_MissingCursorRowClamps(t *testing.T) {
+	m := drilledShopModel(t)
+	m.height = 10
+	m = deliverDrilled(t, m, "api", "cache", "db", "queue", "worker")
+	for range 4 {
+		updated, _ := m.Update(keyMsgFor("down"))
+		m = updated.(Model)
+	}
+	if cursorName(m) != "worker" || m.svcOffset == 0 {
+		t.Fatalf("precondition: cursor on %q offset %d, want worker with a scrolled window", cursorName(m), m.svcOffset)
+	}
+
+	m = deliverDrilled(t, m, "api", "cache", "db")
+
+	if m.svcCursor != 2 {
+		t.Errorf("svcCursor = %d, want 2 (clamped to the last row)", m.svcCursor)
+	}
+	assertCursorVisible(t, m)
+	if maxOffset := max(len(m.svcEntries)-m.svcVisibleCount(), 0); m.svcOffset > maxOffset {
+		t.Errorf("svcOffset = %d, want <= %d", m.svcOffset, maxOffset)
+	}
+}
+
+func TestDrilledReload_OffsetFollowsCursor(t *testing.T) {
+	m := drilledShopModel(t)
+	m.height = 20
+	var services []string
+	for i := 10; i < 40; i++ {
+		services = append(services, fmt.Sprintf("svc-%02d", i))
+	}
+	m = deliverDrilled(t, m, services...)
+	m.svcCursor = 20
+	m.fixSvcOffset()
+	if m.svcOffset == 0 || m.svcCursor != m.svcOffset+m.svcVisibleCount()-1 {
+		t.Fatalf("precondition: cursor %d offset %d visible %d, want the cursor on the last visible row of a scrolled window",
+			m.svcCursor, m.svcOffset, m.svcVisibleCount())
+	}
+	m.updateCache = map[string]updateEntry{
+		m.updatesCacheKey(): {fetchedAt: time.Now(), err: true, errMsg: "registry: 429"},
+	}
+
+	m = deliverDrilled(t, m, append([]string{"svc-05"}, services...)...)
+
+	if m.updatesErr == "" {
+		t.Fatal("precondition: the cached failure must restore updatesErr and cost a footer row")
+	}
+	if got := cursorName(m); got != "svc-30" {
+		t.Errorf("cursor on %q, want svc-30", got)
+	}
+	assertCursorVisible(t, m)
+}
+
+func TestDrilledReload_KeepsTypingSearchOpen(t *testing.T) {
+	m := drilledShopModel(t)
+	for _, k := range []string{"/", "d"} {
+		updated, _ := m.Update(keyMsgFor(k))
+		m = updated.(Model)
+	}
+	if !m.searching || m.searchQuery != "d" {
+		t.Fatalf("precondition: searching=%v query=%q, want an open bar holding d", m.searching, m.searchQuery)
+	}
+
+	m = deliverDrilled(t, m, "adminer", "api", "db", "redis")
+
+	if !m.searching {
+		t.Error("the reload closed the search bar the user is typing in")
+	}
+	if m.searchQuery != "d" {
+		t.Errorf("searchQuery = %q, want d", m.searchQuery)
+	}
+	if want := computeMatches(m.svcEntries, "d"); !slices.Equal(m.searchMatches, want) {
+		t.Errorf("searchMatches = %v, want %v over the new rows", m.searchMatches, want)
+	}
+
+	updated, _ := m.Update(keyMsgFor("d"))
+	m = updated.(Model)
+	if m.confirming {
+		t.Errorf("d armed a %v confirmation; it belongs to the search input", m.pendingOp)
+	}
+	if m.searchQuery != "dd" {
+		t.Errorf("searchQuery = %q, want dd", m.searchQuery)
 	}
 }
 
