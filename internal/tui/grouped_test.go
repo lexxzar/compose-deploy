@@ -6464,21 +6464,17 @@ func deliverDrilled(t *testing.T, m Model, services ...string) Model {
 	return m
 }
 
-func cursorName(m Model) string {
-	return rowIDAt(m.svcEntries, m.svcGroups, m.svcCursor).service
-}
-
 func TestDrilledReload_KeepsCursorMovedDuringLoad(t *testing.T) {
 	m := drilledShopModel(t)
 	updated, _ := m.Update(keyMsgFor("j"))
 	m = updated.(Model)
-	if cursorName(m) != "db" {
-		t.Fatalf("precondition: cursor on %q, want db", cursorName(m))
+	if name, _ := m.cursorService(); name != "db" {
+		t.Fatalf("precondition: cursor on %q, want db", name)
 	}
 
 	m = deliverDrilled(t, m, "db", "api", "aaa")
 
-	if got := cursorName(m); got != "db" {
+	if got, _ := m.cursorService(); got != "db" {
 		t.Errorf("cursor on %q (row %d), want db", got, m.svcCursor)
 	}
 	if m.svcCursor != 2 {
@@ -6515,8 +6511,8 @@ func TestDrilledReload_MissingCursorRowClamps(t *testing.T) {
 		updated, _ := m.Update(keyMsgFor("down"))
 		m = updated.(Model)
 	}
-	if cursorName(m) != "worker" || m.svcOffset == 0 {
-		t.Fatalf("precondition: cursor on %q offset %d, want worker with a scrolled window", cursorName(m), m.svcOffset)
+	if name, _ := m.cursorService(); name != "worker" || m.svcOffset == 0 {
+		t.Fatalf("precondition: cursor on %q offset %d, want worker with a scrolled window", name, m.svcOffset)
 	}
 
 	m = deliverDrilled(t, m, "api", "cache", "db")
@@ -6553,7 +6549,7 @@ func TestDrilledReload_OffsetFollowsCursor(t *testing.T) {
 	if m.updatesErr == "" {
 		t.Fatal("precondition: the cached failure must restore updatesErr and cost a footer row")
 	}
-	if got := cursorName(m); got != "svc-30" {
+	if got, _ := m.cursorService(); got != "svc-30" {
 		t.Errorf("cursor on %q, want svc-30", got)
 	}
 	assertCursorVisible(t, m)

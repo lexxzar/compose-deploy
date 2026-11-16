@@ -14258,7 +14258,7 @@ func TestSvcVisibleCount_ConstantAcrossConfirming(t *testing.T) {
 func assertSearchCleared(t *testing.T, m Model, where string) {
 	t.Helper()
 	if m.searchQuery != "" {
-		t.Errorf("%s: searchQuery = %q, want empty (search must be cleared on departure/reload)", where, m.searchQuery)
+		t.Errorf("%s: searchQuery = %q, want empty (search must be cleared on departure)", where, m.searchQuery)
 	}
 	if m.searchMatches != nil {
 		t.Errorf("%s: searchMatches = %v, want nil", where, m.searchMatches)
@@ -14276,14 +14276,13 @@ func TestSearchRederivedOnServicesReload(t *testing.T) {
 	m.setSingleGroup(mc.services)
 	m.searchQuery = "w"
 	m.searchMatches = computeMatches(m.svcEntries, "w") // [1 2]
-	m.svcCursor = 1
+	m.svcCursor = 0
 	if len(m.searchMatches) != 2 {
 		t.Fatalf("precondition: expected 2 matches, got %v", m.searchMatches)
 	}
 
-	// Reload with a DIFFERENT, shorter list — old indices [1 2] would be invalid.
 	updated, _ := m.Update(servicesMsg{
-		services: []string{"db"},
+		services: []string{"db", "web"},
 		status:   map[string]runner.ServiceStatus{},
 		session:  m.statusSession, // must match to be accepted
 	})
@@ -14292,8 +14291,14 @@ func TestSearchRederivedOnServicesReload(t *testing.T) {
 	if m.searchQuery != "w" {
 		t.Errorf("after servicesMsg reload: searchQuery = %q, want %q", m.searchQuery, "w")
 	}
-	if m.searchMatches != nil {
-		t.Errorf("after servicesMsg reload: searchMatches = %v, want nil (re-derived against [db])", m.searchMatches)
+	if !slices.Equal(m.searchMatches, []int{1}) {
+		t.Errorf("after servicesMsg reload: searchMatches = %v, want [1] (re-derived against [db web])", m.searchMatches)
+	}
+
+	updated, _ = m.Update(keyMsgFor("n"))
+	m = updated.(Model)
+	if name, _ := m.cursorService(); name != "web" {
+		t.Errorf("n after the reload: cursor on %q, want web", name)
 	}
 }
 

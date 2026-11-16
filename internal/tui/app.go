@@ -1333,9 +1333,9 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.svcErr = nil
 		if msg.groupedPayload {
 			// The grouped payload is BOTH the initial load and the 5-second
-			// refresh, so it must preserve what the user set: cursor, selection, fold state and an active
-			// search all survive. Resetting them here would fight the user
-			// every tick. The landing sites clear that state once, on entry.
+			// refresh, so it must preserve what the user set: cursor,
+			// selection, fold state and an active search all survive.
+			// Resetting them here would fight the user every tick. The landing sites clear that state once, on entry.
 			// Capture the cursor's identity BEFORE the rebuild renumbers
 			// every row; restoreCursorRow puts it back on the same row below.
 			cursorID := m.cursorRowID()
@@ -6246,8 +6246,8 @@ func (m Model) selectableCount() int {
 }
 
 // clearSearch resets all container-search state back to its zero value. Called
-// on every transition that leaves screenSelectContainers or reloads the rows,
-// so a committed search can never carry stale indices into svcEntries.
+// on every transition that leaves screenSelectContainers, so a committed search
+// can never carry stale indices into svcEntries.
 func (m *Model) clearSearch() {
 	m.searching = false
 	m.searchQuery = ""
