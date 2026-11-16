@@ -1289,7 +1289,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case servicesMsg:
 		// Drop responses from a previous context (same race class as statusMsg/statsMsg):
 		// loadServices runs ListServices + ContainerStatus, so a stale response can
-		// overwrite both `services` and `svcStatus` for the new context. Sharing
+		// overwrite both `svcGroups` and `svcStatus` for the new context. Sharing
 		// statusSession is intentional — loadServices is the initial-fetch sibling
 		// of refreshStatus and lives in the same lifecycle.
 		if msg.groupedPayload && msg.session == m.statusSession {
@@ -1405,7 +1405,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.searchMatches = computeMatches(m.svcEntries, m.searchQuery)
 		// Re-apply any cached update verdicts so cached glyphs survive the
 		// status-map overwrite. Race-safe regardless of whether the synthetic
-		// cache-hit updatesMsg arrives before or after this messsage. On a
+		// cache-hit updatesMsg arrives before or after this message. On a
 		// fresh CACHED FAILURE entry (within updatesErrorTTL) restore the
 		// warning text from the cache too — otherwise periodic re-entries
 		// or initial-load arrivals would silently drop the soft warning
